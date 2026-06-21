@@ -523,6 +523,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(feature = "sequentia"))] // SEQUENTIA: decodes Liquid-only data
     fn block() {
         // Simple block with only coinbase output
         let block: Block = hex_deserialize!(SIMPLE_BLOCK);
@@ -784,6 +785,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(feature = "sequentia"))] // SEQUENTIA: decodes Liquid-only data
     fn dynafed_block() {
         // Copied from elements RPC during a functionary integration test run
         let block: Block = hex_deserialize!(DYNAFED_BLOCK);
@@ -861,6 +863,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(feature = "sequentia"))] // SEQUENTIA: decodes Liquid-only data
     fn test_failed_block() {
         let block_str = include_str!("../tests/data/failedblock.hex");
 

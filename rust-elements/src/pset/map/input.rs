@@ -544,6 +544,10 @@ impl Input {
                 (_, Some(comm)) => confidential::Value::Confidential(comm),
                 (Some(x), None) => confidential::Value::Explicit(x),
             },
+            // SEQUENTIA: PSET does not (yet) carry the issuance denomination;
+            // default to 8 to match AssetIssuance::null().
+            #[cfg(feature = "sequentia")]
+            denomination: 8,
         }
     }
 }

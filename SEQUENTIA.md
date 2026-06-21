@@ -49,6 +49,6 @@ cargo run -p lwk_wollet --example sequentia_sync
 - [x] Sequentia network + address params
 - [x] Vendored rust-elements with the anchored-header `sequentia` serialization
 - [x] End-to-end watch-only sync against a live Sequentia explorer
-- [ ] `nDenomination` issuance byte (issuance-tx serialization delta)
+- [x] `nDenomination` issuance byte (issuance-tx serialization delta)
 - [ ] Confidential-tx review for the testnet's non-confidential outputs
 - [ ] Wider SWK branding (crate names stay `lwk_*` for upstream tracking)

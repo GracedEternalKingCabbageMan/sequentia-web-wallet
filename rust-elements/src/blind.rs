@@ -1581,6 +1581,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(feature = "sequentia"))] // SEQUENTIA: decodes Liquid-only data
     fn test_partially_blinded_tx() {
         // Partially blinded tx with multiple issuances from options project
         let secp = secp256k1_zkp::Secp256k1::new();

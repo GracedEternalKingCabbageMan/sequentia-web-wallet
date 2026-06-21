@@ -46,6 +46,11 @@ pub struct AssetIssuance {
     pub amount: confidential::Value,
     /// Amount of inflation keys to issue
     pub inflation_keys: confidential::Value,
+    /// SEQUENTIA: asset precision/denomination (number of decimal places).
+    /// Sequentia's `CAssetIssuance` serializes one extra `uint8_t nDenomination`
+    /// after the inflation keys (default 8); standard Elements/Liquid does not.
+    #[cfg(feature = "sequentia")]
+    pub denomination: u8,
 }
 
 impl AssetIssuance {
@@ -56,6 +61,8 @@ impl AssetIssuance {
             asset_entropy: [0; 32],
             amount: confidential::Value::Null,
             inflation_keys: confidential::Value::Null,
+            #[cfg(feature = "sequentia")]
+            denomination: 8,
         }
     }
 
@@ -64,8 +71,47 @@ impl AssetIssuance {
         self.amount.is_null() && self.inflation_keys.is_null()
     }
 }
+#[cfg(not(feature = "sequentia"))]
 serde_struct_impl!(AssetIssuance, asset_blinding_nonce, asset_entropy, amount, inflation_keys);
-impl_consensus_encoding!(AssetIssuance, asset_blinding_nonce, asset_entropy, amount, inflation_keys);
+#[cfg(feature = "sequentia")]
+serde_struct_impl!(AssetIssuance, asset_blinding_nonce, asset_entropy, amount, inflation_keys, denomination);
+
+// SEQUENTIA: hand-written so the extra `denomination` byte (present only in the
+// `sequentia` build) is (de)serialized after `inflation_keys`, byte-for-byte
+// matching Sequentia's `CAssetIssuance`. Non-sequentia builds are unchanged.
+impl Encodable for AssetIssuance {
+    fn consensus_encode<S: io::Write>(&self, mut s: S) -> Result<usize, encode::Error> {
+        let mut ret = 0;
+        ret += self.asset_blinding_nonce.consensus_encode(&mut s)?;
+        ret += self.asset_entropy.consensus_encode(&mut s)?;
+        ret += self.amount.consensus_encode(&mut s)?;
+        ret += self.inflation_keys.consensus_encode(&mut s)?;
+        #[cfg(feature = "sequentia")]
+        {
+            ret += self.denomination.consensus_encode(&mut s)?;
+        }
+        Ok(ret)
+    }
+}
+
+impl Decodable for AssetIssuance {
+    fn consensus_decode<D: io::Read>(mut d: D) -> Result<AssetIssuance, encode::Error> {
+        let asset_blinding_nonce = Decodable::consensus_decode(&mut d)?;
+        let asset_entropy = Decodable::consensus_decode(&mut d)?;
+        let amount = Decodable::consensus_decode(&mut d)?;
+        let inflation_keys = Decodable::consensus_decode(&mut d)?;
+        #[cfg(feature = "sequentia")]
+        let denomination = Decodable::consensus_decode(&mut d)?;
+        Ok(AssetIssuance {
+            asset_blinding_nonce,
+            asset_entropy,
+            amount,
+            inflation_keys,
+            #[cfg(feature = "sequentia")]
+            denomination,
+        })
+    }
+}
 
 impl Default for AssetIssuance {
     fn default() -> Self {
@@ -1845,6 +1891,9 @@ mod tests {
         }
     }
 
+    // SEQUENTIA: this decodes a real *Liquid* issuance tx, which has no
+    // nDenomination byte, so it only applies to non-sequentia builds.
+    #[cfg(not(feature = "sequentia"))]
     #[test]
     fn issuance() {
         let tx: Transaction = hex_deserialize!("\
