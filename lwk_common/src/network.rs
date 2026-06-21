@@ -51,6 +51,7 @@ pub struct ElementsParamsBuilder {
     policy_asset: Option<AssetId>,
     genesis_hash: Option<BlockHash>,
     address_params: Option<&'static AddressParams>,
+    name: Option<&'static str>,
 }
 
 impl ElementsParamsBuilder {
@@ -78,6 +79,13 @@ impl ElementsParamsBuilder {
         self
     }
 
+    /// Specify the short network name (e.g. "sequentia-testnet"). Defaults to
+    /// "liquid-regtest" for generic custom networks.
+    pub fn with_name(mut self, name: &'static str) -> Self {
+        self.name = Some(name);
+        self
+    }
+
     /// Build Elements network parameters.
     ///
     /// Unspecified values would defined as default Liquid regtest parameters
@@ -88,6 +96,7 @@ impl ElementsParamsBuilder {
                 .genesis_hash
                 .unwrap_or(BlockHash::from_byte_array(GENESIS_LIQUID_REGTEST)),
             address_params: self.address_params.unwrap_or(&AddressParams::ELEMENTS),
+            name: self.name.unwrap_or("liquid-regtest"),
         })
     }
 }
@@ -99,6 +108,8 @@ pub struct ElementsParams {
     genesis_hash: BlockHash,
     /// Address parameters used to derive addresses for this network.
     address_params: &'static AddressParams,
+    /// Short network name (e.g. "sequentia-testnet").
+    name: &'static str,
 }
 
 /// The network of the elements blockchain.
@@ -164,6 +175,7 @@ impl Network {
                 .with_policy_asset(policy_asset)
                 .with_genesis_hash(genesis_hash)
                 .with_address_params(&SEQUENTIA_TESTNET_ADDRESS_PARAMS)
+                .with_name("sequentia-testnet")
                 .build()
                 .expect("valid Sequentia params"),
         )
@@ -183,7 +195,7 @@ impl Network {
         match self {
             Network::Liquid => "liquid",
             Network::TestnetLiquid => "liquid-testnet",
-            Network::CustomElements(_) => "liquid-regtest",
+            Network::CustomElements(params) => params.name,
         }
     }
 
@@ -215,7 +227,7 @@ impl std::fmt::Display for Network {
         match self {
             Network::Liquid => write!(f, "liquid"),
             Network::TestnetLiquid => write!(f, "testnet-liquid"),
-            Network::CustomElements(_) => write!(f, "localtest-liquid"),
+            Network::CustomElements(params) => write!(f, "{}", params.name),
         }
     }
 }
@@ -227,9 +239,10 @@ impl FromStr for Network {
         match s {
             "liquid" => Ok(Network::Liquid),
             "testnet-liquid" => Ok(Network::TestnetLiquid),
-            "localtest-liquid" => Ok(Network::default_regtest()),
+            "localtest-liquid" | "liquid-regtest" => Ok(Network::default_regtest()),
+            "sequentia-testnet" => Ok(Network::sequentia_testnet()),
             _ => Err(
-                "invalid network, possible value are: 'liquid', 'testnet-liquid', 'localtest-liquid'"
+                "invalid network, possible value are: 'liquid', 'testnet-liquid', 'localtest-liquid', 'sequentia-testnet'"
                     .to_string(),
             ),
         }
@@ -292,6 +305,10 @@ mod tests {
         assert_eq!(p.bech_hrp.to_string(), "tb");
         assert_eq!(p.blech_hrp.to_string(), "tsqb");
         assert_ne!(p, &AddressParams::ELEMENTS);
+        // identifies as sequentia-testnet (not liquid-regtest), and round-trips
+        assert_eq!(n.as_str(), "sequentia-testnet");
+        assert_eq!(n.to_string(), "sequentia-testnet");
+        assert_eq!(Network::from_str("sequentia-testnet").unwrap(), n);
     }
 
     #[test]
