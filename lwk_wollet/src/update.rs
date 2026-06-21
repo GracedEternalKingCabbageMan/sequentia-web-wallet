@@ -379,6 +379,9 @@ pub(crate) fn default_blockheader() -> BlockHeader {
         time: 0,
         height: 0,
         ext: BlockExtData::default(),
+        // SEQUENTIA: a zero anchor keeps this placeholder a valid Sequentia
+        // header (encode/hash under the `sequentia` feature require Some).
+        bitcoin_anchor: Some((0, BlockHash::all_zeros())),
     }
 }
 

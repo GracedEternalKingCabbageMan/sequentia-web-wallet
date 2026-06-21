@@ -1,0 +1,59 @@
+[package]
+name = "elements"
+version = "0.25.3"
+authors = ["Andrew Poelstra <apoelstra@blockstream.com>"]
+description = "Library with support for de/serialization, parsing and executing on data structures and network messages related to Elements"
+license = "CC0-1.0"
+homepage = "https://github.com/ElementsProject/rust-elements/"
+repository = "https://github.com/ElementsProject/rust-elements/"
+documentation = "https://docs.rs/elements/"
+edition = "2018"
+
+[features]
+default = ["json-contract"]
+
+json-contract = ["serde_json"]
+"serde" = [
+    "bitcoin/serde",
+    "bitcoin/serde",
+    "secp256k1-zkp/serde",
+    "actual-serde",
+]
+base64 = ["bitcoin/base64"]
+
+[dependencies]
+bech32 = "0.11.0"
+bitcoin = "0.32.2"
+secp256k1-zkp = { version = "0.11.0", features = ["global-context", "hashes"] }
+
+# Used for ContractHash::from_json_contract.
+serde_json = { version = "1.0", optional = true }
+
+actual-serde = { package = "serde", version = "1.0.103", features = [
+    "derive",
+], optional = true }
+
+
+[target.wasm32-unknown-unknown.dev-dependencies]
+getrandom = { version = "0.2", features = ["js"] }
+
+[dev-dependencies]
+rand = "0.8"
+rand_chacha = "0.3"
+serde_test = "1.0.19"
+serde_json = "1.0"
+serde_cbor = "0.8"    # older than latest version to support 1.41.1
+bincode = "1.3"
+
+[[example]]
+name = "pset_blind_coinjoin"
+
+[[example]]
+name = "raw_blind"
+
+[[example]]
+name = "tx"
+
+[workspace]
+members = ["elementsd-tests"]
+exclude = ["fuzz"]

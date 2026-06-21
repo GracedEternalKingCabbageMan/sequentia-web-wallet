@@ -23,3 +23,5 @@ lwk_bindings/examples/swaps/
 .cursorrules
 swaps/
 .codex
+rust-elements/target/
+rust-elements/Cargo.lock

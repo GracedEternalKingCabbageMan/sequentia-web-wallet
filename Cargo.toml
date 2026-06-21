@@ -36,6 +36,9 @@ lwk_wollet = { path = "lwk_wollet" }
 lwk_boltz = { path = "lwk_boltz" }
 lwk_payment_instructions = { path = "lwk_payment_instructions" }
 lwk_simplicity = { path = "lwk_simplicity" }
+# SEQUENTIA: vendored rust-elements with the `sequentia` feature so the wallet
+# can (de)serialize Sequentia's anchored block headers + issuance.
+elements = { path = "rust-elements" }
 
 [profile.release-smaller]
 inherits = "release"
@@ -51,7 +54,7 @@ debug = true         # Include debug symbols for profiling
 strip = "none"       # Don't strip any symbols
 
 [workspace.dependencies]
-elements = { version = "0.25.3", features = ["base64", "serde"] }
+elements = { version = "0.25.3", features = ["base64", "serde", "sequentia"] }
 elements-miniscript = { version = "0.4", features = ["base64", "serde"] }
 serde = { version = "1.0" }
 serde_json = { version = "1.0" }
