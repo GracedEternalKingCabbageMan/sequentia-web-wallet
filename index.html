@@ -150,9 +150,17 @@
       </div>
       <div class="card">
         <label class="lbl">Testnet faucet</label>
-        <p class="sub" style="margin:0 0 12px">Get free testnet tSEQ to try out the wallet — sent straight to this wallet.</p>
-        <button id="btnFaucet">Request 50,000 tSEQ</button>
-        <div class="status" id="faucetStatus"></div>
+        <p class="sub" style="margin:0 0 12px">Get free testnet assets to try out the wallet — sent straight to this wallet (tSEQ for fees + staking; the others for asset sends and paying fees in an asset).</p>
+        <div class="row" id="faucetBtns">
+          <button class="primary" data-faucet="">tSEQ</button>
+          <button data-faucet="USDX">USDX</button>
+          <button data-faucet="EURX">EURX</button>
+          <button data-faucet="GOLD">GOLD</button>
+          <button data-faucet="WBTC">WBTC</button>
+          <button data-faucet="SILVR">SILVR</button>
+          <button data-faucet="OILX">OILX</button>
+        </div>
+        <div class="status" id="faucetStatus" style="margin-top:10px"></div>
       </div>
     </section>
 
@@ -163,8 +171,17 @@
         <div id="recipients"></div>
         <button class="ghost" id="btnAddRec" style="margin-top:10px">+ Add recipient</button>
         <div class="field">
-          <label class="lbl">Fee rate (sat/vB, optional)</label>
-          <input id="feeRate" class="mono" placeholder="leave blank for the default">
+          <div class="row">
+            <div class="grow">
+              <label class="lbl">Fee rate (sat/vB, optional)</label>
+              <input id="feeRate" class="mono" placeholder="leave blank for the default">
+            </div>
+            <div style="width:160px">
+              <label class="lbl">Pay fee in</label>
+              <select id="feeAsset"></select>
+            </div>
+          </div>
+          <div class="sub" id="feeAssetHint" style="margin-top:6px"></div>
         </div>
         <div class="row" style="margin-top:14px">
           <button class="primary" id="btnReview">Review &amp; send</button>
@@ -177,7 +194,7 @@
     <section data-panel="receive" class="hide">
       <div class="card">
         <label class="lbl">Receive</label>
-        <p class="sub" style="margin:0 0 10px">Non-confidential, Bitcoin-compatible format. Confidential addresses are opt-in on Sequentia.</p>
+        <p class="sub" id="recvTip" style="margin:0 0 10px">Non-confidential (tb1…), Bitcoin-compatible — the same address also receives parent-chain BTC. Confidential addresses are opt-in on Sequentia.</p>
         <img class="qr" id="qr" alt="address QR">
         <div class="mono" id="addr" style="margin-top:12px">—</div>
         <div class="row" style="margin-top:12px">
@@ -274,6 +291,7 @@
 <script type="module">
 import init, { Mnemonic, Network, Signer, Wollet, EsploraClient, Address, AssetId, Contract }
   from './pkg/lwk_wasm.js';
+import { HDKey, mnemonicToSeedSync, btc } from './btc.js';
 
 const ESPLORA = location.origin + '/api';
 const KEY = 'swk.sequentia.mnemonic';
@@ -301,11 +319,174 @@ function parseAtoms(str, d){ str=(str||'').trim();
   f=(f+'0'.repeat(d)).slice(0,d); return BigInt(i)*(10n**BigInt(d))+BigInt(f||'0'); }
 
 // ---------- local asset labels ----------
+// Built-in tickers for the public testnet demo assets, so they render as
+// USDX/GOLD/etc. out of the box. User-set labels (localStorage) override these.
+const DEFAULT_ASSETS = {
+  'dc7f45fcfeb17c8ae74e284472d85543395f50e88f4a36cb652e8102703b7027': {ticker:'USDX',  name:'USD Stablecoin',       precision:8},
+  'f7a756b4e966623065543e52b754324629295c895046a0916a939898ad373667': {ticker:'EURX',  name:'Euro Stablecoin',      precision:8},
+  'c28fc933ce41f7a9188da029c6f7377fc961e2d58588372ef4073438610b9283': {ticker:'GOLD',  name:'Gold (troy ounce)',    precision:8},
+  '3e30ad0ebd13cc7ac1bbd12df1414b213708a6048b745d185fe935d9624024db': {ticker:'WBTC',  name:'Wrapped Bitcoin',      precision:8},
+  '50a00211d7074d5f857a3dec6cb84a1f3fefb26e56a94a954a299b28ac9f32df': {ticker:'SILVR', name:'Silver (troy ounce)',  precision:8},
+  'f9b069ac00f4dc57381a304704fac93301f90d3d509d207cfbddc8367d4e9cfb': {ticker:'OILX',  name:'Crude Oil (barrel)',   precision:8},
+};
 const labels = () => { try { return JSON.parse(localStorage.getItem(LBL)||'{}'); } catch { return {}; } };
 function saveLabel(hex, info){ const m=labels(); m[hex]=info; localStorage.setItem(LBL, JSON.stringify(m)); }
-function assetMeta(hex){ if(hex===POLICY_HEX) return {ticker:'tSEQ', name:'Sequentia', precision:8};
-  return labels()[hex] || {ticker:hex.slice(0,8)+'…', name:'Asset', precision:0}; }
+function assetMeta(hex){ if(hex==='BTC') return {ticker:'BTC', name:'Bitcoin testnet4', precision:8};
+  if(hex===POLICY_HEX) return {ticker:'tSEQ', name:'Sequentia', precision:8};
+  return labels()[hex] || DEFAULT_ASSETS[hex] || {ticker:hex.slice(0,8)+'…', name:'Asset', precision:0}; }
 let POLICY_HEX='';
+
+// ---------- fee-asset exchange rates (Sequentia any-asset-fees) ----------
+// The node publishes a fee whitelist: each asset's rate is atoms-of-asset per
+// reference unit, scaled by 1e8. The POLICY asset (tSEQ) is the reference and is
+// keyed "bitcoin" (Elements naming). The price server normalizes every asset
+// against tSEQ, so tSEQ sits at 1e8 — but we READ that reference (don't assume it)
+// and value the rest relative to it. Consensus uses these published rates directly,
+// so a fee built with the same rate is exactly what the node requires.
+const EXCHANGE_RATE_SCALE = 100000000;
+let feeRates = {};                        // assetHex -> { rate, source }  (non-stale, positive)
+let feeRefRate = EXCHANGE_RATE_SCALE;     // the tSEQ reference rate, read from the feed
+async function fetchFeeRates(){
+  try{
+    // /feerates = getfeeexchangerates: the node's effective acceptance set {("bitcoin"|hex): rate},
+    // i.e. static + non-stale dynamic. tSEQ (policy) is keyed "bitcoin" and is the reference unit.
+    const d = await fetch('/feerates').then(r=>r.json());
+    const ref = d.bitcoin;                            // policy/tSEQ reference rate (a number)
+    feeRefRate = (ref>0) ? ref : EXCHANGE_RATE_SCALE;
+    console.log(`[feerates] tSEQ reference rate = ${feeRefRate}` +
+      (feeRefRate===EXCHANGE_RATE_SCALE ? ' (1:1 — node normalized to tSEQ)'
+                                        : ' (non-1:1 — valuing other assets relative to it)'));
+    const map={};
+    for(const [k,v] of Object.entries(d)){
+      if(k==='bitcoin' || !(v>0)) continue;          // skip the reference + invalid (node already drops stale)
+      map[k] = { rate: v };
+    }
+    feeRates = map;
+  }catch(e){ console.warn('[feerates] fetch failed:', e?.message??e); feeRates={}; }
+}
+// Fill the "pay fee in" picker: tSEQ (default) + any owned asset the node accepts for fees.
+function populateFeeAssets(){
+  const sel=$('feeAsset'); if(!sel) return;
+  const prev=sel.value;
+  sel.innerHTML='';
+  const add=(val,label)=>{ const o=el('option'); o.value=val; o.textContent=label; sel.appendChild(o); };
+  add(POLICY_HEX, 'tSEQ');
+  const b=balObj();
+  for(const h of Object.keys(b)){
+    if(h===POLICY_HEX || !feeRates[h]) continue;   // only fee-whitelisted (non-stale) owned assets
+    add(h, assetMeta(h).ticker);
+  }
+  if(prev && [...sel.options].some(o=>o.value===prev)) sel.value=prev;
+  updateFeeAssetHint();
+}
+function updateFeeAssetHint(){
+  const sel=$('feeAsset'), hint=$('feeAssetHint'); if(!sel||!hint) return;
+  const h=sel.value;
+  if(!h || h===POLICY_HEX || !feeRates[h]){ hint.textContent=''; return; }
+  const t=assetMeta(h).ticker;
+  const rel=feeRates[h].rate / feeRefRate;        // tSEQ value of one whole unit of the asset
+  hint.textContent = `Fee charged in ${t} at the node's published rate (≈ ${rel.toPrecision(4)} tSEQ per ${t}). Needs enough ${t} in the wallet.`;
+}
+
+// ---------- Bitcoin (testnet4) — same BIP84 keychain, identical tb1 addresses ----------
+const T4_API = location.origin + '/testnet4/api';
+const GAP = 20;                          // address gap limit scanned on each chain
+let btcRoot = null, btcBalance = 0n, btcUsed = new Set(), btcChangeNext = 0, btcScanLimit = GAP+1;
+const BTC_DUST = 294n;            // P2WPKH dust threshold (sats)
+const BTC_DEFAULT_FEERATE = 2;    // sat/vB default for testnet4
+function btcInit(phrase){ btcRoot = HDKey.fromMasterSeed(mnemonicToSeedSync(phrase.trim().replace(/\s+/g,' '))); }
+function btcNode(internal, i){ return btcRoot.derive(`m/84'/1'/0'/${internal?1:0}/${i}`); }
+function btcAddr(internal, i){ return btc.p2wpkh(btcNode(internal,i).publicKey, btc.TEST_NETWORK).address; }
+async function btcAddrInfo(a){ try{ return await fetch(`${T4_API}/address/${a}`).then(r=>r.json()); }catch{ return null; } }
+async function btcScan(){
+  // BIP44-style gap scan: keep scanning GAP-wide batches until a whole batch shows no
+  // activity, so change addresses that drifted past index GAP are still found — a fixed
+  // 0..GAP window would make such change invisible and unspendable.
+  let bal=0n; const used=new Set(); let chgMax=-1, start=0, scanned=GAP;
+  for(let guard=0; guard<64; guard++){
+    const jobs=[];
+    for(let i=start;i<start+GAP;i++){ jobs.push(['e',i,btcAddr(false,i)]); jobs.push(['i',i,btcAddr(true,i)]); }
+    const res = await Promise.all(jobs.map(([t,i,a])=>btcAddrInfo(a).then(d=>({t,i,d}))));
+    let anyUsed=false;
+    for(const r of res){ if(!r.d) continue;
+      const cs=r.d.chain_stats||{}, ms=r.d.mempool_stats||{};
+      bal += BigInt((cs.funded_txo_sum||0)-(cs.spent_txo_sum||0)+(ms.funded_txo_sum||0)-(ms.spent_txo_sum||0));
+      const tc=(cs.tx_count||0)+(ms.tx_count||0);
+      if(tc>0){ anyUsed=true; if(r.t==='e') used.add(r.i); else if(r.i>chgMax) chgMax=r.i; }
+    }
+    start += GAP; scanned = start;
+    if(!anyUsed) break;
+  }
+  btcBalance = bal; btcUsed = used; btcChangeNext = chgMax+1; btcScanLimit = scanned;
+}
+
+// gather spendable utxos across the full scanned range (same window as btcScan, plus any
+// in-session change index not yet re-scanned), each carrying its signing key
+async function btcGatherUtxos(){
+  const lim = Math.max(btcScanLimit, btcChangeNext+1);
+  const jobs=[];
+  for(const internal of [false,true]) for(let i=0;i<lim;i++) jobs.push([internal,i]);
+  const lists = await Promise.all(jobs.map(async([internal,i])=>{
+    const node=btcNode(internal,i); const p=btc.p2wpkh(node.publicKey, btc.TEST_NETWORK);
+    const us=await fetch(`${T4_API}/address/${p.address}/utxo`).then(r=>r.json()).catch(()=>[]);
+    return us.map(u=>({txid:u.txid, vout:u.vout, value:BigInt(u.value), script:p.script, priv:node.privateKey}));
+  }));
+  return lists.flat();
+}
+
+// deterministic vbytes for a P2WPKH-only tx, and the fee field as sat/vB
+function btcVbytes(nin, nout){ return Math.ceil(10.75 + 68*nin + 31*nout); }
+function btcFeeRate(){ const v=parseFloat(($('feeRate').value||'').trim()); return v>0 ? v : BTC_DEFAULT_FEERATE; }
+
+// build + sign a P2WPKH transaction spending wallet utxos to `outputs` ([{address, amount}])
+async function btcBuildTx(outputs, feeRate){
+  const utxos = await btcGatherUtxos();
+  if(!utxos.length) throw new Error('no spendable BTC — testnet4 balance is empty');
+  utxos.sort((a,b)=> a.value<b.value?1:a.value>b.value?-1:0);   // largest first
+  const target = outputs.reduce((s,o)=>s+o.amount, 0n);
+  const feeFor=(nin,nout)=> BigInt(Math.ceil(btcVbytes(nin,nout)*feeRate));
+  const sel=[]; let inSum=0n;
+  for(const u of utxos){ sel.push(u); inSum+=u.value; if(inSum >= target + feeFor(sel.length, outputs.length+1)) break; }
+  let fee=feeFor(sel.length, outputs.length+1), change=inSum-target-fee, withChange=true;
+  if(change < 0n) throw new Error('insufficient BTC for amount + fee');
+  if(change <= BTC_DUST){            // dust change isn't worth an output — fold it into the fee
+    withChange=false;
+    if(inSum - target < feeFor(sel.length, outputs.length)) throw new Error('insufficient BTC for amount + fee');
+    fee = inSum - target; change = 0n;
+  }
+  const tx=new btc.Transaction();
+  for(const u of sel) tx.addInput({txid:u.txid, index:u.vout, witnessUtxo:{script:u.script, amount:u.value}});
+  for(const o of outputs) tx.addOutputAddress(o.address, o.amount, btc.TEST_NETWORK);
+  if(withChange) tx.addOutputAddress(btcAddr(true, btcChangeNext), change, btc.TEST_NETWORK);
+  const seen=new Set();              // sign each distinct key once
+  for(const u of sel){ const k=[...u.priv].join(','); if(seen.has(k)) continue; seen.add(k); tx.sign(u.priv); }
+  tx.finalize();
+  // btcChangeNext is advanced only after a SUCCESSFUL broadcast (see btcReviewBroadcast),
+  // so a cancelled or failed build never burns a change index or marches past the scan window.
+  return { hex: tx.hex, txid: tx.id, fee, inputs: sel.length, vsize: tx.vsize, changeIndex: withChange ? btcChangeNext : null };
+}
+
+// review + broadcast a Bitcoin testnet4 payment (mirrors the Sequentia reviewBroadcast UX)
+async function btcReviewBroadcast(outputs, onDone){
+  const built = await btcBuildTx(outputs, btcFeeRate());
+  const kv=[['Network', '⚠ Bitcoin testnet4 (parent chain) — sending BTC, not a Sequentia asset']];
+  for(const o of outputs) kv.push(['→ '+o.address, fmtAtoms(o.amount,8)+' BTC']);
+  kv.push(['Network fee', `${fmtAtoms(built.fee,8)} BTC · ${built.inputs} input${built.inputs>1?'s':''}, ${built.vsize} vB`]);
+  kv.push(['Total', fmtAtoms(outputs.reduce((s,o)=>s+o.amount,0n)+built.fee,8)+' BTC']);
+  const {m, ok, st} = modalRows({title:'Confirm Bitcoin (testnet4) payment', kv});
+  ok.onclick=async()=>{
+    ok.disabled=true; st.className='status'; st.innerHTML='<span class="spin"></span>Broadcasting…';
+    try{
+      const r=await fetch(`${T4_API}/tx`, {method:'POST', body:built.hex});
+      const txt=(await r.text()).trim();
+      if(!r.ok) throw new Error(txt||('HTTP '+r.status));
+      if(!/^[0-9a-fA-F]{64}$/.test(txt)) throw new Error('unexpected broadcast response: '+txt.slice(0,80));
+      if(built.changeIndex!=null) btcChangeNext = Math.max(btcChangeNext, built.changeIndex+1);  // advance only on a confirmed broadcast
+      m.remove(); toast(`Sent BTC: <a href="/testnet4/tx/${txt}" target="_blank" rel="noopener">${txt.slice(0,18)}…</a>`);
+      if(onDone) onDone(txt); await sync();
+    }catch(e){ st.className='status err'; st.textContent='Failed: '+(e?.message??e); ok.disabled=false; }
+  };
+}
 
 // ---------- views ----------
 function show(id,on=true){ $(id).classList.toggle('hide', !on); }
@@ -315,7 +496,8 @@ function tab(name){
   document.querySelectorAll('[data-panel]').forEach(p=>p.classList.toggle('hide', p.dataset.panel!==name));
   if(name==='receive') renderReceive();
   if(name==='history') renderHistory();
-  if(name==='stake') renderStake();
+  if(name==='stake') refreshStakes();
+  if(name==='send'){ refreshRecipientAssets(); populateFeeAssets(); }
 }
 
 // ---------- boot ----------
@@ -335,6 +517,7 @@ function buildWollet(phrase){
   const m = new Mnemonic(phrase.trim().replace(/\s+/g,' '));
   signer = new Signer(m, network);
   wollet = new Wollet(network, signer.wpkhSlip77Descriptor());
+  btcInit(phrase);   // same BIP84 keychain drives the Bitcoin testnet4 side
 }
 async function openWallet(phrase){
   buildWollet(phrase);
@@ -348,11 +531,15 @@ async function sync(){
   const btn=$('btnSync'); if(btn) btn.disabled=true;
   $('syncStatus').className='status'; $('syncStatus').innerHTML='<span class="spin"></span>Syncing…';
   try{
-    const update = await client.fullScan(wollet);
+    // scan both chains + refresh fee-asset rates in parallel
+    const [update] = await Promise.all([client.fullScan(wollet), btcScan(), fetchFeeRates()]);
     if(update) wollet.applyUpdate(update);
-    renderBalance(); renderHistory();
+    // Cross-chain address cycling: advance the shared receive address past anything
+    // that's been used on either chain (never backward, so a manual "New address" sticks).
+    addrIndex = Math.max(addrIndex ?? 0, unifiedNextUnused());
+    renderBalance(); renderHistory(); renderReceive(); refreshStakes(); populateFeeAssets(); refreshRecipientAssets();
     const t = wollet.tip();
-    $('tipline').textContent = `Synced to block ${t.height()} · ${network.toString()}`;
+    $('tipline').textContent = `Synced to block ${t.height()} · Sequentia + Bitcoin testnet4`;
     $('syncStatus').className='status ok'; $('syncStatus').textContent='Up to date.';
   }catch(e){ $('syncStatus').className='status err'; $('syncStatus').textContent='Sync failed: '+(e?.message??e); }
   finally{ if(btn) btn.disabled=false; }
@@ -361,23 +548,31 @@ function balObj(){ return wollet.balance().toJSON(); }   // {assetHex: "atomsStr
 function renderBalance(){
   const b = balObj();
   const list=$('assetList'); list.innerHTML='';
-  // Asset-agnostic: every asset is shown equally (the native tSEQ is just one
-  // row, listed first; other Sequentia assets follow). No single hero balance.
+  // Asset-agnostic + dual-chain: Bitcoin (parent chain) and tSEQ (native) are
+  // first-class rows, then other Sequentia assets — all displayed equally.
+  const row=(ticker, sub, amt)=>{ const r=el('div','asset-row');
+    r.appendChild(el('span','tk', ticker));
+    const m=el('div','grow'); m.appendChild(el('div',null,sub)); r.appendChild(m);
+    r.appendChild(el('span','amt', amt)); list.appendChild(r); };
+  row('BTC', '<span class="sub">Bitcoin testnet4 · parent chain</span>', fmtAtoms(btcBalance, 8));
   const keys = Object.keys(b).sort((x,y)=> x===POLICY_HEX?-1 : y===POLICY_HEX?1 : 0);
-  if(!keys.length){ list.appendChild(el('div','muted','No assets yet.')); return; }
   for(const h of keys){
-    const m=assetMeta(h); const row=el('div','asset-row');
-    row.appendChild(el('span','tk', m.ticker));
-    const mid=el('div','grow');
-    mid.appendChild(el('div',null, h===POLICY_HEX ? '<span class="sub">native asset</span>'
-      : `<a href="/asset/${h}" target="_blank" rel="noopener" class="aid">${h}</a>`));
-    row.appendChild(mid);
-    row.appendChild(el('span','amt', fmtAtoms(b[h], m.precision)));
-    list.appendChild(row);
+    const meta=assetMeta(h);
+    row(meta.ticker, h===POLICY_HEX ? '<span class="sub">Sequentia native asset</span>'
+      : `<a href="/asset/${h}" target="_blank" rel="noopener" class="aid">${h}</a>`,
+      fmtAtoms(b[h], meta.precision));
   }
 }
 
 // ---------- receive ----------
+// The receive index is unified across chains: it advances past any index that has
+// seen a tx on EITHER the Sequentia or the Bitcoin side, so the single shared address
+// cycles whenever funds arrive on either chain (the tb1 form is identical on both).
+function unifiedNextUnused(){
+  let lwkNext=0; try{ lwkNext = wollet.address(undefined).index(); }catch{}
+  const btcNext = btcUsed.size ? Math.max(...btcUsed)+1 : 0;
+  return Math.max(lwkNext, btcNext);
+}
 function currentAddress(){
   const r = wollet.address(addrIndex==null?undefined:addrIndex); addrIndex=r.index();
   const a = r.address(); return showConf ? a : a.toUnconfidential();
@@ -387,14 +582,26 @@ function renderReceive(){
   $('addr').textContent = a.toString();
   try{ $('qr').src = a.QRCodeUri(); }catch{ $('qr').removeAttribute('src'); }
   $('btnConf').textContent = showConf ? 'Show non-confidential' : 'Show confidential';
+  $('recvTip').textContent = showConf
+    ? 'Confidential (tsqb1…) — amounts and assets are hidden on-chain. A separate, opt-in private receive; the Bitcoin side always uses the non-confidential form.'
+    : 'Non-confidential (tb1…), Bitcoin-compatible — the same address also receives parent-chain BTC. Confidential addresses are opt-in on Sequentia.';
 }
 
 // ---------- send ----------
 function ownedOptions(sel){
+  const prev=sel.value;
   const b=balObj(); sel.innerHTML='';
   const add=(h)=>{ const o=el('option'); o.value=h; o.textContent=assetMeta(h).ticker; sel.appendChild(o); };
   add(POLICY_HEX);
+  add('BTC');   // parent-chain Bitcoin testnet4 — routed through the BTC layer, not lwk
   for(const h of Object.keys(b)) if(h!==POLICY_HEX) add(h);
+  if(prev && [...sel.options].some(o=>o.value===prev)) sel.value=prev;   // keep the user's choice
+}
+// Refresh every recipient row's asset dropdown so newly-arrived assets appear without
+// needing to add a new row (a row's options are otherwise only built when it's created).
+function refreshRecipientAssets(){
+  const box=$('recipients'); if(!box) return;
+  for(const r of box.children){ const sel=r.querySelector('.rasset'); if(sel) ownedOptions(sel); }
 }
 function addRecipientRow(){
   const box=$('recipients'); const i=box.children.length;
@@ -409,30 +616,36 @@ function addRecipientRow(){
   r.querySelector('.x').onclick=()=>{ if(box.children.length>1) r.remove(); };
   box.appendChild(r);
 }
-function buildSendPset(){
-  let b = network.txBuilder();
-  const recs = [...$('recipients').children];
-  let count=0;
-  for(const r of recs){
+function collectRows(){
+  const out=[];
+  for(const r of $('recipients').children){
     const addr=r.querySelector('.raddr').value.trim();
     const amtS=r.querySelector('.ramt').value.trim();
     const asset=r.querySelector('.rasset').value;
     if(!addr && !amtS) continue;
-    const a=new Address(addr);
-    const d=assetMeta(asset).precision;
-    const sats=parseAtoms(amtS, d);
+    out.push({addr, amtS, asset});
+  }
+  return out;
+}
+function buildSendPset(rows){
+  let b = network.txBuilder();
+  for(const r of rows){
+    const a=new Address(r.addr);   // throws on a non-Sequentia / malformed address
+    if(a.isMainnet()) throw new Error('That looks like a mainnet address — this is a Sequentia testnet wallet.');
+    const sats=parseAtoms(r.amtS, assetMeta(r.asset).precision);
     if(sats<=0n) throw new Error('amount must be greater than zero');
-    const assetId = asset===POLICY_HEX ? POLICY : new AssetId(asset);
+    const assetId = r.asset===POLICY_HEX ? POLICY : new AssetId(r.asset);
     // Sequentia default addresses are non-confidential (tb1…): lwk only accepts
     // those via addExplicitRecipient. Confidential (tsqb1…) go through the blinded path.
-    if(a.isBlinded()) b = asset===POLICY_HEX ? b.addLbtcRecipient(a, sats) : b.addRecipient(a, sats, assetId);
+    if(a.isBlinded()) b = r.asset===POLICY_HEX ? b.addLbtcRecipient(a, sats) : b.addRecipient(a, sats, assetId);
     else b = b.addExplicitRecipient(a, sats, assetId);
-    count++;
   }
-  if(!count) throw new Error('add at least one recipient');
   // lwk's feeRate is sat/kvB; the field is sat/vB, so ×1000. Default keeps us above min relay.
   const fr=$('feeRate').value.trim();
   b=b.feeRate(fr ? parseFloat(fr)*1000 : DEFAULT_FEERATE);
+  // Pay the fee in a chosen non-policy asset, at the node's published (consensus) rate.
+  const fa=$('feeAsset') && $('feeAsset').value;
+  if(fa && fa!==POLICY_HEX && feeRates[fa]) b=b.feeAsset(new AssetId(fa), BigInt(feeRates[fa].rate));
   return b.finish(wollet);
 }
 
@@ -448,7 +661,7 @@ function modalRows(rows){
   no.onclick=()=>m.remove();
   return {m, ok, st};
 }
-async function reviewBroadcast(pset, title, onDone){
+async function reviewBroadcast(pset, title, onDone, feeAssetHex){
   const kv=[];
   // psetDetails assumes blinded outputs (Liquid); it throws on Sequentia's
   // explicit (non-confidential) outputs, so fall back to a minimal review.
@@ -465,6 +678,7 @@ async function reviewBroadcast(pset, title, onDone){
     kv.push(['Transaction', 'Ready to sign']);
     kv.push(['Note', 'Non-confidential transfer — amounts are as entered; a network fee applies.']);
   }
+  if(feeAssetHex && feeAssetHex!==POLICY_HEX) kv.push(['Fee paid in', assetMeta(feeAssetHex).ticker]);
   const {m, ok, st} = modalRows({title, kv});
   ok.onclick=async()=>{
     ok.disabled=true; st.className='status'; st.innerHTML='<span class="spin"></span>Signing &amp; broadcasting…';
@@ -503,30 +717,63 @@ $('btnDoImport').onclick=async()=>{ try{ await openWallet($('importPhrase').valu
   catch(e){ $('importErr').textContent='Invalid phrase: '+(e?.message??e); } };
 
 $('btnSync').onclick=sync;
-$('btnFaucet').onclick=async()=>{
-  const btn=$('btnFaucet'); btn.disabled=true;
+async function requestFaucet(asset){
+  const btns=[...document.querySelectorAll('#faucetBtns button')];
+  btns.forEach(b=>b.disabled=true);
   $('faucetStatus').className='status'; $('faucetStatus').innerHTML='<span class="spin"></span>Requesting from the faucet…';
   try{
-    // Request to the confidential (tsqb1) form — the funding node sends to it natively;
-    // it shares the same script as the displayed tb1, so funds are detected either way.
-    const addr=wollet.address(addrIndex==null?undefined:addrIndex).address().toString();
-    const r=await fetch('/faucet',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({address:addr})});
+    // Fund the NON-confidential (tb1) form so the wallet receives EXPLICIT funds (later
+    // spends + change stay non-confidential). The confidential (tsqb1) form is opt-in.
+    const addr=wollet.address(addrIndex==null?undefined:addrIndex).address().toUnconfidential().toString();
+    const body=asset?{address:addr,asset}:{address:addr};
+    const r=await fetch('/faucet',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
     const j=await r.json();
     if(!r.ok) throw new Error(j.error||('HTTP '+r.status));
     $('faucetStatus').className='status ok';
-    $('faucetStatus').innerHTML=`Sent ${Number(j.amount).toLocaleString()} tSEQ — <a href="/tx/${j.txid}" target="_blank" rel="noopener">${j.txid.slice(0,16)}…</a>. It'll show up once it confirms.`;
+    $('faucetStatus').innerHTML=`Sent ${Number(j.amount).toLocaleString()} ${j.asset} — <a href="/tx/${j.txid}" target="_blank" rel="noopener">${j.txid.slice(0,16)}…</a>. It'll show up once it confirms.`;
     setTimeout(sync, 8000);
   }catch(e){ $('faucetStatus').className='status err'; $('faucetStatus').textContent='Faucet error: '+(e?.message??e); }
-  finally{ btn.disabled=false; }
-};
+  finally{ btns.forEach(b=>b.disabled=false); }
+}
+document.querySelectorAll('#faucetBtns button').forEach(b=>{ b.onclick=()=>requestFaucet(b.dataset.faucet); });
 $('btnAddRec').onclick=addRecipientRow;
 $('btnReview').onclick=async()=>{ $('sendErr').textContent='';
-  try{ const pset=buildSendPset(); await reviewBroadcast(pset, 'Confirm payment', ()=>{ $('recipients').innerHTML=''; addRecipientRow(); }); }
-  catch(e){ $('sendErr').textContent=e?.message??String(e); } };
+  try{
+    const rows=collectRows();
+    if(!rows.length) throw new Error('add at least one recipient');
+    const btcRows=rows.filter(r=>r.asset==='BTC');
+    if(btcRows.length && btcRows.length!==rows.length)
+      throw new Error("Bitcoin and Sequentia assets can't be sent in the same transaction");
+    const reset=()=>{ $('recipients').innerHTML=''; addRecipientRow(); };
+    if(btcRows.length){
+      const outputs=rows.map(r=>{ const amount=parseAtoms(r.amtS, 8);
+        if(amount<=0n) throw new Error('amount must be greater than zero');
+        return {address:r.addr, amount}; });
+      await btcReviewBroadcast(outputs, reset);
+    } else {
+      const faHex = $('feeAsset') ? $('feeAsset').value : POLICY_HEX;
+      await reviewBroadcast(buildSendPset(rows), 'Confirm payment', reset, faHex);
+    }
+  }catch(e){ $('sendErr').textContent=e?.message??String(e); } };
 
-$('btnCopy').onclick=()=>navigator.clipboard.writeText($('addr').textContent);
+$('btnCopy').onclick=async()=>{
+  const text=$('addr').textContent; if(!text||text==='—') return;
+  const btn=$('btnCopy'), old=btn.textContent;
+  let ok=false;
+  try{ if(navigator.clipboard?.writeText){ await navigator.clipboard.writeText(text); ok=true; } }catch{}
+  if(!ok){ // plain HTTP is a non-secure context: navigator.clipboard is unavailable, fall back
+    const ta=document.createElement('textarea'); ta.value=text;
+    ta.style.cssText='position:fixed;top:0;left:0;opacity:0';
+    document.body.appendChild(ta); ta.focus(); ta.select();
+    try{ ok=document.execCommand('copy'); }catch{}
+    document.body.removeChild(ta);
+  }
+  btn.textContent = ok ? 'Copied!' : 'Copy failed';
+  setTimeout(()=>{ btn.textContent=old; }, 1200);
+};
 $('btnNewAddr').onclick=()=>{ addrIndex=(addrIndex??0)+1; renderReceive(); };
 $('btnConf').onclick=()=>{ showConf=!showConf; renderReceive(); };
+$('feeAsset').onchange=updateFeeAssetHint;
 
 $('btnIssue').onclick=async()=>{ $('issueErr').textContent='';
   try{ const {pset, meta}=buildIssuePset();
@@ -583,7 +830,10 @@ function renderStake(){
   if(!st.length){ list.appendChild(el('div','muted','No stakes yet.')); return; }
   for(const s of st.slice().reverse()){
     const item=el('div','item');
-    item.appendChild(el('span','badge b-iss','staked'));
+    const pending = s.confirmed===false;
+    const badge = el('span','badge b-iss', pending?'pending':'staked');
+    if(pending) badge.style.opacity='.55';
+    item.appendChild(badge);
     const mid=el('div','grow');
     mid.appendChild(el('div',null,`<a href="/tx/${s.txid}" target="_blank" rel="noopener" class="aid">${s.txid.slice(0,18)}…</a>`));
     mid.appendChild(el('div','sub', `${s.period} · bonded ${new Date(s.time).toLocaleDateString()}`));
@@ -591,6 +841,24 @@ function renderStake(){
     item.appendChild(el('span','amt', fmtAtoms(s.atoms,8)+' tSEQ'));
     list.appendChild(item);
   }
+}
+// Re-check each tracked stake against the chain: mark pending vs confirmed, and drop any
+// whose tx is no longer on-chain (reorged away or never confirmed) once past a grace window,
+// so the list stops tracking stakes that don't exist anymore.
+async function refreshStakes(){
+  let st; try{ st=JSON.parse(localStorage.getItem(STAKES)||'[]'); }catch{ st=[]; }
+  if(!st.length){ renderStake(); return; }
+  const GRACE=10*60*1000, before=JSON.stringify(st), keep=[];
+  for(const s of st){
+    try{
+      const r=await fetch(`/api/tx/${s.txid}/status`);
+      if(r.status===404){ if(Date.now()-(s.time||0) > GRACE) continue; s.confirmed=false; keep.push(s); continue; }
+      if(r.ok){ const j=await r.json(); s.confirmed=!!j.confirmed; }
+      keep.push(s);
+    }catch{ keep.push(s); }   // transient/network error — keep, don't drop on a blip
+  }
+  if(JSON.stringify(keep)!==before) localStorage.setItem(STAKES, JSON.stringify(keep));
+  renderStake();
 }
 $('btnStake').onclick=async()=>{ $('stakeErr').textContent='';
   try{
