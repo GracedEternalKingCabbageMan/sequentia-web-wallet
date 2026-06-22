@@ -133,6 +133,7 @@
       <button data-tab="send">Send</button>
       <button data-tab="receive">Receive</button>
       <button data-tab="assets">Assets</button>
+      <button data-tab="stake">Stake</button>
       <button data-tab="history">History</button>
       <button data-tab="settings">Settings</button>
     </div>
@@ -220,6 +221,32 @@
       </div>
     </section>
 
+    <!-- stake -->
+    <section data-panel="stake" class="hide">
+      <div class="card">
+        <label class="lbl">Stake tSEQ</label>
+        <p class="sub" style="margin:0 0 12px">Staking locks tSEQ in a time-locked script to support the Sequentia network. It's opt-in; the stake unbonds (becomes spendable again) only after the unbonding delay you choose.</p>
+        <div class="row">
+          <div class="grow"><label class="lbl">Amount</label><input id="stAmount" class="mono" placeholder="0.0"></div>
+          <div style="width:150px"><label class="lbl">Unbonding period</label>
+            <select id="stPeriod">
+              <option value="2592000">30 days</option>
+              <option value="7776000">90 days</option>
+              <option value="15552000">180 days</option>
+            </select>
+          </div>
+        </div>
+        <button class="primary" id="btnStake" style="margin-top:14px">Review stake</button>
+        <div class="status err" id="stakeErr"></div>
+        <div class="kv" style="margin-top:12px"><span class="k">Your staker key</span><span class="v" id="stPubkey">—</span></div>
+      </div>
+      <div class="card">
+        <label class="lbl">Your stakes</label>
+        <p class="sub" style="margin:0 0 6px">Bonded from this wallet. Unbonding (spending after the delay matures) is coming in a later update.</p>
+        <div class="list" id="stakeList"><div class="muted">No stakes yet.</div></div>
+      </div>
+    </section>
+
     <!-- history -->
     <section data-panel="history" class="hide">
       <div class="card">
@@ -262,6 +289,8 @@ const ESPLORA = location.origin + '/api';
 const KEY = 'swk.sequentia.mnemonic';
 const LBL = 'swk.sequentia.assets';      // { assetHex: {name,ticker,precision} }
 const DEFAULT_FEERATE = 2000;            // sat/kvB (2 sat/vB) — above the network min relay fee
+const STAKES = 'swk.sequentia.stakes';   // [{pubkey,csv,period,atoms,txid,time}]
+const csvFromSeconds = secs => (1<<22) | Math.ceil(secs/512);   // BIP68 time-based CSV (512s units)
 const $ = id => document.getElementById(id);
 const el = (t,c,h)=>{const e=document.createElement(t); if(c)e.className=c; if(h!=null)e.innerHTML=h; return e;};
 
@@ -292,6 +321,7 @@ function tab(name){
   document.querySelectorAll('[data-panel]').forEach(p=>p.classList.toggle('hide', p.dataset.panel!==name));
   if(name==='receive') renderReceive();
   if(name==='history') renderHistory();
+  if(name==='stake') renderStake();
 }
 
 // ---------- boot ----------
@@ -547,6 +577,39 @@ function renderHistory(){
     list.appendChild(item);
   }
 }
+
+// ---------- stake ----------
+function renderStake(){
+  try{ $('stPubkey').textContent = signer.stakerPublicKey(); }catch{ $('stPubkey').textContent='—'; }
+  const list=$('stakeList'); list.innerHTML='';
+  let st; try{ st=JSON.parse(localStorage.getItem(STAKES)||'[]'); }catch{ st=[]; }
+  if(!st.length){ list.appendChild(el('div','muted','No stakes yet.')); return; }
+  for(const s of st.slice().reverse()){
+    const item=el('div','item');
+    item.appendChild(el('span','badge b-iss','staked'));
+    const mid=el('div','grow');
+    mid.appendChild(el('div',null,`<a href="/tx/${s.txid}" target="_blank" rel="noopener" class="aid">${s.txid.slice(0,18)}…</a>`));
+    mid.appendChild(el('div','sub', `${s.period} · bonded ${new Date(s.time).toLocaleDateString()}`));
+    item.appendChild(mid);
+    item.appendChild(el('span','amt', fmtAtoms(s.atoms,8)+' tSEQ'));
+    list.appendChild(item);
+  }
+}
+$('btnStake').onclick=async()=>{ $('stakeErr').textContent='';
+  try{
+    const secs=parseInt($('stPeriod').value,10), csv=csvFromSeconds(secs);
+    const pubkey=signer.stakerPublicKey();
+    const atoms=parseAtoms($('stAmount').value, 8);
+    if(atoms<=0n) throw new Error('enter an amount to stake');
+    const pset=network.txBuilder().addStakeOutput(pubkey, csv, atoms).feeRate(DEFAULT_FEERATE).finish(wollet);
+    await reviewBroadcast(pset, 'Confirm stake', (txid)=>{
+      const st=(()=>{try{return JSON.parse(localStorage.getItem(STAKES)||'[]')}catch{return[]}})();
+      st.push({pubkey, csv, period:$('stPeriod').selectedOptions[0].textContent, atoms:atoms.toString(), txid:txid.toString(), time:Date.now()});
+      localStorage.setItem(STAKES, JSON.stringify(st));
+      $('stAmount').value=''; renderStake();
+    });
+  }catch(e){ $('stakeErr').textContent=e?.message??String(e); }
+};
 
 // ---------- toast ----------
 let toastT;
