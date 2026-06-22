@@ -141,20 +141,18 @@
     <!-- balance -->
     <section data-panel="balance">
       <div class="card">
-        <label class="lbl">Balance</label>
-        <div class="bal"><span id="balNum">—</span><small>tSEQ</small></div>
+        <div class="row" style="justify-content:space-between;align-items:center;margin-bottom:2px">
+          <label class="lbl" style="margin:0">Assets</label>
+          <button id="btnSync">Refresh</button>
+        </div>
         <div class="status" id="syncStatus"></div>
-        <button class="primary" id="btnSync" style="margin-top:12px">Refresh</button>
+        <div class="list" id="assetList"><div class="muted">No assets yet.</div></div>
       </div>
       <div class="card">
         <label class="lbl">Testnet faucet</label>
         <p class="sub" style="margin:0 0 12px">Get free testnet tSEQ to try out the wallet — sent straight to this wallet.</p>
         <button id="btnFaucet">Request 50,000 tSEQ</button>
         <div class="status" id="faucetStatus"></div>
-      </div>
-      <div class="card">
-        <label class="lbl">Assets you hold</label>
-        <div class="list" id="assetList"><div class="muted">No assets yet.</div></div>
       </div>
     </section>
 
@@ -225,20 +223,12 @@
     <section data-panel="stake" class="hide">
       <div class="card">
         <label class="lbl">Stake tSEQ</label>
-        <p class="sub" style="margin:0 0 12px">Staking locks tSEQ in a time-locked script to support the Sequentia network. It's opt-in; the stake unbonds (becomes spendable again) only after the unbonding delay you choose.</p>
-        <div class="row">
-          <div class="grow"><label class="lbl">Amount</label><input id="stAmount" class="mono" placeholder="0.0"></div>
-          <div style="width:150px"><label class="lbl">Unbonding period</label>
-            <select id="stPeriod">
-              <option value="2592000">30 days</option>
-              <option value="7776000">90 days</option>
-              <option value="15552000">180 days</option>
-            </select>
-          </div>
-        </div>
+        <p class="sub" style="margin:0 0 12px">Staking locks tSEQ in a time-locked script to support the Sequentia network. Your stake weight equals the amount staked, so there's no benefit to a longer lock — the wallet uses the network minimum unbonding period.</p>
+        <div class="field"><label class="lbl">Amount</label><input id="stAmount" class="mono" placeholder="0.0"></div>
         <button class="primary" id="btnStake" style="margin-top:14px">Review stake</button>
         <div class="status err" id="stakeErr"></div>
-        <div class="kv" style="margin-top:12px"><span class="k">Your staker key</span><span class="v" id="stPubkey">—</span></div>
+        <div class="kv" style="margin-top:12px"><span class="k">Unbonding period</span><span class="v" id="stPeriod">~15 days (network minimum)</span></div>
+        <div class="kv"><span class="k">Your staker key</span><span class="v" id="stPubkey">—</span></div>
       </div>
       <div class="card">
         <label class="lbl">Your stakes</label>
@@ -290,7 +280,11 @@ const KEY = 'swk.sequentia.mnemonic';
 const LBL = 'swk.sequentia.assets';      // { assetHex: {name,ticker,precision} }
 const DEFAULT_FEERATE = 2000;            // sat/kvB (2 sat/vB) — above the network min relay fee
 const STAKES = 'swk.sequentia.stakes';   // [{pubkey,csv,period,atoms,txid,time}]
-const csvFromSeconds = secs => (1<<22) | Math.ceil(secs/512);   // BIP68 time-based CSV (512s units)
+// Network minimum unbonding (~15 days, height-based csv=43200). Bonding longer
+// earns nothing — stake weight is the amount, not the lock duration — so the
+// wallet always uses the minimum.
+const STAKE_CSV = 43200;
+const STAKE_PERIOD_LABEL = '~15 days (network minimum)';
 const $ = id => document.getElementById(id);
 const el = (t,c,h)=>{const e=document.createElement(t); if(c)e.className=c; if(h!=null)e.innerHTML=h; return e;};
 
@@ -366,14 +360,17 @@ async function sync(){
 function balObj(){ return wollet.balance().toJSON(); }   // {assetHex: "atomsStr"}
 function renderBalance(){
   const b = balObj();
-  $('balNum').textContent = fmtAtoms(b[POLICY_HEX]||'0', 8);
   const list=$('assetList'); list.innerHTML='';
-  const others = Object.keys(b).filter(h=>h!==POLICY_HEX);
-  if(!others.length){ list.appendChild(el('div','muted','No assets yet.')); return; }
-  for(const h of others){
+  // Asset-agnostic: every asset is shown equally (the native tSEQ is just one
+  // row, listed first; other Sequentia assets follow). No single hero balance.
+  const keys = Object.keys(b).sort((x,y)=> x===POLICY_HEX?-1 : y===POLICY_HEX?1 : 0);
+  if(!keys.length){ list.appendChild(el('div','muted','No assets yet.')); return; }
+  for(const h of keys){
     const m=assetMeta(h); const row=el('div','asset-row');
     row.appendChild(el('span','tk', m.ticker));
-    const mid=el('div','grow'); mid.appendChild(el('div',null,`<a href="/asset/${h}" target="_blank" rel="noopener" class="aid">${h}</a>`));
+    const mid=el('div','grow');
+    mid.appendChild(el('div',null, h===POLICY_HEX ? '<span class="sub">native asset</span>'
+      : `<a href="/asset/${h}" target="_blank" rel="noopener" class="aid">${h}</a>`));
     row.appendChild(mid);
     row.appendChild(el('span','amt', fmtAtoms(b[h], m.precision)));
     list.appendChild(row);
@@ -597,14 +594,14 @@ function renderStake(){
 }
 $('btnStake').onclick=async()=>{ $('stakeErr').textContent='';
   try{
-    const secs=parseInt($('stPeriod').value,10), csv=csvFromSeconds(secs);
+    const csv=STAKE_CSV;
     const pubkey=signer.stakerPublicKey();
     const atoms=parseAtoms($('stAmount').value, 8);
     if(atoms<=0n) throw new Error('enter an amount to stake');
     const pset=network.txBuilder().addStakeOutput(pubkey, csv, atoms).feeRate(DEFAULT_FEERATE).finish(wollet);
     await reviewBroadcast(pset, 'Confirm stake', (txid)=>{
       const st=(()=>{try{return JSON.parse(localStorage.getItem(STAKES)||'[]')}catch{return[]}})();
-      st.push({pubkey, csv, period:$('stPeriod').selectedOptions[0].textContent, atoms:atoms.toString(), txid:txid.toString(), time:Date.now()});
+      st.push({pubkey, csv, period:STAKE_PERIOD_LABEL, atoms:atoms.toString(), txid:txid.toString(), time:Date.now()});
       localStorage.setItem(STAKES, JSON.stringify(st));
       $('stAmount').value=''; renderStake();
     });
