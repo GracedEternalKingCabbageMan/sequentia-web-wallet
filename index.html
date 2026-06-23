@@ -399,7 +399,7 @@ async function loadPrices(){
     const d = await fetch('/prices', {cache:'no-store'}).then(r=>r.json());
     const m = {};
     for(const [t,v] of Object.entries(d)){ const p=(v&&typeof v==='object')?v.price:v; if(p>0) m[t.toUpperCase()]=p; }
-    PRICES = m;
+    if(Object.keys(m).length) PRICES = m;   // keep last-good prices if a poll returns empty/unavailable
     try{ initRefSelector(); }catch{}
     try{ if(typeof renderBalance==='function') renderBalance(); }catch{}
     try{ refreshAllRefHints(); }catch{}
@@ -441,20 +441,87 @@ function refHintFor(amountStr, hex){
   if(atoms===0n) return '';
   return refValueStr(hex, atoms);
 }
+// Fixed-point (never scientific notation) at ≤8dp with trailing zeros dropped, so a written-back
+// field value is always parseAtoms-acceptable.
+const _trimNum = n => { const s=(Math.round(n*1e8)/1e8).toFixed(8); return s.replace(/0+$/,'').replace(/\.$/,''); };
+function _assetUsd(hex){ return PRICES[priceTicker(hex)]; }  // asset's USD base price
+function _bothPriced(hex, ref){ return _assetUsd(hex)>0 && priceOf(ref||REF)>0; }
+const _NUMRE = /^\d+(\.\d+)?$/;   // exactly what parseAtoms accepts; reject anything else (e.g. '1,5') — fail safe
+// The human ASSET amount a tx must use. In reference-input mode (⇄) the user typed a REFERENCE
+// amount (denominated in input._refCcy); convert it back to the asset, ROUNDED to the asset's atom
+// precision and as plain fixed-point so parseAtoms accepts it. Invalid/unpriced → '' (fail safe: a
+// raw reference number is NEVER sent as an asset amount; the downstream >0 guards surface an error).
+function assetAmountOf(input, hex){
+  const raw=(input && input.value || '').trim();
+  if(!raw) return '';
+  if(!input._refMode) return raw;                                  // field already holds the asset amount
+  if(!_NUMRE.test(raw)) return '';                                 // never coerce '1,5'->15, sci notation, etc.
+  const v=parseFloat(raw); if(!isFinite(v)) return '';
+  const pa=_assetUsd(hex), pr=priceOf(input._refCcy||REF);
+  if(!(pa>0)||!(pr>0)) return '';                                  // can't convert → invalid, surfaces an error
+  const dec=assetMeta(hex).precision||0;
+  let s=(v * pr / pa).toFixed(dec);                                // reference→asset, ≤dec decimals, no sci notation
+  if(dec>0) s=s.replace(/\.?0+$/,'');                             // trim trailing zeros (dec>0 guard keeps "100")
+  return s || '0';                                                 // sub-atom rounds to 0 → hits the >0 guard
+}
+// A clickable, bidirectional "≈" hint under an amount field. Default: type the ASSET amount, the
+// hint shows the reference value. Click the ⇄ hint to swap: type the REFERENCE amount, the hint
+// shows the EXACT asset amount that will be sent (same string assetAmountOf returns).
 function attachRefHint(input, assetFn){
   if(!input || input._refHinted) return ()=>{}; input._refHinted=true;
-  const node=el('div','sub'); node.style.cssText='margin-top:4px;min-height:1.1em';
+  input._refMode=false; input._refCcy=REF; input._origPh=input.getAttribute('placeholder')||'';
+  const hexOf=()=> (typeof assetFn==='function')?assetFn():assetFn;
+  const node=el('div','sub'); node.style.cssText='margin-top:4px;min-height:1.1em;cursor:pointer;user-select:none';
+  node.title='Click to switch which currency you enter the amount in';
   input.insertAdjacentElement('afterend', node);
-  const upd=()=>{ const hex=(typeof assetFn==='function')?assetFn():assetFn; node.textContent=refHintFor(input.value, hex); };
+  const setPh=()=>{ input.setAttribute('placeholder', input._refMode ? ('amount in '+(input._refCcy||REF)) : input._origPh); };
+  const upd=()=>{
+    const hex=hexOf(), raw=(input.value||'').trim(), ticker=assetMeta(hex).ticker||'asset';
+    if(!input._refMode){
+      if(!_bothPriced(hex, REF)){ node.textContent = refHintFor(raw, hex); return; }   // unpriced: plain ≈ if any, else ''
+      const t = raw ? refHintFor(raw, hex) : ('enter in '+REF);                          // ⇄ affordance even when empty
+      node.textContent = '⇄ ' + (t || ('enter in '+REF));
+    } else {
+      // ref mode but the asset lost its price: keep a clickable escape (don't blank + trap the user).
+      if(!_bothPriced(hex, input._refCcy)){ node.textContent = raw ? ('⇄ no '+(input._refCcy||REF)+' price — switch to '+ticker) : ''; return; }
+      if(!raw){ node.textContent = '⇄ enter in '+ticker; return; }
+      const a=assetAmountOf(input, hex);                                                 // exact string that will be sent
+      node.textContent = a ? ('⇄ ≈ '+a+' '+ticker) : ('⇄ enter in '+ticker);
+    }
+  };
+  // Swap denominations: convert the current value into the other unit and flip the mode.
+  node.addEventListener('click', ()=>{
+    const hex=hexOf();
+    if(!input._refMode && !_bothPriced(hex, REF)) return;          // only block ENTERING ref mode when unpriced
+    const raw=(input.value||'').trim();
+    if(raw && _NUMRE.test(raw)){ const v=parseFloat(raw), pa=_assetUsd(hex), pr=priceOf(REF);
+      if(pa>0 && pr>0) input.value = input._refMode ? _trimNum(v*pr/pa)   // reference → asset
+                                                    : _trimNum(v*pa/pr);  // asset → reference
+      else if(input._refMode) input.value='';                     // leaving ref mode while unpriced: drop the stale number
+    }
+    input._refMode=!input._refMode; input._refCcy=REF; setPh(); upd(); input.focus();
+  });
+  // On reference change, re-denominate a ref-mode field from its old reference into the new one —
+  // but only retag _refCcy when the value was ACTUALLY converted (else keep the correct old label,
+  // so assetAmountOf never values a stale number with the wrong price).
+  const sync=()=>{
+    if(input._refMode && input._refCcy && input._refCcy!==REF){
+      const raw=(input.value||'').trim(), pOld=priceOf(input._refCcy), pNew=priceOf(REF),
+            v=_NUMRE.test(raw)?parseFloat(raw):NaN;
+      if(isFinite(v) && pOld>0 && pNew>0){ input.value=_trimNum(v*pOld/pNew); input._refCcy=REF; setPh(); }
+    }
+    upd();
+  };
   input.addEventListener('input', upd);
-  _refHints.add({upd, alive:()=>input.isConnected}); upd(); return upd;
+  _refHints.add({upd: sync, alive:()=>input.isConnected}); upd(); return upd;
 }
 function refreshAllRefHints(){ for(const r of [..._refHints]){ if(r.alive && !r.alive()){ _refHints.delete(r); continue; } try{ r.upd(); }catch{} } }
 // Populate the header picker + attach hints to the static amount fields (idempotent).
 function initAppRefUI(){
   initRefSelector();
   attachRefHint($('stAmount'), ()=>POLICY_HEX);                 // stake is always tSEQ
-  attachRefHint($('raAmount'), ()=>($('raAsset')?.value||'').trim());  // reissue: existing asset
+  const updRa=attachRefHint($('raAmount'), ()=>($('raAsset')?.value||'').trim());  // reissue: existing asset
+  const ra=$('raAsset'); if(ra && !ra._refWired){ ra._refWired=true; ra.addEventListener('input', updRa); ra.addEventListener('change', updRa); }  // re-value the hint when the asset id changes
 }
 
 // Fill the "pay fee in" picker: tSEQ (default) + any owned asset the node accepts for fees.
@@ -771,8 +838,8 @@ function collectRows(){
   const out=[];
   for(const r of $('recipients').children){
     const addr=r.querySelector('.raddr').value.trim();
-    const amtS=r.querySelector('.ramt').value.trim();
     const asset=r.querySelector('.rasset').value;
+    const amtS=assetAmountOf(r.querySelector('.ramt'), asset);   // honours ⇄ ref-input mode
     if(!addr && !amtS) continue;
     out.push({addr, amtS, asset});
   }
@@ -941,13 +1008,13 @@ $('btnIssue').onclick=async()=>{ $('issueErr').textContent='';
 
 $('btnReissue').onclick=async()=>{ $('raErr').textContent='';
   try{ const asset=$('raAsset').value.trim(); const m=assetMeta(asset);
-    const amt=parseAtoms($('raAmount').value, m.precision);
+    const amt=parseAtoms(assetAmountOf($('raAmount'), asset), m.precision);   // honours ⇄ ref-input mode
     const pset=network.txBuilder().reissueAsset(new AssetId(asset), amt, undefined, undefined).feeRate(DEFAULT_FEERATE).finish(wollet);
     await reviewBroadcast(pset, 'Reissue '+m.ticker);
   }catch(e){ $('raErr').textContent=e?.message??String(e); } };
 $('btnBurn').onclick=async()=>{ $('raErr').textContent='';
   try{ const asset=$('raAsset').value.trim(); const m=assetMeta(asset);
-    const amt=parseAtoms($('raAmount').value, m.precision);
+    const amt=parseAtoms(assetAmountOf($('raAmount'), asset), m.precision);   // honours ⇄ ref-input mode
     const pset=network.txBuilder().addBurn(amt, new AssetId(asset)).feeRate(DEFAULT_FEERATE).finish(wollet);
     await reviewBroadcast(pset, 'Burn '+m.ticker);
   }catch(e){ $('raErr').textContent=e?.message??String(e); } };
@@ -1113,7 +1180,7 @@ function replaceDialog(txid){
   act.appendChild(ok); act.appendChild(no); c.appendChild(act);
   m.appendChild(c); document.body.appendChild(m);
   no.onclick=()=>m.remove();
-  ok.onclick=()=>{ m.remove(); doReplace(txid, addr.value.trim(), asset.value, amt.value.trim(), fsel.value, parseFloat(rate.value)); };
+  ok.onclick=()=>{ m.remove(); doReplace(txid, addr.value.trim(), asset.value, assetAmountOf(amt, asset.value), fsel.value, parseFloat(rate.value)); };
 }
 async function doReplace(txid, addr, assetHex, amtStr, feeAssetHex, feeRateVb){
   try{
@@ -1170,7 +1237,7 @@ $('btnStake').onclick=async()=>{ $('stakeErr').textContent='';
   try{
     const csv=STAKE_CSV;
     const pubkey=signer.stakerPublicKey();
-    const atoms=parseAtoms($('stAmount').value, 8);
+    const atoms=parseAtoms(assetAmountOf($('stAmount'), POLICY_HEX), 8);   // honours ⇄ ref-input mode
     if(atoms<=0n) throw new Error('enter an amount to stake');
     const pset=network.txBuilder().addStakeOutput(pubkey, csv, atoms).feeRate(DEFAULT_FEERATE).finish(wollet);
     await reviewBroadcast(pset, 'Confirm stake', (txid)=>{
