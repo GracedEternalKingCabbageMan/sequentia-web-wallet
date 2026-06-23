@@ -332,9 +332,25 @@ const DEFAULT_ASSETS = {
 };
 const labels = () => { try { return JSON.parse(localStorage.getItem(LBL)||'{}'); } catch { return {}; } };
 function saveLabel(hex, info){ const m=labels(); m[hex]=info; localStorage.setItem(LBL, JSON.stringify(m)); }
+// The Sequentia Asset Registry is the authoritative metadata source (verified,
+// centrally maintained). Fetch its minimal index at startup and prefer it over
+// the built-in DEFAULT_ASSETS, which remain an offline fallback. Precedence:
+// user labels > registry > built-in defaults > generic.
+const REGISTRY_URL = (typeof window!=='undefined' && window.SEQ_REGISTRY_URL) || '/registry/index.minimal.json';
+let REGISTRY_ASSETS = {};
+async function loadRegistry(){
+  try {
+    const r = await fetch(REGISTRY_URL, {cache:'no-store'}); if(!r.ok) return;
+    const idx = await r.json(); const m = {};            // { id: [domain, ticker, name, precision] }
+    for(const [id,v] of Object.entries(idx)) if(Array.isArray(v)) m[id]={ticker:v[1], name:v[2], precision:v[3], domain:v[0]};
+    REGISTRY_ASSETS = m;
+    try { if(typeof renderBalance==='function') renderBalance(); } catch {}   // refresh labels if the UI is already up
+  } catch {}
+}
+loadRegistry();
 function assetMeta(hex){ if(hex==='BTC') return {ticker:'BTC', name:'Bitcoin testnet4', precision:8};
   if(hex===POLICY_HEX) return {ticker:'tSEQ', name:'Sequentia', precision:8};
-  return labels()[hex] || DEFAULT_ASSETS[hex] || {ticker:hex.slice(0,8)+'…', name:'Asset', precision:0}; }
+  return labels()[hex] || REGISTRY_ASSETS[hex] || DEFAULT_ASSETS[hex] || {ticker:hex.slice(0,8)+'…', name:'Asset', precision:0}; }
 let POLICY_HEX='';
 
 // ---------- fee-asset exchange rates (Sequentia any-asset-fees) ----------
@@ -879,11 +895,14 @@ function renderHistory(){
     const when = t.height()? (ts? new Date(ts*1000).toLocaleString() : 'block '+t.height()) : 'unconfirmed';
     mid.appendChild(el('div',null,`<a href="/tx/${txid}" target="_blank" rel="noopener" class="aid">${txid.slice(0,20)}…</a>`));
     mid.appendChild(el('div','sub', when));
-    if(!t.height() && type==='outgoing'){
+    if(!t.height() && (type==='outgoing' || type==='incoming')){
       const acts=el('div','row'); acts.style.cssText='gap:6px;margin-top:6px;flex-wrap:wrap';
       const mk=(label,fn)=>{ const x=el('button','ghost',label); x.style.cssText='padding:4px 10px;font-size:12px'; x.onclick=fn; return x; };
-      acts.appendChild(mk('Bump fee', ()=>bumpFeeDialog(txid)));   // RBF replacement, fee in any asset
-      acts.appendChild(mk('Speed up', ()=>doCpfp(txid)));          // CPFP, fee in the change's asset
+      if(type==='outgoing'){
+        acts.appendChild(mk('Bump fee', ()=>bumpFeeDialog(txid)));   // RBF: same payment, higher fee
+        acts.appendChild(mk('Replace…', ()=>replaceDialog(txid)));   // RBF: same inputs, new outputs
+      }
+      acts.appendChild(mk('Speed up', ()=>cpfpDialog(txid)));        // CPFP: child fee lifts the package (sender or receiver)
       mid.appendChild(acts);
     }
     item.appendChild(mid);
@@ -896,18 +915,34 @@ function renderHistory(){
   }
 }
 
-// ---------- RBF fee-bump + CPFP rescue (asset-agnostic) ----------
-// On an unconfirmed send: "Bump fee" builds a BIP125 replacement — lwk_wollet re-pins the
-// original inputs and recreates the recipients (Wollet.bumpFeeOf) — at a higher fee paid in
-// WHATEVER asset the user picks; no asset is privileged. "Speed up" attaches a CPFP child
-// (Wollet.cpfpOf) spending the parent's unconfirmed change, paying the child fee in that
-// change's own asset. RBF is on by default (every send signals it), so any send is replaceable.
+// ---------- RBF fee-bump / replace + CPFP rescue (asset-agnostic) ----------
+// On an unconfirmed tx the wallet offers three rescues; no asset is privileged for fees.
+//  • "Bump fee" (outgoing)  — Wollet.bumpFeeOf: re-pins the original inputs and recreates the SAME
+//    recipients at a higher fee, paid in whatever asset the user picks.
+//  • "Replace…"  (outgoing) — Wollet.replaceTxOf: re-pins the original inputs (so it conflicts per
+//    BIP125) but lets the user enter NEW outputs — a different address, asset, or amount — to
+//    correct a still-unconfirmed payment.
+//  • "Speed up"  (in/out)   — Wollet.cpfpOf: spends an unconfirmed output of the parent (the link a
+//    miner evaluates as a package) and pays a HIGH child fee funded from the wallet in a
+//    producer-accepted asset (default tSEQ) — NOT confined to the pinned output's asset. For a
+//    parent stuck on too low a fee; CPFP can't rescue a wrong-fee-asset stranding (use Replace).
+// RBF is on by default (every send signals it), so any send is replaceable.
 function feeAssetSelect(){
   const sel=el('select'); sel.style.marginTop='8px';
   const add=(v,l)=>{ const o=el('option'); o.value=v; o.textContent=l; sel.appendChild(o); };
   add(POLICY_HEX, 'tSEQ');                       // the protocol's default-accepted asset — not special
   for(const h of Object.keys(balObj())){ if(h!==POLICY_HEX) add(h, assetMeta(h).ticker + (feeRates[h]?'':' — no local price')); }
   return sel;
+}
+// Add one recipient to a builder, mirroring buildSendPset's blinded/explicit + policy/asset handling.
+function addOneRecipient(b, addrStr, assetHex, amtStr){
+  const a=new Address(addrStr);
+  if(a.isMainnet()) throw new Error('That looks like a mainnet address — this is a Sequentia testnet wallet.');
+  const sats=parseAtoms(amtStr, assetMeta(assetHex).precision);
+  if(sats<=0n) throw new Error('amount must be greater than zero');
+  const assetId = assetHex===POLICY_HEX ? POLICY : new AssetId(assetHex);
+  if(a.isBlinded()) return assetHex===POLICY_HEX ? b.addLbtcRecipient(a, sats) : b.addRecipient(a, sats, assetId);
+  return b.addExplicitRecipient(a, sats, assetId);
 }
 function bumpFeeDialog(txid){
   const m=el('div','modal'); const c=el('div','card');
@@ -937,20 +972,73 @@ async function doBump(txid, feeAssetHex, feeRateVb){
     await reviewBroadcast(b.finish(wollet), 'Fee-bump (RBF replacement)', null, feeAssetHex);
   }catch(e){ toast('Fee-bump failed: '+(e?.message??e)); }
 }
-async function doCpfp(parentTxid){
+// CPFP: pick the asset to pay the child fee in (default tSEQ, which producers always mine) and a
+// fee rate; the suggested rate is sized from the parent's vsize so the {parent, child} package
+// clears the target as a whole.
+function cpfpDialog(txid){
+  const m=el('div','modal'); const c=el('div','card');
+  c.appendChild(el('label','lbl','Speed up (child-pays-for-parent)'));
+  c.appendChild(el('div','sub','Attaches a child transaction whose high fee lifts this one into a block. Works when the parent is just under-priced — not when its fee asset is one producers reject (use Replace for that).'));
+  c.appendChild(el('label','lbl','Pay the child fee in'));
+  const sel=feeAssetSelect(); c.appendChild(sel);
+  const rl=el('label','lbl','Child fee rate (sat/vB)'); rl.style.marginTop='10px'; c.appendChild(rl);
+  let sug = BUMP_FEERATE/1000;
+  try{ sug = Math.max(1, Math.ceil(wollet.cpfpSuggestedFeerate(new Txid(txid), BUMP_FEERATE)/1000)); }catch(e){}
+  const rate=el('input'); rate.type='number'; rate.min='1'; rate.step='1'; rate.value=String(sug); rate.style.marginTop='4px';
+  c.appendChild(rate);
+  c.appendChild(el('div','sub','Suggested rate already accounts for the parent’s size, so the package clears as a whole.'));
+  const act=el('div','row'); act.style.marginTop='14px';
+  const ok=el('button','primary','Speed up'); const no=el('button','ghost','Cancel');
+  act.appendChild(ok); act.appendChild(no); c.appendChild(act);
+  m.appendChild(c); document.body.appendChild(m);
+  no.onclick=()=>m.remove();
+  ok.onclick=()=>{ m.remove(); doCpfp(txid, sel.value, parseFloat(rate.value)); };
+}
+async function doCpfp(parentTxid, feeAssetHex, feeRateVb){
   try{
-    const t = new Txid(parentTxid);
-    // The asset the child's fee must be paid in = the asset of the very change output cpfpOf
-    // pins. Read it from the wallet (single source of truth in lwk_wollet) rather than
-    // re-deriving it here, so the declared fee asset can never disagree with the only input.
-    const ca = wollet.cpfpFeeAsset(t).toString();
-    let b = wollet.cpfpOf(t).feeRate(BUMP_FEERATE);
-    if(ca!==POLICY_HEX){
-      const r = (feeRates[ca] && feeRates[ca].rate) ? BigInt(feeRates[ca].rate) : BigInt(EXCHANGE_RATE_SCALE);
-      b = b.feeAsset(new AssetId(ca), r);
+    const kvb = Math.max(1, feeRateVb || (BUMP_FEERATE/1000)) * 1000;   // sat/vB → sat/kvB
+    let b = wollet.cpfpOf(new Txid(parentTxid)).feeRate(kvb);
+    if(feeAssetHex && feeAssetHex!==POLICY_HEX){
+      const r = (feeRates[feeAssetHex] && feeRates[feeAssetHex].rate) ? BigInt(feeRates[feeAssetHex].rate) : BigInt(EXCHANGE_RATE_SCALE);
+      b = b.feeAsset(new AssetId(feeAssetHex), r);
     }
-    await reviewBroadcast(b.finish(wollet), 'Speed up (child-pays-for-parent)', null, ca);
-  }catch(e){ toast('Speed up failed: '+(e?.message??e)); }
+    await reviewBroadcast(b.finish(wollet), 'Speed up (child-pays-for-parent)', null, feeAssetHex);
+  }catch(e){ toast('Speed up failed: '+prettyErr(e)); }
+}
+// Replace: same inputs, brand-new outputs. Correct a still-unconfirmed payment.
+function replaceDialog(txid){
+  const m=el('div','modal'); const c=el('div','card');
+  c.appendChild(el('label','lbl','Replace transaction (RBF)'));
+  c.appendChild(el('div','sub','Keeps this transaction’s inputs but sends entirely new outputs, replacing the original before it confirms. The new fee must still exceed the original’s.'));
+  c.appendChild(el('label','lbl','Send to'));
+  const addr=el('input'); addr.type='text'; addr.placeholder='Sequentia address (tb1… or tsqb1…)'; addr.style.marginTop='4px'; c.appendChild(addr);
+  c.appendChild(el('label','lbl','Amount'));
+  const arow=el('div','row'); arow.style.cssText='gap:8px;margin-top:4px';
+  const amt=el('input'); amt.type='text'; amt.placeholder='0.0'; amt.style.flex='1';
+  const asset=el('select'); const addA=(v,l)=>{ const o=el('option'); o.value=v; o.textContent=l; asset.appendChild(o); };
+  addA(POLICY_HEX,'tSEQ'); for(const h of Object.keys(balObj())){ if(h!==POLICY_HEX) addA(h, assetMeta(h).ticker); }
+  arow.appendChild(amt); arow.appendChild(asset); c.appendChild(arow);
+  c.appendChild(el('label','lbl','Pay the fee in')); const fsel=feeAssetSelect(); c.appendChild(fsel);
+  const rl=el('label','lbl','Fee rate (sat/vB)'); rl.style.marginTop='10px'; c.appendChild(rl);
+  const rate=el('input'); rate.type='number'; rate.min='1'; rate.step='1'; rate.value=String(BUMP_FEERATE/1000); rate.style.marginTop='4px'; c.appendChild(rate);
+  const act=el('div','row'); act.style.marginTop='14px';
+  const ok=el('button','primary','Replace'); const no=el('button','ghost','Cancel');
+  act.appendChild(ok); act.appendChild(no); c.appendChild(act);
+  m.appendChild(c); document.body.appendChild(m);
+  no.onclick=()=>m.remove();
+  ok.onclick=()=>{ m.remove(); doReplace(txid, addr.value.trim(), asset.value, amt.value.trim(), fsel.value, parseFloat(rate.value)); };
+}
+async function doReplace(txid, addr, assetHex, amtStr, feeAssetHex, feeRateVb){
+  try{
+    if(!addr) throw new Error('enter a recipient address');
+    const kvb = Math.max(1, feeRateVb || (BUMP_FEERATE/1000)) * 1000;
+    let b = addOneRecipient(wollet.replaceTxOf(new Txid(txid)), addr, assetHex, amtStr).feeRate(kvb);
+    if(feeAssetHex && feeAssetHex!==POLICY_HEX){
+      const r = (feeRates[feeAssetHex] && feeRates[feeAssetHex].rate) ? BigInt(feeRates[feeAssetHex].rate) : BigInt(EXCHANGE_RATE_SCALE);
+      b = b.feeAsset(new AssetId(feeAssetHex), r);
+    }
+    await reviewBroadcast(b.finish(wollet), 'Replace transaction', null, feeAssetHex);
+  }catch(e){ toast('Replace failed: '+prettyErr(e)); }
 }
 
 // ---------- stake ----------
