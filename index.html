@@ -289,7 +289,7 @@
 </div>
 
 <script type="module">
-import init, { Mnemonic, Network, Signer, Wollet, EsploraClient, Address, AssetId, Contract }
+import init, { Mnemonic, Network, Signer, Wollet, EsploraClient, Address, AssetId, Txid, Contract }
   from './pkg/lwk_wasm.js';
 import { HDKey, mnemonicToSeedSync, btc } from './btc.js';
 
@@ -297,6 +297,7 @@ const ESPLORA = location.origin + '/api';
 const KEY = 'swk.sequentia.mnemonic';
 const LBL = 'swk.sequentia.assets';      // { assetHex: {name,ticker,precision} }
 const DEFAULT_FEERATE = 2000;            // sat/kvB (2 sat/vB) — above the network min relay fee
+const BUMP_FEERATE = 10000;              // sat/kvB (10 sat/vB) — rescue rate for RBF/CPFP; the node arbitrates BIP125 in reference value
 const STAKES = 'swk.sequentia.stakes';   // [{pubkey,csv,period,atoms,txid,time}]
 // Network minimum unbonding (~15 days, height-based csv=43200). Bonding longer
 // earns nothing — stake weight is the amount, not the lock duration — so the
@@ -371,10 +372,14 @@ function populateFeeAssets(){
   sel.innerHTML='';
   const add=(val,label)=>{ const o=el('option'); o.value=val; o.textContent=label; sel.appendChild(o); };
   add(POLICY_HEX, 'tSEQ');
+  // Offer EVERY owned asset for fees — never gate on whether THIS node prices it. A producer
+  // elsewhere may accept an asset our relay node doesn't; let the user choose and take the risk
+  // (the hint flags it; RBF is on by default to remediate). No asset is privileged — tSEQ above
+  // is just the protocol's default-accepted asset.
   const b=balObj();
   for(const h of Object.keys(b)){
-    if(h===POLICY_HEX || !feeRates[h]) continue;   // only fee-whitelisted (non-stale) owned assets
-    add(h, assetMeta(h).ticker);
+    if(h===POLICY_HEX) continue;
+    add(h, assetMeta(h).ticker + (feeRates[h] ? '' : ' — no local price'));
   }
   if(prev && [...sel.options].some(o=>o.value===prev)) sel.value=prev;
   updateFeeAssetHint();
@@ -382,10 +387,24 @@ function populateFeeAssets(){
 function updateFeeAssetHint(){
   const sel=$('feeAsset'), hint=$('feeAssetHint'); if(!sel||!hint) return;
   const h=sel.value;
-  if(!h || h===POLICY_HEX || !feeRates[h]){ hint.textContent=''; return; }
+  hint.textContent='';                          // textContent only (never innerHTML) — a ticker can't inject markup
+  if(!h || h===POLICY_HEX) return;
   const t=assetMeta(h).ticker;
-  const rel=feeRates[h].rate / feeRefRate;        // tSEQ value of one whole unit of the asset
-  hint.textContent = `Fee charged in ${t} at the node's published rate (≈ ${rel.toPrecision(4)} tSEQ per ${t}). Needs enough ${t} in the wallet.`;
+  const priced = !!(feeRates[h] && feeRates[h].rate);
+  if(priced){
+    const rel=feeRates[h].rate / feeRefRate;    // value of one unit of the asset in reference units (rfa)
+    hint.textContent = `Fee charged in ${t} at this node's published rate (≈ ${rel.toPrecision(4)} reference units per ${t}). The wallet needs enough ${t} to cover it.`;
+  } else {
+    hint.textContent = `This node has no published rate for ${t} — the fee will be estimated 1:1 with the reference unit, which may be off.`;
+  }
+  // Asset-agnostic caution. No asset (not even the policy asset) is privileged — confirmation
+  // depends on the producer that mines it also accepting THIS asset; the rescue is RBF/CPFP
+  // paying the bump in any asset producers accept, compared in the same reference unit.
+  const warn=el('div','warn');
+  warn.textContent = priced
+    ? `⚠ Confirmation still depends on the producer that mines it accepting ${t}. If it doesn't confirm, RBF (on by default) lets you replace it — paying the bump in any asset producers accept.`
+    : `⚠ Your relay node doesn't price ${t}, so it may reject this and the estimated fee may be off. You can still try — another producer may accept ${t}. RBF is on by default, so you can replace it (e.g. with a different fee asset) if needed.`;
+  hint.appendChild(warn);
 }
 
 // ---------- Bitcoin (testnet4) — same BIP84 keychain, identical tb1 addresses ----------
@@ -643,9 +662,15 @@ function buildSendPset(rows){
   // lwk's feeRate is sat/kvB; the field is sat/vB, so ×1000. Default keeps us above min relay.
   const fr=$('feeRate').value.trim();
   b=b.feeRate(fr ? parseFloat(fr)*1000 : DEFAULT_FEERATE);
-  // Pay the fee in a chosen non-policy asset, at the node's published (consensus) rate.
+  // Pay the fee in whatever asset the user chose. Use this node's published rate when it has
+  // one; otherwise fall back to a 1:1 reference rate so the tx still builds — the user has opted
+  // to take the risk (another producer may accept it; our relay node may reject it). RBF is on by
+  // default to remediate. No asset is special.
   const fa=$('feeAsset') && $('feeAsset').value;
-  if(fa && fa!==POLICY_HEX && feeRates[fa]) b=b.feeAsset(new AssetId(fa), BigInt(feeRates[fa].rate));
+  if(fa && fa!==POLICY_HEX){
+    const rate = (feeRates[fa] && feeRates[fa].rate) ? BigInt(feeRates[fa].rate) : BigInt(EXCHANGE_RATE_SCALE);
+    b=b.feeAsset(new AssetId(fa), rate);
+  }
   return b.finish(wollet);
 }
 
@@ -814,12 +839,76 @@ function renderHistory(){
     const when = t.height()? (ts? new Date(ts*1000).toLocaleString() : 'block '+t.height()) : 'unconfirmed';
     mid.appendChild(el('div',null,`<a href="/tx/${txid}" target="_blank" rel="noopener" class="aid">${txid.slice(0,20)}…</a>`));
     mid.appendChild(el('div','sub', when));
+    if(!t.height() && type==='outgoing'){
+      const acts=el('div','row'); acts.style.cssText='gap:6px;margin-top:6px;flex-wrap:wrap';
+      const mk=(label,fn)=>{ const x=el('button','ghost',label); x.style.cssText='padding:4px 10px;font-size:12px'; x.onclick=fn; return x; };
+      acts.appendChild(mk('Bump fee', ()=>bumpFeeDialog(txid)));   // RBF replacement, fee in any asset
+      acts.appendChild(mk('Speed up', ()=>doCpfp(txid)));          // CPFP, fee in the change's asset
+      mid.appendChild(acts);
+    }
     item.appendChild(mid);
     const pol = delta[POLICY_HEX];
     if(pol!=null){ const neg=BigInt(pol)<0n; item.appendChild(el('span','amt '+(neg?'neg':'pos'), fmtAtoms(pol,8)+' tSEQ')); }
     else { const k=Object.keys(delta)[0]; if(k){ const m=assetMeta(k); item.appendChild(el('span','amt', fmtAtoms(delta[k],m.precision)+' '+m.ticker)); } }
     list.appendChild(item);
   }
+}
+
+// ---------- RBF fee-bump + CPFP rescue (asset-agnostic) ----------
+// On an unconfirmed send: "Bump fee" builds a BIP125 replacement — lwk_wollet re-pins the
+// original inputs and recreates the recipients (Wollet.bumpFeeOf) — at a higher fee paid in
+// WHATEVER asset the user picks; no asset is privileged. "Speed up" attaches a CPFP child
+// (Wollet.cpfpOf) spending the parent's unconfirmed change, paying the child fee in that
+// change's own asset. RBF is on by default (every send signals it), so any send is replaceable.
+function feeAssetSelect(){
+  const sel=el('select'); sel.style.marginTop='8px';
+  const add=(v,l)=>{ const o=el('option'); o.value=v; o.textContent=l; sel.appendChild(o); };
+  add(POLICY_HEX, 'tSEQ');                       // the protocol's default-accepted asset — not special
+  for(const h of Object.keys(balObj())){ if(h!==POLICY_HEX) add(h, assetMeta(h).ticker + (feeRates[h]?'':' — no local price')); }
+  return sel;
+}
+function bumpFeeDialog(txid){
+  const m=el('div','modal'); const c=el('div','card');
+  c.appendChild(el('label','lbl','Replace with a higher fee (RBF)'));
+  c.appendChild(el('div','sub','Re-broadcasts the same payment at a higher fee. Pay the bump in any asset — confirmation depends on the producer that mines it accepting that asset.'));
+  c.appendChild(el('label','lbl','Pay the bump fee in'));
+  const sel=feeAssetSelect(); c.appendChild(sel);
+  const rl=el('label','lbl','New fee rate (sat/vB)'); rl.style.marginTop='10px'; c.appendChild(rl);
+  const rate=el('input'); rate.type='number'; rate.min='1'; rate.step='1'; rate.value=String(BUMP_FEERATE/1000); rate.style.marginTop='4px';
+  c.appendChild(rate);
+  c.appendChild(el('div','sub',"Must exceed the original's fee rate (in reference value), or the network rejects the replacement."));
+  const act=el('div','row'); act.style.marginTop='14px';
+  const ok=el('button','primary','Replace'); const no=el('button','ghost','Cancel');
+  act.appendChild(ok); act.appendChild(no); c.appendChild(act);
+  m.appendChild(c); document.body.appendChild(m);
+  no.onclick=()=>m.remove();
+  ok.onclick=()=>{ m.remove(); doBump(txid, sel.value, parseFloat(rate.value)); };
+}
+async function doBump(txid, feeAssetHex, feeRateVb){
+  try{
+    const kvb = Math.max(1, feeRateVb || (BUMP_FEERATE/1000)) * 1000;   // sat/vB → sat/kvB; user can raise it above the original
+    let b = wollet.bumpFeeOf(new Txid(txid)).feeRate(kvb);
+    if(feeAssetHex && feeAssetHex!==POLICY_HEX){
+      const r = (feeRates[feeAssetHex] && feeRates[feeAssetHex].rate) ? BigInt(feeRates[feeAssetHex].rate) : BigInt(EXCHANGE_RATE_SCALE);
+      b = b.feeAsset(new AssetId(feeAssetHex), r);
+    }
+    await reviewBroadcast(b.finish(wollet), 'Fee-bump (RBF replacement)', null, feeAssetHex);
+  }catch(e){ toast('Fee-bump failed: '+(e?.message??e)); }
+}
+async function doCpfp(parentTxid){
+  try{
+    const t = new Txid(parentTxid);
+    // The asset the child's fee must be paid in = the asset of the very change output cpfpOf
+    // pins. Read it from the wallet (single source of truth in lwk_wollet) rather than
+    // re-deriving it here, so the declared fee asset can never disagree with the only input.
+    const ca = wollet.cpfpFeeAsset(t).toString();
+    let b = wollet.cpfpOf(t).feeRate(BUMP_FEERATE);
+    if(ca!==POLICY_HEX){
+      const r = (feeRates[ca] && feeRates[ca].rate) ? BigInt(feeRates[ca].rate) : BigInt(EXCHANGE_RATE_SCALE);
+      b = b.feeAsset(new AssetId(ca), r);
+    }
+    await reviewBroadcast(b.finish(wollet), 'Speed up (child-pays-for-parent)', null, ca);
+  }catch(e){ toast('Speed up failed: '+(e?.message??e)); }
 }
 
 // ---------- stake ----------
