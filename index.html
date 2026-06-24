@@ -231,7 +231,7 @@
         <label class="lbl">Reissue / burn an asset</label>
         <div class="field"><label class="lbl">Asset id</label><input id="raAsset" class="mono" placeholder="64-hex asset id"></div>
         <div class="row" style="margin-top:10px">
-          <div class="grow"><label class="lbl">Amount (atoms)</label><input id="raAmount" class="mono" placeholder="100"></div>
+          <div class="grow"><label class="lbl">Amount</label><input id="raAmount" class="mono" placeholder="0.0"></div>
         </div>
         <div class="row" style="margin-top:12px">
           <button id="btnReissue">Reissue</button>
@@ -250,7 +250,8 @@
         <div class="field"><label class="lbl">Amount</label><input id="stAmount" class="mono" placeholder="0.0"></div>
         <button class="primary" id="btnStake" style="margin-top:14px">Review stake</button>
         <div class="status err" id="stakeErr"></div>
-        <div class="kv" style="margin-top:12px"><span class="k">Unbonding period</span><span class="v" id="stPeriod">~15 days (network minimum)</span></div>
+        <div class="kv" style="margin-top:12px"><span class="k">Minimum stake</span><span class="v" id="stMin">40,000 tSEQ</span></div>
+        <div class="kv"><span class="k">Unbonding period</span><span class="v" id="stPeriod">~15 days (network minimum)</span></div>
         <div class="kv"><span class="k">Your staker key</span><span class="v" id="stPubkey">—</span></div>
       </div>
       <div class="card">
@@ -310,6 +311,8 @@ const STAKES = 'swk.sequentia.stakes';   // [{pubkey,csv,period,atoms,txid,time}
 // wallet always uses the minimum.
 const STAKE_CSV = 43200;
 const STAKE_PERIOD_LABEL = '~15 days (network minimum)';
+// Chain minimum stake: 40,000 tSEQ = 4e12 atoms (tSEQ precision 8). Mirrors the desktop wallet.
+const STAKE_MIN_ATOMS = 4000000000000n;
 const $ = id => document.getElementById(id);
 const el = (t,c,h)=>{const e=document.createElement(t); if(c)e.className=c; if(h!=null)e.innerHTML=h; return e;};
 
@@ -358,6 +361,19 @@ function assetMeta(hex){ if(hex==='BTC') return {ticker:'BTC', name:'Bitcoin tes
   if(hex===POLICY_HEX) return {ticker:'tSEQ', name:'Sequentia', precision:8};
   return labels()[hex] || REGISTRY_ASSETS[hex] || DEFAULT_ASSETS[hex] || {ticker:hex.slice(0,8)+'…', name:'Asset', precision:0}; }
 let POLICY_HEX='';
+// True when we have NO authoritative precision for this asset — assetMeta() only
+// falls back to precision:0 (the generic ticker:hex…/name:'Asset' placeholder).
+// Sending such an asset at precision 0 would mis-parse the amount (e.g. a 1e8x
+// trap for an 8-dp asset), so the send is blocked until the precision is known.
+function precisionKnown(hex){
+  if(hex==='BTC' || hex===POLICY_HEX) return true;
+  return !!(labels()[hex] || REGISTRY_ASSETS[hex] || DEFAULT_ASSETS[hex]);
+}
+// Precision for an asset being SENT; throws if it's owned but unlabeled (unknown precision).
+function sendPrecision(hex){
+  if(!precisionKnown(hex)) throw new Error('unknown precision for asset '+hex.slice(0,12)+'… — label it before sending');
+  return assetMeta(hex).precision;
+}
 
 // ---------- fee-asset exchange rates (Sequentia any-asset-fees) ----------
 // The node publishes a fee whitelist: each asset's rate is atoms-of-asset per
@@ -385,7 +401,15 @@ async function fetchFeeRates(){
       map[k] = { rate: v };
     }
     feeRates = map;
-  }catch(e){ console.warn('[feerates] fetch failed:', e?.message??e); feeRates={}; }
+  }catch(e){ console.warn('[feerates] fetch failed:', e?.message??e); }   // keep last-good rates on a transient failure (mirrors loadPrices)
+}
+// The published rate (atoms-of-asset per reference unit) the tx must build its fee with.
+// There is NO 1:1 fallback: a fabricated rate produces a wrong fee, so an unpriced asset is
+// a hard error. (The selectors gate unpriced assets out, so this is a last-line guard.)
+function feeRateFor(hex){
+  const r = feeRates[hex] && feeRates[hex].rate;
+  if(!(r>0)) throw new Error('no fee rate for '+assetMeta(hex).ticker+'; try again');
+  return BigInt(r);
 }
 
 // ---------- reference-currency valuation (user-chosen display denomination) ----------
@@ -444,6 +468,8 @@ function refHintFor(amountStr, hex){
 // Fixed-point (never scientific notation) at ≤8dp with trailing zeros dropped, so a written-back
 // field value is always parseAtoms-acceptable.
 const _trimNum = n => { const s=(Math.round(n*1e8)/1e8).toFixed(8); return s.replace(/0+$/,'').replace(/\.$/,''); };
+// Same, but rounded/clamped to `dp` decimals — used to write an ASSET amount back at its own precision.
+const _trimNumDp = (n, dp) => { dp=Math.max(0,Math.min(8,dp|0)); const s=n.toFixed(dp); return dp>0 ? s.replace(/\.?0+$/,'') : s; };
 function _assetUsd(hex){ return PRICES[priceTicker(hex)]; }  // asset's USD base price
 function _bothPriced(hex, ref){ return _assetUsd(hex)>0 && priceOf(ref||REF)>0; }
 const _NUMRE = /^\d+(\.\d+)?$/;   // exactly what parseAtoms accepts; reject anything else (e.g. '1,5') — fail safe
@@ -495,7 +521,10 @@ function attachRefHint(input, assetFn){
     if(!input._refMode && !_bothPriced(hex, REF)) return;          // only block ENTERING ref mode when unpriced
     const raw=(input.value||'').trim();
     if(raw && _NUMRE.test(raw)){ const v=parseFloat(raw), pa=_assetUsd(hex), pr=priceOf(REF);
-      if(pa>0 && pr>0) input.value = input._refMode ? _trimNum(v*pr/pa)   // reference → asset
+      // reference → asset write-back must round to the ASSET's atom precision (not a fixed 8dp),
+      // or a sub-8-precision asset gets an un-sendable value (e.g. "1.23456789" for a 2dp asset).
+      const dec=assetMeta(hex).precision||0;
+      if(pa>0 && pr>0) input.value = input._refMode ? _trimNumDp(v*pr/pa, dec)   // reference → asset
                                                     : _trimNum(v*pa/pr);  // asset → reference
       else if(input._refMode) input.value='';                     // leaving ref mode while unpriced: drop the stale number
     }
@@ -531,14 +560,14 @@ function populateFeeAssets(){
   sel.innerHTML='';
   const add=(val,label)=>{ const o=el('option'); o.value=val; o.textContent=label; sel.appendChild(o); };
   add(POLICY_HEX, 'tSEQ');
-  // Offer EVERY owned asset for fees — never gate on whether THIS node prices it. A producer
-  // elsewhere may accept an asset our relay node doesn't; let the user choose and take the risk
-  // (the hint flags it; RBF is on by default to remediate). No asset is privileged — tSEQ above
-  // is just the protocol's default-accepted asset.
+  // Only offer owned assets this node actually prices: building a fee in an unpriced asset has no
+  // valid rate (feeRateFor would throw), so listing it would just produce a broken send. tSEQ above
+  // is always available — it's the protocol's default-accepted asset.
   const b=balObj();
   for(const h of Object.keys(b)){
     if(h===POLICY_HEX) continue;
-    add(h, assetMeta(h).ticker + (feeRates[h] ? '' : ' — no local price'));
+    if(!(feeRates[h] && feeRates[h].rate>0)) continue;   // unpriced: gate it out of the selector
+    add(h, assetMeta(h).ticker);
   }
   if(prev && [...sel.options].some(o=>o.value===prev)) sel.value=prev;
   updateFeeAssetHint();
@@ -839,9 +868,13 @@ function collectRows(){
   for(const r of $('recipients').children){
     const addr=r.querySelector('.raddr').value.trim();
     const asset=r.querySelector('.rasset').value;
-    const amtS=assetAmountOf(r.querySelector('.ramt'), asset);   // honours ⇄ ref-input mode
+    const amtInput=r.querySelector('.ramt');
+    const amtS=assetAmountOf(amtInput, asset);   // honours ⇄ ref-input mode
     if(!addr && !amtS) continue;
-    out.push({addr, amtS, asset});
+    // Preserve the ⇄ reference-input details so the review can show "typed X REF -> sending Y TICKER".
+    const ref = (amtInput && amtInput._refMode && (amtInput.value||'').trim())
+      ? { typed:(amtInput.value||'').trim(), ccy:(amtInput._refCcy||REF) } : null;
+    out.push({addr, amtS, asset, ref});
   }
   return out;
 }
@@ -850,7 +883,7 @@ function buildSendPset(rows){
   for(const r of rows){
     const a=new Address(r.addr);   // throws on a non-Sequentia / malformed address
     if(a.isMainnet()) throw new Error('That looks like a mainnet address — this is a Sequentia testnet wallet.');
-    const sats=parseAtoms(r.amtS, assetMeta(r.asset).precision);
+    const sats=parseAtoms(r.amtS, sendPrecision(r.asset));
     if(sats<=0n) throw new Error('amount must be greater than zero');
     const assetId = r.asset===POLICY_HEX ? POLICY : new AssetId(r.asset);
     // Sequentia default addresses are non-confidential (tb1…): lwk only accepts
@@ -861,14 +894,12 @@ function buildSendPset(rows){
   // lwk's feeRate is sat/kvB; the field is sat/vB, so ×1000. Default keeps us above min relay.
   const fr=$('feeRate').value.trim();
   b=b.feeRate(fr ? parseFloat(fr)*1000 : DEFAULT_FEERATE);
-  // Pay the fee in whatever asset the user chose. Use this node's published rate when it has
-  // one; otherwise fall back to a 1:1 reference rate so the tx still builds — the user has opted
-  // to take the risk (another producer may accept it; our relay node may reject it). RBF is on by
-  // default to remediate. No asset is special.
+  // Pay the fee in whatever asset the user chose, at this node's published rate. There is no 1:1
+  // fallback — a fabricated rate yields a wrong fee, so an unpriced asset is a hard error
+  // (feeRateFor throws). The selectors already gate unpriced assets out; this is the last guard.
   const fa=$('feeAsset') && $('feeAsset').value;
   if(fa && fa!==POLICY_HEX){
-    const rate = (feeRates[fa] && feeRates[fa].rate) ? BigInt(feeRates[fa].rate) : BigInt(EXCHANGE_RATE_SCALE);
-    b=b.feeAsset(new AssetId(fa), rate);
+    b=b.feeAsset(new AssetId(fa), feeRateFor(fa));
   }
   return b.finish(wollet);
 }
@@ -885,24 +916,45 @@ function modalRows(rows){
   no.onclick=()=>m.remove();
   return {m, ok, st};
 }
-async function reviewBroadcast(pset, title, onDone, feeAssetHex){
+// Render a Sequentia review from the STRUCTURED rows the caller already has, NOT from
+// wollet.psetDetails (which throws on Sequentia's explicit/non-confidential outputs, leaving the
+// old "Ready to sign" blind-signing trap). `review` = { rows:[{addr?, atoms, hex, ref?}], feeAssetHex? }
+//   ref (optional, ⇄ mode): { typed, ccy } — the reference amount the user typed.
+// psetDetails is kept only as a best-effort fee cross-check inside its own try/catch.
+async function reviewBroadcast(pset, title, onDone, feeAssetHex, review){
   const kv=[];
-  // psetDetails assumes blinded outputs (Liquid); it throws on Sequentia's
-  // explicit (non-confidential) outputs, so fall back to a minimal review.
-  try{
-    const bal = wollet.psetDetails(pset).balance();
-    for(const r of bal.recipients()){
-      const asset=r.asset()?.toString()||POLICY_HEX; const m=assetMeta(asset);
-      kv.push(['→ '+(r.address()?.toString()||'(script)'), fmtAtoms(r.value()||0n, m.precision)+' '+m.ticker]);
+  // First line: this is a Sequentia (testnet) payment, NOT a parent-chain BTC one.
+  kv.push(['Network', 'Sequentia (testnet) — not parent-chain BTC']);
+  if(review && Array.isArray(review.rows)){
+    for(const r of review.rows){
+      const m=assetMeta(r.hex);
+      const amtStr=fmtAtoms(r.atoms, m.precision)+' '+m.ticker;
+      const ref=refValueStr(r.hex, r.atoms);
+      const v = amtStr + (ref ? ('  ('+ref+')') : '');
+      kv.push([r.addr ? ('→ '+r.addr) : 'Amount', v]);
+      // ⇄ reference-input mode: spell out exactly what was typed vs what is being sent.
+      if(r.ref && r.ref.typed!=null && r.ref.ccy)
+        kv.push(['You entered', 'You typed '+r.ref.typed+' '+r.ref.ccy+' -> sending '+fmtAtoms(r.atoms,m.precision)+' '+m.ticker]);
     }
-    const net = bal.balances().toJSON();   // {asset: signed atoms}
-    for(const [h,v] of Object.entries(net)){ const m=assetMeta(h); kv.push(['Net '+m.ticker, fmtAtoms(v, m.precision)]); }
-    kv.push(['Network fee', fmtAtoms(bal.fee(), 8)+' tSEQ']);
-  }catch{
-    kv.push(['Transaction', 'Ready to sign']);
-    kv.push(['Note', 'Non-confidential transfer — amounts are as entered; a network fee applies.']);
+    if(feeAssetHex!==undefined) kv.push(['Fee paid in', (feeAssetHex && feeAssetHex!==POLICY_HEX) ? assetMeta(feeAssetHex).ticker : 'tSEQ']);
+    // Best-effort fee cross-check only — never the source of truth, never blocks the review.
+    try{ const fee=wollet.psetDetails(pset).balance().fee(); if(fee!=null) kv.push(['Network fee (est.)', fmtAtoms(fee,8)+' tSEQ']); }catch{}
+  } else {
+    // No structured rows supplied (issuance, etc.): keep the psetDetails best-effort, then a clear note.
+    try{
+      const bal = wollet.psetDetails(pset).balance();
+      for(const r of bal.recipients()){
+        const asset=r.asset()?.toString()||POLICY_HEX; const m=assetMeta(asset);
+        kv.push(['→ '+(r.address()?.toString()||'(script)'), fmtAtoms(r.value()||0n, m.precision)+' '+m.ticker]);
+      }
+      const net = bal.balances().toJSON();   // {asset: signed atoms}
+      for(const [h,v] of Object.entries(net)){ const m=assetMeta(h); kv.push(['Net '+m.ticker, fmtAtoms(v, m.precision)]); }
+      kv.push(['Network fee', fmtAtoms(bal.fee(), 8)+' tSEQ']);
+    }catch{
+      kv.push(['Note', 'Non-confidential transfer — amounts are as entered; a network fee applies.']);
+    }
+    if(feeAssetHex && feeAssetHex!==POLICY_HEX) kv.push(['Fee paid in', assetMeta(feeAssetHex).ticker]);
   }
-  if(feeAssetHex && feeAssetHex!==POLICY_HEX) kv.push(['Fee paid in', assetMeta(feeAssetHex).ticker]);
   const {m, ok, st} = modalRows({title, kv});
   ok.onclick=async()=>{
     ok.disabled=true; st.className='status'; st.innerHTML='<span class="spin"></span>Signing &amp; broadcasting…';
@@ -976,7 +1028,10 @@ $('btnReview').onclick=async()=>{ $('sendErr').textContent='';
       await btcReviewBroadcast(outputs, reset);
     } else {
       const faHex = $('feeAsset') ? $('feeAsset').value : POLICY_HEX;
-      await reviewBroadcast(buildSendPset(rows), 'Confirm payment', reset, faHex);
+      const pset = buildSendPset(rows);
+      // Structured review rows (recipient, resolved atoms, asset, ⇄ ref details) — never blind-sign.
+      const reviewRows = rows.map(r=>({ addr:r.addr, atoms:parseAtoms(r.amtS, sendPrecision(r.asset)), hex:r.asset, ref:r.ref }));
+      await reviewBroadcast(pset, 'Confirm Sequentia payment', reset, faHex, {rows:reviewRows, feeAssetHex:faHex});
     }
   }catch(e){ $('sendErr').textContent=e?.message??String(e); } };
 
@@ -1008,15 +1063,19 @@ $('btnIssue').onclick=async()=>{ $('issueErr').textContent='';
 
 $('btnReissue').onclick=async()=>{ $('raErr').textContent='';
   try{ const asset=$('raAsset').value.trim(); const m=assetMeta(asset);
-    const amt=parseAtoms(assetAmountOf($('raAmount'), asset), m.precision);   // honours ⇄ ref-input mode
+    const input=$('raAmount');
+    const amt=parseAtoms(assetAmountOf(input, asset), m.precision);   // honours ⇄ ref-input mode
+    const ref=(input._refMode && (input.value||'').trim()) ? {typed:(input.value||'').trim(), ccy:(input._refCcy||REF)} : null;
     const pset=network.txBuilder().reissueAsset(new AssetId(asset), amt, undefined, undefined).feeRate(DEFAULT_FEERATE).finish(wollet);
-    await reviewBroadcast(pset, 'Reissue '+m.ticker);
+    await reviewBroadcast(pset, 'Confirm Sequentia payment', null, POLICY_HEX, {rows:[{atoms:amt, hex:asset, ref}], feeAssetHex:POLICY_HEX});
   }catch(e){ $('raErr').textContent=e?.message??String(e); } };
 $('btnBurn').onclick=async()=>{ $('raErr').textContent='';
   try{ const asset=$('raAsset').value.trim(); const m=assetMeta(asset);
-    const amt=parseAtoms(assetAmountOf($('raAmount'), asset), m.precision);   // honours ⇄ ref-input mode
+    const input=$('raAmount');
+    const amt=parseAtoms(assetAmountOf(input, asset), m.precision);   // honours ⇄ ref-input mode
+    const ref=(input._refMode && (input.value||'').trim()) ? {typed:(input.value||'').trim(), ccy:(input._refCcy||REF)} : null;
     const pset=network.txBuilder().addBurn(amt, new AssetId(asset)).feeRate(DEFAULT_FEERATE).finish(wollet);
-    await reviewBroadcast(pset, 'Burn '+m.ticker);
+    await reviewBroadcast(pset, 'Confirm Sequentia payment', null, POLICY_HEX, {rows:[{atoms:amt, hex:asset, ref}], feeAssetHex:POLICY_HEX});
   }catch(e){ $('raErr').textContent=e?.message??String(e); } };
 
 $('btnReveal').onclick=()=>{ $('seedReveal').textContent=localStorage.getItem(KEY)||''; show('seedReveal'); $('btnReveal').classList.add('hide'); };
@@ -1080,15 +1139,16 @@ function renderHistory(){
 function feeAssetSelect(){
   const sel=el('select'); sel.style.marginTop='8px';
   const add=(v,l)=>{ const o=el('option'); o.value=v; o.textContent=l; sel.appendChild(o); };
-  add(POLICY_HEX, 'tSEQ');                       // the protocol's default-accepted asset — not special
-  for(const h of Object.keys(balObj())){ if(h!==POLICY_HEX) add(h, assetMeta(h).ticker + (feeRates[h]?'':' — no local price')); }
+  add(POLICY_HEX, 'tSEQ');                       // the protocol's default-accepted asset — always available
+  // Only priced assets: an unpriced asset has no valid fee rate (feeRateFor would throw).
+  for(const h of Object.keys(balObj())){ if(h!==POLICY_HEX && feeRates[h] && feeRates[h].rate>0) add(h, assetMeta(h).ticker); }
   return sel;
 }
 // Add one recipient to a builder, mirroring buildSendPset's blinded/explicit + policy/asset handling.
 function addOneRecipient(b, addrStr, assetHex, amtStr){
   const a=new Address(addrStr);
   if(a.isMainnet()) throw new Error('That looks like a mainnet address — this is a Sequentia testnet wallet.');
-  const sats=parseAtoms(amtStr, assetMeta(assetHex).precision);
+  const sats=parseAtoms(amtStr, sendPrecision(assetHex));
   if(sats<=0n) throw new Error('amount must be greater than zero');
   const assetId = assetHex===POLICY_HEX ? POLICY : new AssetId(assetHex);
   if(a.isBlinded()) return assetHex===POLICY_HEX ? b.addLbtcRecipient(a, sats) : b.addRecipient(a, sats, assetId);
@@ -1117,8 +1177,7 @@ async function doBump(txid, feeAssetHex, feeRateVb){
     const kvb = Math.max(1, feeRateVb || (BUMP_FEERATE/1000)) * 1000;   // sat/vB → sat/kvB; user can raise it above the original
     let b = wollet.bumpFeeOf(new Txid(txid)).feeRate(kvb);
     if(feeAssetHex && feeAssetHex!==POLICY_HEX){
-      const r = (feeRates[feeAssetHex] && feeRates[feeAssetHex].rate) ? BigInt(feeRates[feeAssetHex].rate) : BigInt(EXCHANGE_RATE_SCALE);
-      b = b.feeAsset(new AssetId(feeAssetHex), r);
+      b = b.feeAsset(new AssetId(feeAssetHex), feeRateFor(feeAssetHex));
     }
     await reviewBroadcast(b.finish(wollet), 'Fee-bump (RBF replacement)', null, feeAssetHex);
   }catch(e){ toast('Fee-bump failed: '+(e?.message??e)); }
@@ -1151,8 +1210,7 @@ async function doCpfp(parentTxid, feeAssetHex, feeRateVb){
     const kvb = Math.max(1, feeRateVb || (BUMP_FEERATE/1000)) * 1000;   // sat/vB → sat/kvB
     let b = wollet.cpfpOf(new Txid(parentTxid)).feeRate(kvb);
     if(feeAssetHex && feeAssetHex!==POLICY_HEX){
-      const r = (feeRates[feeAssetHex] && feeRates[feeAssetHex].rate) ? BigInt(feeRates[feeAssetHex].rate) : BigInt(EXCHANGE_RATE_SCALE);
-      b = b.feeAsset(new AssetId(feeAssetHex), r);
+      b = b.feeAsset(new AssetId(feeAssetHex), feeRateFor(feeAssetHex));
     }
     await reviewBroadcast(b.finish(wollet), 'Speed up (child-pays-for-parent)', null, feeAssetHex);
   }catch(e){ toast('Speed up failed: '+prettyErr(e)); }
@@ -1188,10 +1246,10 @@ async function doReplace(txid, addr, assetHex, amtStr, feeAssetHex, feeRateVb){
     const kvb = Math.max(1, feeRateVb || (BUMP_FEERATE/1000)) * 1000;
     let b = addOneRecipient(wollet.replaceTxOf(new Txid(txid)), addr, assetHex, amtStr).feeRate(kvb);
     if(feeAssetHex && feeAssetHex!==POLICY_HEX){
-      const r = (feeRates[feeAssetHex] && feeRates[feeAssetHex].rate) ? BigInt(feeRates[feeAssetHex].rate) : BigInt(EXCHANGE_RATE_SCALE);
-      b = b.feeAsset(new AssetId(feeAssetHex), r);
+      b = b.feeAsset(new AssetId(feeAssetHex), feeRateFor(feeAssetHex));
     }
-    await reviewBroadcast(b.finish(wollet), 'Replace transaction', null, feeAssetHex);
+    const atoms=parseAtoms(amtStr, sendPrecision(assetHex));
+    await reviewBroadcast(b.finish(wollet), 'Confirm Sequentia payment', null, feeAssetHex, {rows:[{addr, atoms, hex:assetHex}], feeAssetHex});
   }catch(e){ toast('Replace failed: '+prettyErr(e)); }
 }
 
@@ -1237,15 +1295,18 @@ $('btnStake').onclick=async()=>{ $('stakeErr').textContent='';
   try{
     const csv=STAKE_CSV;
     const pubkey=signer.stakerPublicKey();
-    const atoms=parseAtoms(assetAmountOf($('stAmount'), POLICY_HEX), 8);   // honours ⇄ ref-input mode
+    const input=$('stAmount');
+    const atoms=parseAtoms(assetAmountOf(input, POLICY_HEX), 8);   // honours ⇄ ref-input mode
     if(atoms<=0n) throw new Error('enter an amount to stake');
+    if(atoms<STAKE_MIN_ATOMS) throw new Error('stake is below the network minimum of '+fmtAtoms(STAKE_MIN_ATOMS,8)+' tSEQ');
+    const ref=(input._refMode && (input.value||'').trim()) ? {typed:(input.value||'').trim(), ccy:(input._refCcy||REF)} : null;
     const pset=network.txBuilder().addStakeOutput(pubkey, csv, atoms).feeRate(DEFAULT_FEERATE).finish(wollet);
-    await reviewBroadcast(pset, 'Confirm stake', (txid)=>{
+    await reviewBroadcast(pset, 'Confirm Sequentia payment', (txid)=>{
       const st=(()=>{try{return JSON.parse(localStorage.getItem(STAKES)||'[]')}catch{return[]}})();
       st.push({pubkey, csv, period:STAKE_PERIOD_LABEL, atoms:atoms.toString(), txid:txid.toString(), time:Date.now()});
       localStorage.setItem(STAKES, JSON.stringify(st));
       $('stAmount').value=''; renderStake();
-    });
+    }, POLICY_HEX, {rows:[{atoms, hex:POLICY_HEX, ref}], feeAssetHex:POLICY_HEX});
   }catch(e){ $('stakeErr').textContent=e?.message??String(e); }
 };
 
