@@ -166,10 +166,15 @@ async function loadMarkets(){
   C.$('swErr').textContent = '';
 }
 
-// All assets that appear as one side of SOME tradable market (same- or cross-chain),
-// regardless of the other side. Used to seed the pay-side picker.
-function allTradableAssets(){
+// Assets the composer can START from (either side, before the other is chosen):
+// everything the user OWNS (so the wallet's own assets are always selectable, even
+// before a market has loaded), plus every asset quoted by some market, plus BTC if a
+// cross-chain market exists. findRoute() still gates an actual swap on a real market,
+// so an owned-but-unmarketed asset is offered but routes to "No market".
+function startableAssets(){
   const set = new Set();
+  const bal = C.balObj() || {};
+  for (const h of Object.keys(bal)){ if (big(bal[h]) > 0n) set.add(h); }   // what you hold
   for (const m of MARKETS){ set.add(m.market.base_asset); set.add(m.market.quote_asset); }
   for (const xm of XMARKETS){ set.add('BTC'); set.add(xm.seq_asset); }
   return [...set];
@@ -179,7 +184,7 @@ function allTradableAssets(){
 // null, every tradable asset is a candidate. This is how the pickers only offer a
 // counter-asset that actually trades against the chosen one.
 function counterpartsOf(other){
-  if (!other) return allTradableAssets();
+  if (!other) return startableAssets();
   const set = new Set();
   for (const m of MARKETS){
     const b = m.market.base_asset, q = m.market.quote_asset;
@@ -217,18 +222,19 @@ function findRoute(pay, receive){
   return null;
 }
 
-// Seed default assets if unset: prefer tSEQ as the pay side if it trades.
+// The composer deliberately opens with NO pair preselected — both sides sit on
+// "Select asset" so no asset (least of all SEQ) is implied as a default. Here we
+// only VALIDATE the current state (e.g. after markets reload) and drop stale picks.
 function ensureDefaults(){
-  const all = allTradableAssets();
-  if (!all.length){ S.payAsset = S.receiveAsset = null; return; }
-  if (!S.payAsset || !all.includes(S.payAsset)){
-    S.payAsset = all.includes(C.POLICY_HEX) ? C.POLICY_HEX : all[0];
+  const startable = startableAssets();
+  if (S.payAsset && !startable.includes(S.payAsset)) S.payAsset = null;
+  if (S.receiveAsset && (S.receiveAsset === S.payAsset ||
+      (S.payAsset && !counterpartsOf(S.payAsset).includes(S.receiveAsset)))){
+    S.receiveAsset = null;
   }
-  if (!S.receiveAsset || S.receiveAsset === S.payAsset || !counterpartsOf(S.payAsset).includes(S.receiveAsset)){
-    const cps = counterpartsOf(S.payAsset);
-    S.receiveAsset = cps[0] || null;
-  }
-  if (!S.feeAsset) S.feeAsset = C.POLICY_HEX;
+  // No hardcoded fee asset: defaultFeeAsset() (chosen lazily at quote time) prefers
+  // the asset you're already paying with. Drop a stale/unaccepted fee pick.
+  if (S.feeAsset && !acceptedFee(S.feeAsset)) S.feeAsset = null;
 }
 
 // ---------------------------------------------------------------------------
@@ -271,7 +277,15 @@ function paintRouteLine(){
   const { $ } = C;
   const route = findRoute(S.payAsset, S.receiveAsset);
   if (!S.payAsset || !S.receiveAsset){
-    $('swRate').textContent = 'Pick two assets to see a rate.'; $('swRoute').textContent = ''; return;
+    if (S.payAsset && !S.receiveAsset){
+      const cps = counterpartsOf(S.payAsset);
+      $('swRate').textContent = cps.length
+        ? 'Choose what to receive.'
+        : 'No markets trade against ' + tk(S.payAsset) + ' yet.';
+    } else {
+      $('swRate').textContent = 'Pick two assets to see a rate.';
+    }
+    $('swRoute').textContent = ''; return;
   }
   if (!route){
     $('swRate').textContent = 'No market between ' + tk(S.payAsset) + ' and ' + tk(S.receiveAsset) + '.';
@@ -362,7 +376,10 @@ async function requoteSame(route, amtStr){
   const status = $('swStatus');
   status.className = 'status'; status.innerHTML = '<span class="spin"></span>Quoting…';
   try {
-    const feeAsset = S.feeAsset || C.POLICY_HEX;
+    // Lazily pick a neutral fee asset (the one you're paying with) the first time we
+    // actually quote — no asset is defaulted up front. Persist it so chip/review agree.
+    if (!S.feeAsset) S.feeAsset = defaultFeeAsset();
+    const feeAsset = S.feeAsset;
     // When the user typed the QUOTE-leg amount, first get the market price to
     // convert it into a base-leg amount the preview can take.
     if (!anchoredOnBase){
@@ -512,21 +529,41 @@ function paintFee(feeAssetHex, feeAtoms, noteOverride){
   $('swFeePick').style.opacity = cross ? '.5' : '';
 }
 
-// Build the fee-asset candidate list (reuse the wallet's pricing gate): tSEQ
-// (default-accepted) + any owned, node-priced asset. SEQ shown as a normal ticker.
+// An asset is acceptable for fees if the node publishes a rate for it. Native is
+// always accepted by the protocol — a backend fact — so it's a valid fallback, but
+// it gets NO special label or position in the UI (open fee market, no privilege).
+function acceptedFee(hex){
+  if (!hex || hex === 'BTC') return false;
+  if (hex === C.POLICY_HEX) return true;
+  return !!(C.feeRates[hex] && C.feeRates[hex].rate > 0);
+}
+const feeVal = (h) => Number(big((C.balObj()||{})[h] || 0)) / Math.pow(10, C.assetMeta(h).precision || 0);
+// Default fee asset: the one you're ALREADY paying with (neutral — no privileged
+// asset); else the largest node-accepted asset you hold; else any node-priced asset.
+function defaultFeeAsset(){
+  if (acceptedFee(S.payAsset)) return S.payAsset;
+  const bal = C.balObj() || {};
+  const owned = Object.keys(bal).filter(h => big(bal[h]) > 0n && acceptedFee(h)).sort((a,b)=> feeVal(b)-feeVal(a));
+  if (owned.length) return owned[0];
+  const priced = Object.keys(C.feeRates||{}).filter(h => C.feeRates[h] && C.feeRates[h].rate > 0);
+  return priced[0] || C.POLICY_HEX;
+}
+// The fee-asset candidate list: the asset you're paying with first (most natural fee
+// source), then owned node-accepted assets, then any other node-priced asset. Every
+// entry is treated identically — no asset is flagged as a "default".
 function feeAssetOptions(){
-  const out = [{ hex: C.POLICY_HEX, ticker: C.assetMeta(C.POLICY_HEX).ticker }];
-  const b = C.balObj();
-  for (const h of Object.keys(b)){
-    if (h === C.POLICY_HEX) continue;
-    if (!(C.feeRates[h] && C.feeRates[h].rate > 0)) continue;   // gate unpriced assets out
-    out.push({ hex: h, ticker: C.assetMeta(h).ticker });
-  }
+  const seen = new Set(), out = [];
+  const add = (hex) => { if (hex && !seen.has(hex) && acceptedFee(hex)){ seen.add(hex); out.push({ hex, ticker: C.assetMeta(hex).ticker }); } };
+  add(S.payAsset);
+  const bal = C.balObj() || {};
+  Object.keys(bal).filter(h => big(bal[h]) > 0n).forEach(add);
+  Object.keys(C.feeRates||{}).forEach(add);
+  add(C.POLICY_HEX);
   return out;
 }
 function renderFeePicker(){
-  if (!S.feeAsset) S.feeAsset = C.POLICY_HEX;
-  C.$('swFeeTk').textContent = C.assetMeta(S.feeAsset).ticker;
+  const fa = S.feeAsset || (S.payAsset ? defaultFeeAsset() : null);
+  C.$('swFeeTk').textContent = fa ? C.assetMeta(fa).ticker : '—';
 }
 function openFeePicker(){
   if (C.$('swFeePick').disabled) return;
@@ -540,9 +577,8 @@ function openFeePicker(){
   });
 }
 function feeAssetSubline(hex){
-  if (hex === C.POLICY_HEX) return 'Default-accepted';
-  const priced = !!(C.feeRates[hex] && C.feeRates[hex].rate);
-  return priced ? "Node's published rate" : 'No published rate';
+  if (hex === S.payAsset) return 'The asset you’re paying with';
+  return 'Accepted for fees';
 }
 
 // ---------------------------------------------------------------------------
@@ -852,6 +888,7 @@ export const __test__ = { proposeSignComplete, stripBip32, dexPost,
   // Reframe: given (payAsset, receiveAsset) over the loaded markets, return the
   // route the composer would take ({kind:'same', side, market} | {kind:'cross', ...} | null).
   composerRoute: (pay, receive) => findRoute(pay, receive),
-  counterpartsOf, allTradableAssets,
+  counterpartsOf, startableAssets, allTradableAssets: startableAssets,
+  acceptedFee, defaultFeeAsset,
   state: S,
 };
