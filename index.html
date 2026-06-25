@@ -21,6 +21,9 @@
   .card{background:var(--panel);border:1px solid var(--line);border-radius:16px;padding:20px;margin-top:16px}
   .muted{color:var(--dim);font-size:14px}
   .sub{font-size:12.5px;color:var(--dim)}
+  .amt-row{display:flex;align-items:center;gap:8px}
+  .amt-row input{flex:1 1 auto;min-width:0}
+  .denom{color:var(--dim);font-weight:650;white-space:nowrap;font-size:13px}
   button{font:inherit;font-weight:650;cursor:pointer;border-radius:10px;border:1px solid var(--line);
          background:#1d242d;color:var(--txt);padding:10px 15px;transition:filter .15s,transform .08s}
   button:hover{filter:brightness(1.13)} button:active{transform:translateY(1px)}
@@ -697,18 +700,31 @@ function assetAmountOf(input, hex){
   if(dec>0) s=s.replace(/\.?0+$/,'');                             // trim trailing zeros (dec>0 guard keeps "100")
   return s || '0';                                                 // sub-atom rounds to 0 → hits the >0 guard
 }
-// A clickable, bidirectional "≈" hint under an amount field. Default: type the ASSET amount, the
-// hint shows the reference value. Click the ⇄ hint to swap: type the REFERENCE amount, the hint
-// shows the EXACT asset amount that will be sent (same string assetAmountOf returns).
+// Global denomination toggle: every amount field is entered either in its asset or in the chosen
+// reference currency. One ⇄ click (under any field) flips them ALL at once; the unit you're
+// currently entering in is shown to the right of each field.
+let refInputMode=false;
+function setRefInputMode(on){
+  refInputMode=on;
+  for(const r of [..._refHints]){ if(r.alive && !r.alive()){ _refHints.delete(r); continue; } try{ r.setMode && r.setMode(on); }catch{} }
+}
+// A clickable, bidirectional "⇄" hint under an amount field. Default: type the ASSET amount, the
+// hint shows the reference value. Click to enter the value in the reference currency instead; the
+// hint then shows the EXACT asset amount that will be sent (same string assetAmountOf returns).
 function attachRefHint(input, assetFn){
   if(!input || input._refHinted) return ()=>{}; input._refHinted=true;
   input._refMode=false; input._refCcy=REF; input._origPh=input.getAttribute('placeholder')||'';
   const hexOf=()=> (typeof assetFn==='function')?assetFn():assetFn;
+  // Wrap the input so the denomination indicator sits to its right; the ⇄ hint goes below.
+  const wrap=el('div','amt-row'); input.parentNode.insertBefore(wrap, input); wrap.appendChild(input);
+  const denom=el('span','denom'); wrap.appendChild(denom);
   const node=el('div','sub'); node.style.cssText='margin-top:4px;min-height:1.1em;cursor:pointer;user-select:none';
-  node.title='Click to switch which currency you enter the amount in';
-  input.insertAdjacentElement('afterend', node);
-  const setPh=()=>{ input.setAttribute('placeholder', input._refMode ? ('amount in '+(input._refCcy||REF)) : input._origPh); };
+  node.title='Click to switch which currency you enter amounts in (affects every field)';
+  wrap.insertAdjacentElement('afterend', node);
+  const setPh=()=>{ input.setAttribute('placeholder', input._refMode ? ('amount in '+REF) : input._origPh); };
+  const setDenom=()=>{ denom.textContent = input._refMode ? REF : (assetMeta(hexOf()).ticker||''); };
   const upd=()=>{
+    setDenom();
     const hex=hexOf(), raw=(input.value||'').trim(), ticker=assetMeta(hex).ticker||'asset';
     if(!input._refMode){
       if(!_bothPriced(hex, REF)){ node.textContent = refHintFor(raw, hex); return; }   // unpriced: plain ≈ if any, else ''
@@ -716,40 +732,41 @@ function attachRefHint(input, assetFn){
       node.textContent = '⇄ ' + (t || ('enter in '+REF));
     } else {
       // ref mode but the asset lost its price: keep a clickable escape (don't blank + trap the user).
-      if(!_bothPriced(hex, input._refCcy)){ node.textContent = raw ? ('⇄ no '+(input._refCcy||REF)+' price — switch to '+ticker) : ''; return; }
+      if(!_bothPriced(hex, REF)){ node.textContent = raw ? ('⇄ no '+REF+' price — switch to '+ticker) : ''; return; }
       if(!raw){ node.textContent = '⇄ enter in '+ticker; return; }
       const a=assetAmountOf(input, hex);                                                 // exact string that will be sent
       node.textContent = a ? ('⇄ ≈ '+a+' '+ticker) : ('⇄ enter in '+ticker);
     }
   };
-  // Swap denominations: convert the current value into the other unit and flip the mode.
-  node.addEventListener('click', ()=>{
+  // Put THIS field into the given mode, converting its value between asset and reference.
+  const setMode=(on)=>{
     const hex=hexOf();
-    if(!input._refMode && !_bothPriced(hex, REF)) return;          // only block ENTERING ref mode when unpriced
-    const raw=(input.value||'').trim();
-    if(raw && _NUMRE.test(raw)){ const v=parseFloat(raw), pa=_assetUsd(hex), pr=priceOf(REF);
-      // reference → asset write-back must round to the ASSET's atom precision (not a fixed 8dp),
-      // or a sub-8-precision asset gets an un-sendable value (e.g. "1.23456789" for a 2dp asset).
-      const dec=assetMeta(hex).precision||0;
-      if(pa>0 && pr>0) input.value = input._refMode ? _trimNumDp(v*pr/pa, dec)   // reference → asset
-                                                    : _trimNum(v*pa/pr);  // asset → reference
-      else if(input._refMode) input.value='';                     // leaving ref mode while unpriced: drop the stale number
+    if(on && !_bothPriced(hex, REF)){ input._refMode=false; setPh(); upd(); return; }   // unpriced: can't enter ref mode
+    if(input._refMode!==on){
+      const raw=(input.value||'').trim();
+      if(raw && _NUMRE.test(raw)){ const v=parseFloat(raw), pa=_assetUsd(hex), pr=priceOf(REF), dec=assetMeta(hex).precision||0;
+        // asset→reference is plain; reference→asset write-back rounds to the asset's atom precision.
+        if(pa>0 && pr>0) input.value = on ? _trimNum(v*pa/pr) : _trimNumDp(v*pr/pa, dec);
+        else if(!on) input.value='';                              // leaving ref mode while unpriced: drop the stale number
+      }
+      input._refMode=on; input._refCcy=REF;
     }
-    input._refMode=!input._refMode; input._refCcy=REF; setPh(); upd(); input.focus();
-  });
-  // On reference change, re-denominate a ref-mode field from its old reference into the new one —
-  // but only retag _refCcy when the value was ACTUALLY converted (else keep the correct old label,
-  // so assetAmountOf never values a stale number with the wrong price).
+    setPh(); upd();
+  };
+  // On reference change, re-denominate a ref-mode field from its old reference into the new one.
   const sync=()=>{
     if(input._refMode && input._refCcy && input._refCcy!==REF){
       const raw=(input.value||'').trim(), pOld=priceOf(input._refCcy), pNew=priceOf(REF),
             v=_NUMRE.test(raw)?parseFloat(raw):NaN;
-      if(isFinite(v) && pOld>0 && pNew>0){ input.value=_trimNum(v*pOld/pNew); input._refCcy=REF; setPh(); }
+      if(isFinite(v) && pOld>0 && pNew>0){ input.value=_trimNum(v*pOld/pNew); input._refCcy=REF; }
     }
-    upd();
+    setPh(); upd();
   };
+  node.addEventListener('click', ()=> setRefInputMode(!refInputMode));
   input.addEventListener('input', upd);
-  _refHints.add({upd: sync, alive:()=>input.isConnected}); upd(); return upd;
+  _refHints.add({upd: sync, setMode, alive:()=>input.isConnected});
+  if(refInputMode) setMode(true); else upd();   // adopt the current global mode (e.g. a row added in ref mode)
+  return upd;
 }
 function refreshAllRefHints(){ for(const r of [..._refHints]){ if(r.alive && !r.alive()){ _refHints.delete(r); continue; } try{ r.upd(); }catch{} } }
 // Populate the header picker + attach hints to the static amount fields (idempotent).
@@ -1216,10 +1233,8 @@ function addRecipientRow(){
   const r=el('div','rec');
   r.innerHTML = `<button class="x" title="remove">✕</button>
     <label class="lbl">Address</label><input class="mono raddr" placeholder="tb1… or tsqb1…">
-    <div class="row" style="margin-top:10px">
-      <div class="grow"><label class="lbl">Amount</label><input class="mono ramt" placeholder="0.0"></div>
-      <div style="width:130px"><label class="lbl">Asset</label><select class="rasset"></select></div>
-    </div>`;
+    <label class="lbl" style="margin-top:10px">Asset</label><select class="rasset" style="width:100%"></select>
+    <label class="lbl" style="margin-top:10px">Amount</label><input class="mono ramt" placeholder="0.0">`;
   const rsel=r.querySelector('.rasset');
   ownedOptions(rsel);
   const updRecHint=attachRefHint(r.querySelector('.ramt'), ()=>rsel.value);   // ≈ ref under the amount
