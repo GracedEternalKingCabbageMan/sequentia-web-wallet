@@ -241,14 +241,16 @@ function ensureDefaults(){
 // pane painting
 // ---------------------------------------------------------------------------
 function tk(hex){ return hex ? C.assetMeta(hex).ticker : 'Select'; }
+// Precision/ticker for BTC, the one parent-chain asset, so it formats like any other.
+function metaOf(hex){ return hex === 'BTC' ? { ticker: 'BTC', precision: 8 } : C.assetMeta(hex); }
 function balAtoms(hex){
-  if (!hex || hex === 'BTC') return 0n;     // BTC balance lives in the parent layer; not shown here
+  if (!hex) return 0n;
+  if (hex === 'BTC') return big(C.btcBalance || 0);   // parent-chain balance, shown like any other
   const b = C.balObj(); return big(b[hex] || 0);
 }
 function balStr(hex){
   if (!hex) return '';
-  if (hex === 'BTC') return 'on Bitcoin testnet4';
-  const a = balAtoms(hex), m = C.assetMeta(hex);
+  const a = balAtoms(hex), m = metaOf(hex);
   return 'Balance ' + C.fmtAtoms(a, m.precision) + ' ' + m.ticker;
 }
 
@@ -596,8 +598,7 @@ function setFinality(kind){
 // ---------------------------------------------------------------------------
 function balLine(hex){
   if (!hex) return { b:'', r:'' };
-  if (hex === 'BTC') return { b:'parent chain', r:'' };
-  const a = balAtoms(hex), m = C.assetMeta(hex);
+  const a = balAtoms(hex), m = metaOf(hex);
   return { b: C.fmtAtoms(a, m.precision) + ' ' + m.ticker, r: C.refValueStr(hex, a) || '' };
 }
 
@@ -626,7 +627,7 @@ function openPicker(side){
     requote().catch(()=>{});
   });
 }
-function pickerName(hex){ if (hex === 'BTC') return 'Bitcoin testnet4 · parent chain'; return C.assetMeta(hex).name || 'Asset'; }
+function pickerName(hex){ if (hex === 'BTC') return 'Bitcoin testnet4'; return C.assetMeta(hex).name || 'Asset'; }
 
 // A lightweight searchable popover anchored under `anchorEl`. `items` are
 // { hex, ticker, name, bal:{b,r}, enabled }. onPick(hex) is called on selection.

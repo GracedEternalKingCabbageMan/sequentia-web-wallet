@@ -54,9 +54,9 @@
   a{color:var(--amber2);text-decoration:none} a:hover{text-decoration:underline}
   .hide{display:none}
   /* tabs */
-  .tabs{display:flex;gap:4px;margin-top:18px;background:var(--panel);border:1px solid var(--line);
-        border-radius:12px;padding:4px;overflow-x:auto}
-  .tabs button{flex:1 0 auto;border:none;background:transparent;color:var(--dim);padding:9px 12px;font-size:13.5px;border-radius:8px;white-space:nowrap}
+  .tabs{display:flex;flex-wrap:wrap;gap:4px;margin-top:18px;background:var(--panel);border:1px solid var(--line);
+        border-radius:12px;padding:4px}
+  .tabs button{flex:1 1 auto;border:none;background:transparent;color:var(--dim);padding:9px 12px;font-size:13.5px;border-radius:8px;white-space:nowrap;cursor:pointer}
   .tabs button.active{background:#1d242d;color:var(--txt)}
   /* lists */
   .list{margin-top:6px}
@@ -1092,6 +1092,7 @@ function initSwapTab(){
     get network(){ return network; }, get client(){ return client; },
     get POLICY(){ return POLICY; }, get POLICY_HEX(){ return POLICY_HEX; },
     get addrIndex(){ return addrIndex; },
+    get btcBalance(){ return btcBalance; },   // parent-chain balance, so BTC shows a balance like any other asset
     el, $, assetMeta, balObj, fmtAtoms, parseAtoms,
     refValueStr, attachRefHint, assetAmountOf, feeRateFor, prettyErr,
     get feeRates(){ return feeRates; },   // reassigned by fetchFeeRates — read fresh
@@ -1142,7 +1143,7 @@ function renderBalance(){
     const a=el('span','amt'); a.appendChild(el('div',null,amt));
     if(ref) a.appendChild(el('div','sub', ref));
     r.appendChild(a); list.appendChild(r); };
-  row('BTC', '<span class="sub">Bitcoin testnet4 · parent chain</span>', fmtAtoms(btcBalance, 8), refValueStr('BTC', btcBalance));
+  row('BTC', '<span class="sub">Bitcoin testnet4</span>', fmtAtoms(btcBalance, 8), refValueStr('BTC', btcBalance));
   const keys = Object.keys(b).sort((x,y)=> x===POLICY_HEX?-1 : y===POLICY_HEX?1 : 0);
   for(const h of keys){
     const meta=assetMeta(h);
