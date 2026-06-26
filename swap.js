@@ -537,7 +537,9 @@ function paintFee(feeAssetHex, feeAtoms, noteOverride){
 function acceptedFee(hex){
   if (!hex || hex === 'BTC') return false;
   if (hex === C.POLICY_HEX) return true;
-  return !!(C.feeRates[hex] && C.feeRates[hex].rate > 0);
+  const r = C.feeRates || {};
+  const e = r[hex] || r[C.assetMeta(hex).ticker];   // feeRates is keyed by ticker, not asset hex
+  return !!(e && e.rate > 0);
 }
 const feeVal = (h) => Number(big((C.balObj()||{})[h] || 0)) / Math.pow(10, C.assetMeta(h).precision || 0);
 // Default fee asset: the one you're ALREADY paying with (neutral — no privileged
@@ -547,8 +549,7 @@ function defaultFeeAsset(){
   const bal = C.balObj() || {};
   const owned = Object.keys(bal).filter(h => big(bal[h]) > 0n && acceptedFee(h)).sort((a,b)=> feeVal(b)-feeVal(a));
   if (owned.length) return owned[0];
-  const priced = Object.keys(C.feeRates||{}).filter(h => C.feeRates[h] && C.feeRates[h].rate > 0);
-  return priced[0] || C.POLICY_HEX;
+  return C.POLICY_HEX;   // hold no node-accepted asset: fall back to tSEQ
 }
 // The fee-asset candidate list: the asset you're paying with first (most natural fee
 // source), then owned node-accepted assets, then any other node-priced asset. Every
