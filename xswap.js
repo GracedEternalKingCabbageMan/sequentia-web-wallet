@@ -531,7 +531,18 @@ async function claimSeq(){
   const { wasm } = C;
   // Destination SPK: a fresh wallet address, unconfidential (explicit output).
   const destSpk = takerDestSpkHex();
-  const fee = C.seqClaimFee != null ? Number(C.seqClaimFee) : 100000;
+  // Claim fee paid IN THE CLAIMED ASSET (the HTLC holds only the asset, no native tSEQ):
+  // convert the native policy fee to the asset via its published rate. A flat 100000 atoms
+  // of a valuable asset is a huge native-equivalent fee the node rejects ("Fee exceeds
+  // maximum ... maxfeerate") — a valuable asset needs only ~1 atom.
+  const claimAsset = SWAP.seq_leg.asset_id;
+  let fee = 1;
+  try {
+    const rate = (claimAsset === C.POLICY_HEX) ? C.EXCHANGE_RATE_SCALE : Number(C.feeRateFor(claimAsset));
+    const nativeFeeSats = Math.ceil(C.DEFAULT_FEERATE * 350 / 1000);   // ~policy fee (tSEQ-sats), ~350-vB claim
+    fee = Math.max(1, Math.ceil(nativeFeeSats * C.EXCHANGE_RATE_SCALE / rate));
+  } catch {}
+  { const amt = Number(SWAP.seq_leg.amount); if (fee > Math.floor(amt/2)) fee = Math.max(1, Math.floor(amt/2)); }
   const spend = {
     txid: SWAP.seq_leg.txid,
     vout: SWAP.seq_leg.vout,

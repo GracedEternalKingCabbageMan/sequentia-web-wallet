@@ -1219,6 +1219,7 @@ function initSwapTab(){
     get addrIndex(){ return addrIndex; },
     el, $, assetMeta, balObj, fmtAtoms, parseAtoms,
     refValueStr, attachRefHint, prettyErr, modalRows, toast, sync,
+    feeRateFor, DEFAULT_FEERATE, EXCHANGE_RATE_SCALE,   // open-fee-market SEQ-leg claim fee
     btcLeg,                                   // the BTC-leg bridge (testnet4)
     SEQ_ESPLORA: ESPLORA,                     // Sequentia esplora for the claim broadcast
     onExit: () => renderSwap(),               // no swap left -> back to the composer (single entry point)
