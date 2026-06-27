@@ -1612,7 +1612,7 @@ async function reviewBroadcast(pset, title, onDone, feeAssetHex, review){
       const signed = signer.sign(pset);
       const finalized = wollet.finalize(signed);
       const txid = await client.broadcast(finalized);
-      m.remove(); toast('Broadcast:', {href:'/tx/'+txid.toString(), label:txid.toString().slice(0,18)+'…'});
+      m.remove(); toast('Broadcast:', {href:'/explorer/tx/'+txid.toString(), label:txid.toString().slice(0,18)+'…'});
       if(onDone) onDone(txid); await sync();
     }catch(e){ st.className='status err'; st.textContent='Failed: '+prettyErr(e); ok.disabled=false; }
   };
@@ -1657,7 +1657,7 @@ async function requestFaucet(asset){
     if(!r.ok) throw new Error(j.error||('HTTP '+r.status));
     $('faucetStatus').className='status ok';
     { const fs=$('faucetStatus'); fs.textContent=`Sent ${Number(j.amount).toLocaleString()} ${j.asset}: `;
-      fs.appendChild(txLink('/tx/'+j.txid, String(j.txid).slice(0,16)+'…'));
+      fs.appendChild(txLink('/explorer/tx/'+j.txid, String(j.txid).slice(0,16)+'…'));
       fs.appendChild(document.createTextNode(". It'll show up once it confirms.")); }
     setTimeout(sync, 8000);
   }catch(e){ $('faucetStatus').className='status err'; $('faucetStatus').textContent='Faucet error: '+(e?.message??e); }
@@ -1754,7 +1754,7 @@ function renderHistory(){
     item.appendChild(el('span','badge '+bcls, type));
     const mid=el('div','grow');
     const when = t.height()? (ts? new Date(ts*1000).toLocaleString() : 'block '+t.height()) : 'unconfirmed';
-    { const _d=el('div'); _d.appendChild(txLink('/tx/'+txid, txid.slice(0,20)+'…')); mid.appendChild(_d); }
+    { const _d=el('div'); _d.appendChild(txLink('/explorer/tx/'+txid, txid.slice(0,20)+'…')); mid.appendChild(_d); }
     mid.appendChild(el('div','sub', when));
     if(!t.height() && (type==='outgoing' || type==='incoming')){
       const acts=el('div','row'); acts.style.cssText='gap:6px;margin-top:6px;flex-wrap:wrap';
