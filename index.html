@@ -1252,6 +1252,7 @@ function initSwapTab(){
     get btcBalance(){ return btcBalance; },   // parent-chain balance, so BTC shows a balance like any other asset
     el, $, assetMeta, balObj, fmtAtoms, parseAtoms,
     refValueStr, attachRefHint, assetAmountOf, feeRateFor, prettyErr,
+    DEFAULT_FEERATE, EXCHANGE_RATE_SCALE,   // for the order-book swap's open-fee-market fee estimate
     get feeRates(){ return feeRates; },   // reassigned by fetchFeeRates — read fresh
     modalRows, toast, sync,
     // Where the daemon's same-chain Trade API lives. A reverse-proxy prefix in

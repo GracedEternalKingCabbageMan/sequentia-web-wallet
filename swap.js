@@ -474,10 +474,19 @@ function executableQuote(o, payAsset, receiveAsset, editedAsset, typedAtoms){
   const recv = (offerAmt * take) / baseAmt;
   const pay  = ceilDiv(wantAmt * take, baseAmt);
   const feeAsset = S.feeAsset || defaultFeeAsset();
-  let feeAmount = 0n; try { feeAmount = C.feeRateFor(feeAsset) * EST_SWAP_VSIZE; } catch {}
+  // Open-fee-market fee: the native policy fee (in tSEQ-sats) converted into the chosen
+  // fee asset via its published exchange rate — fee_atoms = ceil(native_fee_sats * SCALE / rate),
+  // so a more valuable asset pays FEWER atoms. NOTE feeRateFor() is the exchange RATE, not a fee
+  // amount; the old `feeRateFor * vsize` produced an absurd fee (e.g. ~29,526 USDX) that broke funding.
+  let feeAmount = 0n, feeRate = BigInt(C.EXCHANGE_RATE_SCALE);
+  try {
+    feeRate = (feeAsset === C.POLICY_HEX) ? BigInt(C.EXCHANGE_RATE_SCALE) : C.feeRateFor(feeAsset);
+    const nativeFeeSats = (BigInt(C.DEFAULT_FEERATE) * EST_SWAP_VSIZE) / 1000n;   // sat/kvB * vbytes / 1000
+    feeAmount = ceilDiv(nativeFeeSats * BigInt(C.EXCHANGE_RATE_SCALE), feeRate);
+  } catch {}
   return { kind:'same', offer:o, takeBase:take,
     assetP: payAsset, amountP: pay, assetR: receiveAsset, amountR: recv,
-    feeAsset, feeAmount, capped: take >= baseAmt };
+    feeAsset, feeAmount, feeRate, capped: take >= baseAmt };
 }
 
 function paintEmptyRate(pay, receive, n){
@@ -851,7 +860,7 @@ async function liftOffer(q, st){
       new wasm.AssetId(q.assetP), q.amountP,
       new wasm.AssetId(q.assetR), q.amountR,
       receiveAddr,
-      new wasm.AssetId(q.feeAsset), q.feeAmount,
+      new wasm.AssetId(q.feeAsset), q.feeAmount, q.feeRate,
     );
     return sreq.toJson();
   };
