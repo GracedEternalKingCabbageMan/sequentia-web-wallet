@@ -120,13 +120,19 @@ function wireAmount(input, side){
 export async function renderSwap(){
   if (!C.wollet) return;
   // If a cross-chain swap is already in flight, jump straight to its stepper —
-  // the composer's single entry point also resumes an interrupted BTC swap.
+  // the composer's single entry point also resumes an interrupted BTC swap. Two
+  // directions, two wizards: forward (pay BTC, get asset) and reverse (sell asset).
   if (X && X.hasInFlight && X.hasInFlight()){
     showCross(true);
     X.renderXswap();
     return;
   }
-  showCross(false);
+  if (X && X.hasReverseInFlight && X.hasReverseInFlight()){
+    showReverse(true);
+    X.renderReverse();
+    return;
+  }
+  showCross(false); showReverse(false);
   await loadMarkets();
   // Default the pay/receive assets to the first sensible tradable pair so the
   // composer is never empty: tSEQ on top if it trades, else the first market.
@@ -137,14 +143,22 @@ export async function renderSwap(){
 }
 
 function showCross(on){
-  const cw = C.$('swapCrossWrap'), comp = C.$('swComposer');
+  const cw = C.$('swapCrossWrap'), rw = C.$('swapReverseWrap'), comp = C.$('swComposer');
   if (cw) cw.classList.toggle('hide', !on);
+  if (on && rw) rw.classList.add('hide');     // forward + reverse hosts are mutually exclusive
   if (comp) comp.classList.toggle('hide', on);
   // "Back to composer" only makes sense before BTC is locked. Once a cross-chain
   // swap is in flight it must be resumed/abandoned/refunded from the stepper, not
   // walked away from — so hide Back whenever a swap is persisted.
   const back = C.$('swXBack');
   if (back) back.classList.toggle('hide', !on || (X && X.hasInFlight && X.hasInFlight()));
+}
+// Reverse (asset -> BTC) wizard host, symmetric with showCross.
+function showReverse(on){
+  const cw = C.$('swapCrossWrap'), rw = C.$('swapReverseWrap'), comp = C.$('swComposer');
+  if (rw) rw.classList.toggle('hide', !on);
+  if (on && cw) cw.classList.add('hide');
+  if (comp) comp.classList.toggle('hide', on);
 }
 
 // ---------------------------------------------------------------------------
@@ -294,7 +308,9 @@ function paintRouteLine(){
     $('swRoute').textContent = '';
     return;
   }
-  $('swRoute').textContent = route.kind === 'cross' ? 'Cross-chain · BTC HTLC' : 'Same-chain · SeqDEX maker';
+  $('swRoute').textContent = route.kind === 'cross'
+    ? (route.payIsBtc ? 'Cross-chain · buy with BTC' : 'Cross-chain · sell for BTC')
+    : 'Same-chain · SeqDEX maker';
   // The rate line is filled by the quote (showQuote / showXRate); a placeholder until then.
   if (!LAST_QUOTE) $('swRate').textContent = '1 ' + tk(S.payAsset) + ' = … ' + tk(S.receiveAsset);
 }
@@ -458,22 +474,14 @@ function paintQuoteSame(){
 async function requoteCross(route, amtStr){
   const { $ } = C;
   if (!X || !X.quote){ $('swErr').textContent = 'Cross-chain route unavailable in this build.'; setReviewEnabled(false); return; }
-  // Cross-chain MVP only does BTC -> asset (you pay BTC, the maker locks the asset).
-  // Selling an asset for BTC isn't supported yet, so guard BEFORE quoting; otherwise the
-  // doomed quote returns a confusing reserve error instead of telling you to flip.
-  if (!route.payIsBtc){
-    const t = C.assetMeta(S.payAsset).ticker || 'that asset';
-    $('swErr').textContent = `Cross-chain currently only supports BTC → asset (pay BTC, receive the asset). Selling ${t} for BTC isn't supported yet; flip the sides so you pay BTC.`;
-    $('swStatus').textContent = ''; clearOpposite(); setReviewEnabled(false); return;
-  }
-  // The daemon prices in seq_amount; quoting is anchored on the SEQ-asset side.
+  // Both directions are quoted on the SEQ-asset amount (the daemon prices in
+  // seq_amount): forward = pay BTC, receive asset; reverse = sell asset for BTC.
   const seqAsset = route.xm.seq_asset;
-  const seqIsPay = (S.payAsset === seqAsset);
+  const seqPrec = C.assetMeta(seqAsset).precision || 0;
   const editedIsSeq = (S.edited === 'pay' ? S.payAsset : S.receiveAsset) === seqAsset;
   const status = $('swStatus'); status.className = 'status'; status.innerHTML = '<span class="spin"></span>Quoting…';
   try {
     let seqAtoms;
-    const seqPrec = C.assetMeta(seqAsset).precision || 0;
     if (editedIsSeq){
       seqAtoms = C.parseAtoms(amtStr, seqPrec);
     } else {
@@ -481,15 +489,20 @@ async function requoteCross(route, amtStr){
       const btcUnits = Number(C.parseAtoms(amtStr, 8)) / 1e8;
       const seqPerBtc = route.xm.price_seq_per_btc || 0;
       if (!(seqPerBtc > 0)) throw new Error('no cross-chain price yet');
-      // price_seq_per_btc is seq-atoms per btc-atom.
-      seqAtoms = BigInt(Math.max(1, Math.round(btcUnits * 1e8 * seqPerBtc)));
+      seqAtoms = BigInt(Math.max(1, Math.round(btcUnits * 1e8 * seqPerBtc)));   // seq-atoms per btc-atom
     }
     if (seqAtoms <= 0n) throw new Error('enter an amount greater than zero');
-    const xq = await X.quote(seqAsset, seqAtoms);   // { seq_amount, btc_amount, fee_btc, price_seq_per_btc, ... }
-    LAST_QUOTE = { kind:'cross', route, xq, seqAsset };
+    if (route.payIsBtc){
+      const xq = await X.quote(seqAsset, seqAtoms);          // { seq_amount, btc_amount, fee_btc, ... }
+      LAST_QUOTE = { kind:'cross', reverse:false, route, xq, seqAsset };
+    } else {
+      if (!X.reverseQuote) throw new Error('selling an asset for BTC is unavailable in this build');
+      const rq = await X.reverseQuote(seqAsset, seqAtoms);   // same shape; btc_amount is what you receive (net of fee)
+      LAST_QUOTE = { kind:'cross', reverse:true, route, xq: rq, seqAsset };
+    }
     status.textContent = '';
     paintQuoteCross();
-    setReviewEnabled(true);   // reached only for the supported BTC -> asset direction
+    setReviewEnabled(true);
   } catch (e){
     status.textContent = '';
     $('swErr').textContent = 'Quote failed: ' + (e.message || e);
@@ -740,13 +753,20 @@ async function reviewSame(q){
   };
 }
 
-// Cross-chain: hand the priced quote to xswap.js and show its wizard stepper.
+// Cross-chain: hand the priced quote to the right wizard and show its stepper.
 async function reviewCross(q){
   const { $ } = C;
-  if (!q.route.payIsBtc){ $('swErr').textContent = 'Cross-chain currently only supports BTC → asset; flip the sides so you pay BTC.'; return; }
-  if (!X || !X.openFromComposer){ $('swErr').textContent = 'Cross-chain route unavailable in this build.'; return; }
-  // Switch to the wizard host; xswap.js takes over from here (its own review modals,
-  // anchor gate, claim/poll, and localStorage resume are unchanged).
+  if (!X){ $('swErr').textContent = 'Cross-chain route unavailable in this build.'; return; }
+  if (q.reverse){
+    // Reverse (sell asset for BTC): the xrswap.js wizard takes over (its own review
+    // modals, leg verification, fund/claim/poll, and localStorage resume).
+    if (!X.openReverseFromComposer){ $('swErr').textContent = 'Selling an asset for BTC is unavailable in this build.'; return; }
+    showReverse(true);
+    X.openReverseFromComposer(q.xq);
+    return;
+  }
+  // Forward (pay BTC, receive asset): the xswap.js wizard takes over.
+  if (!X.openFromComposer){ $('swErr').textContent = 'Cross-chain route unavailable in this build.'; return; }
   showCross(true);
   X.openFromComposer(q.xq);   // seeds LAST_XQUOTE in xswap.js + renders the lock step
 }

@@ -414,6 +414,14 @@
         <div id="xStepper"></div>
         <div class="status err" id="xswapErr" style="margin-top:8px"></div>
       </div>
+
+      <!-- reverse cross-chain (asset -> BTC) wizard host: hidden until Review routes
+           a "sell asset for BTC" swap here. Rendered entirely by xrswap.js. -->
+      <div id="swapReverseWrap" class="hide" style="margin-top:16px">
+        <div id="xrStepper"></div>
+        <span id="xrExpiry" class="hide"></span>
+        <div class="status err" id="xrswapErr" style="margin-top:8px"></div>
+      </div>
     </section>
 
     <!-- assets -->
@@ -508,6 +516,7 @@ import init, { Mnemonic, Network, Signer, Wollet, EsploraClient, Address, AssetI
 import { HDKey, mnemonicToSeedSync, btc } from './btc.js';
 import { initSwap, renderSwap } from './swap.js';
 import { initXswap, renderXswap, fetchXmarkets, fetchXquote, openFromComposer, hasInFlight } from './xswap.js';
+import { initXrswap, fetchRQuote, openReverseFromComposer, hasInFlight as hasReverseInFlight, renderReverse } from './xrswap.js';
 
 const ESPLORA = location.origin + '/api';
 const KEY = 'swk.sequentia.mnemonic';
@@ -942,6 +951,63 @@ const BTC_HTLC_REFUND_PATH_INTERNAL = false, BTC_HTLC_REFUND_PATH_INDEX = 0; // 
 function btcHtlcRefundNode(){ return btcRoot.derive(`m/84'/1'/0'/2/${BTC_HTLC_REFUND_PATH_INDEX}`); }
 function hexOfBytes(a){ return [...a].map(b=>b.toString(16).padStart(2,'0')).join(''); }
 function bytesOfHex(h){ const a=new Uint8Array(h.length/2); for(let i=0;i<a.length;i++) a[i]=parseInt(h.substr(i*2,2),16); return a; }
+function concatU8(...arrs){ let n=0; for(const a of arrs) n+=a.length; const out=new Uint8Array(n); let o=0; for(const a of arrs){ out.set(a,o); o+=a.length; } return out; }
+// DER-encode a 64-byte compact (r||s) ECDSA signature. HDKey.sign already returns
+// a low-S (canonical) signature, so no normalization is needed here.
+function derFromCompact(sig){
+  const trim = (b) => { let i=0; while(i<b.length-1 && b[i]===0) i++; b=b.slice(i); if(b[0]&0x80) b=concatU8(Uint8Array.of(0), b); return b; };
+  const r = trim(sig.slice(0,32)), s = trim(sig.slice(32,64));
+  const body = concatU8(Uint8Array.of(0x02, r.length), r, Uint8Array.of(0x02, s.length), s);
+  return concatU8(Uint8Array.of(0x30, body.length), body);
+}
+// The taker's dedicated BTC-leg claim key (reverse swap): m/84'/1'/0'/2/1. Distinct
+// from the refund key (/2/0) so the two roles never share a key.
+const BTC_HTLC_CLAIM_PATH_INDEX = 1;
+function btcHtlcClaimNode(){ return btcRoot.derive(`m/84'/1'/0'/2/${BTC_HTLC_CLAIM_PATH_INDEX}`); }
+
+// Spend a BTC HTLC P2SH output on testnet4 via one of its two branches, building
+// the scriptSig BY HAND (the @scure signer does not template this non-standard
+// HTLC, so we compute the legacy SIGHASH_ALL ourselves, sign with the branch key,
+// and set finalScriptSig directly). The redeemScript is the Design-A HTLC:
+//   OP_IF OP_SHA256 <H> OP_EQUALVERIFY <claim_pub> OP_CHECKSIG
+//   OP_ELSE <locktime> OP_CLTV OP_DROP <refund_pub> OP_CHECKSIG OP_ENDIF
+// claim  branch (IF, true):  scriptSig = <sig> <preimage> OP_1 <redeem>
+// refund branch (ELSE,false):scriptSig = <sig> OP_0       <redeem>  (+ nLockTime, non-final seq)
+async function btcHtlcSpend({ branch, txid, vout, amount, redeem_script, locktime, signNode, preimage }){
+  const redeem = bytesOfHex(redeem_script);
+  const dest = btcAddr(true, btcChangeNext);
+  const feeRate = btcFeeRate();
+  // Conservative legacy-vsize estimate (one HTLC input + one P2WPKH output).
+  const scriptSigLen = branch === 'claim' ? 240 : 200;
+  const vbytes = Math.ceil(10.75 + 41 + scriptSigLen + 31);
+  const fee = BigInt(Math.ceil(vbytes * feeRate));
+  const out = BigInt(amount) - fee;
+  if (out <= 0n) throw new Error(branch + ' amount is below the tx fee');
+  const p2shSpk = btc.p2sh({ script: redeem }, btc.TEST_NETWORK).script;
+  const tx = new btc.Transaction({ allowUnknownInputs:true, allowUnknownOutputs:true });
+  tx.addInput({
+    txid, index: vout,
+    // refund needs a non-final sequence (0xfffffffd: BIP68-disabled so absolute
+    // CLTV applies, BIP125-replaceable so it can be fee-bumped). claim has no CLTV.
+    sequence: branch === 'refund' ? 0xfffffffd : 0xffffffff,
+    witnessUtxo: { script: p2shSpk, amount: BigInt(amount) },
+  });
+  tx.addOutputAddress(dest, out, btc.TEST_NETWORK);
+  if (branch === 'refund') tx.lockTime = locktime;
+  const sighash = tx.preimageLegacy(0, redeem, 1);      // legacy SIGHASH_ALL over the redeemScript
+  const sigPlus = concatU8(derFromCompact(signNode.sign(sighash)), Uint8Array.of(0x01));
+  const items = branch === 'claim'
+    ? [sigPlus, bytesOfHex(preimage), 1, redeem]         // <sig> <preimage> OP_1 <redeem>
+    : [sigPlus, 0, redeem];                              // <sig> OP_0 <redeem>
+  tx.updateInput(0, { finalScriptSig: btc.Script.encode(items) }, true);
+  const hex = tx.hex;
+  const r = await fetch(`${T4_API}/tx`, { method:'POST', body: hex });
+  const t = (await r.text()).trim();
+  if (!r.ok) throw new Error(t || ('HTTP '+r.status));
+  if (!/^[0-9a-fA-F]{64}$/.test(t)) throw new Error('unexpected broadcast response: '+t.slice(0,80));
+  btcChangeNext++;   // a fresh change index was consumed as the destination
+  return t;
+}
 
 const btcLeg = {
   // The taker's dedicated BTC-leg refund keypair (compressed pubkey hex + priv hex).
@@ -967,42 +1033,101 @@ const btcLeg = {
     const { vout, height } = await btcWaitConf(txid, spkHex);
     return { txid, vout, height, amount: BigInt(amountAtoms), asset_id: '' };
   },
-  // Refund the BTC leg via the CLTV/ELSE branch after T_btc. Builds a P2SH spend
-  // with scriptSig <sig> OP_FALSE <redeemScript>, nLockTime=locktime,
-  // nSequence=0xfffffffe, to a fresh wallet address. (testnet4 Bitcoin tx.)
-  async refund({ txid, vout, amount, redeem_script, locktime, refund_secret }){
-    const redeem = bytesOfHex(redeem_script);
-    const priv = bytesOfHex(refund_secret);
-    const dest = btcAddr(true, btcChangeNext);
-    const feeRate = btcFeeRate();
-    const vbytes = Math.ceil(10.75 + 200 /*p2sh htlc input*/ + 31);
-    const fee = BigInt(Math.ceil(vbytes*feeRate));
-    const out = BigInt(amount) - fee;
-    if(out <= 0n) throw new Error('refund amount below fee');
-    const tx = new btc.Transaction({ allowUnknownInputs:true, allowUnknownOutputs:true });
-    tx.addInput({
-      txid, index: vout, sequence: 0xfffffffe,
-      // The HTLC output is a bare P2SH of `redeem`; provide the redeemScript so
-      // the signer can produce a legacy sighash over it.
-      nonWitnessUtxo: undefined,
-      witnessUtxo: { script: btc.p2sh({ script: redeem }, btc.TEST_NETWORK).script, amount: BigInt(amount) },
-      redeemScript: redeem,
-    });
-    tx.addOutputAddress(dest, out, btc.TEST_NETWORK);
-    tx.lockTime = locktime;
-    // NOTE: the ELSE/CLTV branch scriptSig (<sig> OP_FALSE <redeemScript>) is a
-    // custom finalization the standard signer does not template. This refund path
-    // is provided for completeness for the testnet4 production leg; on regtest the
-    // BTC leg is funded on an Elements parent (see the verify harness gap note),
-    // so this exact code is not exercised end-to-end by the headless test.
-    tx.signIdx(priv, 0);
-    tx.finalize();
-    const r = await fetch(`${T4_API}/tx`, { method:'POST', body: tx.hex });
-    const t = (await r.text()).trim();
-    if(!r.ok) throw new Error(t || ('HTTP '+r.status));
-    return t;
+  // The taker's dedicated BTC-leg CLAIM keypair (reverse swap: the taker claims the
+  // maker's funded BTC leg with the revealed preimage).
+  claimKey(){
+    const n = btcHtlcClaimNode();
+    return { public_key: hexOfBytes(n.publicKey), secret_hex: hexOfBytes(n.privateKey) };
+  },
+  // Locate the HTLC funding output (and its confirmation depth) by its P2SH spk on
+  // testnet4. Used by the reverse taker to independently verify the maker's BTC leg.
+  async findFunding(txid, redeemHex){
+    const spkHex = hexOfBytes(btc.p2sh({ script: bytesOfHex(redeemHex) }, btc.TEST_NETWORK).script).toLowerCase();
+    const tx = await fetch(`${T4_API}/tx/${txid}`).then(r=>r.json());
+    let vout=-1, value=0n;
+    (tx.vout||[]).forEach((o,idx)=>{ if((o.scriptpubkey||'').toLowerCase()===spkHex){ vout=idx; value=BigInt(o.value||0); } });
+    if(vout<0) throw new Error('maker BTC leg output not found in '+String(txid).slice(0,18)+'…');
+    return { vout, value, confirmed: !!(tx.status && tx.status.confirmed), height: tx.status && tx.status.block_height };
+  },
+  // Claim the maker's BTC leg via the IF branch, revealing the preimage:
+  // scriptSig <sig> <preimage> OP_1 <redeemScript>, to a fresh wallet address.
+  async claim({ txid, vout, amount, redeem_script, preimage }){
+    return await btcHtlcSpend({ branch:'claim', txid, vout, amount, redeem_script, preimage, signNode: btcHtlcClaimNode() });
+  },
+  // Refund the BTC leg via the CLTV/ELSE branch after T_btc:
+  // scriptSig <sig> OP_0 <redeemScript>, nLockTime=locktime, non-final sequence.
+  async refund({ txid, vout, amount, redeem_script, locktime }){
+    return await btcHtlcSpend({ branch:'refund', txid, vout, amount, redeem_script, locktime, signNode: btcHtlcRefundNode() });
   },
 };
+
+// ---------- SEQ-leg HTLC helper (reverse cross-chain swap: asset -> BTC) ----------
+// In the reverse direction the taker FUNDS the Sequentia asset leg (the maker
+// already locked the BTC leg). This bridge funds the SEQ HTLC P2SH with an EXPLICIT
+// (unconfidential) output so the daemon can read the asset+amount, waits for its
+// confirmation, and (off-ramp) refunds the SEQ leg after T_seq. The SEQ HTLC uses
+// the SAME Design-A redeemScript as the BTC leg; its P2SH version byte (196) is
+// identical to Bitcoin testnet, so btc.p2sh(...).address is the Sequentia P2SH
+// address byte-for-byte (validated below by parsing it under the Sequentia network).
+const seqLeg = {
+  // The taker's SEQ-leg refund keypair — the canonical HTLC key at m/3/0 (used as
+  // the SEQ CLAIM key in the forward flow; here it is the SEQ REFUND key).
+  refundKey(){ return signer.htlcKeypair(); },           // { public_key, secret_hex }
+  htlcSpkHex(redeemHex){ return hexOfBytes(btc.p2sh({ script: bytesOfHex(redeemHex) }, btc.TEST_NETWORK).script); },
+  htlcAddress(redeemHex){
+    const a = btc.p2sh({ script: bytesOfHex(redeemHex) }, btc.TEST_NETWORK).address;
+    Address.parse(a, network);                            // validate under Sequentia (p2sh prefix 196)
+    return a;
+  },
+  // Fund the SEQ asset HTLC: send `amountAtoms` of `assetHex` to the P2SH as an
+  // explicit output via the proven TxBuilder -> sign -> finalize -> broadcast path.
+  async fund(redeemHex, assetHex, amountAtoms){
+    const addr = Address.parse(this.htlcAddress(redeemHex), network);
+    const pset = network.txBuilder()
+      .addExplicitRecipient(addr, BigInt(amountAtoms), new AssetId(assetHex))
+      .feeRate(DEFAULT_FEERATE)
+      .finish(wollet);
+    const signed = signer.sign(pset);
+    const finalized = wollet.finalize(signed);
+    const txid = await client.broadcast(finalized);
+    return { txid: txid.toString ? txid.toString() : String(txid) };
+  },
+  // Poll the Sequentia esplora until the funding tx confirms; return the HTLC vout
+  // (the output paying the P2SH), its height and block hash.
+  async waitConf(txid, redeemHex, tries=240){
+    const spkHex = this.htlcSpkHex(redeemHex).toLowerCase();
+    for(let i=0;i<tries;i++){
+      try{
+        const tx = await fetch(`${ESPLORA}/tx/${txid}`).then(r=>r.json());
+        let vout=-1; (tx.vout||[]).forEach((o,idx)=>{ if((o.scriptpubkey||'').toLowerCase()===spkHex) vout=idx; });
+        if(tx.status && tx.status.confirmed) return { vout: vout<0?0:vout, height: tx.status.block_height, block_hash: tx.status.block_hash };
+      }catch{}
+      await new Promise(r=>setTimeout(r,3000));
+    }
+    throw new Error('Sequentia HTLC funding tx did not confirm in time');
+  },
+  // Refund the SEQ leg via the CLTV/ELSE branch after T_seq (a Sequentia tx). The
+  // refund key is the canonical HTLC key (re-derived; secret passed for parity).
+  async refund({ txid, vout, amount, asset_id, redeem_script, locktime, refund_secret, dest_spk, fee }){
+    const spend = { txid, vout, amount: Number(amount), asset_id, dest_spk, fee: Number(fee) };
+    const hex = buildSeqHtlcRefundTx(spend, redeem_script, refund_secret, locktime);
+    return await broadcastSeqRaw(hex);
+  },
+};
+// Broadcast a raw signed Elements tx hex on the Sequentia chain (Transaction+client,
+// falling back to a direct esplora /tx POST). Mirrors xswap.js's broadcastSeqTx.
+async function broadcastSeqRaw(rawHex){
+  try{
+    const tx = new Transaction(rawHex);
+    const txid = await client.broadcastTx(tx);
+    return txid && txid.toString ? txid.toString() : String(txid);
+  }catch(e){ /* fall through to esplora POST */ }
+  const r = await fetch(`${ESPLORA}/tx`, { method:'POST', body: rawHex });
+  const t = (await r.text()).trim();
+  if(!r.ok) throw new Error(t || ('HTTP '+r.status));
+  if(!/^[0-9a-fA-F]{64}$/.test(t)) throw new Error('unexpected broadcast response: '+t.slice(0,80));
+  return t;
+}
 // Poll testnet4 for the HTLC funding tx's confirmation; resolve its vout+height.
 // testnet4 blocks target ~10 min and vary, so wait up to ~25 min (300 x 5s); the
 // per-poll try/catch tolerates transient fetch failures (flaky connectivity).
@@ -1085,6 +1210,20 @@ function initSwapTab(){
     // production; overridable for local testing via a global.
     XDEX: (typeof window!=='undefined' && window.SEQ_XDEX_BASE) || (typeof window!=='undefined' && window.SEQ_DEX_BASE) || (location.origin + '/dex'),
   });
+  // The REVERSE cross-chain (asset -> BTC) wizard. It funds the asset leg with an
+  // explicit output (the seqLeg bridge) and claims the maker's BTC leg with the
+  // revealed secret (the btcLeg bridge's claim path).
+  initXrswap({
+    wasm: { buildSeqHtlcRedeemScript, buildSeqHtlcRefundTx, Transaction },
+    get wollet(){ return wollet; }, get signer(){ return signer; },
+    get network(){ return network; }, get client(){ return client; },
+    get addrIndex(){ return addrIndex; },
+    el, $, assetMeta, fmtAtoms, refValueStr, prettyErr, modalRows, toast, sync,
+    btcLeg, seqLeg,                            // the BTC-leg + SEQ-leg bridges
+    SEQ_ESPLORA: ESPLORA,
+    onExit: () => renderSwap(),
+    XDEX: (typeof window!=='undefined' && window.SEQ_XDEX_BASE) || (typeof window!=='undefined' && window.SEQ_DEX_BASE) || (location.origin + '/dex'),
+  });
   // The symmetric Pay -> Receive composer (the single swap entry point). It
   // discovers same-chain markets itself, and reaches the cross-chain wizard
   // through the `xroute` bridge below (markets/quote/openFromComposer/hasInFlight).
@@ -1102,13 +1241,20 @@ function initSwapTab(){
     // Where the daemon's same-chain Trade API lives. A reverse-proxy prefix in
     // production (same-origin /dex), overridable for local testing via a global.
     DEX: (typeof window!=='undefined' && window.SEQ_DEX_BASE) || (location.origin + '/dex'),
-    // Cross-chain bridge: the composer routes a BTC swap into the xswap.js wizard.
+    // Cross-chain bridge: the composer routes a BTC swap into the xswap.js wizard
+    // (forward: pay BTC, receive asset) or the xrswap.js wizard (reverse: sell
+    // asset for BTC). Markets are the same pairs in both directions.
     xroute: {
       markets: () => fetchXmarkets(),
       quote: (seqAsset, seqAtoms) => fetchXquote(seqAsset, seqAtoms),
       openFromComposer: (q) => openFromComposer(q),
       hasInFlight: () => hasInFlight(),
       renderXswap: () => renderXswap(),
+      // reverse (asset -> BTC)
+      reverseQuote: (seqAsset, seqAtoms) => fetchRQuote(seqAsset, seqAtoms),
+      openReverseFromComposer: (q) => openReverseFromComposer(q),
+      hasReverseInFlight: () => hasReverseInFlight(),
+      renderReverse: () => renderReverse(),
     },
   });
 }
