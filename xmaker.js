@@ -55,8 +55,23 @@ const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 const big = (v) => BigInt(v == null ? 0 : v);
 
 // Timing knobs (mirror the Go XcTiming, cmd/seqob-maker). Poll 5s; the taker has
-// 2h to fund the BTC leg; give the SEQ lock 15m to see the BTC confirm.
-const T = { poll: 5000, termsReqWait: 120000, btcFundWait: 2*60*60*1000, seqLockWait: 15*60*1000 };
+// 2h to fund; give the SEQ lock/anchor gate their own windows.
+const T = { poll: 5000, termsReqWait: 120000, btcFundWait: 2*60*60*1000, seqLockWait: 15*60*1000,
+            anchorWait: 20*60*1000, minBtcConf: 1, seqClaimMargin: 10 };
+
+const ANCHOR_BASE = () => (typeof location !== 'undefined' ? location.origin : '');
+// A Sequentia block's Bitcoin-anchor height + the node's anchor status, SELF-DERIVED
+// via the explorer's read-only /anchor endpoints (context-overridable for tests).
+async function anchorHeightOf(blockHash){
+  if (C && C.anchorHeightOf) return C.anchorHeightOf(blockHash);
+  const a = await fetch(ANCHOR_BASE() + '/anchor/' + blockHash).then(r => r.ok ? r.json() : null);
+  return a && a.anchorheight != null ? Number(a.anchorheight) : null;
+}
+async function anchorStatusOk(){
+  if (C && C.anchorStatusOk) return C.anchorStatusOk();
+  const s = await fetch(ANCHOR_BASE() + '/anchorstatus').then(r => r.ok ? r.json() : null);
+  return !!(s && (s.anchorstatus === 'ok' || s.anchorStatus === 'ok'));
+}
 
 export function initXmaker(ctx){ C = ctx; if (C && C.SEQOB && seqob.setSeqobBase) seqob.setSeqobBase(C.SEQOB); }
 
@@ -279,9 +294,173 @@ export async function startForwardMaker({ assetHex, assetAtoms, btcSats, expiryS
 
 export function liveMakerOffers(){ return [...LIVE.values()].map(r => r.offer); }
 
+// ===========================================================================
+// REVERSE maker (offer side = BUY, cross direction 1 = ASSET_TO_BTC): the maker
+// BUYS a Sequentia asset with BTC. A taker SELLS it for BTC. Funding order: the
+// MAKER funds the BTC leg first and HOLDS THE SECRET; the taker funds the asset
+// leg; the maker runs the anchor gate on its OWN self-derived view (never the
+// taker's claim), then claims the asset REVEALING s; the taker claims the BTC
+// with s. Refund-on-stall: the maker reclaims its BTC after the (longer) T_btc.
+// Because it holds the secret, the anchor gate here is SELF-DERIVED and mandatory.
+// ===========================================================================
+export function buildReverseCrossOffer({ assetHex, assetAtoms, btcSats, expirySecs, minAnchorDepth, recvAddr }){
+  const now = Math.floor(nowUnix());
+  const makerPub = makerPubHex();
+  const offer = {
+    offer_id: randHex16(), schema_version: 1,
+    pair: { base_asset: assetHex, quote_asset: 'BTC' },
+    offer_asset: 'BTC',     offer_amount: String(btcSats),      // maker gives BTC
+    want_asset: assetHex,   want_amount: String(assetAtoms),    // maker wants the asset
+    base_amount: String(assetAtoms),
+    allow_partial: false, created_at_unix: now, expires_at_unix: now + (expirySecs || 3600),
+    min_anchor_depth: minAnchorDepth || 0,
+    cross_chain: {
+      btc_sentinel: 'BTC', maker_recv_address: recvAddr || '',
+      maker_claim_pub: makerPub, maker_refund_pub: makerPub, maker_leg_locktime: 144,
+      direction: 1,   // BUY: taker pays the asset, receives BTC
+    },
+  };
+  return seqob.signOffer(offer, makerPriv());
+}
+
+export async function RunMakerReverse(session, lift, offer, onState){
+  const emit = (st) => { saveMakerSwap(st); try { onState && onState(st); } catch {} };
+  const assetHex   = offer.pair.base_asset || offer.pair.baseAsset;
+  const seqAmount  = big(offer.want_amount  || offer.wantAmount);    // asset atoms the maker BUYS
+  const btcAmount  = big(offer.offer_amount || offer.offerAmount);   // sats the maker PAYS
+  const baseAmount = big(offer.base_amount  || offer.baseAmount);
+  if (lift.takeAmount !== baseAmount){ await session.fail('bad_take', 'cross lifts are whole-HTLC'); return; }
+
+  // 1. recv terms_request — BOTH taker keys are required (the BTC HTLC's claim
+  //    branch pays the taker; the SEQ HTLC's refund branch pays the taker).
+  const tr = await session.recv(XcType.TermsRequest, T.termsReqWait);
+  const takerSeqRefundPub = tr.taker_seq_refund_pub || tr.takerSeqRefundPub;
+  const takerBtcClaimPub  = tr.taker_btc_claim_pub  || tr.takerBtcClaimPub;
+  if (!takerSeqRefundPub || !takerBtcClaimPub){ await session.fail('bad_terms_req', 'terms_request missing taker keys'); return; }
+
+  // 2. mint the secret (the maker holds it) + keys + locktimes. PERSIST FIRST —
+  //    the secret is the crown jewel; it must survive a reload before any coins move.
+  const sec = C.wasm.generateSwapSecret();          // {secret_hex, hash_hex}
+  const makerSeqClaim  = C.signer.htlcKeypair();    // maker claims the asset with this (reveals s)
+  const makerBtcRefund = C.btcLeg.refundKey();      // maker refunds its BTC leg with this
+  const btcLocktime = (await btcTip()) + 100;
+  const seqLocktime = (await seqTip()) + 240;       // T_seq < T_btc
+  const st = {
+    direction: 'reverse', state: 'terms', offer_id: lift.offerId, session_id: lift.sessionId, asset: assetHex,
+    seq_amount: seqAmount.toString(), btc_amount: btcAmount.toString(),
+    hash_hex: sec.hash_hex, secret_hex: sec.secret_hex,
+    maker_seq_claim: makerSeqClaim, maker_btc_refund: makerBtcRefund,
+    taker_seq_refund_pub: takerSeqRefundPub, taker_btc_claim_pub: takerBtcClaimPub,
+    btc_locktime: btcLocktime, seq_locktime: seqLocktime,
+  };
+  emit(st);
+
+  // 3. LockBTCLeg FIRST — maker funds BTC: claim=taker, refund=maker, T_btc.
+  const btcRedeem = C.wasm.buildSeqHtlcRedeemScript(sec.hash_hex, takerBtcClaimPub, makerBtcRefund.public_key, btcLocktime);
+  const funded = await C.btcLeg.fund(btcRedeem, Number(btcAmount), btcLocktime, makerBtcRefund);   // {txid,vout,height,amount}
+  st.btc_leg = { txid: funded.txid, vout: funded.vout, amount: btcAmount.toString(), redeem_script: btcRedeem, locktime: btcLocktime, height: funded.height || 0 };
+  st.state = 'btc_locked'; emit(st);
+
+  // 4. send btc_leg_locked (the terms ride here). Announce failure is FATAL — the
+  //    BTC is already locked, so on any error the maker just refunds after T_btc.
+  try {
+    await session.send({ type: XcType.BtcLegLocked, hash_h: sec.hash_hex,
+      maker_seq_claim_pub: makerSeqClaim.public_key, maker_refund_pub: makerBtcRefund.public_key,
+      seq_locktime: seqLocktime, btc_amount: Number(btcAmount), seq_amount: Number(seqAmount), fee_btc: 0,
+      leg: { txid: funded.txid, vout: funded.vout, amount: Number(btcAmount), redeem_script: btcRedeem, locktime: btcLocktime } });
+  } catch (e){ return await refundReverseBtc(st, onState, 'could not announce btc_leg_locked: ' + (e.message||e)); }
+
+  // 5. recv seq_leg_funded (the taker funds the asset leg against our BTC lock).
+  let sf;
+  try { sf = await session.recv(XcType.SeqLegFunded, T.btcFundWait); }
+  catch (e){ return await refundReverseBtc(st, onState, 'taker never funded the asset leg: ' + (e.message||e)); }
+  const sleg = sf.leg;
+  if (!sleg || !sleg.txid){ return await refundReverseBtc(st, onState, 'seq_leg_funded had no leg'); }
+
+  // 6. Verify the taker's SEQ leg on-chain: re-derive the redeem (claim=maker,
+  //    refund=taker, T_seq), self-derive the funding vout/block (never trust the
+  //    courier), and value-bind (asset + >= agreed amount) so a dust/wrong-asset
+  //    leg can't trick us into revealing s.
+  const seqRedeem = C.wasm.buildSeqHtlcRedeemScript(sec.hash_hex, makerSeqClaim.public_key, takerSeqRefundPub, seqLocktime);
+  let conf; try { conf = await C.seqLeg.waitConf(sleg.txid, seqRedeem); }
+  catch (e){ return await refundReverseBtc(st, onState, 'taker asset leg did not confirm: ' + (e.message||e)); }
+  const out = C.seqLeg.readOutput ? await C.seqLeg.readOutput(sleg.txid, conf.vout) : null;
+  if (!out){ return await refundReverseBtc(st, onState, 'could not read the taker asset leg output (blinded/unreadable) — not revealing'); }
+  if (out.asset !== assetHex){ await session.fail('bad_asset', 'taker locked the wrong asset'); return await refundReverseBtc(st, onState, 'taker locked the wrong asset'); }
+  if (out.value < seqAmount){ await session.fail('bad_amount', 'taker locked less than agreed'); return await refundReverseBtc(st, onState, 'taker locked less than agreed'); }
+  st.seq_leg = { txid: sleg.txid, vout: conf.vout, amount: seqAmount.toString(), asset: assetHex, redeem_script: seqRedeem, locktime: seqLocktime, block_hash: conf.block_hash, seq_height: conf.height };
+  st.state = 'seq_verified'; emit(st);
+
+  // 7. measure our OWN BTC-leg confirmation height Hp.
+  let hp = Number(st.btc_leg.height) || 0;
+  if (!hp){ try { const f = await C.btcLeg.findFunding(st.btc_leg.txid, btcRedeem); if (f && f.confirmed) hp = Number(f.height); } catch {} }
+  if (!hp){ return await refundReverseBtc(st, onState, 'our BTC leg has not confirmed; not revealing'); }
+
+  // 8. ANCHOR GATE (self-derived, mandatory): the taker's asset block must anchor
+  //    at a Bitcoin height >= our BTC-leg height, and the node's anchor status ok,
+  //    so a Bitcoin reorg that could undo our BTC lock also undoes the asset leg.
+  const deadline = nowMs() + T.anchorWait;
+  for (;;){
+    let ah = null, okStatus = false;
+    try { ah = await anchorHeightOf(conf.block_hash); } catch {}
+    try { okStatus = await anchorStatusOk(); } catch {}
+    if (ah != null && ah >= hp && okStatus) break;
+    if (nowMs() > deadline) return await refundReverseBtc(st, onState, `anchor gate failed (anchor ${ah} < BTC ${hp} or status not ok); not revealing`);
+    await sleep(T.poll);
+  }
+
+  // 9. no-reveal margin: never reveal so close to T_seq that our claim could miss
+  //    its window (leaving s leaked with the asset already refundable to the taker).
+  if ((await seqTip()) + T.seqClaimMargin >= seqLocktime){
+    return await refundReverseBtc(st, onState, 'too close to the asset locktime; not revealing');
+  }
+
+  // 10. claim the asset leg — REVEALS s on-chain.
+  const claimTxid = await C.seqLeg.claim({
+    txid: st.seq_leg.txid, vout: st.seq_leg.vout, amount: Number(seqAmount),
+    asset_id: assetHex, redeem_script: seqRedeem, claim_secret: makerSeqClaim.secret_hex, secret_hex: sec.secret_hex,
+  });
+  st.seq_claim_txid = claimTxid; st.state = 'settled'; emit(st);
+
+  // 11. courtesy secret_revealed (the taker also reads s off our claim scriptSig).
+  try { await session.send({ type: XcType.SecretRevealed, preimage: sec.secret_hex }); } catch {}
+  dropMakerSwap(st.session_id);
+  return { settled: true, seq_claim_txid: claimTxid };
+}
+
+// Refund the maker's BTC leg after T_btc (the reverse stall path). Safe because
+// s is never revealed on any path that reaches here; T_seq < T_btc, so the taker's
+// asset refund window is already open by the time our BTC refund is spendable.
+async function refundReverseBtc(st, onState, reason){
+  const emit = (s) => { saveMakerSwap(s); try { onState && onState(s); } catch {} };
+  st.refund_reason = reason; st.state = 'refunding'; emit(st);
+  for (;;){
+    let tip = 0; try { tip = await btcTip(); } catch {}
+    if (tip && tip >= st.btc_locktime){
+      const txid = await C.btcLeg.refund({
+        txid: st.btc_leg.txid, vout: st.btc_leg.vout, amount: Number(big(st.btc_leg.amount)),
+        redeem_script: st.btc_leg.redeem_script, locktime: st.btc_locktime,
+      });
+      st.btc_refund_txid = txid; st.state = 'refunded'; emit(st); dropMakerSwap(st.session_id);
+      return { settled: false, refunded: true, btc_refund_txid: txid, reason };
+    }
+    await sleep(30000);
+  }
+}
+
+export async function startReverseMaker({ assetHex, assetAtoms, btcSats, expirySecs, minAnchorDepth, recvAddr }, onState){
+  const offer = buildReverseCrossOffer({ assetHex, assetAtoms, btcSats, expirySecs, minAnchorDepth, recvAddr });
+  const listener = await openMakerListener(offer, makerPriv(), async (session, lift) => {
+    try { await RunMakerReverse(session, lift, offer, onState); }
+    catch (e){ try { await session.fail('maker_error', (e && e.message) || String(e)); } catch {} throw e; }
+  });
+  LIVE.set(offer.offer_id, { offer, listener });
+  return { offer, close: () => { try { listener.close(); } catch {} LIVE.delete(offer.offer_id); }, activeCount: () => listener.activeCount() };
+}
+
 // --- small utils (no Date.now-in-tests concern; browser only) ---
 function nowUnix(){ return Math.floor(Date.now() / 1000); }
 function nowMs(){ return Date.now(); }
 function randHex16(){ const a = new Uint8Array(8); (crypto || window.crypto).getRandomValues(a); return [...a].map(b => b.toString(16).padStart(2,'0')).join(''); }
 
-export const __test__ = { RunMakerForward, settleMakerForward, buildForwardCrossOffer, readPreimageOnChain, sha256Hex, setC: (c) => { C = c; } };
+export const __test__ = { RunMakerForward, settleMakerForward, buildForwardCrossOffer, RunMakerReverse, buildReverseCrossOffer, readPreimageOnChain, sha256Hex, setC: (c) => { C = c; } };

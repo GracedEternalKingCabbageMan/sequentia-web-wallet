@@ -92,5 +92,67 @@ ok(res && res.settled === true && res.btc_claim_txid === 'btc_claim_txid', 'RunM
 // 5. No XcFail was sent on the happy path.
 ok(!sent.some(m => m.type === 'fail'), 'no XcFail on the happy path');
 
+// ===========================================================================
+// REVERSE maker: maker funds BTC first + holds the secret, verifies the taker's
+// asset leg + self-derived anchor gate, then claims the asset REVEALING s.
+// ===========================================================================
+const { RunMakerReverse } = __test__;
+const secretR = 'dd'.repeat(32);
+const hashR = sha256Hex(secretR);
+const offerR = {
+  pair: { base_asset: 'GOLDHEX', quote_asset: 'BTC' },
+  offer_asset: 'BTC', offer_amount: '25000',      // maker pays BTC
+  want_asset: 'GOLDHEX', want_amount: '5000000',  // maker wants the asset
+  base_amount: '5000000', cross_chain: { direction: 1 },
+};
+const takerSeqRefundPub = '03takerSeqRefund', takerBtcClaimPub = '03takerBtcClaim';
+let rFund = null, rClaim = null;
+const fakeCR = {
+  SEQOB: '/seqob',
+  btcTip: async () => 142500, seqTip: async () => 16500,
+  anchorHeightOf: async (_h) => 142600,   // >= Hp (142600) -> gate passes
+  anchorStatusOk: async () => true,
+  wasm: {
+    buildSeqHtlcRedeemScript: (h, claim, ref, lock) => redeem(h, claim, ref, lock),
+    generateSwapSecret: () => ({ secret_hex: secretR, hash_hex: hashR }),
+  },
+  signer: { htlcKeypair: () => ({ public_key: '02makerSeqClaim', secret_hex: 'ee'.repeat(32) }) },
+  btcLeg: {
+    refundKey: () => ({ public_key: '02makerBtcRefund', secret_hex: 'ff'.repeat(32) }),
+    fund: async (r, amount, locktime, _refund) => { rFund = { r, amount, locktime }; return { txid: 'maker_btc_txid', vout: 0, height: 142600, amount }; },
+    findFunding: async () => ({ confirmed: true, height: 142600 }),
+    refund: async () => 'btc_refund_txid',
+  },
+  seqLeg: {
+    waitConf: async (_txid, _redeem) => ({ vout: 0, height: 16700, block_hash: 'seqblkR' }),
+    readOutput: async (_txid, _vout) => ({ value: 5000000n, asset: 'GOLDHEX' }),
+    claim: async (args) => { rClaim = args; return 'seq_claim_txid'; },
+  },
+};
+initXmaker(fakeCR); __test__.setC(fakeCR);
+
+const scriptedR = [
+  { type: 'terms_request', taker_seq_refund_pub: takerSeqRefundPub, taker_btc_claim_pub: takerBtcClaimPub },
+  { type: 'seq_leg_funded', leg: { txid: 'taker_seq_txid', vout: 0, amount: 5000000, asset: 'GOLDHEX', block_hash: 'seqblkR', anchor_height: 142600 } },
+];
+let sriR = 0; const sentR = [];
+const sessionR = {
+  send: async (m) => { sentR.push(m); },
+  recv: async (wantType) => { const m = scriptedR[sriR++]; if (!m) throw new Error('no more scripted (want '+wantType+')'); if (m.type !== wantType) throw new Error(`want ${wantType} got ${m.type}`); return m; },
+  fail: async (code, message) => { sentR.push({ type: 'fail', code, message }); },
+  close: () => {},
+};
+const resR = await RunMakerReverse(sessionR, { sessionId: 'sessR', offerId: 'offR', takeAmount: 5000000n }, offerR);
+
+const btcLocked = sentR.find(m => m.type === 'btc_leg_locked');
+ok(btcLocked && btcLocked.hash_h === hashR && btcLocked.maker_seq_claim_pub === '02makerSeqClaim', 'reverse: maker sends btc_leg_locked with hash + its SEQ-claim pub');
+ok(btcLocked && btcLocked.seq_locktime === 16740 && btcLocked.btc_amount === 25000 && btcLocked.seq_amount === 5000000, 'reverse: btc_leg_locked carries terms (T_seq 16740, amounts)');
+ok(rFund && rFund.r === redeem(hashR, takerBtcClaimPub, '02makerBtcRefund', 142600) && rFund.amount === 25000, 'reverse: maker funds BTC leg claim=taker, refund=maker, T_btc');
+ok(rClaim && rClaim.claim_secret === 'ee'.repeat(32) && rClaim.secret_hex === secretR, 'reverse: maker claims the asset leg with its claim key, revealing the secret');
+const revealed = sentR.find(m => m.type === 'secret_revealed');
+ok(revealed && revealed.preimage === secretR, 'reverse: maker sends secret_revealed');
+ok(resR && resR.settled === true && resR.seq_claim_txid === 'seq_claim_txid', 'reverse: RunMakerReverse reports settled');
+ok(!sentR.some(m => m.type === 'fail'), 'reverse: no XcFail on the happy path');
+
 console.log(fails === 0 ? '\nALL PASS' : `\n${fails} FAILED`);
 process.exit(fails === 0 ? 0 : 1);

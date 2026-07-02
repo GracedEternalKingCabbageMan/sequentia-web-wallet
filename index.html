@@ -532,7 +532,7 @@ import { HDKey, mnemonicToSeedSync, btc } from './btc.js';
 import { initSwap, renderSwap } from './swap.js';
 import { initXswap, renderXswap, fetchXmarkets, fetchXquote, fetchXbook, openFromComposer, hasInFlight } from './xswap.js';
 import { initXrswap, fetchRQuote, openReverseFromComposer, hasInFlight as hasReverseInFlight, renderReverse } from './xrswap.js';
-import { initXmaker, startForwardMaker, liveMakerOffers } from './xmaker.js';
+import { initXmaker, startForwardMaker, startReverseMaker, liveMakerOffers } from './xmaker.js';
 
 const ESPLORA = location.origin + '/api';
 const KEY = 'swk.sequentia.mnemonic';
@@ -1130,6 +1130,38 @@ const seqLeg = {
     const hex = buildSeqHtlcRefundTx(spend, redeem_script, refund_secret, locktime);
     return await broadcastSeqRaw(hex);
   },
+  // CLAIM the SEQ leg via the IF/hashlock branch (reveals the preimage) to a fresh
+  // wallet address. Used by the cross-chain reverse MAKER (which claims the taker's
+  // funded asset leg, revealing s). Mirrors xswap.js's claimSeq: the fee is paid IN
+  // THE CLAIMED ASSET, converted from the policy fee via the asset's published rate
+  // (the HTLC holds no native tSEQ), capped at half the output.
+  async claim({ txid, vout, amount, asset_id, redeem_script, claim_secret, secret_hex }){
+    const a = wollet.address(addrIndex==null?undefined:addrIndex).address();
+    const unconf = a.toUnconfidential ? a.toUnconfidential() : a;
+    const destSpk = hexOfBytes(unconf.scriptPubkey().bytes());
+    let fee = 1;
+    try {
+      const rate = (asset_id === POLICY_HEX) ? EXCHANGE_RATE_SCALE : Number(feeRateFor(asset_id));
+      const nativeFeeSats = Math.ceil(DEFAULT_FEERATE * 350 / 1000);
+      fee = Math.max(1, Math.ceil(nativeFeeSats * EXCHANGE_RATE_SCALE / rate));
+    } catch {}
+    if (fee > Math.floor(Number(amount)/2)) fee = Math.max(1, Math.floor(Number(amount)/2));
+    const spend = { txid, vout, amount: Number(amount), asset_id, dest_spk: destSpk, fee };
+    const hex = buildSeqHtlcClaimTx(spend, redeem_script, claim_secret, secret_hex);
+    return await broadcastSeqRaw(hex);
+  },
+  // Read a SEQ funding output's explicit value + asset (for the reverse maker to
+  // verify the taker's leg before revealing s). Returns null if unreadable/blinded.
+  async readOutput(txid, vout){
+    try {
+      const tx = await fetch(`${ESPLORA}/tx/${txid}`).then(r=>r.ok?r.json():null);
+      const o = tx && tx.vout && tx.vout[vout];
+      if (!o) return null;
+      const value = (o.value != null) ? BigInt(o.value) : null;
+      const asset = o.asset || o.assetid || null;
+      return (value != null && asset) ? { value, asset } : null;   // blinded outputs lack explicit value/asset
+    } catch { return null; }
+  },
 };
 // Broadcast a raw signed Elements tx hex on the Sequentia chain (Transaction+client,
 // falling back to a direct esplora /tx POST). Mirrors xswap.js's broadcastSeqTx.
@@ -1283,7 +1315,8 @@ function initSwapTab(){
       markets: () => fetchXmarkets(),
       quote: (seqAsset, seqAtoms) => fetchXquote(seqAsset, seqAtoms),
       book: (seqAsset) => fetchXbook(seqAsset),   // resting cross offers (both directions) for BTC<->asset
-      makerStart: (params, onState) => startForwardMaker(params, onState),   // self-start a cross market (post + serve)
+      makerStart: (params, onState) => startForwardMaker(params, onState),          // self-start: SELL asset for BTC
+      makerStartReverse: (params, onState) => startReverseMaker(params, onState),    // self-start: BUY asset with BTC
       makerLive: () => liveMakerOffers(),
       openFromComposer: (q) => openFromComposer(q),
       hasInFlight: () => hasInFlight(),

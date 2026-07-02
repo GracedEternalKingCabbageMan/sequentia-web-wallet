@@ -561,18 +561,23 @@ async function requoteCross(route, amtStr){
     if (!offers.length){
       status.textContent = ''; clearOpposite(); setFinality('cross');
       if (!route.payIsBtc && X && X.makerStart){
-        // SELL asset for BTC with no resting bid: the wallet CAN self-start this
-        // market — it holds the asset and runs the forward maker HTLC itself.
-        LAST_QUOTE = { kind: 'cross-make', assetHex: seqAsset };
+        // SELL asset for BTC with no resting bid: self-start via the FORWARD maker
+        // (the wallet holds the asset, locks it, claims the taker's BTC).
+        LAST_QUOTE = { kind: 'cross-make', reverse: false, assetHex: seqAsset };
         $('swRate').textContent = `No resting offers yet — Review to post your own and sell ${am.ticker} for BTC.`;
         $('swRoute').textContent = 'Cross-chain · be the first (sell for BTC)';
         setReviewEnabled(true);
+      } else if (route.payIsBtc && X && X.makerStartReverse){
+        // BUY asset with BTC with no resting ask: self-start via the REVERSE maker
+        // (the wallet funds a BTC bid, holds the secret, claims the taker's asset).
+        LAST_QUOTE = { kind: 'cross-make', reverse: true, assetHex: seqAsset };
+        $('swRate').textContent = `No resting offers yet — Review to post your own and buy ${am.ticker} with BTC.`;
+        $('swRoute').textContent = 'Cross-chain · be the first (buy with BTC)';
+        setReviewEnabled(true);
       } else {
-        // BUY asset with BTC: a wallet-posted BTC-funded bid (reverse maker) is a
-        // later addition, so this side is take-only until a maker posts.
         LAST_QUOTE = null; setReviewEnabled(false);
-        $('swRate').textContent = `No resting offers to buy ${am.ticker} with BTC yet — a market maker needs to post one.`;
-        $('swRoute').textContent = 'Cross-chain · buy with BTC';
+        $('swRate').textContent = `No resting offers for ${am.ticker}/BTC yet — a market maker needs to post one.`;
+        $('swRoute').textContent = route.payIsBtc ? 'Cross-chain · buy with BTC' : 'Cross-chain · sell for BTC';
       }
       return;
     }
@@ -870,19 +875,40 @@ async function onReview(){
 // covenants). The offer rests only while the listener is open.
 async function postCrossOfferReview(q){
   const { $ } = C;
-  if (!X || !X.makerStart){ $('swErr').textContent = 'Cross-chain making is unavailable in this build.'; return; }
+  const reverse = !!q.reverse;   // reverse = BUY the asset with BTC; else SELL the asset for BTC
+  const start = reverse ? (X && X.makerStartReverse) : (X && X.makerStart);
+  if (!X || !start){ $('swErr').textContent = 'Cross-chain making is unavailable in this build.'; return; }
   const assetHex = q.assetHex;
   const am = C.assetMeta(assetHex);
+  // SELL: pay = asset, receive = BTC.  BUY: pay = BTC, receive = asset.
   let assetAtoms, btcSats;
   try {
-    assetAtoms = C.parseAtoms(($('swPayAmt').value || '').trim(), am.precision || 0);   // pay = the asset you sell
-    btcSats    = C.parseAtoms(($('swRecvAmt').value || '').trim(), 8);                   // receive = the BTC you want
+    if (reverse){
+      btcSats    = C.parseAtoms(($('swPayAmt').value || '').trim(), 8);
+      assetAtoms = C.parseAtoms(($('swRecvAmt').value || '').trim(), am.precision || 0);
+    } else {
+      assetAtoms = C.parseAtoms(($('swPayAmt').value || '').trim(), am.precision || 0);
+      btcSats    = C.parseAtoms(($('swRecvAmt').value || '').trim(), 8);
+    }
     if (assetAtoms <= 0n || btcSats <= 0n) throw 0;
-  } catch { $('swErr').textContent = `Enter both amounts — how much ${am.ticker} to sell and how much BTC you want.`; return; }
-  const have = balAtoms(assetHex);
-  if (assetAtoms > have){ $('swErr').textContent = `You only hold ${C.fmtAtoms(have, am.precision)} ${am.ticker}.`; return; }
+  } catch { $('swErr').textContent = `Enter both amounts — the ${am.ticker} and the BTC.`; return; }
+  if (reverse){
+    const haveBtc = balAtoms('BTC');
+    if (btcSats > haveBtc){ $('swErr').textContent = `You only hold ${C.fmtAtoms(haveBtc, 8)} BTC.`; return; }
+  } else {
+    const have = balAtoms(assetHex);
+    if (assetAtoms > have){ $('swErr').textContent = `You only hold ${C.fmtAtoms(have, am.precision)} ${am.ticker}.`; return; }
+  }
   const assetU = Number(assetAtoms)/Math.pow(10, am.precision||0), btcU = Number(btcSats)/1e8;
-  const kv = [
+  const kv = reverse ? [
+    ['Posting', `A resting CROSS bid — you become the maker of the ${am.ticker}/BTC market`],
+    ['You pay', C.fmtAtoms(btcSats, 8) + ' BTC'],
+    ['You buy', amtRow(assetHex, assetAtoms) + refSuffix(assetHex, assetAtoms)],
+    ['Price', assetU>0 ? `1 ${am.ticker} = ${trim(btcU/assetU)} BTC` : '—'],
+    ['How it settles', 'You lock BTC in an HTLC; a taker locks the asset; you verify anchoring, claim the asset (revealing the secret); the taker claims your BTC. Atomic — anchor-bound.'],
+    ['Keep this tab open', 'Cross-chain settlement is interactive: your wallet must be open to settle a lift. Closing it un-rests the offer; nothing is at risk (a stalled lock refunds after its timeout).'],
+    ['Finality', 'Anchor-bound to Bitcoin (reverts only if Bitcoin reverts).'],
+  ] : [
     ['Posting', `A resting CROSS offer — you become the maker of the ${am.ticker}/BTC market`],
     ['You sell', amtRow(assetHex, assetAtoms) + refSuffix(assetHex, assetAtoms)],
     ['You want', C.fmtAtoms(btcSats, 8) + ' BTC'],
@@ -891,14 +917,14 @@ async function postCrossOfferReview(q){
     ['Keep this tab open', 'Cross-chain settlement is interactive: your wallet must be open to settle a lift. Closing it un-rests the offer; nothing is at risk.'],
     ['Finality', 'Anchor-bound to Bitcoin (reverts only if Bitcoin reverts).'],
   ];
-  const { m: modal, ok, st } = C.modalRows({ title: 'Sell for BTC — start this market', kv });
-  if (ok) ok.textContent = 'Post cross offer';
+  const { m: modal, ok, st } = C.modalRows({ title: reverse ? 'Buy with BTC — start this market' : 'Sell for BTC — start this market', kv });
+  if (ok) ok.textContent = reverse ? 'Post cross bid' : 'Post cross offer';
   ok.onclick = async () => {
     ok.disabled = true; st.className = 'status'; st.innerHTML = '<span class="spin"></span>Signing + posting…';
     try {
       const recvAddr = C.wollet.address(C.addrIndex == null ? undefined : C.addrIndex).address();
-      const handle = await X.makerStart({ assetHex, assetAtoms, btcSats, expirySecs: 3600, recvAddr }, onCrossMakeState);
-      XMAKE = { handle, assetHex, assetAtoms, btcSats, offerId: handle.offer.offer_id, state: 'resting' };
+      const handle = await start({ assetHex, assetAtoms, btcSats, expirySecs: 3600, recvAddr }, onCrossMakeState);
+      XMAKE = { handle, assetHex, assetAtoms, btcSats, reverse, offerId: handle.offer.offer_id, state: 'resting' };
       modal.remove();
       C.toast('Cross offer posted — live in the order book. Keep this tab open to settle.');
       resetComposer();
@@ -923,13 +949,22 @@ function renderXMake(){
   const host = C.$('swMyOrders'); if (!host) return;
   if (!XMAKE){ return; }   // leave same-chain "your orders" render intact when no cross make
   const am = C.assetMeta(XMAKE.assetHex);
-  const phases = { resting:'Resting — waiting for a taker', terms:'A taker is lifting…', btc_verified:'Taker funded BTC — locking your asset…',
+  const phases = XMAKE.reverse ? {
+    resting:'Resting — waiting for a taker', terms:'A taker is lifting…', btc_locked:'You locked BTC — waiting for the taker to lock the asset…',
+    seq_verified:'Asset locked — verifying anchoring…', settled:'Settled — you bought the asset for BTC',
+    refunding:'Stalled — refunding your BTC…', refunded:'Refunded — the swap stalled; your BTC is back',
+  } : {
+    resting:'Resting — waiting for a taker', terms:'A taker is lifting…', btc_verified:'Taker funded BTC — locking your asset…',
     seq_locked:'Asset locked — waiting for the taker to claim…', secret_learned:'Taker claimed; claiming your BTC…',
-    settled:'Settled — you sold the asset for BTC', refunded:'Refunded — the swap stalled; your asset is back' };
+    settled:'Settled — you sold the asset for BTC', refunded:'Refunded — the swap stalled; your asset is back',
+  };
   const label = phases[XMAKE.state] || XMAKE.state;
   const done = XMAKE.state === 'settled' || XMAKE.state === 'refunded';
+  const headline = XMAKE.reverse
+    ? `Your resting cross bid · buy ${esc(C.fmtAtoms(XMAKE.assetAtoms, am.precision))} ${esc(am.ticker)} for ${esc(C.fmtAtoms(XMAKE.btcSats,8))} BTC`
+    : `Your resting cross offer · sell ${esc(C.fmtAtoms(XMAKE.assetAtoms, am.precision))} ${esc(am.ticker)} for ${esc(C.fmtAtoms(XMAKE.btcSats,8))} BTC`;
   host.innerHTML = `<div class="swbook"><div class="swbook-head">
-      <span class="lbl">Your resting cross offer · sell ${esc(C.fmtAtoms(XMAKE.assetAtoms, am.precision))} ${esc(am.ticker)} for ${esc(C.fmtAtoms(XMAKE.btcSats,8))} BTC</span>
+      <span class="lbl">${headline}</span>
       <span class="sub">${esc(label)}</span></div>
     <div class="swbook-row"><span class="sub">Keep this tab open to settle. </span>
       <button type="button" class="ghost" id="swXMakeCancel">${done ? 'Clear' : 'Cancel offer'}</button></div></div>`;
