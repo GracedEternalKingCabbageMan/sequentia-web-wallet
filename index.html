@@ -532,6 +532,7 @@ import { HDKey, mnemonicToSeedSync, btc } from './btc.js';
 import { initSwap, renderSwap } from './swap.js';
 import { initXswap, renderXswap, fetchXmarkets, fetchXquote, fetchXbook, openFromComposer, hasInFlight } from './xswap.js';
 import { initXrswap, fetchRQuote, openReverseFromComposer, hasInFlight as hasReverseInFlight, renderReverse } from './xrswap.js';
+import { initXmaker, startForwardMaker, liveMakerOffers } from './xmaker.js';
 
 const ESPLORA = location.origin + '/api';
 const KEY = 'swk.sequentia.mnemonic';
@@ -1242,6 +1243,15 @@ function initSwapTab(){
     onExit: () => renderSwap(),
     XDEX: (typeof window!=='undefined' && window.SEQ_XDEX_BASE) || (typeof window!=='undefined' && window.SEQ_DEX_BASE) || (location.origin + '/dex'),
   });
+  // The cross-chain MAKER (post a cross offer + serve lifts over the courier). It
+  // reuses the same BTC/SEQ leg bridges + HTLC-script binding as the takers; only
+  // the maker orchestration + courier listen are new.
+  initXmaker({
+    wasm: { buildSeqHtlcRedeemScript },
+    SEQOB: (typeof window!=='undefined' && window.SEQ_SEQOB_URL) || (location.origin + '/seqob'),
+    get addrIndex(){ return addrIndex; },
+    btcLeg, seqLeg,
+  });
   // The symmetric Pay -> Receive composer (the single swap entry point). It
   // discovers same-chain markets itself, and reaches the cross-chain wizard
   // through the `xroute` bridge below (markets/quote/openFromComposer/hasInFlight).
@@ -1273,6 +1283,8 @@ function initSwapTab(){
       markets: () => fetchXmarkets(),
       quote: (seqAsset, seqAtoms) => fetchXquote(seqAsset, seqAtoms),
       book: (seqAsset) => fetchXbook(seqAsset),   // resting cross offers (both directions) for BTC<->asset
+      makerStart: (params, onState) => startForwardMaker(params, onState),   // self-start a cross market (post + serve)
+      makerLive: () => liveMakerOffers(),
       openFromComposer: (q) => openFromComposer(q),
       hasInFlight: () => hasInFlight(),
       renderXswap: () => renderXswap(),
