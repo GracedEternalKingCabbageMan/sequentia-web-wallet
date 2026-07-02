@@ -38,6 +38,7 @@ let MARKETS = [];        // legacy RFQ markets (kept only to seed the picker; ro
 let XMARKETS = [];       // cross-chain: [{ btc_asset, seq_asset, ... }] (BTC<->asset)
 let LAST_QUOTE = null;   // the priced/oriented same-chain legs for the current composer state
 let BOOK = { offers: [], pair: null };   // the resting offers for the selected same-chain pair
+let XBOOK = { offers: [], seqAsset: null, payIsBtc: true };   // resting cross offers for the selected BTC<->asset pair
 
 // The wallet's SeqOB MAKER identity: a stable per-browser key that signs resting
 // offers + doubles as the E2E session key. It is NOT a fund key (funds move via the
@@ -225,15 +226,17 @@ function startableAssets(){
 function counterpartsOf(other){
   if (!other) return startableAssets();
   const set = new Set();
-  // Same-chain order book: any OTHER Sequentia asset is a valid counterpart (the
-  // pair may have no resting offers yet — then it's startable).
-  if (other !== 'BTC'){
+  if (other === 'BTC'){
+    // Cross-chain order book: BTC pairs with ANY Sequentia asset. The pair may have
+    // no resting cross offers yet, in which case its book shows empty (a maker must
+    // post one) — but every asset is selectable, not just ones with a live market.
+    for (const h of startableAssets()){ if (h !== 'BTC') set.add(h); }
+  } else {
+    // Same-chain: any OTHER Sequentia asset is a valid counterpart (the pair may
+    // have no resting offers yet — then it's startable). BTC is always a valid
+    // cross-chain counterpart for a Sequentia asset.
     for (const h of startableAssets()){ if (h !== other && h !== 'BTC') set.add(h); }
-  }
-  for (const xm of XMARKETS){
-    // BTC <-> seq_asset is a tradable pair in both directions.
-    if (other === 'BTC') set.add(xm.seq_asset);
-    if (other === xm.seq_asset) set.add('BTC');
+    set.add('BTC');
   }
   return [...set];
 }
@@ -245,12 +248,12 @@ function findRoute(pay, receive){
   const btc = (pay === 'BTC') || (receive === 'BTC');
   if (btc){
     const seqAsset = pay === 'BTC' ? receive : pay;
-    const xm = XMARKETS.find(m => m.seq_asset === seqAsset);
-    if (!xm) return null;
-    // The daemon's cross-chain MVP only offers taker BUYS asset paying BTC, i.e.
-    // pay=BTC, receive=asset. (We still let the user flip; we just label the
-    // unsupported direction when routing.)
-    return { kind: 'cross', xm, payIsBtc: pay === 'BTC' };
+    if (seqAsset === 'BTC') return null;   // BTC<->BTC is not a market
+    // Cross-chain order book: ANY BTC<->asset pair is routable. It may have no
+    // resting cross offers yet (the book then shows empty). A live RFQ market, if
+    // any, is attached only for its cached price; it is no longer required.
+    const xm = XMARKETS.find(m => m.seq_asset === seqAsset) || null;
+    return { kind: 'cross', seqAsset, xm, payIsBtc: pay === 'BTC' };
   }
   // Same-chain order book: ANY two distinct Sequentia assets form a market. It may
   // have no resting offers yet, in which case the user can start it by posting one.
@@ -377,10 +380,11 @@ async function requote(){
   $('swErr').textContent = '';
   paintRouteLine();
   const route = findRoute(S.payAsset, S.receiveAsset);
-  if (!route){ setReviewEnabled(false); clearOpposite(); return; }
+  if (!route){ setReviewEnabled(false); clearOpposite(); const bh = C.$('swBook'); if (bh) bh.innerHTML = ''; return; }
   const amtStr = typedAmount(S.edited);
-  if (!amtStr || amtStr === '0'){ clearOpposite(); setReviewEnabled(false); return; }
-
+  // Do NOT bail on an empty amount: requoteSame/requoteCross fetch and RENDER the
+  // order book first (so it is visible the moment a pair is chosen), then quote
+  // only if an amount is present.
   if (route.kind === 'cross') return requoteCross(route, amtStr);
   return requoteSame(route, amtStr);
 }
@@ -424,7 +428,7 @@ async function requoteSame(route, amtStr){
     BOOK = { pair:{ base_asset: receive, quote_asset: pay }, offers: liftable };
     renderBook(pay, receive);
 
-    if (!amtStr || !amtStr.trim()){ status.textContent=''; setReviewEnabled(false); paintEmptyRate(pay, receive, liftable.length); return; }
+    if (!amtStr || !amtStr.trim()){ status.textContent=''; clearOpposite(); setReviewEnabled(false); paintEmptyRate(pay, receive, liftable.length); return; }
 
     if (!liftable.length){
       // No resting liquidity: offer to START the market rather than erroring.
@@ -536,22 +540,53 @@ function paintQuoteSame(){
 async function requoteCross(route, amtStr){
   const { $ } = C;
   if (!X || !X.quote){ $('swErr').textContent = 'Cross-chain route unavailable in this build.'; setReviewEnabled(false); return; }
-  // Both directions are quoted on the SEQ-asset amount (the daemon prices in
-  // seq_amount): forward = pay BTC, receive asset; reverse = sell asset for BTC.
-  const seqAsset = route.xm.seq_asset;
-  const seqPrec = C.assetMeta(seqAsset).precision || 0;
-  const editedIsSeq = (S.edited === 'pay' ? S.payAsset : S.receiveAsset) === seqAsset;
-  const status = $('swStatus'); status.className = 'status'; status.innerHTML = '<span class="spin"></span>Quoting…';
+  const seqAsset = route.seqAsset;
+  const am = C.assetMeta(seqAsset);
+  const seqPrec = am.precision || 0;
+  const status = $('swStatus'); status.className = 'status'; status.innerHTML = '<span class="spin"></span>Loading the cross-chain order book…';
+  $('swErr').textContent = '';
   try {
+    // Fetch + render the cross order book for this pair, then pick the side that
+    // matches the taker's direction: buy asset with BTC = forward offers; sell
+    // asset for BTC = reverse offers. "No offers" is not an error — it renders an
+    // empty book (cross markets need a maker with BTC reserves, so unlike a
+    // same-chain pair the wallet can't self-start one yet).
+    let book = { forward: [], reverse: [] };
+    if (X.book) book = await X.book(seqAsset).catch(() => ({ forward: [], reverse: [] }));
+    const offers = route.payIsBtc ? (book.forward || []) : (book.reverse || []);
+    XBOOK = { seqAsset, payIsBtc: route.payIsBtc, offers };
+    renderXBook(seqAsset, route.payIsBtc, offers);
+
+    if (!offers.length){
+      status.textContent = ''; clearOpposite(); LAST_QUOTE = null; setReviewEnabled(false);
+      $('swRate').textContent = route.payIsBtc
+        ? `No resting offers to buy ${am.ticker} with BTC yet — a market maker needs to post one.`
+        : `No resting offers to sell ${am.ticker} for BTC yet — a market maker needs to post one.`;
+      $('swRoute').textContent = route.payIsBtc ? 'Cross-chain · buy with BTC' : 'Cross-chain · sell for BTC';
+      setFinality('cross');
+      return;
+    }
+
+    if (!amtStr || !amtStr.trim()){
+      status.textContent = ''; clearOpposite(); setReviewEnabled(false);
+      const n = offers.length;
+      $('swRate').textContent = `${n} resting cross-chain offer${n>1?'s':''} — enter an amount.`;
+      $('swRoute').textContent = route.payIsBtc ? 'Cross-chain · buy with BTC' : 'Cross-chain · sell for BTC';
+      setFinality('cross');
+      return;
+    }
+
+    // seq_amount to quote (the daemon prices in the asset amount): use the typed
+    // asset amount, or convert a typed BTC amount via the best resting offer.
+    const editedIsSeq = (S.edited === 'pay' ? S.payAsset : S.receiveAsset) === seqAsset;
     let seqAtoms;
     if (editedIsSeq){
       seqAtoms = C.parseAtoms(amtStr, seqPrec);
     } else {
-      // The user typed BTC; convert to a seq_amount via the market price, then quote.
-      const btcUnits = Number(C.parseAtoms(amtStr, 8)) / 1e8;
-      const seqPerBtc = route.xm.price_seq_per_btc || 0;
-      if (!(seqPerBtc > 0)) throw new Error('no cross-chain price yet');
-      seqAtoms = BigInt(Math.max(1, Math.round(btcUnits * 1e8 * seqPerBtc)));   // seq-atoms per btc-atom
+      const btcAtoms = C.parseAtoms(amtStr, 8);
+      const { asset, btc } = xOfferAmts(offers[0], route.payIsBtc);
+      if (!(asset > 0n && btc > 0n)) throw new Error('no cross-chain price yet');
+      seqAtoms = (btcAtoms * asset) / btc;   // asset-atoms per btc-atom, from the best offer
     }
     if (seqAtoms <= 0n) throw new Error('enter an amount greater than zero');
     if (route.payIsBtc){
@@ -567,9 +602,39 @@ async function requoteCross(route, amtStr){
     setReviewEnabled(true);
   } catch (e){
     status.textContent = '';
-    $('swErr').textContent = 'Quote failed: ' + (e.message || e);
+    $('swErr').textContent = 'Cross-chain order book: ' + (e.message || e);
     setReviewEnabled(false);
   }
+}
+
+// Asset/BTC atom amounts of a cross offer, per taker direction. Forward (dir 0):
+// base_amount = the asset, want_amount = BTC. Reverse (dir 1): offer_amount = BTC,
+// want_amount (or base_amount) = the asset.
+function xOfferAmts(o, payIsBtc){
+  const ba = big(o.base_amount||o.baseAmount), wa = big(o.want_amount||o.wantAmount), of = big(o.offer_amount||o.offerAmount);
+  return payIsBtc ? { asset: ba, btc: wa } : { asset: (wa || ba), btc: of };
+}
+
+// Cross-chain order book (resting cross offers for one BTC<->asset pair + direction),
+// rendered into the shared #swBook host like the same-chain book.
+function renderXBook(seqAsset, payIsBtc, offers){
+  const host = C.$('swBook'); if (!host) return;
+  const am = C.assetMeta(seqAsset);
+  offers = offers || [];
+  const rows = offers.slice(0, 12).map(o => {
+    const { asset, btc } = xOfferAmts(o, payIsBtc);
+    const assetU = Number(asset)/Math.pow(10, am.precision||0), btcU = Number(btc)/1e8;
+    const price = assetU > 0 ? btcU/assetU : 0;
+    return `<div class="swbook-row">
+      <span class="mono">${esc(C.fmtAtoms(asset, am.precision))} ${esc(am.ticker)}</span>
+      <span class="sub">@ ${esc(trim(price))} BTC/${esc(am.ticker)}</span></div>`;
+  }).join('');
+  const dirLbl = payIsBtc ? `${esc(am.ticker)} for BTC` : `BTC for ${esc(am.ticker)}`;
+  host.innerHTML = `<div class="swbook"><div class="swbook-head">
+      <span class="lbl">Cross-chain order book · ${dirLbl}</span>
+      <span class="sub">${offers.length} resting offer${offers.length===1?'':'s'}</span></div>
+    ${rows || '<div class="sub" style="padding:6px 2px">No resting cross-chain offers yet — a market maker with BTC reserves needs to post one.</div>'}</div>`;
+  renderMyOrders();
 }
 
 function paintQuoteCross(){

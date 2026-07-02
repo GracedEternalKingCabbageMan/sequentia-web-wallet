@@ -270,6 +270,25 @@ function bestForwardOffer(fwd, wantAtoms){
   if (covering.length) return covering[0];
   return withAmt.sort((a, b) => (a.ba > b.ba ? -1 : a.ba < b.ba ? 1 : 0))[0];
 }
+// A cross offer whose direction is ASSET_TO_BTC (taker SELLS the asset for BTC).
+function isReverseCrossOffer(o){
+  if (o._verified === false) return false;
+  const cc = xcSettlement(o); if (!cc) return false;
+  return Number(pick(cc, 'direction') ?? 0) === 1;   // 1 = ASSET_TO_BTC
+}
+
+// The cross-chain ORDER BOOK for one BTC<->seqAsset pair, split by taker direction
+// so the composer can render it exactly like the same-chain book:
+//   forward = taker BUYS the asset paying BTC  (maker offer direction 0)
+//   reverse = taker SELLS the asset for BTC    (maker offer direction 1)
+// Only signature-verified offers are returned (see isForwardCrossOffer). An empty
+// side means no resting cross liquidity for that direction yet.
+export async function fetchXbook(seqAsset){
+  let offers = [];
+  try { const bk = await seqob.fetchBook(seqAsset, 'BTC'); offers = bk.offers || []; } catch { offers = []; }
+  return { forward: offers.filter(isForwardCrossOffer), reverse: offers.filter(isReverseCrossOffer) };
+}
+
 // A courier quote is the chosen resting offer's size (whole-HTLC — cross lifts do
 // not partial-fill). The maker keys, locktimes and exact fee are minted per-lift
 // over the courier (in openFromComposer), so they are blank here.

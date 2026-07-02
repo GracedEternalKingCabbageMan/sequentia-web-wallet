@@ -530,7 +530,7 @@ import init, { Mnemonic, Network, Signer, Wollet, EsploraClient, Address, AssetI
   from './pkg/lwk_wasm.js';
 import { HDKey, mnemonicToSeedSync, btc } from './btc.js';
 import { initSwap, renderSwap } from './swap.js';
-import { initXswap, renderXswap, fetchXmarkets, fetchXquote, openFromComposer, hasInFlight } from './xswap.js';
+import { initXswap, renderXswap, fetchXmarkets, fetchXquote, fetchXbook, openFromComposer, hasInFlight } from './xswap.js';
 import { initXrswap, fetchRQuote, openReverseFromComposer, hasInFlight as hasReverseInFlight, renderReverse } from './xrswap.js';
 
 const ESPLORA = location.origin + '/api';
@@ -1272,6 +1272,7 @@ function initSwapTab(){
     xroute: {
       markets: () => fetchXmarkets(),
       quote: (seqAsset, seqAtoms) => fetchXquote(seqAsset, seqAtoms),
+      book: (seqAsset) => fetchXbook(seqAsset),   // resting cross offers (both directions) for BTC<->asset
       openFromComposer: (q) => openFromComposer(q),
       hasInFlight: () => hasInFlight(),
       renderXswap: () => renderXswap(),
