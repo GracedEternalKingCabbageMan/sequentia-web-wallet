@@ -189,4 +189,100 @@ export async function openCourierSession(offer, takeAtoms, feeAsset, opts){
   return new CourierSession(crypter, sessionId, t);
 }
 
-export const __test__ = { encodeXcMsg, decodeXcMsg, failMsg, XcType, CourierSession, b64encode, b64decode };
+// ---------------------------------------------------------------------------
+// MAKER side: openMakerListener registers a signed cross offer on the relay and
+// serves incoming lifts. This is the inverse of openCourierSession: instead of
+// sending start_lift and awaiting lift_accepted (taker), the maker sends
+// offer_submit (To field 102) to rest the offer AND register this WS as its lift
+// route, then handles From frames — lift_requested (143: a taker lifted; carries
+// taker_session_pubkey) and swap_msg (131: sealed courier passthrough). The
+// maker's per-session E2E key is ECDH(makerOfferPriv, taker_session_pubkey),
+// symmetric with the taker's ECDH(sessPriv, makerOfferPubkey), so Crypter is
+// reused unchanged. Mirrors the Go seqob-maker serveCross loop (cmd/seqob-maker
+// /main.go). Single-lift-at-a-time (whole-HTLC, no partials): a second concurrent
+// lift is refused with XcFail{busy}, matching the daemon.
+//   signedOffer : the SIGNED cross offer object (its maker_pubkey must match makerPriv)
+//   makerPriv   : the maker offer private key (Uint8Array/hex) used to sign the offer
+//   onLift(session, lift) : async; runs the maker settlement driver for one lift.
+//                           lift = { sessionId, offerId, takeAmount (BigInt) }.
+//   opts.ws     : inject a transport for tests (else a real WebSocket to the relay)
+// Returns { close(), resubmit(offer), activeCount() }.
+export async function openMakerListener(signedOffer, makerPriv, onLift, opts){
+  opts = opts || {};
+  const priv = typeof makerPriv === 'string' ? hexToBytes(makerPriv) : makerPriv;
+  const ws = opts.ws || new WebSocket(wsURL());
+  if (!opts.ws) ws.binaryType = 'arraybuffer';
+
+  const sessions = new Map();   // sessionId -> { push(env), fail(err) }
+  let closed = false;
+  let inFlight = 0;             // single-lift-at-a-time guard (whole-HTLC)
+
+  const send = (obj) => ws.send(JSON.stringify(obj));
+
+  async function handleLift(lr){
+    const sessionId = lr.session_id || lr.sessionId;
+    const takerPubB64 = lr.taker_session_pubkey || lr.takerSessionPubkey;
+    if (!sessionId || !takerPubB64 || sessions.has(sessionId)) return;
+
+    const crypter = await Crypter.fromECDH(priv, b64decode(takerPubB64));
+    const inbox = []; let waiter = null;
+    const push = (env) => { if (waiter){ const w = waiter; waiter = null; w.resolve(env); } else inbox.push(env); };
+    const fail = (err) => { if (waiter){ const w = waiter; waiter = null; w.reject(err); } };
+    const transport = {
+      send,
+      recv: (timeoutMs) => new Promise((resolve, reject) => {
+        if (inbox.length) return resolve(inbox.shift());
+        waiter = { resolve, reject };
+        if (timeoutMs) setTimeout(() => { if (waiter){ waiter = null; reject(new Error('courier timed out')); } }, timeoutMs);
+      }),
+      close: () => {},   // per-session close is a no-op; the listener owns the shared ws
+    };
+    sessions.set(sessionId, { push, fail });
+    const session = new CourierSession(crypter, sessionId, transport);
+
+    // Whole-HTLC: refuse a second concurrent lift rather than half-serve it.
+    if (inFlight > 0){ try { await session.fail('busy', 'maker is settling another lift'); } catch {} sessions.delete(sessionId); return; }
+    inFlight++;
+    try {
+      await onLift(session, {
+        sessionId,
+        offerId: lr.offer_id || lr.offerId,
+        takeAmount: BigInt(lr.take_amount || lr.takeAmount || 0),
+      });
+    } catch (e){
+      try { await session.fail('maker_error', (e && e.message) || String(e)); } catch {}
+    } finally {
+      inFlight--; sessions.delete(sessionId);
+    }
+  }
+
+  ws.onmessage = (ev) => {
+    let m; try { m = JSON.parse(typeof ev.data === 'string' ? ev.data : td.decode(new Uint8Array(ev.data))); } catch { return; }
+    if (m.error) return;   // GenericError; ignore (offer_submit rejections surface via no lifts)
+    const lr = m.lift_requested || m.liftRequested;
+    if (lr){ handleLift(lr).catch(() => {}); return; }
+    const sm = m.swap_msg || m.swapMsg;
+    if (sm && (sm.session_id || sm.sessionId)){
+      const s = sessions.get(sm.session_id || sm.sessionId);
+      if (s) s.push(m);
+      return;
+    }
+    // public_book / order_status / market_list frames are ignored by the maker loop.
+  };
+  ws.onclose = () => { closed = true; for (const s of sessions.values()) s.fail(new Error('relay connection closed')); };
+
+  if (!opts.ws){
+    await new Promise((resolve, reject) => { ws.onopen = resolve; ws.onerror = () => reject(new Error('could not reach the order-book relay')); });
+  }
+  // Rest the offer + register as its lift route.
+  send({ offer_submit: signedOffer });
+
+  return {
+    close: () => { closed = true; try { ws.close(); } catch {} },
+    resubmit: (offer) => { if (!closed) send({ offer_submit: offer || signedOffer }); },
+    activeCount: () => sessions.size,
+    _ws: ws,
+  };
+}
+
+export const __test__ = { encodeXcMsg, decodeXcMsg, failMsg, XcType, CourierSession, b64encode, b64decode, openMakerListener };
