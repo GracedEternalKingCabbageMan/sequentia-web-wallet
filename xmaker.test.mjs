@@ -112,6 +112,7 @@ const fakeCR = {
   btcTip: async () => 142500, seqTip: async () => 16500,
   anchorHeightOf: async (_h) => 142600,   // >= Hp (142600) -> gate passes
   anchorStatusOk: async () => true,
+  posCertifiedOf: async (_h) => true,     // quorum-certified -> gate passes
   wasm: {
     buildSeqHtlcRedeemScript: (h, claim, ref, lock) => redeem(h, claim, ref, lock),
     generateSwapSecret: () => ({ secret_hex: secretR, hash_hex: hashR }),

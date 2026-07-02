@@ -72,6 +72,14 @@ async function anchorStatusOk(){
   const s = await fetch(ANCHOR_BASE() + '/anchorstatus').then(r => r.ok ? r.json() : null);
   return !!(s && (s.anchorstatus === 'ok' || s.anchorStatus === 'ok'));
 }
+// Whether a Sequentia block is quorum-certified (immediately final). Returns
+// null when the node/endpoint predates the poscertified field (feature-detect:
+// the caller then keeps anchor-only, matching the daemon's VerifySeqLegSafe).
+async function posCertifiedOf(blockHash){
+  if (C && C.posCertifiedOf) return C.posCertifiedOf(blockHash);
+  const a = await fetch(ANCHOR_BASE() + '/anchor/' + blockHash).then(r => r.ok ? r.json() : null);
+  return (a && a.poscertified != null) ? !!a.poscertified : null;
+}
 
 export function initXmaker(ctx){ C = ctx; if (C && C.SEQOB && seqob.setSeqobBase) seqob.setSeqobBase(C.SEQOB); }
 
@@ -399,13 +407,18 @@ export async function RunMakerReverse(session, lift, offer, onState){
   // 8. ANCHOR GATE (self-derived, mandatory): the taker's asset block must anchor
   //    at a Bitcoin height >= our BTC-leg height, and the node's anchor status ok,
   //    so a Bitcoin reorg that could undo our BTC lock also undoes the asset leg.
+  // Also require QUORUM CERTIFICATION of the asset block (in addition to the
+  // anchor ordering), mirroring the daemon's VerifySeqLegSafe. Feature-detected:
+  // certNull (field absent on an un-upgraded node) keeps anchor-only. This adds NO
+  // min-anchor-DEPTH wait — the anchor axis stays 0-conf by design.
   const deadline = nowMs() + T.anchorWait;
   for (;;){
-    let ah = null, okStatus = false;
+    let ah = null, okStatus = false, cert = null;
     try { ah = await anchorHeightOf(conf.block_hash); } catch {}
     try { okStatus = await anchorStatusOk(); } catch {}
-    if (ah != null && ah >= hp && okStatus) break;
-    if (nowMs() > deadline) return await refundReverseBtc(st, onState, `anchor gate failed (anchor ${ah} < BTC ${hp} or status not ok); not revealing`);
+    try { cert = await posCertifiedOf(conf.block_hash); } catch {}
+    if (ah != null && ah >= hp && okStatus && cert !== false) break;   // cert===null (absent) or true passes; false blocks
+    if (nowMs() > deadline) return await refundReverseBtc(st, onState, `anchor gate failed (anchor ${ah} < BTC ${hp}, status ok=${okStatus}, quorum-certified=${cert}); not revealing`);
     await sleep(T.poll);
   }
 
