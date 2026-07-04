@@ -408,34 +408,50 @@ async function requoteSame(route, amtStr){
   $('swErr').textContent = '';
   try {
     if (!S.feeAsset) S.feeAsset = defaultFeeAsset();
-    // The relay keys markets by exact base/quote order, so fetch BOTH orientations
-    // and keep the offers we can TAKE for pay->receive: maker gives `receive`, wants `pay`.
-    const [b1, b2] = await Promise.all([
-      seqob.fetchBook(receive, pay).catch(()=>({offers:[]})),
-      seqob.fetchBook(pay, receive).catch(()=>({offers:[]})),
-    ]);
+    // The relay keys markets by exact base/quote order, so fetch BOTH orientations. A 4xx means "no
+    // such market yet" (genuinely empty); a network/5xx error means the relay is UNREACHABLE. T7:
+    // never conflate the two, or an outage looks like an empty book and invites posting into the void.
+    let reachErr = null;
+    const safeBook = async (a, b) => {
+      try { return await seqob.fetchBook(a, b); }
+      catch (e){ if (/HTTP\s*4\d\d/.test(e.message||'')) return { offers: [] };   // 4xx: empty/unknown market
+                 reachErr = e; return { offers: [] }; }                            // network/5xx: unreachable
+    };
+    const [b1, b2] = await Promise.all([ safeBook(receive, pay), safeBook(pay, receive) ]);
     const now = Math.floor(Date.now()/1000);
-    const seen = new Set(), liftable = [];
+    const notExpired = (o) => { const exp = Number(o.expires_at_unix || o.expiresAtUnix || 0); return !(exp && exp <= now); };
+    // Keep the offers we can TAKE (give `receive`, want `pay`) AND the opposite side (give `pay`,
+    // want `receive`) — the latter feeds the T14 spread/mid summary.
+    const seen = new Set(), liftable = [], otherSide = [];
     for (const o of [...(b1.offers||[]), ...(b2.offers||[])]){
       const id = (o.maker_pubkey||o.makerPubkey)+':'+(o.offer_id||o.offerId);
       if (seen.has(id)) continue; seen.add(id);
       if (o._verified === false) continue;                       // untrusted relay: skip forged rows
-      if ((o.offer_asset||o.offerAsset) !== receive || (o.want_asset||o.wantAsset) !== pay) continue;
-      const exp = Number(o.expires_at_unix || o.expiresAtUnix || 0);
-      if (exp && exp <= now) continue;
-      liftable.push(o);
+      if (!notExpired(o)) continue;
+      const oa = o.offer_asset||o.offerAsset, wa = o.want_asset||o.wantAsset;
+      if (oa === receive && wa === pay) liftable.push(o);
+      else if (oa === pay && wa === receive) otherSide.push(o);
     }
     liftable.sort((a,bb)=> ratioRecvPerPay(bb) - ratioRecvPerPay(a));  // best price for the taker first
-    BOOK = { pair:{ base_asset: receive, quote_asset: pay }, offers: liftable };
+    BOOK = { pair:{ base_asset: receive, quote_asset: pay }, offers: liftable, otherOffers: otherSide };
     renderBook(pay, receive);
+
+    // T7: relay unreachable AND nothing to show — say so and let the user retry; do NOT invite first-maker.
+    if (reachErr && !liftable.length){
+      status.textContent = ''; clearOpposite(); LAST_QUOTE = null; setReviewEnabled(false);
+      $('swRate').textContent = 'Order book unreachable - retry.';
+      $('swRoute').textContent = '';
+      $('swErr').textContent = 'Could not reach the order-book relay (' + (reachErr.message || reachErr) + '). Check your connection and press Refresh.';
+      return;
+    }
 
     if (!amtStr || !amtStr.trim()){ status.textContent=''; clearOpposite(); setReviewEnabled(false); paintEmptyRate(pay, receive, liftable.length); return; }
 
     if (!liftable.length){
-      // No resting liquidity: offer to START the market rather than erroring.
+      // Genuinely empty (the relay answered): offer to START the market rather than erroring.
       status.textContent = '';
       LAST_QUOTE = { kind:'same', startMarket:true, pay, receive };
-      $('swRate').textContent = `No resting offers yet — Review to post your own and start this market.`;
+      $('swRate').textContent = `No resting offers yet - Review to post your own and start this market.`;
       $('swRoute').textContent = 'Order book · be the first';
       paintFee(S.feeAsset, null);
       setFinality('same');
@@ -446,9 +462,21 @@ async function requoteSame(route, amtStr){
     const editedAsset = S.edited === 'pay' ? pay : receive;
     const typed = C.parseAtoms(amtStr, C.assetMeta(editedAsset).precision || 0);
     if (typed <= 0n) throw new Error('enter an amount greater than zero');
-    LAST_QUOTE = executableQuote(liftable[0], pay, receive, editedAsset, typed);
+    const q = executableQuote(liftable[0], pay, receive, editedAsset, typed);
+    LAST_QUOTE = q;
     status.textContent = '';
+    // Guards (T14). A quote whose received leg rounds to zero is not executable; and the composer
+    // must not build a swap that exceeds the wallet's balance (it would only fail at Confirm today).
+    if (q.amountR <= 0n){ setReviewEnabled(false); $('swErr').textContent = 'Too small - the amount you would receive rounds to zero. Enter a larger amount.'; return; }
+    if (q.amountP <= 0n){ setReviewEnabled(false); $('swErr').textContent = 'Enter a larger amount.'; return; }
+    if (q.assetP !== 'BTC'){
+      const have = balAtoms(q.assetP);
+      if (q.amountP > have){ setReviewEnabled(false); $('swErr').textContent = `You only hold ${C.fmtAtoms(have, C.assetMeta(q.assetP).precision)} ${C.assetMeta(q.assetP).ticker}.`; return; }
+    }
     paintQuoteSame();
+    // Oversize (T14): the fill was capped to the best offer size (the `capped` flag was set and never
+    // surfaced). Tell the user their typed amount exceeded a single-offer lift.
+    if (q.capped){ status.className = 'status'; status.textContent = 'Filled up to the best offer size; a larger amount needs more resting offers.'; }
     setReviewEnabled(true);
   } catch (e){
     status.textContent = '';
@@ -462,6 +490,29 @@ function ratioRecvPerPay(o){
   return want > 0 ? off/want : 0;
 }
 function ceilDiv(a, b){ return (a + b - 1n) / b; }
+
+// T14: best ask/bid, mid, spread (all in PAY per 1 RECEIVE, the conventional "price of receive") and
+// total takeable depth (in RECEIVE units), from the two book sides — whichever the data allows. Any
+// side may be absent, in which case its figure is null. sideA = offers we can take (give RECEIVE,
+// want PAY); sideB = the opposite side (give PAY, want RECEIVE).
+// TODO(browser-verify): the per-row price still reads RECEIVE-per-PAY while this summary reads
+// PAY-per-RECEIVE (conventional). Both are explicitly labelled; confirm they read clearly together.
+function bookStats(sideA, sideB, payMeta, recvMeta){
+  const toPay  = a => Number(a)/Math.pow(10, payMeta.precision||0);
+  const toRecv = a => Number(a)/Math.pow(10, recvMeta.precision||0);
+  let bestAsk = Infinity, bestBid = 0, depthRecv = 0;
+  for (const o of (sideA||[])){
+    const off = toRecv(big(o.offer_amount||o.offerAmount)), want = toPay(big(o.want_amount||o.wantAmount));
+    if (off > 0){ depthRecv += off; const p = want/off; if (p > 0 && p < bestAsk) bestAsk = p; }   // cheapest ask
+  }
+  for (const o of (sideB||[])){
+    const off = toPay(big(o.offer_amount||o.offerAmount)), want = toRecv(big(o.want_amount||o.wantAmount));
+    if (want > 0){ const p = off/want; if (p > bestBid) bestBid = p; }                              // highest bid
+  }
+  const hasAsk = isFinite(bestAsk) && bestAsk > 0, hasBid = bestBid > 0;
+  return { bestAsk: hasAsk?bestAsk:null, bestBid: hasBid?bestBid:null,
+           mid: (hasAsk&&hasBid)?(bestAsk+bestBid)/2:null, spread:(hasAsk&&hasBid)?(bestAsk-bestBid):null, depthRecv };
+}
 
 // Executable legs against ONE resting offer, using the daemon's exact proRata:
 //   recv = floor(offer_amount * take / base),  pay = ceil(want_amount * take / base)
@@ -497,8 +548,8 @@ function executableQuote(o, payAsset, receiveAsset, editedAsset, typedAtoms){
 function paintEmptyRate(pay, receive, n){
   const { $ } = C;
   $('swRate').textContent = n
-    ? `${n} resting offer${n>1?'s':''} for ${C.assetMeta(receive).ticker} — enter an amount.`
-    : `No resting offers for ${C.assetMeta(receive).ticker}/${C.assetMeta(pay).ticker} yet — enter an amount to start this market.`;
+    ? `${n} resting offer${n>1?'s':''} for ${C.assetMeta(receive).ticker} - enter an amount.`
+    : `No resting offers for ${C.assetMeta(receive).ticker}/${C.assetMeta(pay).ticker} yet - enter an amount to start this market.`;
   $('swRoute').textContent = 'Order book';
   setFinality('same');
 }
@@ -552,11 +603,20 @@ async function requoteCross(route, amtStr){
     // asset for BTC = reverse offers. "No offers" is not an error — it renders an
     // empty book (cross markets need a maker with BTC reserves, so unlike a
     // same-chain pair the wallet can't self-start one yet).
-    let book = { forward: [], reverse: [] };
-    if (X.book) book = await X.book(seqAsset).catch(() => ({ forward: [], reverse: [] }));
+    let book = { forward: [], reverse: [], unreachable: false };
+    if (X.book) book = await X.book(seqAsset).catch(() => ({ forward: [], reverse: [], unreachable: true }));
     const offers = route.payIsBtc ? (book.forward || []) : (book.reverse || []);
     XBOOK = { seqAsset, payIsBtc: route.payIsBtc, offers };
     renderXBook(seqAsset, route.payIsBtc, offers);
+
+    // T7: cross-chain relay unreachable AND nothing to show — offer a retry, never invite first-maker.
+    if (book.unreachable && !offers.length){
+      status.textContent = ''; clearOpposite(); LAST_QUOTE = null; setReviewEnabled(false);
+      $('swRate').textContent = 'Cross-chain order book unreachable - retry.';
+      $('swRoute').textContent = '';
+      $('swErr').textContent = 'Could not reach the cross-chain order book (' + (book.unreachable === true ? 'relay unreachable' : book.unreachable) + '). Check your connection and press Refresh.';
+      return;
+    }
 
     if (!offers.length){
       status.textContent = ''; clearOpposite(); setFinality('cross');
@@ -564,19 +624,19 @@ async function requoteCross(route, amtStr){
         // SELL asset for BTC with no resting bid: self-start via the FORWARD maker
         // (the wallet holds the asset, locks it, claims the taker's BTC).
         LAST_QUOTE = { kind: 'cross-make', reverse: false, assetHex: seqAsset };
-        $('swRate').textContent = `No resting offers yet — Review to post your own and sell ${am.ticker} for BTC.`;
+        $('swRate').textContent = `No resting offers yet - Review to post your own and sell ${am.ticker} for BTC.`;
         $('swRoute').textContent = 'Cross-chain · be the first (sell for BTC)';
         setReviewEnabled(true);
       } else if (route.payIsBtc && X && X.makerStartReverse){
         // BUY asset with BTC with no resting ask: self-start via the REVERSE maker
         // (the wallet funds a BTC bid, holds the secret, claims the taker's asset).
         LAST_QUOTE = { kind: 'cross-make', reverse: true, assetHex: seqAsset };
-        $('swRate').textContent = `No resting offers yet — Review to post your own and buy ${am.ticker} with BTC.`;
+        $('swRate').textContent = `No resting offers yet - Review to post your own and buy ${am.ticker} with BTC.`;
         $('swRoute').textContent = 'Cross-chain · be the first (buy with BTC)';
         setReviewEnabled(true);
       } else {
         LAST_QUOTE = null; setReviewEnabled(false);
-        $('swRate').textContent = `No resting offers for ${am.ticker}/BTC yet — a market maker needs to post one.`;
+        $('swRate').textContent = `No resting offers for ${am.ticker}/BTC yet - a market maker needs to post one.`;
         $('swRoute').textContent = route.payIsBtc ? 'Cross-chain · buy with BTC' : 'Cross-chain · sell for BTC';
       }
       return;
@@ -585,7 +645,7 @@ async function requoteCross(route, amtStr){
     if (!amtStr || !amtStr.trim()){
       status.textContent = ''; clearOpposite(); setReviewEnabled(false);
       const n = offers.length;
-      $('swRate').textContent = `${n} resting cross-chain offer${n>1?'s':''} — enter an amount.`;
+      $('swRate').textContent = `${n} resting cross-chain offer${n>1?'s':''} - enter an amount.`;
       $('swRoute').textContent = route.payIsBtc ? 'Cross-chain · buy with BTC' : 'Cross-chain · sell for BTC';
       setFinality('cross');
       return;
@@ -648,7 +708,7 @@ function renderXBook(seqAsset, payIsBtc, offers){
   host.innerHTML = `<div class="swbook"><div class="swbook-head">
       <span class="lbl">Cross-chain order book · ${dirLbl}</span>
       <span class="sub">${offers.length} resting offer${offers.length===1?'':'s'}</span></div>
-    ${rows || '<div class="sub" style="padding:6px 2px">No resting cross-chain offers yet — a market maker with BTC reserves needs to post one.</div>'}</div>`;
+    ${rows || '<div class="sub" style="padding:6px 2px">No resting cross-chain offers yet - a market maker with BTC reserves needs to post one.</div>'}</div>`;
   renderMyOrders();
 }
 
@@ -682,7 +742,7 @@ function paintFee(feeAssetHex, feeAtoms, noteOverride){
   const { $ } = C;
   const fm = C.assetMeta(feeAssetHex);
   $('swFeeTk').textContent = fm.ticker;
-  $('swFeeAmt').textContent = (feeAtoms != null) ? (C.fmtAtoms(feeAtoms, fm.precision) + ' ' + fm.ticker) : '—';
+  $('swFeeAmt').textContent = (feeAtoms != null) ? (C.fmtAtoms(feeAtoms, fm.precision) + ' ' + fm.ticker) : '-';
   const ref = (feeAtoms != null) ? (C.refValueStr(feeAssetHex, feeAtoms) || '') : '';
   $('swFeeRef').textContent = ref;
   $('swFeeNote').textContent = noteOverride || 'Pay the fee in any asset the network prices.';
@@ -729,7 +789,7 @@ function feeAssetOptions(){
 }
 function renderFeePicker(){
   const fa = S.feeAsset || (S.payAsset ? defaultFeeAsset() : null);
-  C.$('swFeeTk').textContent = fa ? C.assetMeta(fa).ticker : '—';
+  C.$('swFeeTk').textContent = fa ? C.assetMeta(fa).ticker : '-';
 }
 function openFeePicker(){
   if (C.$('swFeePick').disabled) return;
@@ -891,7 +951,7 @@ async function postCrossOfferReview(q){
       btcSats    = C.parseAtoms(($('swRecvAmt').value || '').trim(), 8);
     }
     if (assetAtoms <= 0n || btcSats <= 0n) throw 0;
-  } catch { $('swErr').textContent = `Enter both amounts — the ${am.ticker} and the BTC.`; return; }
+  } catch { $('swErr').textContent = `Enter both amounts - the ${am.ticker} and the BTC.`; return; }
   if (reverse){
     const haveBtc = balAtoms('BTC');
     if (btcSats > haveBtc){ $('swErr').textContent = `You only hold ${C.fmtAtoms(haveBtc, 8)} BTC.`; return; }
@@ -901,23 +961,23 @@ async function postCrossOfferReview(q){
   }
   const assetU = Number(assetAtoms)/Math.pow(10, am.precision||0), btcU = Number(btcSats)/1e8;
   const kv = reverse ? [
-    ['Posting', `A resting CROSS bid — you become the maker of the ${am.ticker}/BTC market`],
+    ['Posting', `A resting CROSS bid - you become the maker of the ${am.ticker}/BTC market`],
     ['You pay', C.fmtAtoms(btcSats, 8) + ' BTC'],
     ['You buy', amtRow(assetHex, assetAtoms) + refSuffix(assetHex, assetAtoms)],
-    ['Price', assetU>0 ? `1 ${am.ticker} = ${trim(btcU/assetU)} BTC` : '—'],
-    ['How it settles', 'You lock BTC in an HTLC; a taker locks the asset; you verify anchoring, claim the asset (revealing the secret); the taker claims your BTC. Atomic — anchor-bound.'],
+    ['Price', assetU>0 ? `1 ${am.ticker} = ${trim(btcU/assetU)} BTC` : '-'],
+    ['How it settles', 'You lock BTC in an HTLC; a taker locks the asset; you verify anchoring, claim the asset (revealing the secret); the taker claims your BTC. Atomic - anchor-bound.'],
     ['Keep this tab open', 'Cross-chain settlement is interactive: your wallet must be open to settle a lift. Closing it un-rests the offer; nothing is at risk (a stalled lock refunds after its timeout).'],
     ['Finality', 'Anchor-bound to Bitcoin (reverts only if Bitcoin reverts).'],
   ] : [
-    ['Posting', `A resting CROSS offer — you become the maker of the ${am.ticker}/BTC market`],
+    ['Posting', `A resting CROSS offer - you become the maker of the ${am.ticker}/BTC market`],
     ['You sell', amtRow(assetHex, assetAtoms) + refSuffix(assetHex, assetAtoms)],
     ['You want', C.fmtAtoms(btcSats, 8) + ' BTC'],
-    ['Price', assetU>0 ? `1 ${am.ticker} = ${trim(btcU/assetU)} BTC` : '—'],
-    ['How it settles', 'A taker pays BTC; you lock the asset in an HTLC; they claim it revealing the secret; you claim the BTC. Atomic — anchor-bound.'],
+    ['Price', assetU>0 ? `1 ${am.ticker} = ${trim(btcU/assetU)} BTC` : '-'],
+    ['How it settles', 'A taker pays BTC; you lock the asset in an HTLC; they claim it revealing the secret; you claim the BTC. Atomic - anchor-bound.'],
     ['Keep this tab open', 'Cross-chain settlement is interactive: your wallet must be open to settle a lift. Closing it un-rests the offer; nothing is at risk.'],
     ['Finality', 'Anchor-bound to Bitcoin (reverts only if Bitcoin reverts).'],
   ];
-  const { m: modal, ok, st } = C.modalRows({ title: reverse ? 'Buy with BTC — start this market' : 'Sell for BTC — start this market', kv });
+  const { m: modal, ok, st } = C.modalRows({ title: reverse ? 'Buy with BTC - start this market' : 'Sell for BTC - start this market', kv });
   if (ok) ok.textContent = reverse ? 'Post cross bid' : 'Post cross offer';
   ok.onclick = async () => {
     ok.disabled = true; st.className = 'status'; st.innerHTML = '<span class="spin"></span>Signing + posting…';
@@ -926,7 +986,7 @@ async function postCrossOfferReview(q){
       const handle = await start({ assetHex, assetAtoms, btcSats, expirySecs: 3600, recvAddr }, onCrossMakeState);
       XMAKE = { handle, assetHex, assetAtoms, btcSats, reverse, offerId: handle.offer.offer_id, state: 'resting' };
       modal.remove();
-      C.toast('Cross offer posted — live in the order book. Keep this tab open to settle.');
+      C.toast('Cross offer posted - live in the order book. Keep this tab open to settle.');
       resetComposer();
       renderXMake();
       renderSwap();
@@ -950,29 +1010,58 @@ function renderXMake(){
   if (!XMAKE){ return; }   // leave same-chain "your orders" render intact when no cross make
   const am = C.assetMeta(XMAKE.assetHex);
   const phases = XMAKE.reverse ? {
-    resting:'Resting — waiting for a taker', terms:'A taker is lifting…', btc_locked:'You locked BTC — waiting for the taker to lock the asset…',
-    seq_verified:'Asset locked — verifying anchoring…', settled:'Settled — you bought the asset for BTC',
-    refunding:'Stalled — refunding your BTC…', refunded:'Refunded — the swap stalled; your BTC is back',
+    resting:'Resting - waiting for a taker', terms:'A taker is lifting…', btc_locked:'You locked BTC - waiting for the taker to lock the asset…',
+    seq_verified:'Asset locked - verifying anchoring…', settled:'Settled - you bought the asset for BTC',
+    refunding:'Stalled - refunding your BTC…', refunded:'Refunded - the swap stalled; your BTC is back',
   } : {
-    resting:'Resting — waiting for a taker', terms:'A taker is lifting…', btc_verified:'Taker funded BTC — locking your asset…',
-    seq_locked:'Asset locked — waiting for the taker to claim…', secret_learned:'Taker claimed; claiming your BTC…',
-    settled:'Settled — you sold the asset for BTC', refunded:'Refunded — the swap stalled; your asset is back',
+    resting:'Resting - waiting for a taker', terms:'A taker is lifting…', btc_verified:'Taker funded BTC - locking your asset…',
+    seq_locked:'Asset locked - waiting for the taker to claim…', secret_learned:'Taker claimed; claiming your BTC…',
+    settled:'Settled - you sold the asset for BTC', refunded:'Refunded - the swap stalled; your asset is back',
   };
   const label = phases[XMAKE.state] || XMAKE.state;
   const done = XMAKE.state === 'settled' || XMAKE.state === 'refunded';
   const headline = XMAKE.reverse
     ? `Your resting cross bid · buy ${esc(C.fmtAtoms(XMAKE.assetAtoms, am.precision))} ${esc(am.ticker)} for ${esc(C.fmtAtoms(XMAKE.btcSats,8))} BTC`
     : `Your resting cross offer · sell ${esc(C.fmtAtoms(XMAKE.assetAtoms, am.precision))} ${esc(am.ticker)} for ${esc(C.fmtAtoms(XMAKE.btcSats,8))} BTC`;
+  const resumed = !!XMAKE.resumed;
+  const note = resumed
+    ? 'Recovering an interrupted swap. It continues in the background; keep this tab open until it settles or refunds.'
+    : 'Keep this tab open to settle.';
+  const btnLabel = done ? 'Clear' : (resumed ? 'Dismiss' : 'Cancel offer');
   host.innerHTML = `<div class="swbook"><div class="swbook-head">
-      <span class="lbl">${headline}</span>
+      <span class="lbl">${esc(headline)}</span>
       <span class="sub">${esc(label)}</span></div>
-    <div class="swbook-row"><span class="sub">Keep this tab open to settle. </span>
-      <button type="button" class="ghost" id="swXMakeCancel">${done ? 'Clear' : 'Cancel offer'}</button></div></div>`;
+    <div class="swbook-row"><span class="sub">${esc(note)}</span>
+      <button type="button" class="ghost" id="swXMakeCancel">${esc(btnLabel)}</button></div></div>`;
   const btn = C.$('swXMakeCancel');
   if (btn) btn.onclick = () => {
-    try { XMAKE.handle && XMAKE.handle.close(); } catch {}
-    XMAKE = null; host.innerHTML = ''; C.toast('Cross offer removed.'); renderSwap();
+    // A resumed swap has no live listener/offer to close — Dismiss only hides the panel; the
+    // background settlement/refund watcher (xmaker) keeps running and drops its record when terminal.
+    if (!resumed){ try { XMAKE.handle && XMAKE.handle.close(); } catch {} }
+    XMAKE = null; host.innerHTML = '';
+    C.toast(resumed ? 'Hidden. The swap keeps recovering in the background.' : 'Cross offer removed.');
+    renderSwap();
   };
+}
+
+// T11: on load, re-launch any interrupted cross-maker settlement/refund watcher that xmaker.js
+// persisted (fund-loss safety), and surface the recovering swap in the resting-order panel. The
+// watcher runs regardless of the active tab; here we only mirror its progress into the UI.
+export function resumeCrossMakers(){
+  if (!X || !X.resumeMakers) return;
+  const onState = (st) => {
+    if (!st) return;
+    const reverse = st.direction === 'reverse';
+    // Map the persisted maker record onto the panel's shape (there is no live `handle` on resume).
+    XMAKE = { resumed: true, handle: null, assetHex: st.asset,
+      assetAtoms: big(st.seq_amount || 0), btcSats: big(st.btc_amount || 0),
+      reverse, offerId: st.offer_id, session_id: st.session_id, state: st.state, detail: st };
+    try { renderXMake(); } catch {}
+  };
+  Promise.resolve(X.resumeMakers(onState)).then((list) => {
+    if (Array.isArray(list) && list.length && C.toast)
+      C.toast('Recovering ' + list.length + ' interrupted cross-chain swap' + (list.length>1?'s':'') + ' - keep this tab open until it settles or refunds.');
+  }).catch(() => {});
 }
 
 async function reviewSame(q){
@@ -987,7 +1076,7 @@ async function reviewSame(q){
     ['Fee paid in', fm.ticker],
     ['Maker', short(q.offer && (q.offer.maker_pubkey || q.offer.makerPubkey))],
     ['Finality', 'Settles in ~1 block · anchor-bound to Bitcoin (reverts only if Bitcoin reverts).'],
-    ['Settlement', 'Atomic — settles in full or not at all.'],
+    ['Settlement', 'Atomic - settles in full or not at all.'],
   ];
   const { m: modal, ok, st } = C.modalRows({ title: 'Review swap', kv });
   ok.onclick = async () => {
@@ -1030,7 +1119,7 @@ function resetComposer(){
 
 function amtRow(hex, atoms){ const m = C.assetMeta(hex); return C.fmtAtoms(atoms, m.precision) + ' ' + m.ticker; }
 function refSuffix(hex, atoms){ const r = C.refValueStr(hex, atoms); return r ? ('  ('+r+')') : ''; }
-function trim(n){ if (!isFinite(n)) return '—'; const s = (Math.round(n*1e8)/1e8).toString(); return s; }
+function trim(n){ if (!isFinite(n)) return '-'; const s = (Math.round(n*1e8)/1e8).toString(); return s; }
 
 // ---------------------------------------------------------------------------
 // build -> propose -> sign (add_details + strip bip32) -> complete  (UNCHANGED)
@@ -1077,14 +1166,14 @@ async function postOfferReview(q){
     payAtoms = C.parseAtoms($('swPayAmt').value.trim(), C.assetMeta(pay).precision || 0);
     recvAtoms = C.parseAtoms($('swRecvAmt').value.trim(), C.assetMeta(receive).precision || 0);
     if (payAtoms <= 0n || recvAtoms <= 0n) throw 0;
-  } catch { $('swErr').textContent = 'Enter both amounts — what you give and what you want — to start a market.'; return; }
+  } catch { $('swErr').textContent = 'Enter both amounts - what you give and what you want - to start a market.'; return; }
   const pm = C.assetMeta(pay), rm = C.assetMeta(receive);
   const payU = Number(payAtoms)/Math.pow(10, pm.precision||0), recvU = Number(recvAtoms)/Math.pow(10, rm.precision||0);
   const kv = [
-    ['Posting', 'A resting offer — you become the maker of this market'],
+    ['Posting', 'A resting offer - you become the maker of this market'],
     ['You give', amtRow(pay, payAtoms) + refSuffix(pay, payAtoms)],
     ['You want', amtRow(receive, recvAtoms) + refSuffix(receive, recvAtoms)],
-    ['Price', payU>0 ? `1 ${pm.ticker} = ${trim(recvU/payU)} ${rm.ticker}` : '—'],
+    ['Price', payU>0 ? `1 ${pm.ticker} = ${trim(recvU/payU)} ${rm.ticker}` : '-'],
     ['Filling', 'A taker fills it from the other side. Filling needs you (the maker) online to co-sign; in-wallet co-sign is coming, so for now the offer rests publicly and you can cancel it anytime.'],
     ['Expires', 'In 1 hour (re-post to refresh).'],
     ['Finality', 'Settles in ~1 block · anchor-bound to Bitcoin (reverts only if Bitcoin reverts).'],
@@ -1110,7 +1199,7 @@ async function postOfferReview(q){
       seqob.signOffer(offer, makerPriv());
       await seqob.postOffer(offer);
       modal.remove();
-      C.toast('Offer posted — your market is live in the order book.');
+      C.toast('Offer posted - your market is live in the order book.');
       resetComposer();
       renderSwap();
     } catch (e){
@@ -1137,10 +1226,19 @@ function renderBook(pay, receive){
       <span class="mono">${esc(C.fmtAtoms(offerAmt, rm.precision))} ${esc(rm.ticker)}</span>
       <span class="sub">@ ${esc(trim(price))} ${esc(rm.ticker)}/${esc(pm.ticker)}</span></button>`;
   }).join('');
+  // T14: spread/mid/depth summary where the data allows (degrades gracefully to just the side present).
+  const st = bookStats(offers, BOOK.otherOffers || [], pm, rm);
+  const stParts = [];
+  if (st.bestAsk != null) stParts.push(`ask 1 ${esc(rm.ticker)} = ${esc(trim(st.bestAsk))} ${esc(pm.ticker)}`);
+  if (st.bestBid != null) stParts.push(`bid ${esc(trim(st.bestBid))}`);
+  if (st.mid != null)     stParts.push(`mid ${esc(trim(st.mid))}`);
+  if (st.spread != null)  stParts.push(`spread ${esc(trim(st.spread))}`);
+  if (st.depthRecv > 0)   stParts.push(`depth ${esc(trim(st.depthRecv))} ${esc(rm.ticker)}`);
+  const statLine = stParts.length ? `<div class="sub" style="margin:2px 0 4px">${stParts.join(' · ')}</div>` : '';
   host.innerHTML = `<div class="swbook"><div class="swbook-head">
       <span class="lbl">Order book · ${esc(rm.ticker)} for ${esc(pm.ticker)}</span>
       <span class="sub">${offers.length} resting offer${offers.length===1?'':'s'}</span></div>
-    ${rows || '<div class="sub" style="padding:6px 2px">No resting offers — enter an amount and Review to start this market.</div>'}</div>`;
+    ${statLine}${rows || '<div class="sub" style="padding:6px 2px">No resting offers - enter an amount and Review to start this market.</div>'}</div>`;
   host.querySelectorAll('.swbook-row').forEach(b => b.onclick = () => fillFromOffer(b.dataset.id, b.dataset.maker, pay, receive));
   renderMyOrders();
 }
@@ -1162,7 +1260,9 @@ async function renderMyOrders(){
   if (XMAKE) return renderXMake();   // a live wallet cross offer owns this panel
 
   let orders = [];
-  try { orders = await seqob.fetchMyOrders(makerPubHex()); } catch { host.innerHTML = ''; return; }
+  // On a fetch error, leave whatever is already rendered rather than blanking the panel (a transient
+  // relay blip should not make your resting orders vanish from the UI).
+  try { orders = await seqob.fetchMyOrders(makerPubHex()); } catch { return; }
   if (!orders.length){ host.innerHTML = ''; return; }
   const rows = orders.map(o => {
     const give = C.assetMeta(o.offer_asset||o.offerAsset), want = C.assetMeta(o.want_asset||o.wantAsset);
@@ -1179,13 +1279,8 @@ async function renderMyOrders(){
   });
 }
 
-function randId(){
-  const a = new Uint8Array(8); (crypto || window.crypto).getRandomValues(a);
-  return [...a].map(b => b.toString(16).padStart(2,'0')).join('');
-}
-
 // ---------------------------------------------------------------------------
-// PSET bip32 / global-xpub stripper.  (UNCHANGED — verified byte-exact.)
+// PSET bip32 / global-xpub stripper.  (UNCHANGED - verified byte-exact.)
 // ---------------------------------------------------------------------------
 function b64ToBytes(b64){
   const bin = atob(b64.trim()); const a = new Uint8Array(bin.length);
