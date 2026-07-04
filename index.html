@@ -68,6 +68,12 @@
   .b-iss{color:var(--blue);border-color:#244a63;background:#0d1f2a}
   .amt{margin-left:auto;font-weight:700;font:14px ui-monospace,monospace;white-space:nowrap}
   .amt.pos{color:var(--green)} .amt.neg{color:var(--amber2)}
+  .bal-total{margin:2px 0 14px;padding:14px 16px;border:1px solid var(--line);border-radius:12px;background:var(--card2,rgba(255,255,255,.02))}
+  .bal-total:empty{display:none}
+  .bal-total-label{font-size:12px;color:var(--dim);text-transform:uppercase;letter-spacing:.05em}
+  .bal-total-amt{font:600 26px ui-monospace,monospace;margin-top:2px}
+  .bal-total-note{font-size:12px;color:var(--dim);margin-top:2px}
+  .ref-unpriced{outline:1px solid var(--amber2)}
   .asset-row{display:flex;align-items:baseline;gap:10px;padding:10px 0;border-top:1px solid var(--line)}
   .asset-row:first-child{border-top:none}
   .tk{font-weight:700} .aid{font:12px ui-monospace,monospace;color:var(--dim);word-break:break-all}
@@ -241,6 +247,7 @@
     <!-- balance -->
     <section data-panel="balance">
       <div class="card">
+        <div id="balTotal" class="bal-total"></div>
         <div class="row" style="justify-content:space-between;align-items:center;margin-bottom:2px">
           <label class="lbl" style="margin:0">Assets</label>
           <button id="btnSync">Refresh</button>
@@ -673,19 +680,29 @@ async function loadPrices(){
   }catch(e){ console.warn('[prices] fetch failed:', e?.message??e); }
 }
 loadPrices();
-// Market-feed ticker for an asset (BTC parent-chain -> WBTC price; tSEQ -> SEQ).
-function priceTicker(hex){ if(hex==='BTC') return 'WBTC'; if(hex===POLICY_HEX) return 'SEQ'; return assetMeta(hex).ticker; }
+// Market-feed ticker for an asset (BTC parent-chain -> BTC price; tSEQ -> SEQ).
+function priceTicker(hex){ if(hex==='BTC') return 'BTC'; if(hex===POLICY_HEX) return 'SEQ'; return assetMeta(hex).ticker; }
+// USD price for a ticker, tolerating the historical BTC<->WBTC feed-key drift so
+// Bitcoin is always valued whichever key the feed uses.
+function priceFor(t){ if(!t) return null; return PRICES[t] || (t==='BTC'?PRICES['WBTC']:(t==='WBTC'?PRICES['BTC']:null)) || null; }
 function refOptions(){ const s=new Set(['USD']); for(const t of Object.keys(PRICES)) s.add(t==='WBTC'?'BTC':t); return [...s]; }
-function priceOf(ref){ return ref==='USD' ? 1 : (PRICES[ref==='BTC'?'WBTC':ref] || null); }
-// "≈ 12.34 USD" for `atoms` of asset `hex` in the chosen reference, or '' if unpriced.
-function refValueStr(hex, atoms){
-  const pu = PRICES[priceTicker(hex)], pr = priceOf(REF);
-  if(!(pu>0) || !(pr>0)) return '';
+function priceOf(ref){ return ref==='USD' ? 1 : priceFor(ref); }
+// True when the chosen reference currency has no price and we are showing USD instead.
+function refUnpriced(){ return REF!=='USD' && !(priceOf(REF)>0); }
+// Value of `atoms` of asset `hex` in the chosen reference currency. If the chosen
+// reference itself is unpriced we fall back to USD (with a header notice) rather
+// than blanking every value app-wide. Returns {v, ref} or null if the ASSET is unpriced.
+function refValue(hex, atoms){
+  const pu = priceFor(priceTicker(hex));
+  if(!(pu>0)) return null;
+  let ref = REF, pr = priceOf(ref);
+  if(!(pr>0)){ ref='USD'; pr=1; }
   const units = Number(BigInt(atoms)) / Math.pow(10, assetMeta(hex).precision||0);
-  const v = units * pu / pr;
-  const dp = REF==='BTC' ? 8 : (Math.abs(v) >= 1 ? 2 : 6);
-  return '≈ ' + v.toLocaleString(undefined,{maximumFractionDigits:dp}) + ' ' + REF;
+  return { v: units*pu/pr, ref };
 }
+function fmtRef(v, ref){ const dp = ref==='BTC' ? 8 : (Math.abs(v) >= 1 ? 2 : 6); return v.toLocaleString(undefined,{maximumFractionDigits:dp}) + ' ' + ref; }
+// "≈ 12.34 USD" for `atoms` of asset `hex`, or '' if unpriced.
+function refValueStr(hex, atoms){ const rv = refValue(hex, atoms); return rv ? '≈ ' + fmtRef(rv.v, rv.ref) : ''; }
 // Changing the reference re-denominates the whole wallet at once: the balance rows
 // and every live "≈" hint under an amount field.
 function setRef(r){ REF=r; try{ localStorage.setItem('seqRefCcy', r); }catch{} initRefSelector(); try{ renderBalance(); }catch{} refreshAllRefHints(); }
@@ -696,6 +713,10 @@ function initRefSelector(){
   const opts=refOptions(); if(!opts.includes(REF)) opts.push(REF);
   sel.innerHTML=''; for(const o of opts){ const op=el('option'); op.value=o; op.textContent=o; if(o===REF) op.selected=true; sel.appendChild(op); }
   if(!sel._wired){ sel._wired=true; sel.onchange=()=>setRef(sel.value); }
+  // If the chosen reference has no live price, values are shown in USD; tell the user.
+  const unpriced = refUnpriced();
+  sel.title = unpriced ? (REF+' has no live price right now; values are shown in USD') : '';
+  sel.classList.toggle('ref-unpriced', unpriced);
 }
 // --- live "≈ <ref>" hints under any asset-amount <input>, wallet-wide ---
 // attachRefHint(input, assetFn) drops a muted line under `input` that re-values the
@@ -1353,9 +1374,10 @@ function balObj(){ return wollet.balance().toJSON(); }   // {assetHex: "atomsStr
 function renderBalance(){
   const b = balObj();
   const list=$('assetList'); list.innerHTML='';
-  // Asset-agnostic + dual-chain: Bitcoin (parent chain) and tSEQ (native) are
-  // first-class rows, then other Sequentia assets — all displayed equally. Each
-  // amount also carries its value in the chosen reference currency (if priced).
+  // Equal-standing + dual-chain: a headline portfolio total across BTC (parent chain)
+  // and every Sequentia asset in the chosen reference currency, then per-asset rows
+  // in a uniform order with NOTHING pinned. No asset is privileged; the staking note
+  // lives only in the Stake tab. Each amount carries its own reference value if priced.
   // sub is a DOM node (not an HTML string): el() sets textContent, so passing
   // markup as a string would render it literally. Build nodes instead.
   const row=(ticker, sub, amt, ref)=>{ const r=el('div','asset-row');
@@ -1364,12 +1386,24 @@ function renderBalance(){
     const a=el('span','amt'); a.appendChild(el('div',null,amt));
     if(ref) a.appendChild(el('div','sub', ref));
     r.appendChild(a); list.appendChild(r); };
+  // Headline total: sum every priced holding into one reference-currency figure.
+  let total=0, totalRef=null, anyPriced=false, allPriced=true;
+  const holdings=[['BTC', btcBalance], ...Object.keys(b).map(h=>[h, b[h]])];
+  for(const [h,amt] of holdings){ const rv=refValue(h, amt); if(rv){ total+=rv.v; totalRef=rv.ref; anyPriced=true; } else if((amt||0)>0) allPriced=false; }
+  const card=$('balTotal');
+  if(card){ card.innerHTML='';
+    card.appendChild(el('div','bal-total-label','Total balance'));
+    card.appendChild(el('div','bal-total-amt', anyPriced ? fmtRef(total, totalRef||REF) : 'unavailable'));
+    if(anyPriced && !allPriced) card.appendChild(el('div','bal-total-note','priced assets only'));
+    else if(refUnpriced()) card.appendChild(el('div','bal-total-note', REF+' has no live price; shown in USD'));
+  }
+  // BTC (parent chain) leads only because it is the other chain, not a privileged unit.
   row('BTC', el('span','sub','Bitcoin testnet4'), fmtAtoms(btcBalance, 8), refValueStr('BTC', btcBalance));
-  const keys = Object.keys(b).sort((x,y)=> x===POLICY_HEX?-1 : y===POLICY_HEX?1 : 0);
+  // Uniform order (by ticker); tSEQ is one row among equals, not pinned.
+  const keys = Object.keys(b).sort((x,y)=> assetMeta(x).ticker.localeCompare(assetMeta(y).ticker));
   for(const h of keys){
     const meta=assetMeta(h);
-    row(meta.ticker, h===POLICY_HEX ? el('span','sub','Sequentia staking asset') : txLink('/asset/'+h, h),
-      fmtAtoms(b[h], meta.precision), refValueStr(h, b[h]));
+    row(meta.ticker, txLink('/asset/'+h, h), fmtAtoms(b[h], meta.precision), refValueStr(h, b[h]));
   }
 }
 
