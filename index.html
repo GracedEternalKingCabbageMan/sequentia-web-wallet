@@ -1371,6 +1371,10 @@ async function sync(){
   finally{ if(btn) btn.disabled=false; }
 }
 function balObj(){ return wollet.balance().toJSON(); }   // {assetHex: "atomsStr"}
+// Spendable balance (atoms) of an asset for the Send tab: BTC parent-chain or a Sequentia asset.
+function availableFor(hex){ if(hex==='BTC') return (typeof btcBalance!=='undefined' && btcBalance) ? btcBalance : 0n; const b=balObj(); return b[hex]||0n; }
+// Re-run every recipient row's "Available:" line after a sync changes balances.
+function refreshAllAvail(){ const box=document.getElementById('recipients'); if(!box) return; for(const r of box.children){ if(typeof r._refreshAvail==='function'){ try{ r._refreshAvail(); }catch{} } } }
 function renderBalance(){
   const b = balObj();
   const list=$('assetList'); list.innerHTML='';
@@ -1405,6 +1409,7 @@ function renderBalance(){
     const meta=assetMeta(h);
     row(meta.ticker, txLink('/asset/'+h, h), fmtAtoms(b[h], meta.precision), refValueStr(h, b[h]));
   }
+  refreshAllAvail();   // keep the Send tab's "Available:" lines in sync with balances
 }
 
 // ---------- receive ----------
@@ -1570,12 +1575,23 @@ function addRecipientRow(){
     <label class="lbl">Address</label>
     <div class="addr-row"><input class="mono raddr" placeholder="tb1… or tsqb1…"><button type="button" class="ghost scanbtn" title="Scan a QR code">⊡ Scan</button></div>
     <label class="lbl" style="margin-top:10px">Asset</label><select class="rasset" style="width:100%"></select>
-    <label class="lbl" style="margin-top:10px">Amount</label><input class="mono ramt" placeholder="0.0">`;
+    <label class="lbl" style="margin-top:10px">Amount</label><input class="mono ramt" placeholder="0.0">
+    <div class="sub ravail"></div>`;
   const rsel=r.querySelector('.rasset');
   ownedOptions(rsel);
   const sbtn=r.querySelector('.scanbtn'); if(sbtn) sbtn.onclick=()=> openScanner(r.querySelector('.raddr'), r.querySelector('.ramt'));
   const updRecHint=attachRefHint(r.querySelector('.ramt'), ()=>rsel.value);   // ≈ ref under the amount
-  rsel.onchange=()=>{ defaultFeeAssetToSent(); updateFeeForSendType(); updRecHint(); };   // default the fee to the sent asset; re-value too
+  // "Available: X TICKER" under the amount, so the user sees their spendable balance
+  // for the selected asset without leaving the Send tab. Refreshed on asset change and
+  // after every sync (refreshAllAvail).
+  const availLine=r.querySelector('.ravail');
+  r._refreshAvail=()=>{ const hex=rsel.value;
+    if(!hex){ availLine.textContent=''; return; }
+    const prec = hex==='BTC' ? 8 : (assetMeta(hex).precision||0);
+    const tk = hex==='BTC' ? 'BTC' : assetMeta(hex).ticker;
+    availLine.textContent = 'Available: ' + fmtAtoms(availableFor(hex), prec) + ' ' + tk; };
+  rsel.onchange=()=>{ defaultFeeAssetToSent(); updateFeeForSendType(); updRecHint(); r._refreshAvail(); };   // default the fee to the sent asset; re-value too
+  r._refreshAvail();
   r.querySelector('.x').onclick=()=>{ if(box.children.length>1){ r.remove(); updateFeeForSendType(); } };
   box.appendChild(r);
   updateFeeForSendType();
