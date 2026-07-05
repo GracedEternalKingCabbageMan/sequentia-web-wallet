@@ -17,6 +17,10 @@
   .mark{width:42px;height:42px;border-radius:50%;display:block}
   h1{font-size:21px;margin:0;letter-spacing:-.01em}
   .net{font-size:12px;color:var(--amber2);border:1px solid var(--line);border-radius:999px;padding:2px 10px;margin-left:auto}
+  .lnpill{margin-left:8px;color:var(--sub)}
+  .lnpill.ln-ready{color:#7ee0a0;border-color:#2f6b45}
+  .lnpill.ln-warn{color:var(--amber2)}
+  .lnpill.ln-err{color:#e08a8a;border-color:#6b2f2f}
   .tip{font-size:11.5px;color:var(--dim);margin-left:8px}
   .card{background:var(--panel);border:1px solid var(--line);border-radius:16px;padding:20px;margin-top:16px}
   .muted{color:var(--dim);font-size:14px}
@@ -68,6 +72,12 @@
   .b-iss{color:var(--blue);border-color:#244a63;background:#0d1f2a}
   .amt{margin-left:auto;font-weight:700;font:14px ui-monospace,monospace;white-space:nowrap}
   .amt.pos{color:var(--green)} .amt.neg{color:var(--amber2)}
+  .bal-total{margin:2px 0 14px;padding:14px 16px;border:1px solid var(--line);border-radius:12px;background:var(--card2,rgba(255,255,255,.02))}
+  .bal-total:empty{display:none}
+  .bal-total-label{font-size:12px;color:var(--dim);text-transform:uppercase;letter-spacing:.05em}
+  .bal-total-amt{font:600 26px ui-monospace,monospace;margin-top:2px}
+  .bal-total-note{font-size:12px;color:var(--dim);margin-top:2px}
+  .ref-unpriced{outline:1px solid var(--amber2)}
   .asset-row{display:flex;align-items:baseline;gap:10px;padding:10px 0;border-top:1px solid var(--line)}
   .asset-row:first-child{border-top:none}
   .tk{font-weight:700} .aid{font:12px ui-monospace,monospace;color:var(--dim);word-break:break-all}
@@ -130,6 +140,10 @@
   .swmeta{display:flex;flex-direction:column;gap:14px}
   .swmeta-row{display:flex;align-items:baseline;justify-content:space-between;gap:12px;flex-wrap:wrap}
   #swRate{color:var(--txt);font-size:13.5px}
+  .swroutemode{display:flex;gap:8px}
+  .swrail{flex:1;padding:9px 12px;border:1px solid var(--line);border-radius:10px;background:var(--panel2);color:var(--sub);font-size:13px;cursor:pointer;transition:.12s}
+  .swrail:hover{border-color:var(--accent)}
+  .swrail.sel{border-color:var(--accent);color:var(--txt);background:var(--panel);box-shadow:inset 0 0 0 1px var(--accent)}
   .swfee{border:1px solid var(--line);border-radius:12px;padding:12px 14px;background:var(--panel2)}
   .swfee-head{display:flex;align-items:baseline;gap:10px;flex-wrap:wrap}
   .swfee-body{display:flex;align-items:center;gap:12px;margin-top:9px;flex-wrap:wrap}
@@ -181,6 +195,7 @@
     <img class="mark" src="./sequentia-mark.png" alt="Sequentia">
     <h1>Sequentia Wallet</h1>
     <span class="net" id="net">testnet</span>
+    <span class="net lnpill hide" id="lnStatus" title="Lightning device signer status">⚡ LN</span>
   </div>
   <div class="sub" id="tipline">A self-custodial wallet powered by SWK (Sequentia Wallet Kit), running entirely in your browser.</div>
 
@@ -241,6 +256,7 @@
     <!-- balance -->
     <section data-panel="balance">
       <div class="card">
+        <div id="balTotal" class="bal-total"></div>
         <div class="row" style="justify-content:space-between;align-items:center;margin-bottom:2px">
           <label class="lbl" style="margin:0">Assets</label>
           <button id="btnSync">Refresh</button>
@@ -256,7 +272,6 @@
           <button data-faucet="USDX">USDX</button>
           <button data-faucet="EURX">EURX</button>
           <button data-faucet="GOLD">GOLD</button>
-          <button data-faucet="WBTC">WBTC</button>
           <button data-faucet="SILVR">SILVR</button>
           <button data-faucet="OILX">OILX</button>
         </div>
@@ -273,7 +288,7 @@
         <div class="field">
           <div class="row">
             <div class="grow">
-              <label class="lbl" id="feeRateLabel">Fee rate (sat/vB, optional)</label>
+              <label class="lbl" id="feeRateLabel">Fee rate (optional)</label>
               <input id="feeRate" class="mono" placeholder="leave blank for the default">
             </div>
             <div style="width:160px" id="feeAssetBox">
@@ -370,6 +385,14 @@
           <div class="swmeta-row" id="swRateRow">
             <span class="sub" id="swRate">Pick two assets to see a rate.</span>
             <span class="sub" id="swRoute"></span>
+          </div>
+
+          <!-- BTC<->asset: choose the settlement rail. Instant Lightning (pure-LN,
+               non-custodial via the hosted-signer LSP) vs on-chain HTLC. Shown only
+               when a BTC<->asset pair is selected and the on-device signer is live. -->
+          <div class="swroutemode hide" id="swRouteMode">
+            <button type="button" class="swrail sel" id="swRailCross" data-rail="cross">On-chain HTLC</button>
+            <button type="button" class="swrail" id="swRailLn" data-rail="ln">⚡ Instant (Lightning)</button>
           </div>
 
           <!-- open fee market: pay the network fee in any asset the node prices -->
@@ -492,8 +515,13 @@
     <!-- history -->
     <section data-panel="history" class="hide">
       <div class="card">
-        <label class="lbl">History</label>
+        <label class="lbl">Sequentia history</label>
         <div class="list" id="histList"><div class="muted">No transactions yet.</div></div>
+      </div>
+      <div class="card">
+        <label class="lbl">Bitcoin (testnet4) history</label>
+        <p class="sub" style="margin:0 0 6px">Parent-chain BTC on the shared tb1 address. Links open the testnet4 explorer.</p>
+        <div class="list" id="btcHistList"><div class="muted">No Bitcoin transactions yet.</div></div>
       </div>
     </section>
 
@@ -529,10 +557,12 @@ import init, { Mnemonic, Network, Signer, Wollet, EsploraClient, Address, AssetI
   generateSwapSecret, buildSeqHtlcRedeemScript, buildSeqHtlcClaimTx, buildSeqHtlcRefundTx }
   from './pkg/lwk_wasm.js';
 import { HDKey, mnemonicToSeedSync, btc } from './btc.js';
-import { initSwap, renderSwap } from './swap.js';
+import { initSwap, renderSwap, resumeCrossMakers } from './swap.js';
 import { initXswap, renderXswap, fetchXmarkets, fetchXquote, fetchXbook, openFromComposer, hasInFlight } from './xswap.js';
 import { initXrswap, fetchRQuote, openReverseFromComposer, hasInFlight as hasReverseInFlight, renderReverse } from './xrswap.js';
-import { initXmaker, startForwardMaker, startReverseMaker, liveMakerOffers } from './xmaker.js';
+import { initXmaker, startForwardMaker, startReverseMaker, liveMakerOffers, resumeMakerSwaps } from './xmaker.js';
+import { initSeqln, connectDevice as lnConnectDevice, disconnectDevice as lnDisconnect,
+  onSeqlnStatus, seqlnState, seqlnAvailable, seqlnGetStatus, seqlnSwap, lnFinalityCopy } from './seqln.js';
 
 const ESPLORA = location.origin + '/api';
 const KEY = 'swk.sequentia.mnemonic';
@@ -673,19 +703,29 @@ async function loadPrices(){
   }catch(e){ console.warn('[prices] fetch failed:', e?.message??e); }
 }
 loadPrices();
-// Market-feed ticker for an asset (BTC parent-chain -> WBTC price; tSEQ -> SEQ).
-function priceTicker(hex){ if(hex==='BTC') return 'WBTC'; if(hex===POLICY_HEX) return 'SEQ'; return assetMeta(hex).ticker; }
+// Market-feed ticker for an asset (BTC parent-chain -> BTC price; tSEQ -> SEQ).
+function priceTicker(hex){ if(hex==='BTC') return 'BTC'; if(hex===POLICY_HEX) return 'SEQ'; return assetMeta(hex).ticker; }
+// USD price for a ticker, tolerating the historical BTC<->WBTC feed-key drift so
+// Bitcoin is always valued whichever key the feed uses.
+function priceFor(t){ if(!t) return null; return PRICES[t] || (t==='BTC'?PRICES['WBTC']:(t==='WBTC'?PRICES['BTC']:null)) || null; }
 function refOptions(){ const s=new Set(['USD']); for(const t of Object.keys(PRICES)) s.add(t==='WBTC'?'BTC':t); return [...s]; }
-function priceOf(ref){ return ref==='USD' ? 1 : (PRICES[ref==='BTC'?'WBTC':ref] || null); }
-// "≈ 12.34 USD" for `atoms` of asset `hex` in the chosen reference, or '' if unpriced.
-function refValueStr(hex, atoms){
-  const pu = PRICES[priceTicker(hex)], pr = priceOf(REF);
-  if(!(pu>0) || !(pr>0)) return '';
+function priceOf(ref){ return ref==='USD' ? 1 : priceFor(ref); }
+// True when the chosen reference currency has no price and we are showing USD instead.
+function refUnpriced(){ return REF!=='USD' && !(priceOf(REF)>0); }
+// Value of `atoms` of asset `hex` in the chosen reference currency. If the chosen
+// reference itself is unpriced we fall back to USD (with a header notice) rather
+// than blanking every value app-wide. Returns {v, ref} or null if the ASSET is unpriced.
+function refValue(hex, atoms){
+  const pu = priceFor(priceTicker(hex));
+  if(!(pu>0)) return null;
+  let ref = REF, pr = priceOf(ref);
+  if(!(pr>0)){ ref='USD'; pr=1; }
   const units = Number(BigInt(atoms)) / Math.pow(10, assetMeta(hex).precision||0);
-  const v = units * pu / pr;
-  const dp = REF==='BTC' ? 8 : (Math.abs(v) >= 1 ? 2 : 6);
-  return '≈ ' + v.toLocaleString(undefined,{maximumFractionDigits:dp}) + ' ' + REF;
+  return { v: units*pu/pr, ref };
 }
+function fmtRef(v, ref){ const dp = ref==='BTC' ? 8 : (Math.abs(v) >= 1 ? 2 : 6); return v.toLocaleString(undefined,{maximumFractionDigits:dp}) + ' ' + ref; }
+// "≈ 12.34 USD" for `atoms` of asset `hex`, or '' if unpriced.
+function refValueStr(hex, atoms){ const rv = refValue(hex, atoms); return rv ? '≈ ' + fmtRef(rv.v, rv.ref) : ''; }
 // Changing the reference re-denominates the whole wallet at once: the balance rows
 // and every live "≈" hint under an amount field.
 function setRef(r){ REF=r; try{ localStorage.setItem('seqRefCcy', r); }catch{} initRefSelector(); try{ renderBalance(); }catch{} refreshAllRefHints(); }
@@ -696,6 +736,10 @@ function initRefSelector(){
   const opts=refOptions(); if(!opts.includes(REF)) opts.push(REF);
   sel.innerHTML=''; for(const o of opts){ const op=el('option'); op.value=o; op.textContent=o; if(o===REF) op.selected=true; sel.appendChild(op); }
   if(!sel._wired){ sel._wired=true; sel.onchange=()=>setRef(sel.value); }
+  // If the chosen reference has no live price, values are shown in USD; tell the user.
+  const unpriced = refUnpriced();
+  sel.title = unpriced ? (REF+' has no live price right now; values are shown in USD') : '';
+  sel.classList.toggle('ref-unpriced', unpriced);
 }
 // --- live "≈ <ref>" hints under any asset-amount <input>, wallet-wide ---
 // attachRefHint(input, assetFn) drops a muted line under `input` that re-values the
@@ -765,7 +809,7 @@ function attachRefHint(input, assetFn){
       node.textContent = '⇄ ' + (t || ('enter in '+REF));
     } else {
       // ref mode but the asset lost its price: keep a clickable escape (don't blank + trap the user).
-      if(!_bothPriced(hex, REF)){ node.textContent = raw ? ('⇄ no '+REF+' price — switch to '+ticker) : ''; return; }
+      if(!_bothPriced(hex, REF)){ node.textContent = raw ? ('⇄ no '+REF+' price - switch to '+ticker) : ''; return; }
       if(!raw){ node.textContent = '⇄ enter in '+ticker; return; }
       const a=assetAmountOf(input, hex);                                                 // exact string that will be sent
       node.textContent = a ? ('⇄ ≈ '+a+' '+ticker) : ('⇄ enter in '+ticker);
@@ -1231,6 +1275,52 @@ async function openWallet(phrase){
   localStorage.setItem(KEY, phrase.trim().replace(/\s+/g,' '));
   addrIndex=null; views('app'); tab('balance'); addRecipientRow(); initAppRefUI(); initSwapTab();
   await sync();
+  // T11: after the wallet is up, re-launch any maker settlement/refund watcher that a prior session
+  // persisted mid-flow (fund-loss safety) and surface the interrupted swap for recovery.
+  try{ resumeCrossMakers(); }catch(e){ console.warn('[resume] cross-maker resume failed:', e?.message??e); }
+  // Lightning (LSP): bring the on-device signer online so the "Instant (Lightning)"
+  // swap rail becomes available. Non-fatal + opt-in: if the wss endpoint / host key
+  // aren't configured, LN stays off and the composer uses the on-chain rail.
+  try{ initLightning(phrase); }catch(e){ console.warn('[ln] init failed:', e?.message??e); }
+}
+
+// ---------- Lightning (hosted-SeqLN LSP) ----------
+// Derive a stable per-wallet device transport (Noise) private key from the seed,
+// so it survives across sessions and is recoverable from the mnemonic. In a full
+// build this pubkey is registered with the LSP at onboarding; SEQ_LSP_DEV_KEY
+// overrides it for local pinning against a fixed harness node.
+function lnDeviceTransportPriv(phrase){
+  const override = (typeof window!=='undefined') && window.SEQ_LSP_DEV_KEY;
+  if (override && /^[0-9a-fA-F]{64}$/.test(override)) return override.toLowerCase();
+  const seed = mnemonicToSeedSync(phrase.trim().replace(/\s+/g,' '));
+  const k = HDKey.fromMasterSeed(seed).derive("m/1017'/0'/0'");
+  return [...k.privateKey].map(b=>b.toString(16).padStart(2,'0')).join('');
+}
+function lnStatusPill(){
+  const el = $('lnStatus'); if (!el) return;
+  const st = seqlnState();
+  const wsCfg = (typeof window!=='undefined') && window.SEQ_LSP_WS;
+  if (!wsCfg){ el.classList.add('hide'); return; }   // LN not deployed for this wallet
+  el.classList.remove('hide');
+  el.className = 'net lnpill ' + (st.connected ? 'ln-ready' : (st.phase==='error' ? 'ln-err' : 'ln-warn'));
+  el.textContent = st.connected ? '⚡ LN ready' : '⚡ LN ' + (st.phase||'…');
+  el.title = 'Lightning device signer: ' + st.phase + (st.detail?(' — '+st.detail):'');
+  // Re-quote the composer so the "Instant (Lightning)" rail appears/disappears live.
+  try{ if(typeof renderSwap==='function' && $('swReview')) renderSwap(); }catch{}
+}
+function initLightning(phrase){
+  initSeqln();                       // reads window.SEQ_LSP_URL / _WS / _HOST_PUBKEY / _TOKEN
+  onSeqlnStatus(() => lnStatusPill());
+  lnStatusPill();
+  const wsCfg = (typeof window!=='undefined') && window.SEQ_LSP_WS;
+  const hostPub = (typeof window!=='undefined') && window.SEQ_LSP_HOST_PUBKEY;
+  if (!wsCfg || !hostPub) return;    // LN not deployed here; composer stays on-chain-only
+  const mnemonic = ((typeof window!=='undefined') && window.SEQ_LSP_DEV_MNEMONIC) || phrase;
+  const deviceTransportPrivkey = lnDeviceTransportPriv(phrase);
+  const policy = ((typeof window!=='undefined') && window.SEQ_LSP_POLICY) || 'permissive';
+  lnConnectDevice({ mnemonic, deviceTransportPrivkey, policy })
+    .then((id)=>{ if(id) console.log('[ln] device signer serving hosted node', id); })
+    .catch((e)=> console.warn('[ln] connect failed:', e?.message??e));
 }
 // Hand the Swap module everything it needs from the app: the wasm classes, the
 // live wallet/signer/network handles (read fresh via getters so a re-open keeps
@@ -1318,6 +1408,10 @@ function initSwapTab(){
       makerStart: (params, onState) => startForwardMaker(params, onState),          // self-start: SELL asset for BTC
       makerStartReverse: (params, onState) => startReverseMaker(params, onState),    // self-start: BUY asset with BTC
       makerLive: () => liveMakerOffers(),
+      // T11: rehydrate + re-launch any non-terminal maker settlement/refund watcher persisted by
+      // xmaker.js (closing the tab mid-settlement is otherwise a fund-loss risk). Returns the
+      // resumed swap snapshots so the composer can surface interrupted-swap recovery.
+      resumeMakers: (onState) => resumeMakerSwaps(onState),
       openFromComposer: (q) => openFromComposer(q),
       hasInFlight: () => hasInFlight(),
       renderXswap: () => renderXswap(),
@@ -1326,6 +1420,15 @@ function initSwapTab(){
       openReverseFromComposer: (q) => openReverseFromComposer(q),
       hasReverseInFlight: () => hasReverseInFlight(),
       renderReverse: () => renderReverse(),
+    },
+    // Instant Lightning (pure-LN) rail: the composer's "Instant (Lightning)"
+    // route for a BTC<->asset pair. Non-custodial via the hosted-signer LSP (the
+    // device co-signs; the LSP commands the hosted node to take a pure-LN offer).
+    ln: {
+      available: () => seqlnAvailable(),
+      status: () => seqlnGetStatus(),
+      swap: (p) => seqlnSwap(p),
+      finalityCopy: () => lnFinalityCopy(),
     },
   });
 }
@@ -1350,12 +1453,17 @@ async function sync(){
   finally{ if(btn) btn.disabled=false; }
 }
 function balObj(){ return wollet.balance().toJSON(); }   // {assetHex: "atomsStr"}
+// Spendable balance (atoms) of an asset for the Send tab: BTC parent-chain or a Sequentia asset.
+function availableFor(hex){ if(hex==='BTC') return (typeof btcBalance!=='undefined' && btcBalance) ? btcBalance : 0n; const b=balObj(); return b[hex]||0n; }
+// Re-run every recipient row's "Available:" line after a sync changes balances.
+function refreshAllAvail(){ const box=document.getElementById('recipients'); if(!box) return; for(const r of box.children){ if(typeof r._refreshAvail==='function'){ try{ r._refreshAvail(); }catch{} } } }
 function renderBalance(){
   const b = balObj();
   const list=$('assetList'); list.innerHTML='';
-  // Asset-agnostic + dual-chain: Bitcoin (parent chain) and tSEQ (native) are
-  // first-class rows, then other Sequentia assets — all displayed equally. Each
-  // amount also carries its value in the chosen reference currency (if priced).
+  // Equal-standing + dual-chain: a headline portfolio total across BTC (parent chain)
+  // and every Sequentia asset in the chosen reference currency, then per-asset rows
+  // in a uniform order with NOTHING pinned. No asset is privileged; the staking note
+  // lives only in the Stake tab. Each amount carries its own reference value if priced.
   // sub is a DOM node (not an HTML string): el() sets textContent, so passing
   // markup as a string would render it literally. Build nodes instead.
   const row=(ticker, sub, amt, ref)=>{ const r=el('div','asset-row');
@@ -1364,13 +1472,77 @@ function renderBalance(){
     const a=el('span','amt'); a.appendChild(el('div',null,amt));
     if(ref) a.appendChild(el('div','sub', ref));
     r.appendChild(a); list.appendChild(r); };
+  // Headline total: sum every priced holding into one reference-currency figure.
+  let total=0, totalRef=null, anyPriced=false, allPriced=true;
+  const holdings=[['BTC', btcBalance], ...Object.keys(b).map(h=>[h, b[h]])];
+  for(const [h,amt] of holdings){ const rv=refValue(h, amt); if(rv){ total+=rv.v; totalRef=rv.ref; anyPriced=true; } else if((amt||0)>0) allPriced=false; }
+  const card=$('balTotal');
+  if(card){ card.innerHTML='';
+    card.appendChild(el('div','bal-total-label','Total balance'));
+    card.appendChild(el('div','bal-total-amt', anyPriced ? fmtRef(total, totalRef||REF) : 'unavailable'));
+    if(anyPriced && !allPriced) card.appendChild(el('div','bal-total-note','priced assets only'));
+    else if(refUnpriced()) card.appendChild(el('div','bal-total-note', REF+' has no live price; shown in USD'));
+  }
+  // BTC (parent chain) leads only because it is the other chain, not a privileged unit.
   row('BTC', el('span','sub','Bitcoin testnet4'), fmtAtoms(btcBalance, 8), refValueStr('BTC', btcBalance));
-  const keys = Object.keys(b).sort((x,y)=> x===POLICY_HEX?-1 : y===POLICY_HEX?1 : 0);
+  // Uniform order (by ticker); tSEQ is one row among equals, not pinned.
+  const keys = Object.keys(b).sort((x,y)=> assetMeta(x).ticker.localeCompare(assetMeta(y).ticker));
+  const lmap=labels();
   for(const h of keys){
     const meta=assetMeta(h);
-    row(meta.ticker, h===POLICY_HEX ? el('span','sub','Sequentia staking asset') : txLink('/asset/'+h, h),
-      fmtAtoms(b[h], meta.precision), refValueStr(h, b[h]));
+    const known=precisionKnown(h);
+    // Elide the 64-char hex id (link text), and use the /explorer/ prefix so the link lands on the
+    // asset page instead of the SPA catch-all/greeting (W1). The full id is still the href.
+    const sub=el('div');
+    sub.appendChild(txLink('/explorer/asset/'+h, h.slice(0,10)+'…'+h.slice(-6)));
+    if(!known){
+      // Received an asset the wallet can't name/scale: today a dead end (can't be sent). Offer to
+      // label it (ticker/name/precision), so it becomes sendable. See labelAssetDialog / T9.
+      const w=el('span','sub'); w.textContent=' · unlabeled'; w.style.cssText='color:var(--amber2);margin-left:6px'; sub.appendChild(w);
+      const lb=el('button','ghost','Label to send'); lb.style.cssText='padding:2px 9px;font-size:11px;margin-left:8px'; lb.onclick=()=>labelAssetDialog(h); sub.appendChild(lb);
+    } else if(lmap[h] && lmap[h].local){
+      const m2=el('button','ghost','local label'); m2.title='A wallet-local label (not in the registry). Click to edit.'; m2.style.cssText='padding:2px 9px;font-size:11px;margin-left:8px;opacity:.75'; m2.onclick=()=>labelAssetDialog(h); sub.appendChild(m2);
+    }
+    // Unknown-precision assets have no authoritative precision, so show raw atoms honestly (rather
+    // than silently mis-scaling at precision 0); labeling then renders the real amount + ref value.
+    const amtStr = known ? fmtAtoms(b[h], meta.precision) : (BigInt(b[h]).toString()+' atoms');
+    row(meta.ticker, sub, amtStr, known ? refValueStr(h, b[h]) : '');
   }
+  refreshAllAvail();   // keep the Send tab's "Available:" lines in sync with balances
+}
+// Wallet-local "label this asset" affordance (T9 / W2): give a received-but-unknown asset a ticker,
+// name, and PRECISION so it can be read and SENT. Stored in localStorage (LBL) marked local:true and
+// visibly distinguished from registry/default labels. Precedence stays user > registry > default.
+function labelAssetDialog(hex){
+  const m=el('div','modal'); const c=el('div','card');
+  c.appendChild(el('label','lbl','Label this asset'));
+  c.appendChild(el('div','sub','A wallet-local name so you can read and send this asset. Stored only in this browser, not the public registry. Set the precision to match the asset issuance, or amounts will be scaled wrong.'));
+  c.appendChild(el('label','lbl','Asset id'));
+  const idr=el('div','mono'); idr.textContent=hex; idr.style.margin='4px 0 8px'; c.appendChild(idr);
+  const cur=labels()[hex]||REGISTRY_ASSETS[hex]||DEFAULT_ASSETS[hex]||{};
+  const genericTk=(cur.ticker && /…$/.test(cur.ticker)) ? '' : (cur.ticker||'');
+  c.appendChild(el('label','lbl','Ticker'));
+  const tk=el('input'); tk.value=genericTk; tk.placeholder='e.g. GOLD'; tk.maxLength=16; c.appendChild(tk);
+  c.appendChild(el('label','lbl','Name (optional)'));
+  const nm=el('input'); nm.value=(cur.name && cur.name!=='Asset')?cur.name:''; nm.placeholder='e.g. Gold (troy ounce)'; nm.maxLength=48; nm.style.marginTop='4px'; c.appendChild(nm);
+  c.appendChild(el('label','lbl','Precision (decimals, 0-8)'));
+  const pr=el('input'); pr.type='number'; pr.min='0'; pr.max='8'; pr.step='1'; pr.value=String(cur.precision!=null?cur.precision:8); pr.style.marginTop='4px'; c.appendChild(pr);
+  const act=el('div','row'); act.style.marginTop='14px';
+  const ok=el('button','primary','Save label'); const no=el('button','ghost','Cancel');
+  act.appendChild(ok); act.appendChild(no); c.appendChild(act);
+  const err=el('div','status err'); c.appendChild(err);
+  m.appendChild(c); document.body.appendChild(m);
+  no.onclick=()=>m.remove();
+  ok.onclick=()=>{
+    const p=parseInt(pr.value,10);
+    if(!(p>=0 && p<=8)){ err.textContent='precision must be a whole number 0-8'; return; }
+    const ticker=(tk.value||'').trim().replace(/[<>]/g,'').slice(0,16);
+    if(!ticker){ err.textContent='enter a ticker'; return; }
+    const name=(nm.value||'').trim().replace(/[<>]/g,'').slice(0,48) || 'Asset';
+    saveLabel(hex, {ticker, name, precision:p, local:true});
+    m.remove();
+    renderBalance(); populateFeeAssets(); refreshRecipientAssets(); try{ renderHistory(); }catch{}
+  };
 }
 
 // ---------- receive ----------
@@ -1388,7 +1560,14 @@ function currentAddress(){
 }
 function renderReceive(){
   const a = currentAddress();
-  $('addr').textContent = a.toString();
+  $('addr').textContent = a.toString();   // the shown/copied text is ALWAYS the bare tb1/tsqb1 address (correct on both chains)
+  // TODO(browser-verify / qr.rs): QRCodeUri() returns a QR image whose PAYLOAD is a Liquid
+  // `liquidnetwork:<ADDR>` URI (SWK/lwk_common/src/qr.rs:16-20), which brands Sequentia as Liquid
+  // and hands external scanners a wrong-network scheme. The dual-chain-correct payload is the BARE
+  // address (universally scannable on Bitcoin AND Sequentia). A pure-JS fix needs a QR ENCODER, but
+  // the wallet only ships jsqr.js (a decoder); there is none. So the real fix is in qr.rs (emit the
+  // bare address, or a `sequentia:` scheme) and a wasm rebuild — out of scope for a JS-only change.
+  // Until then the visible/copied address above is correct; only the encoded QR carries the scheme.
   try{ $('qr').src = a.QRCodeUri(); }catch{ $('qr').removeAttribute('src'); }
   $('btnConf').textContent = showConf ? 'Show non-confidential' : 'Show confidential';
   $('recvTip').textContent = showConf
@@ -1536,12 +1715,23 @@ function addRecipientRow(){
     <label class="lbl">Address</label>
     <div class="addr-row"><input class="mono raddr" placeholder="tb1… or tsqb1…"><button type="button" class="ghost scanbtn" title="Scan a QR code">⊡ Scan</button></div>
     <label class="lbl" style="margin-top:10px">Asset</label><select class="rasset" style="width:100%"></select>
-    <label class="lbl" style="margin-top:10px">Amount</label><input class="mono ramt" placeholder="0.0">`;
+    <label class="lbl" style="margin-top:10px">Amount</label><input class="mono ramt" placeholder="0.0">
+    <div class="sub ravail"></div>`;
   const rsel=r.querySelector('.rasset');
   ownedOptions(rsel);
   const sbtn=r.querySelector('.scanbtn'); if(sbtn) sbtn.onclick=()=> openScanner(r.querySelector('.raddr'), r.querySelector('.ramt'));
   const updRecHint=attachRefHint(r.querySelector('.ramt'), ()=>rsel.value);   // ≈ ref under the amount
-  rsel.onchange=()=>{ defaultFeeAssetToSent(); updateFeeForSendType(); updRecHint(); };   // default the fee to the sent asset; re-value too
+  // "Available: X TICKER" under the amount, so the user sees their spendable balance
+  // for the selected asset without leaving the Send tab. Refreshed on asset change and
+  // after every sync (refreshAllAvail).
+  const availLine=r.querySelector('.ravail');
+  r._refreshAvail=()=>{ const hex=rsel.value;
+    if(!hex){ availLine.textContent=''; return; }
+    const prec = hex==='BTC' ? 8 : (assetMeta(hex).precision||0);
+    const tk = hex==='BTC' ? 'BTC' : assetMeta(hex).ticker;
+    availLine.textContent = 'Available: ' + fmtAtoms(availableFor(hex), prec) + ' ' + tk; };
+  rsel.onchange=()=>{ defaultFeeAssetToSent(); updateFeeForSendType(); updRecHint(); r._refreshAvail(); };   // default the fee to the sent asset; re-value too
+  r._refreshAvail();
   r.querySelector('.x').onclick=()=>{ if(box.children.length>1){ r.remove(); updateFeeForSendType(); } };
   box.appendChild(r);
   updateFeeForSendType();
@@ -1760,17 +1950,19 @@ $('btnIssue').onclick=async()=>{ $('issueErr').textContent='';
   }catch(e){ $('issueErr').textContent=e?.message??String(e); } };
 
 $('btnReissue').onclick=async()=>{ $('raErr').textContent='';
-  try{ const asset=$('raAsset').value.trim(); const m=assetMeta(asset);
+  try{ const asset=$('raAsset').value.trim();
+    const prec=sendPrecision(asset);   // T9: same unknown-precision guard as Send — throws 'label it before sending' rather than mis-scaling at precision 0 (the 1e8 trap)
     const input=$('raAmount');
-    const amt=parseAtoms(assetAmountOf(input, asset), m.precision);   // honours ⇄ ref-input mode
+    const amt=parseAtoms(assetAmountOf(input, asset), prec);   // honours ⇄ ref-input mode
     const ref=(input._refMode && (input.value||'').trim()) ? {typed:(input.value||'').trim(), ccy:(input._refCcy||REF)} : null;
     const pset=network.txBuilder().reissueAsset(new AssetId(asset), amt, undefined, undefined).feeRate(DEFAULT_FEERATE).finish(wollet);
     await reviewBroadcast(pset, 'Confirm Sequentia payment', null, POLICY_HEX, {rows:[{atoms:amt, hex:asset, ref}], feeAssetHex:POLICY_HEX});
   }catch(e){ $('raErr').textContent=e?.message??String(e); } };
 $('btnBurn').onclick=async()=>{ $('raErr').textContent='';
-  try{ const asset=$('raAsset').value.trim(); const m=assetMeta(asset);
+  try{ const asset=$('raAsset').value.trim();
+    const prec=sendPrecision(asset);   // T9: same unknown-precision guard as Send — never burn a mis-scaled amount on an unlabeled asset
     const input=$('raAmount');
-    const amt=parseAtoms(assetAmountOf(input, asset), m.precision);   // honours ⇄ ref-input mode
+    const amt=parseAtoms(assetAmountOf(input, asset), prec);   // honours ⇄ ref-input mode
     const ref=(input._refMode && (input.value||'').trim()) ? {typed:(input.value||'').trim(), ccy:(input._refCcy||REF)} : null;
     const pset=network.txBuilder().addBurn(amt, new AssetId(asset)).feeRate(DEFAULT_FEERATE).finish(wollet);
     await reviewBroadcast(pset, 'Confirm Sequentia payment', null, POLICY_HEX, {rows:[{atoms:amt, hex:asset, ref}], feeAssetHex:POLICY_HEX});
@@ -1781,6 +1973,7 @@ $('btnLock').onclick=()=>{ if(confirm('Remove this wallet from the browser? Make
 
 // ---------- history ----------
 function renderHistory(){
+  renderBtcHistory().catch(()=>{});   // dual-chain (T6): parent-chain BTC history alongside Sequentia; async + independent
   const list=$('histList'); if(!wollet){ return; } list.innerHTML='';
   let txs; try{ txs=wollet.transactions(); }catch(e){ list.appendChild(el('div','err','History error: '+(e?.message??e))); return; }
   if(!txs.length){ list.appendChild(el('div','muted','No transactions yet.')); return; }
@@ -1818,6 +2011,51 @@ function renderHistory(){
     const amt = nz.reduce((best,e)=> best && absBig(BigInt(best[1]))>=absBig(BigInt(e[1])) ? best : e, null) || [POLICY_HEX, delta[POLICY_HEX]??'0'];
     const am=assetMeta(amt[0]); const aneg=BigInt(amt[1])<0n;
     item.appendChild(el('span','amt '+(aneg?'neg':'pos'), fmtAtoms(amt[1],am.precision)+' '+am.ticker));
+    list.appendChild(item);
+  }
+}
+// ---------- Bitcoin (testnet4) history (T6: BTC is first-class, dual-chain parity) ----------
+// The parent-chain history mirrors the Sequentia list above: esplora testnet4 /address/{a}/txs for
+// the wallet's active BTC addresses, deduped by txid, classified in/out by net delta to the wallet,
+// each row linking to the testnet4 explorer (/testnet4/tx/...).
+async function renderBtcHistory(){
+  const list=$('btcHistList'); if(!list) return;
+  if(!btcRoot){ list.innerHTML=''; list.appendChild(el('div','muted','No Bitcoin transactions yet.')); return; }
+  // Wallet address universe (for in/out classification): the full scanned window on both branches.
+  const lim = Math.max(btcScanLimit, btcChangeNext+1, GAP+1);
+  const walletAddrs = new Set();
+  for(const internal of [false,true]) for(let i=0;i<lim;i++) walletAddrs.add(btcAddr(internal,i));
+  // Addresses to query: those with known activity (used external + issued change) — every wallet tx
+  // touches at least one, so this captures all of them without fetching the whole window.
+  const query = new Set();
+  for(const i of btcUsed) query.add(btcAddr(false,i));
+  for(let i=0;i<btcChangeNext;i++) query.add(btcAddr(true,i));
+  if(!query.size){ list.innerHTML=''; list.appendChild(el('div','muted','No Bitcoin transactions yet.')); return; }
+  const seen = new Map();   // txid -> esplora tx
+  await Promise.all([...query].map(async a=>{
+    try{ const txs=await fetch(`${T4_API}/address/${a}/txs`).then(r=>r.ok?r.json():[]);
+      for(const t of (txs||[])) if(t && t.txid) seen.set(t.txid, t); }catch{}
+  }));
+  const txs=[...seen.values()];
+  txs.sort((a,b)=>(((b.status&&b.status.block_height)??9e9)-((a.status&&a.status.block_height)??9e9)));   // unconfirmed first, then newest
+  list.innerHTML='';
+  if(!txs.length){ list.appendChild(el('div','muted','No Bitcoin transactions yet.')); return; }
+  for(const t of txs.slice(0,60)){
+    let inSum=0n, outSum=0n;
+    for(const vin of (t.vin||[])){ const po=vin.prevout; if(po && walletAddrs.has(po.scriptpubkey_address)) inSum+=BigInt(po.value||0); }
+    for(const vo of (t.vout||[])){ if(walletAddrs.has(vo.scriptpubkey_address)) outSum+=BigInt(vo.value||0); }
+    const delta = outSum - inSum;
+    const incoming = delta >= 0n;
+    const item=el('div','item');
+    item.appendChild(el('span','badge '+(incoming?'b-in':'b-out'), incoming?'incoming':'outgoing'));
+    const mid=el('div','grow');
+    const conf = t.status && t.status.confirmed;
+    const when = conf ? (t.status.block_time ? new Date(t.status.block_time*1000).toLocaleString() : 'block '+t.status.block_height) : 'unconfirmed';
+    { const _d=el('div'); _d.appendChild(txLink('/testnet4/tx/'+t.txid, t.txid.slice(0,20)+'…')); mid.appendChild(_d); }
+    mid.appendChild(el('div','sub', when+' · Bitcoin testnet4'));
+    item.appendChild(mid);
+    const mag = delta<0n ? -delta : delta;
+    item.appendChild(el('span','amt '+(incoming?'pos':'neg'), (incoming?'':'-')+fmtAtoms(mag,8)+' BTC'));
     list.appendChild(item);
   }
 }

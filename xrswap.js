@@ -292,7 +292,7 @@ function startCountdown(){
   const tick = () => {
     if (!LAST_RQUOTE || !LAST_RQUOTE.expires_at_unix || SWAP){ el.textContent = ''; return; }
     const secs = LAST_RQUOTE.expires_at_unix - Math.floor(Date.now()/1000);
-    if (secs <= 0){ el.textContent = 'Quote expired — get a fresh quote.'; el.className = 'sub err';
+    if (secs <= 0){ el.textContent = 'Quote expired - get a fresh quote.'; el.className = 'sub err';
       if (COUNTDOWN){ clearInterval(COUNTDOWN); COUNTDOWN = null; } return; }
     el.className = 'sub'; el.textContent = `Quote valid for ${secs}s`;
   };
@@ -308,7 +308,7 @@ function verifyMakerBtcLeg(){
   const recomputed = C.wasm.buildSeqHtlcRedeemScript(
     SWAP.hash_hex, SWAP.taker_btc_claim_pub, SWAP.maker_btc_refund_pub, SWAP.btc_locktime);
   if (String(recomputed).toLowerCase() !== String(SWAP.btc_leg.redeem_script).toLowerCase())
-    return { ok:false, reason:'maker BTC-leg script does not match the agreed terms — do not fund' };
+    return { ok:false, reason:'maker BTC-leg script does not match the agreed terms - do not fund' };
   if (SWAP.btc_leg.amount < SWAP.btc_amount)
     return { ok:false, reason:`maker locked ${SWAP.btc_leg.amount} BTC atoms, less than the agreed ${SWAP.btc_amount}` };
   if (!(SWAP.btc_locktime > SWAP.seq_locktime))
@@ -366,8 +366,8 @@ async function onOpen(){
   const kv = USE_COURIER ? [
     ['You sell', C.fmtAtoms(q.seq_amount, sm.precision) + ' ' + sm.ticker],
     ['You receive', C.fmtAtoms(q.btc_amount, 8) + ' BTC'],
-    ['How it works', 'The maker locks the BTC first. Once it confirms, your wallet locks the asset, the maker takes it by revealing a secret, and your wallet uses that secret to claim the BTC — automatically. You only confirm here.'],
-    ['You commit', 'your ' + sm.ticker + ' once the maker’s BTC lock confirms — until then nothing is spent'],
+    ['How it works', 'The maker locks the BTC first. Once it confirms, your wallet locks the asset, the maker takes it by revealing a secret, and your wallet uses that secret to claim the BTC - automatically. You only confirm here.'],
+    ['You commit', 'your ' + sm.ticker + ' once the maker’s BTC lock confirms - until then nothing is spent'],
     ['If the maker stalls', 'your asset is refundable after Sequentia block T_seq (the wizard offers it)'],
     ['Settlement', 'the BTC you receive is anchor-bound to Bitcoin; it can revert only if Bitcoin itself reverts'],
   ] : [
@@ -392,7 +392,7 @@ async function onOpen(){
         LAST_RQUOTE = null;
         renderStepper();
         startPoll();
-        C.toast && C.toast('Maker locked the BTC leg — waiting for it to confirm.');
+        C.toast && C.toast('Maker locked the BTC leg - waiting for it to confirm.');
       }
     } catch (e){
       if (modal.isConnected){ st.className = 'status err'; st.textContent = 'Failed: ' + C.prettyErr(e); ok.disabled = false; }
@@ -454,12 +454,12 @@ async function driveReverse(q){
     };
     // Reject bad terms BEFORE funding: amounts must match the offer, script must
     // recompute, and the timelocks must be sane. Nothing is spent on abort.
-    if (SWAP.btc_amount !== q.btc_amount){ await failAbort(session, 'terms_mismatch', 'the maker offered fewer sats than the order — nothing was spent'); return; }
-    if (big(leg.amount) < q.btc_amount){ await failAbort(session, 'terms_mismatch', 'the maker locked less BTC than agreed — nothing was spent'); return; }
+    if (SWAP.btc_amount !== q.btc_amount){ await failAbort(session, 'terms_mismatch', 'the maker offered fewer sats than the order - nothing was spent'); return; }
+    if (big(leg.amount) < q.btc_amount){ await failAbort(session, 'terms_mismatch', 'the maker locked less BTC than agreed - nothing was spent'); return; }
     const v = verifyMakerBtcLeg();
-    if (!v.ok){ await failAbort(session, 'btc_leg_invalid', v.reason + ' — nothing was spent'); return; }
+    if (!v.ok){ await failAbort(session, 'btc_leg_invalid', v.reason + ' - nothing was spent'); return; }
     setPhase('await_btc_conf');
-    C.toast && C.toast('Maker locked the BTC leg — waiting for it to confirm.');
+    C.toast && C.toast('Maker locked the BTC leg - waiting for it to confirm.');
 
     // 4. Wait for the maker's BTC leg to confirm on our OWN node before we fund
     //    the asset (so the Sequentia leg anchors at/above it).
@@ -481,7 +481,7 @@ async function driveReverse(q){
       asset: SWAP.market.seq_asset, redeem_script: redeem, locktime: SWAP.seq_locktime,
       block_hash: conf.block_hash, anchor_height: conf.height,
     }});
-    C.toast && C.toast('Asset leg funded — waiting for the maker to reveal the secret.');
+    C.toast && C.toast('Asset leg funded - waiting for the maker to reveal the secret.');
 
     // 6. Fast path: the maker may courier a courtesy secret_revealed after it
     //    claims. Accept it only if it hashes to H (else it is worthless). The
@@ -520,7 +520,7 @@ async function waitMakerBtcConf(txid, redeemHex, tBtc){
     } catch { /* transient; keep polling */ }
     await new Promise(r => setTimeout(r, 8000));
   }
-  SWAP.state = ST.FAILED; SWAP.detail = 'the maker’s BTC lock did not confirm in time — nothing of yours was spent'; saveSwap(); renderStepper();
+  SWAP.state = ST.FAILED; SWAP.detail = 'the maker’s BTC lock did not confirm in time - nothing of yours was spent'; saveSwap(); renderStepper();
   return null;
 }
 
@@ -626,7 +626,7 @@ async function onFundSeq(){
       modal.remove();
       renderStepper();
       startPoll();
-      C.toast && C.toast('Asset leg funded and submitted — waiting for the maker to reveal the secret.');
+      C.toast && C.toast('Asset leg funded and submitted - waiting for the maker to reveal the secret.');
     } catch (e){ st.className = 'status err'; st.textContent = 'Failed: ' + C.prettyErr(e); ok.disabled = false; }
   };
 }
@@ -664,7 +664,7 @@ async function claimBtc(){
     SWAP.state = ST.BTC_CLAIMED;
     SWAP.detail = '';
     saveSwap();
-    C.toast && C.toast('BTC leg claimed — swap complete:', { href:'/testnet4/tx/'+txid, label:String(txid).slice(0,18)+'…' });
+    C.toast && C.toast('BTC leg claimed - swap complete:', { href:'/testnet4/tx/'+txid, label:String(txid).slice(0,18)+'…' });
     C.sync && C.sync().catch(()=>{});   // refresh balances (we received BTC, spent the asset)
   } finally { CLAIMING = false; }
 }
@@ -756,7 +756,7 @@ function badge(state){
     [ST.REFUNDED]:     ['Refunded', 'b-out'],
     [ST.FAILED]:       ['Failed', 'b-out'],
   };
-  return map[state] || ['—', 'b-out'];
+  return map[state] || ['-', 'b-out'];
 }
 function renderStepper(){
   const { $, el } = C;
@@ -822,14 +822,14 @@ function stepConfirmCard(){
   const done = SWAP.btc_leg_height > 0;
   const body = [ C.el('div','sub','Wait for the maker’s BTC lock to confirm so your Sequentia leg can anchor at or above it.') ];
   if (done) body.push(okLine('BTC leg confirmed at parent height ' + SWAP.btc_leg_height + '.'));
-  else if (locked) body.push(C.el('div','status','Waiting for the maker’s BTC lock to confirm — one Bitcoin block, usually 10–20 minutes on testnet4.'));
+  else if (locked) body.push(C.el('div','status','Waiting for the maker’s BTC lock to confirm - one Bitcoin block, usually 10–20 minutes on testnet4.'));
   return stepCard(2, 'BTC lock confirms', done, locked && !done, body);
 }
 function stepFundCard(){
   const ready = SWAP.btc_leg_height > 0;
   const funded = !!(SWAP.seq_leg && SWAP.seq_leg.txid);
   const active = ready && !funded && ![ST.FAILED, ST.REFUNDED].includes(SWAP.state);
-  const body = [ C.el('div','sub','Fund your asset in an HTLC the maker can take only by revealing the secret — which lets you claim the BTC.') ];
+  const body = [ C.el('div','sub','Fund your asset in an HTLC the maker can take only by revealing the secret - which lets you claim the BTC.') ];
   if (SWAP.seq_leg && SWAP.seq_leg.txid) body.push(kvRowHtml('Asset leg tx', txLink(SWAP.seq_leg.txid, false)));
   const c = stepCard(3, 'Fund the asset leg', funded, active, body);
   // Courier swaps fund automatically; only the RFQ path shows a manual button.
@@ -841,7 +841,7 @@ function stepFundCard(){
 function stepRevealCard(){
   const submitted = SWAP.state === ST.SEQ_SUBMITTED || !!SWAP.preimage || SWAP.state === ST.SEQ_CLAIMED || SWAP.state === ST.BTC_CLAIMED;
   const done = !!SWAP.preimage;
-  const body = [ C.el('div','sub','The maker runs the anchor-ordering gate, then takes your asset leg — revealing the secret on Sequentia.') ];
+  const body = [ C.el('div','sub','The maker runs the anchor-ordering gate, then takes your asset leg - revealing the secret on Sequentia.') ];
   if (SWAP.seq_claim_txid) body.push(kvRowHtml('Maker asset-claim tx', txLink(SWAP.seq_claim_txid, false)));
   if (SWAP.preimage) body.push(kvRow('Secret revealed', short(SWAP.preimage)));
   return stepCard(4, 'Maker reveals the secret', done, submitted && !done, body);
@@ -849,10 +849,10 @@ function stepRevealCard(){
 function stepClaimCard(){
   const done = SWAP.state === ST.BTC_CLAIMED || !!SWAP.btc_claim_txid;
   const canClaim = !!SWAP.preimage && !done;
-  const body = [ C.el('div','sub','Claim the maker’s BTC leg with the revealed secret — completing the swap (anchor-bounded; reverts only if Bitcoin reverts).') ];
+  const body = [ C.el('div','sub','Claim the maker’s BTC leg with the revealed secret - completing the swap (anchor-bounded; reverts only if Bitcoin reverts).') ];
   if (SWAP.btc_claim_txid) body.push(kvRowHtml('Your BTC claim tx', txLink(SWAP.btc_claim_txid, true)));
   if (SWAP.state === ST.REFUNDED) body.push(okLine('Refunded: ' + (SWAP.detail || 'your asset leg was refunded.')));
-  if (done) body.push(okLine('Swap complete — you received BTC for your asset, linked by the secret.'));
+  if (done) body.push(okLine('Swap complete - you received BTC for your asset, linked by the secret.'));
   const c = stepCard(5, 'Claim your BTC', done, canClaim, body);
   if (canClaim){
     const btn = C.el('button','primary','Claim BTC now'); btn.onclick = onClaimBtc; btn.style.marginTop = '10px'; c.appendChild(btn);
@@ -877,7 +877,7 @@ function kvRowHtml(k, html){ const d = C.el('div','kv'); d.appendChild(C.el('spa
 // Plain-HTTP is a non-secure context (no navigator.clipboard), so fall back to execCommand.
 function kvRowCopy(k, value){
   const d = C.el('div','kv'); d.appendChild(C.el('span','k',k));
-  const v = C.el('span','v'); v.textContent = value || '—';
+  const v = C.el('span','v'); v.textContent = value || '-';
   v.style.cssText = 'font-family:ui-monospace,SFMono-Regular,Menlo,monospace;word-break:break-all;cursor:pointer;user-select:all';
   v.title = 'Click to copy';
   const fb = C.el('span','',''); fb.style.cssText = 'margin-left:6px;color:#3fb950;font-size:.8em;opacity:0;transition:opacity .15s';
@@ -892,9 +892,9 @@ function kvRowCopy(k, value){
   };
   d.appendChild(v); d.appendChild(fb); return d;
 }
-function short(s){ return s ? (String(s).slice(0,10) + '…' + String(s).slice(-6)) : '—'; }
+function short(s){ return s ? (String(s).slice(0,10) + '…' + String(s).slice(-6)) : '-'; }
 function txLink(txid, parent){
-  if (!txid) return '—';
+  if (!txid) return '-';
   const href = parent ? ('/testnet4/tx/' + txid) : ('/explorer/tx/' + txid);
   return `<a href="${href}" target="_blank" rel="noopener">${short(txid)}</a>`;
 }

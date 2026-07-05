@@ -122,6 +122,42 @@ function saveMakerSwap(st){
 }
 function dropMakerSwap(sid){ try { const all = loadState(); delete all[sid]; localStorage.setItem(LS_KEY, JSON.stringify(all)); } catch {} }
 
+// T11 (fund-loss safety): on load, rehydrate persisted maker swaps and re-launch the ON-CHAIN
+// settlement/refund watcher for any that are not terminal. Closing the tab mid-settlement is
+// otherwise a silent fund-loss risk. Both watchers re-read chain state, so relaunching is
+// idempotent-safe. Returns the resumed snapshots so the composer can surface recovery UI.
+let _resumed = false;
+export async function resumeMakerSwaps(onState){
+  if (_resumed) return [];             // launch the watchers at most once per page load
+  _resumed = true;
+  const all = loadState();
+  const resumed = [];
+  for (const st of Object.values(all)){
+    if (!st || !st.state || !st.session_id) continue;
+    if (st.state === 'settled' || st.state === 'refunded'){ dropMakerSwap(st.session_id); continue; }   // terminal: clean up the stale record
+    if (st.direction === 'forward'){
+      // FORWARD: the maker LOCKED its asset leg (step 6). If the taker claims it (revealing s) the
+      // maker MUST claim the BTC leg or lose the asset for nothing — settleMakerForward does exactly
+      // that (else refunds the asset after T_seq). Nothing is at risk before the asset is locked.
+      if (!st.seq_leg){ dropMakerSwap(st.session_id); continue; }
+      resumed.push(st);
+      settleMakerForward(st, onState).catch(e => { try { onState && onState({ ...st, resume_error: (e && e.message) || String(e) }); } catch {} });
+    } else if (st.direction === 'reverse'){
+      // REVERSE: the maker LOCKED its BTC leg first and holds the secret. On resume take the SAFE
+      // path — recover the BTC via refundReverseBtc, which NEVER reveals s. It refunds after T_btc;
+      // if the taker already claimed with a revealed s the refund simply can't spend the spent output
+      // (no funds lost). TODO(browser-verify): a fuller resume could instead COMPLETE a still-live
+      // reverse buy (re-run the anchor gate + asset claim from st.secret_hex/st.seq_leg), but that
+      // tangles with the untestable anchor gate, so resume conservatively refunds.
+      if (!st.btc_leg){ dropMakerSwap(st.session_id); continue; }
+      if (st.seq_claim_txid){ dropMakerSwap(st.session_id); continue; }   // we already revealed/claimed the asset: nothing to refund
+      resumed.push(st);
+      refundReverseBtc(st, onState, st.refund_reason || 'resumed after a reload; recovering your BTC').catch(e => { try { onState && onState({ ...st, resume_error: (e && e.message) || String(e) }); } catch {} });
+    }
+  }
+  return resumed;
+}
+
 // ---------------------------------------------------------------------------
 // Offer builder: a signed FORWARD (SELL asset for BTC) cross offer. Mirrors the
 // Go buildCrossOffer (cmd/seqob-maker/main.go): pair base=asset, quote="BTC";
@@ -393,7 +429,7 @@ export async function RunMakerReverse(session, lift, offer, onState){
   let conf; try { conf = await C.seqLeg.waitConf(sleg.txid, seqRedeem); }
   catch (e){ return await refundReverseBtc(st, onState, 'taker asset leg did not confirm: ' + (e.message||e)); }
   const out = C.seqLeg.readOutput ? await C.seqLeg.readOutput(sleg.txid, conf.vout) : null;
-  if (!out){ return await refundReverseBtc(st, onState, 'could not read the taker asset leg output (blinded/unreadable) — not revealing'); }
+  if (!out){ return await refundReverseBtc(st, onState, 'could not read the taker asset leg output (blinded/unreadable) - not revealing'); }
   if (out.asset !== assetHex){ await session.fail('bad_asset', 'taker locked the wrong asset'); return await refundReverseBtc(st, onState, 'taker locked the wrong asset'); }
   if (out.value < seqAmount){ await session.fail('bad_amount', 'taker locked less than agreed'); return await refundReverseBtc(st, onState, 'taker locked less than agreed'); }
   st.seq_leg = { txid: sleg.txid, vout: conf.vout, amount: seqAmount.toString(), asset: assetHex, redeem_script: seqRedeem, locktime: seqLocktime, block_hash: conf.block_hash, seq_height: conf.height };
@@ -476,4 +512,5 @@ function nowUnix(){ return Math.floor(Date.now() / 1000); }
 function nowMs(){ return Date.now(); }
 function randHex16(){ const a = new Uint8Array(8); (crypto || window.crypto).getRandomValues(a); return [...a].map(b => b.toString(16).padStart(2,'0')).join(''); }
 
-export const __test__ = { RunMakerForward, settleMakerForward, buildForwardCrossOffer, RunMakerReverse, buildReverseCrossOffer, readPreimageOnChain, sha256Hex, setC: (c) => { C = c; } };
+export const __test__ = { RunMakerForward, settleMakerForward, buildForwardCrossOffer, RunMakerReverse, buildReverseCrossOffer, readPreimageOnChain, sha256Hex, setC: (c) => { C = c; },
+  resumeMakerSwaps, loadState, saveMakerSwap, dropMakerSwap, _resetResume: () => { _resumed = false; } };

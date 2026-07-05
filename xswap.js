@@ -284,9 +284,12 @@ function isReverseCrossOffer(o){
 // Only signature-verified offers are returned (see isForwardCrossOffer). An empty
 // side means no resting cross liquidity for that direction yet.
 export async function fetchXbook(seqAsset){
-  let offers = [];
-  try { const bk = await seqob.fetchBook(seqAsset, 'BTC'); offers = bk.offers || []; } catch { offers = []; }
-  return { forward: offers.filter(isForwardCrossOffer), reverse: offers.filter(isReverseCrossOffer) };
+  let offers = [], unreachable = false;
+  // T7: distinguish "no such cross market yet" (4xx = genuinely empty) from an unreachable relay
+  // (network/5xx). The caller uses `unreachable` to offer a retry instead of inviting a first maker.
+  try { const bk = await seqob.fetchBook(seqAsset, 'BTC'); offers = bk.offers || []; }
+  catch (e){ if (!/HTTP\s*4\d\d/.test((e && e.message) || '')) unreachable = true; offers = []; }
+  return { forward: offers.filter(isForwardCrossOffer), reverse: offers.filter(isReverseCrossOffer), unreachable };
 }
 
 // A courier quote is the chosen resting offer's size (whole-HTLC — cross lifts do
@@ -421,7 +424,7 @@ async function runForwardCourier(q){
       return;
     }
 
-    setStepStatus('lock', `Locking your ${C.fmtAtoms(fq.btc_amount,8)} BTC and waiting for 1 confirmation (about one Bitcoin block — often ~20 min on testnet4)…`, true);
+    setStepStatus('lock', `Locking your ${C.fmtAtoms(fq.btc_amount,8)} BTC and waiting for 1 confirmation (about one Bitcoin block - often ~20 min on testnet4)…`, true);
     await lockBtcLeg(fq);                 // funds + confirms the BTC HTLC; sets SWAP (PENDING) + saveSwap
     SWAP.courier = true;                  // lockBtcLeg rebuilt SWAP; restore courier identity
     SWAP.offer_id = offer.offer_id || offer.offerId;
@@ -464,7 +467,7 @@ async function runForwardCourier(q){
     const claimTxid = await claimSeq();                 // reveals the secret; state -> SEQ_CLAIMED
     setStepStatus('done', '', false);
     renderStepper();
-    C.toast && C.toast('Swap complete — ' + sm.ticker + ' claimed (anchor-bound to Bitcoin).',
+    C.toast && C.toast('Swap complete - ' + sm.ticker + ' claimed (anchor-bound to Bitcoin).',
       { href: '/explorer/tx/' + claimTxid, label: String(claimTxid).slice(0, 18) + '…' });
     session.close();
   } catch (e){
@@ -477,7 +480,7 @@ async function runForwardCourier(q){
     } else {
       // Nothing spent yet — back to the composer with an explanation.
       SWAP = null; renderStepper();
-      if ($('xswapErr')) $('xswapErr').textContent = 'Could not start the swap: ' + C.prettyErr(e) + ' — nothing was spent.';
+      if ($('xswapErr')) $('xswapErr').textContent = 'Could not start the swap: ' + C.prettyErr(e) + ' - nothing was spent.';
       if (C.onExit) C.onExit();
     }
   } finally {
@@ -487,7 +490,7 @@ async function runForwardCourier(q){
 // Seal a terms-mismatch abort into a thrown Error (the caller catches it).
 function abortTerms(session, why){
   try { session.fail('terms_mismatch', why); } catch {}
-  return new Error('Terms didn’t match the offer: ' + why + ' — nothing was spent.');
+  return new Error('Terms didn’t match the offer: ' + why + ' - nothing was spent.');
 }
 function normCourierSeqLeg(l){
   if (!l) return null;
@@ -504,7 +507,7 @@ function normCourierSeqLeg(l){
 function describeForwardFailure(e){
   const T = SWAP && SWAP.btc_locktime;
   const base = 'The swap didn’t complete: ' + C.prettyErr(e);
-  if (SWAP && SWAP.seq_claim_txid) return base + ' — but your asset was already claimed.';
+  if (SWAP && SWAP.seq_claim_txid) return base + ' - but your asset was already claimed.';
   return base + (T ? ` Your BTC is refundable after block ${T} (use “Refund BTC leg”).` : '');
 }
 // One confirmation modal with the maker's real per-lift terms; resolves true/false.
@@ -516,7 +519,7 @@ function confirmLockModal(fq, sm){
       ['You receive', C.fmtAtoms(fq.seq_amount, sm.precision) + ' ' + sm.ticker],
       ['Maker fee', C.fmtAtoms(fq.fee_btc, 8) + ' BTC'],
       ['BTC refund after', 'block ' + fq.btc_locktime + ' (if the maker stalls, you reclaim the BTC)'],
-      ['Then, automatically', 'the maker locks the asset, the wallet checks the Bitcoin anchor, and claims your asset. Anchor-bound to Bitcoin — reverts only if Bitcoin reverts.'],
+      ['Then, automatically', 'the maker locks the asset, the wallet checks the Bitcoin anchor, and claims your asset. Anchor-bound to Bitcoin - reverts only if Bitcoin reverts.'],
     ];
     const { m, ok } = C.modalRows({ title: 'Confirm cross-chain swap', kv });
     if (ok) ok.textContent = 'Lock BTC & swap';
@@ -668,7 +671,7 @@ function startCountdown(){
   const tick = () => {
     if (!LAST_XQUOTE || !LAST_XQUOTE.expires_at_unix){ el.textContent = ''; return; }
     const secs = LAST_XQUOTE.expires_at_unix - Math.floor(Date.now()/1000);
-    if (secs <= 0){ el.textContent = 'Quote expired — get a fresh quote.'; el.className = 'sub err';
+    if (secs <= 0){ el.textContent = 'Quote expired - get a fresh quote.'; el.className = 'sub err';
       if (COUNTDOWN){ clearInterval(COUNTDOWN); COUNTDOWN = null; } return; }
     el.className = 'sub'; el.textContent = `Quote valid for ${secs}s`;
   };
@@ -742,7 +745,7 @@ async function onLockBtc(){
       modal.remove();
       resetQuote();
       renderStepper();
-      C.toast && C.toast('BTC leg locked — propose the swap to the maker next.');
+      C.toast && C.toast('BTC leg locked - propose the swap to the maker next.');
     } catch (e){ st.className = 'status err'; st.textContent = 'Failed: ' + C.prettyErr(e); ok.disabled = false; }
   };
 }
@@ -816,11 +819,11 @@ function verifyLeg(){
   if (!SWAP || !SWAP.seq_leg) return { ok:false, reason:'no Sequentia leg yet' };
   const want = SWAP.market && SWAP.market.seq_asset;
   if (want && SWAP.seq_leg.asset_id !== want)
-    return { ok:false, reason:`maker locked ${C.assetMeta(SWAP.seq_leg.asset_id).ticker}, not the agreed ${C.assetMeta(want).ticker} — do not claim; refund your BTC` };
+    return { ok:false, reason:`maker locked ${C.assetMeta(SWAP.seq_leg.asset_id).ticker}, not the agreed ${C.assetMeta(want).ticker} - do not claim; refund your BTC` };
   try {
     if (SWAP.seq_amount != null && BigInt(String(SWAP.seq_leg.amount)) < BigInt(String(SWAP.seq_amount)))
-      return { ok:false, reason:'maker locked less than agreed — do not claim; refund your BTC' };
-  } catch { return { ok:false, reason:'unreadable leg amount — do not claim' }; }
+      return { ok:false, reason:'maker locked less than agreed - do not claim; refund your BTC' };
+  } catch { return { ok:false, reason:'unreadable leg amount - do not claim' }; }
   return { ok:true };
 }
 function verifyAnchor(){
@@ -1005,7 +1008,7 @@ function badge(state){
     [ST.REFUNDED]:    ['Refunded', 'b-out'],
     [ST.FAILED]:      ['Failed', 'b-out'],
   };
-  return map[state] || ['—', 'b-out'];
+  return map[state] || ['-', 'b-out'];
 }
 function setStepStatus(_step, msg, spin){
   const el = C.$('xStepStatus'); if (!el) return;
@@ -1079,7 +1082,7 @@ function kvRow(k, v){
 // textarea + execCommand trick (same as index.html's btnCopy).
 function kvRowCopy(k, value){
   const d = C.el('div','kv'); d.appendChild(C.el('span','k',k));
-  const v = C.el('span','v'); v.textContent = value || '—';
+  const v = C.el('span','v'); v.textContent = value || '-';
   v.style.cssText = 'font-family:ui-monospace,SFMono-Regular,Menlo,monospace;word-break:break-all;cursor:pointer;user-select:all';
   v.title = 'Click to copy';
   const fb = C.el('span','',''); fb.style.cssText = 'margin-left:6px;color:#3fb950;font-size:.8em;opacity:0;transition:opacity .15s';
@@ -1094,9 +1097,9 @@ function kvRowCopy(k, value){
   };
   d.appendChild(v); d.appendChild(fb); return d;
 }
-function short(s){ return s ? (String(s).slice(0,10) + '…' + String(s).slice(-6)) : '—'; }
+function short(s){ return s ? (String(s).slice(0,10) + '…' + String(s).slice(-6)) : '-'; }
 function txLink(txid, parent){
-  if (!txid) return '—';
+  if (!txid) return '-';
   const href = parent ? ('/testnet4/tx/' + txid) : ('/explorer/tx/' + txid);
   return `<a href="${href}" target="_blank" rel="noopener">${short(txid)}</a>`;
 }
@@ -1148,9 +1151,9 @@ function stepAnchorCard(){
     body.push(kvRow('Sequentia anchor_height', String(SWAP.seq_leg.anchor_height)));
     body.push(kvRow('Your BTC-leg height', String(SWAP.btc_leg.height)));
     if (gate.ok){
-      body.push(okLine(`Anchor verified: anchor_height ${gate.anchor_height} ≥ your BTC-leg height ${gate.btc_height} — the Sequentia leg is bound to a Bitcoin block ≥ your BTC lock, so it can't outlive your BTC.`));
+      body.push(okLine(`Anchor verified: anchor_height ${gate.anchor_height} ≥ your BTC-leg height ${gate.btc_height} - the Sequentia leg is bound to a Bitcoin block ≥ your BTC lock, so it can't outlive your BTC.`));
     } else {
-      body.push(errLine('Anchor NOT verified: ' + (gate.reason || 'ordering not satisfied') + ' — do NOT claim; refund the BTC leg after T_btc instead.'));
+      body.push(errLine('Anchor NOT verified: ' + (gate.reason || 'ordering not satisfied') + ' - do NOT claim; refund the BTC leg after T_btc instead.'));
     }
   }
   return stepCard(3, 'Verify anchor ordering', done, have && !done, body);
@@ -1160,7 +1163,7 @@ function stepClaimCard(){
   const gate = have ? verifyAnchor() : { ok:false };
   const claimed = !!(SWAP.seq_claim_txid) || SWAP.state === ST.SEQ_CLAIMED || SWAP.state === ST.BTC_CLAIMED;
   const active = have && gate.ok && !claimed;
-  const body = [ C.el('div','sub','Claim the Sequentia leg with your secret. This reveals the secret on-chain so the maker can claim your BTC — completing the atomic swap.') ];
+  const body = [ C.el('div','sub','Claim the Sequentia leg with your secret. This reveals the secret on-chain so the maker can claim your BTC - completing the atomic swap.') ];
   if (SWAP.seq_claim_txid) body.push(kvRowHtml('Sequentia claim tx', txLink(SWAP.seq_claim_txid, false)));
   const c = stepCard(4, 'Claim Sequentia leg', claimed, active, body);
   // Courier swaps claim automatically while the session is live; a manual button
@@ -1181,12 +1184,12 @@ function stepDoneCard(){
   // wallet does not poll for. The RFQ path waits for the on-chain BTC_CLAIMED.
   const done = SWAP.state === ST.BTC_CLAIMED || (SWAP.courier && SWAP.state === ST.SEQ_CLAIMED);
   const body = [ C.el('div','sub', SWAP.courier
-    ? 'You have your asset. The maker uses your revealed secret to claim the BTC leg, finishing their side; your asset is settled (anchor-bound to Bitcoin — reverts only if Bitcoin does).'
+    ? 'You have your asset. The maker uses your revealed secret to claim the BTC leg, finishing their side; your asset is settled (anchor-bound to Bitcoin - reverts only if Bitcoin does).'
     : 'The maker extracts your revealed secret and claims the BTC leg. The swap is then complete (anchor-bounded; reorgs only if Bitcoin does).') ];
   if (SWAP.btc_claim_txid) body.push(kvRowHtml('BTC claim tx (maker)', txLink(SWAP.btc_claim_txid, true)));
   if (SWAP.preimage) body.push(kvRow('Preimage revealed', short(SWAP.preimage)));
   if (SWAP.state === ST.REFUNDED){ body.push(okLine('Refunded: ' + (SWAP.detail || 'the BTC leg was refunded to you.'))); }
-  if (done) body.push(okLine(SWAP.courier ? 'Swap complete — your asset is claimed and settled.' : 'Swap complete — both legs settled, linked by your secret.'));
+  if (done) body.push(okLine(SWAP.courier ? 'Swap complete - your asset is claimed and settled.' : 'Swap complete - both legs settled, linked by your secret.'));
   return stepCard(5, 'Done', done, !done && SWAP.state === ST.SEQ_CLAIMED, body);
 }
 

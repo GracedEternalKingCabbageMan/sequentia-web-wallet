@@ -155,5 +155,54 @@ ok(revealed && revealed.preimage === secretR, 'reverse: maker sends secret_revea
 ok(resR && resR.settled === true && resR.seq_claim_txid === 'seq_claim_txid', 'reverse: RunMakerReverse reports settled');
 ok(!sentR.some(m => m.type === 'fail'), 'reverse: no XcFail on the happy path');
 
+// ===========================================================================
+// T11 resume: on load, re-launch the on-chain settlement/refund watcher for any
+// NON-terminal persisted maker swap (fund-loss safety), and clean up records that
+// are terminal or never committed maker funds. Needs a localStorage shim (node has
+// none, so the earlier emits were no-ops — we seed a fresh store here).
+// ===========================================================================
+const _store = new Map();
+globalThis.localStorage = {
+  getItem: (k) => (_store.has(k) ? _store.get(k) : null),
+  setItem: (k, v) => { _store.set(k, String(v)); },
+  removeItem: (k) => { _store.delete(k); },
+};
+const secretFwd = '11'.repeat(32), hashFwd = sha256Hex(secretFwd);
+const secretRev = '22'.repeat(32), hashRev = sha256Hex(secretRev);
+let fwdClaim = null, revRefund = null;
+const fakeC3 = {
+  SEQOB: '/seqob',
+  btcTip: async () => 142600,   // >= the reverse btc_locktime -> refund fires immediately
+  seqTip: async () => 16500,    // < the forward seq_locktime -> forward stays on the claim path
+  readPreimage: async (_txid, _vout, h) => (h.toLowerCase() === hashFwd.toLowerCase() ? secretFwd : null),
+  btcLeg: { claim: async (a) => { fwdClaim = a; return 'fwd_btc_claim'; },
+            refund: async (a) => { revRefund = a; return 'rev_btc_refund'; } },
+  seqLeg: { refund: async () => 'seq_refund' },
+};
+initXmaker(fakeC3); __test__.setC(fakeC3);
+
+const seed = (o) => __test__.saveMakerSwap(o);
+seed({ direction: 'forward', state: 'seq_locked', session_id: 'fwdA', offer_id: 'ofA', asset: 'GOLDHEX',
+  seq_amount: '5000000', btc_amount: '25000', hash_hex: hashFwd,
+  seq_leg: { txid: 'seqfund', vout: 0, amount: '5000000', asset: 'GOLDHEX', redeem_script: 'r', locktime: 16740 },
+  btc_leg: { txid: 'takerbtc', vout: 0, amount: '25000', redeem_script: 'r', locktime: 142600 },
+  seq_locktime: 16740, btc_locktime: 142600, maker_seq_refund: { public_key: 'x', secret_hex: 'bb'.repeat(32) } });
+seed({ direction: 'reverse', state: 'seq_verified', session_id: 'revA', offer_id: 'ofR', asset: 'GOLDHEX',
+  seq_amount: '5000000', btc_amount: '25000', hash_hex: hashRev, secret_hex: secretRev,
+  btc_leg: { txid: 'makerbtc', vout: 0, amount: '25000', redeem_script: 'r', locktime: 142600 },
+  btc_locktime: 142600, maker_btc_refund: { public_key: 'y', secret_hex: 'ff'.repeat(32) } });
+seed({ direction: 'forward', state: 'settled', session_id: 'termA' });   // terminal -> dropped, not resumed
+seed({ direction: 'forward', state: 'terms', session_id: 'noleg' });     // no asset locked yet -> dropped
+
+__test__._resetResume();
+const resumed = await __test__.resumeMakerSwaps(() => {});
+await new Promise(r => setTimeout(r, 60));   // let the fire-and-forget watchers finish (fakes resolve immediately)
+
+ok(resumed.length === 2, 'resume relaunches exactly the 2 fund-at-risk swaps (not terminal, not un-committed)');
+ok(resumed.some(s => s.session_id === 'fwdA') && resumed.some(s => s.session_id === 'revA'), 'resume picks the forward(seq-locked) + reverse(btc-locked) records');
+ok(fwdClaim && fwdClaim.preimage === secretFwd && fwdClaim.txid === 'takerbtc', 'forward resume claims the taker BTC leg with the on-chain-revealed secret (no fund loss)');
+ok(revRefund && revRefund.txid === 'makerbtc', 'reverse resume refunds the maker BTC leg (safe path; never reveals s)');
+ok(Object.keys(__test__.loadState()).length === 0, 'after resume all records are terminal/cleaned (settled+refunded dropped, stale removed)');
+
 console.log(fails === 0 ? '\nALL PASS' : `\n${fails} FAILED`);
 process.exit(fails === 0 ? 0 : 1);
