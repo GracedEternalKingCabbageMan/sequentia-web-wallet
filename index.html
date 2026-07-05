@@ -17,6 +17,10 @@
   .mark{width:42px;height:42px;border-radius:50%;display:block}
   h1{font-size:21px;margin:0;letter-spacing:-.01em}
   .net{font-size:12px;color:var(--amber2);border:1px solid var(--line);border-radius:999px;padding:2px 10px;margin-left:auto}
+  .lnpill{margin-left:8px;color:var(--sub)}
+  .lnpill.ln-ready{color:#7ee0a0;border-color:#2f6b45}
+  .lnpill.ln-warn{color:var(--amber2)}
+  .lnpill.ln-err{color:#e08a8a;border-color:#6b2f2f}
   .tip{font-size:11.5px;color:var(--dim);margin-left:8px}
   .card{background:var(--panel);border:1px solid var(--line);border-radius:16px;padding:20px;margin-top:16px}
   .muted{color:var(--dim);font-size:14px}
@@ -136,6 +140,10 @@
   .swmeta{display:flex;flex-direction:column;gap:14px}
   .swmeta-row{display:flex;align-items:baseline;justify-content:space-between;gap:12px;flex-wrap:wrap}
   #swRate{color:var(--txt);font-size:13.5px}
+  .swroutemode{display:flex;gap:8px}
+  .swrail{flex:1;padding:9px 12px;border:1px solid var(--line);border-radius:10px;background:var(--panel2);color:var(--sub);font-size:13px;cursor:pointer;transition:.12s}
+  .swrail:hover{border-color:var(--accent)}
+  .swrail.sel{border-color:var(--accent);color:var(--txt);background:var(--panel);box-shadow:inset 0 0 0 1px var(--accent)}
   .swfee{border:1px solid var(--line);border-radius:12px;padding:12px 14px;background:var(--panel2)}
   .swfee-head{display:flex;align-items:baseline;gap:10px;flex-wrap:wrap}
   .swfee-body{display:flex;align-items:center;gap:12px;margin-top:9px;flex-wrap:wrap}
@@ -187,6 +195,7 @@
     <img class="mark" src="./sequentia-mark.png" alt="Sequentia">
     <h1>Sequentia Wallet</h1>
     <span class="net" id="net">testnet</span>
+    <span class="net lnpill hide" id="lnStatus" title="Lightning device signer status">⚡ LN</span>
   </div>
   <div class="sub" id="tipline">A self-custodial wallet powered by SWK (Sequentia Wallet Kit), running entirely in your browser.</div>
 
@@ -378,6 +387,14 @@
             <span class="sub" id="swRoute"></span>
           </div>
 
+          <!-- BTC<->asset: choose the settlement rail. Instant Lightning (pure-LN,
+               non-custodial via the hosted-signer LSP) vs on-chain HTLC. Shown only
+               when a BTC<->asset pair is selected and the on-device signer is live. -->
+          <div class="swroutemode hide" id="swRouteMode">
+            <button type="button" class="swrail sel" id="swRailCross" data-rail="cross">On-chain HTLC</button>
+            <button type="button" class="swrail" id="swRailLn" data-rail="ln">⚡ Instant (Lightning)</button>
+          </div>
+
           <!-- open fee market: pay the network fee in any asset the node prices -->
           <div class="swfee" id="swFeeRow">
             <div class="swfee-head">
@@ -544,6 +561,8 @@ import { initSwap, renderSwap, resumeCrossMakers } from './swap.js';
 import { initXswap, renderXswap, fetchXmarkets, fetchXquote, fetchXbook, openFromComposer, hasInFlight } from './xswap.js';
 import { initXrswap, fetchRQuote, openReverseFromComposer, hasInFlight as hasReverseInFlight, renderReverse } from './xrswap.js';
 import { initXmaker, startForwardMaker, startReverseMaker, liveMakerOffers, resumeMakerSwaps } from './xmaker.js';
+import { initSeqln, connectDevice as lnConnectDevice, disconnectDevice as lnDisconnect,
+  onSeqlnStatus, seqlnState, seqlnAvailable, seqlnGetStatus, seqlnSwap, lnFinalityCopy } from './seqln.js';
 
 const ESPLORA = location.origin + '/api';
 const KEY = 'swk.sequentia.mnemonic';
@@ -1259,6 +1278,49 @@ async function openWallet(phrase){
   // T11: after the wallet is up, re-launch any maker settlement/refund watcher that a prior session
   // persisted mid-flow (fund-loss safety) and surface the interrupted swap for recovery.
   try{ resumeCrossMakers(); }catch(e){ console.warn('[resume] cross-maker resume failed:', e?.message??e); }
+  // Lightning (LSP): bring the on-device signer online so the "Instant (Lightning)"
+  // swap rail becomes available. Non-fatal + opt-in: if the wss endpoint / host key
+  // aren't configured, LN stays off and the composer uses the on-chain rail.
+  try{ initLightning(phrase); }catch(e){ console.warn('[ln] init failed:', e?.message??e); }
+}
+
+// ---------- Lightning (hosted-SeqLN LSP) ----------
+// Derive a stable per-wallet device transport (Noise) private key from the seed,
+// so it survives across sessions and is recoverable from the mnemonic. In a full
+// build this pubkey is registered with the LSP at onboarding; SEQ_LSP_DEV_KEY
+// overrides it for local pinning against a fixed harness node.
+function lnDeviceTransportPriv(phrase){
+  const override = (typeof window!=='undefined') && window.SEQ_LSP_DEV_KEY;
+  if (override && /^[0-9a-fA-F]{64}$/.test(override)) return override.toLowerCase();
+  const seed = mnemonicToSeedSync(phrase.trim().replace(/\s+/g,' '));
+  const k = HDKey.fromMasterSeed(seed).derive("m/1017'/0'/0'");
+  return [...k.privateKey].map(b=>b.toString(16).padStart(2,'0')).join('');
+}
+function lnStatusPill(){
+  const el = $('lnStatus'); if (!el) return;
+  const st = seqlnState();
+  const wsCfg = (typeof window!=='undefined') && window.SEQ_LSP_WS;
+  if (!wsCfg){ el.classList.add('hide'); return; }   // LN not deployed for this wallet
+  el.classList.remove('hide');
+  el.className = 'net lnpill ' + (st.connected ? 'ln-ready' : (st.phase==='error' ? 'ln-err' : 'ln-warn'));
+  el.textContent = st.connected ? '⚡ LN ready' : '⚡ LN ' + (st.phase||'…');
+  el.title = 'Lightning device signer: ' + st.phase + (st.detail?(' — '+st.detail):'');
+  // Re-quote the composer so the "Instant (Lightning)" rail appears/disappears live.
+  try{ if(typeof renderSwap==='function' && $('swReview')) renderSwap(); }catch{}
+}
+function initLightning(phrase){
+  initSeqln();                       // reads window.SEQ_LSP_URL / _WS / _HOST_PUBKEY / _TOKEN
+  onSeqlnStatus(() => lnStatusPill());
+  lnStatusPill();
+  const wsCfg = (typeof window!=='undefined') && window.SEQ_LSP_WS;
+  const hostPub = (typeof window!=='undefined') && window.SEQ_LSP_HOST_PUBKEY;
+  if (!wsCfg || !hostPub) return;    // LN not deployed here; composer stays on-chain-only
+  const mnemonic = ((typeof window!=='undefined') && window.SEQ_LSP_DEV_MNEMONIC) || phrase;
+  const deviceTransportPrivkey = lnDeviceTransportPriv(phrase);
+  const policy = ((typeof window!=='undefined') && window.SEQ_LSP_POLICY) || 'permissive';
+  lnConnectDevice({ mnemonic, deviceTransportPrivkey, policy })
+    .then((id)=>{ if(id) console.log('[ln] device signer serving hosted node', id); })
+    .catch((e)=> console.warn('[ln] connect failed:', e?.message??e));
 }
 // Hand the Swap module everything it needs from the app: the wasm classes, the
 // live wallet/signer/network handles (read fresh via getters so a re-open keeps
@@ -1358,6 +1420,15 @@ function initSwapTab(){
       openReverseFromComposer: (q) => openReverseFromComposer(q),
       hasReverseInFlight: () => hasReverseInFlight(),
       renderReverse: () => renderReverse(),
+    },
+    // Instant Lightning (pure-LN) rail: the composer's "Instant (Lightning)"
+    // route for a BTC<->asset pair. Non-custodial via the hosted-signer LSP (the
+    // device co-signs; the LSP commands the hosted node to take a pure-LN offer).
+    ln: {
+      available: () => seqlnAvailable(),
+      status: () => seqlnGetStatus(),
+      swap: (p) => seqlnSwap(p),
+      finalityCopy: () => lnFinalityCopy(),
     },
   });
 }

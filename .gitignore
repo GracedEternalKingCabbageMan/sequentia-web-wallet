@@ -2,3 +2,8 @@
 # Symlinked/copied in at deploy; not tracked.
 pkg
 pkg/
+# EXCEPTION: the vendored SeqLN Tier-2 device-signer wasm (the Lightning module's
+# on-device signer) IS tracked. It is a different artifact from the lwk_wasm pkg
+# and ships with the wallet so the "Instant (Lightning)" route works.
+!lightning/pkg/
+!lightning/pkg/**

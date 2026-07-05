@@ -34,6 +34,7 @@ import { secp256k1 } from './btc.js';
 
 let C = null;            // injected app context (see index.html initSwapTab)
 let X = null;            // the cross-chain route handle ({ openFromComposer, renderXswap, hasInFlight })
+let L = null;            // the Lightning (LSP) route handle ({ available, swap, status, finalityCopy })
 let MARKETS = [];        // legacy RFQ markets (kept only to seed the picker; routing is order-book)
 let XMARKETS = [];       // cross-chain: [{ btc_asset, seq_asset, ... }] (BTC<->asset)
 let LAST_QUOTE = null;   // the priced/oriented same-chain legs for the current composer state
@@ -62,6 +63,7 @@ const S = {
   edited: 'pay',          // which side the user last typed ('pay' | 'receive')
   feeAsset: null,         // chosen fee asset hex (defaults to POLICY_HEX)
   quoting: false,
+  rail: 'cross',          // BTC<->asset settlement rail: 'cross' (on-chain HTLC) | 'ln' (instant Lightning)
 };
 
 const TRADE_TYPE = { BUY: 0, SELL: 1 };   // seqdex.v1 TradeType enum
@@ -102,6 +104,7 @@ function normMarket(m){
 export function initSwap(ctx){
   C = ctx;
   X = ctx.xroute || null;     // cross-chain bridge wired in index.html (see initSwapTab)
+  L = ctx.ln || null;         // Lightning (LSP) bridge wired in index.html (see initSwapTab)
   seqob.setSeqobBase(C.SEQOB || '/seqob');   // the order-book relay (same-origin proxy)
   const { $ } = C;
   if ($('swReview') && !$('swReview')._wired){
@@ -112,6 +115,10 @@ export function initSwap(ctx){
     $('swPayPick').onclick  = () => openPicker('pay');
     $('swRecvPick').onclick = () => openPicker('receive');
     $('swFeePick').onclick  = openFeePicker;
+    // Instant-Lightning vs on-chain-HTLC rail chooser (shown only for a BTC<->asset
+    // pair when the on-device signer is live).
+    if ($('swRailLn'))    $('swRailLn').onclick    = () => setRail('ln');
+    if ($('swRailCross')) $('swRailCross').onclick = () => setRail('cross');
     if ($('swXBack')) $('swXBack').onclick = () => { showCross(false); renderSwap(); };
     // Live re-quote as the user types. The edited side is the "fixed" leg; the
     // other side is quoted. Debounced so we don't hammer the daemon per keystroke.
@@ -250,11 +257,17 @@ function findRoute(pay, receive){
   if (btc){
     const seqAsset = pay === 'BTC' ? receive : pay;
     if (seqAsset === 'BTC') return null;   // BTC<->BTC is not a market
+    const payIsBtc = pay === 'BTC';
+    // Instant Lightning rail: a pure-LN asset<->BTC trade over the hosted-signer
+    // LSP (keys on device, non-custodial). Offered only when the on-device signer
+    // is actually serving; otherwise fall through to the on-chain HTLC rail.
+    if (S.rail === 'ln' && L && L.available && L.available())
+      return { kind: 'ln', seqAsset, payIsBtc };
     // Cross-chain order book: ANY BTC<->asset pair is routable. It may have no
     // resting cross offers yet (the book then shows empty). A live RFQ market, if
     // any, is attached only for its cached price; it is no longer required.
     const xm = XMARKETS.find(m => m.seq_asset === seqAsset) || null;
-    return { kind: 'cross', seqAsset, xm, payIsBtc: pay === 'BTC' };
+    return { kind: 'cross', seqAsset, xm, payIsBtc };
   }
   // Same-chain order book: ANY two distinct Sequentia assets form a market. It may
   // have no resting offers yet, in which case the user can start it by posting one.
@@ -303,6 +316,34 @@ function paintPanes(){
   $('swMax').style.display = (S.payAsset && S.payAsset !== 'BTC' && balAtoms(S.payAsset) > 0n) ? '' : 'none';
   paintRefHints();
   paintRouteLine();
+  updateRailToggle();
+}
+
+// Show the Instant-Lightning / on-chain-HTLC rail chooser only for a BTC<->asset
+// pair when the on-device signer is live; otherwise hide it and fall back to the
+// on-chain cross rail so an unconfigured wallet behaves exactly as before.
+function updateRailToggle(){
+  const box = C.$('swRouteMode'); if (!box) return;
+  const pay = S.payAsset, receive = S.receiveAsset;
+  const btcPair = pay && receive && pay !== receive
+    && ((pay === 'BTC') !== (receive === 'BTC'));   // exactly one side is BTC
+  const lnOk = !!(L && L.available && L.available());
+  if (btcPair && lnOk){
+    box.classList.remove('hide');
+    const ln = C.$('swRailLn'), cr = C.$('swRailCross');
+    if (ln) ln.classList.toggle('sel', S.rail === 'ln');
+    if (cr) cr.classList.toggle('sel', S.rail !== 'ln');
+  } else {
+    box.classList.add('hide');
+    if (S.rail === 'ln') S.rail = 'cross';   // LN not applicable here
+  }
+}
+function setRail(r){
+  if (S.rail === r) return;
+  S.rail = r;
+  LAST_QUOTE = null; setReviewEnabled(false);
+  updateRailToggle();
+  requote();
 }
 function paintRefHints(){
   // Re-value the "≈ <ref>" hints against the current asset + typed amount. The
@@ -335,6 +376,8 @@ function paintRouteLine(){
   }
   $('swRoute').textContent = route.kind === 'cross'
     ? (route.payIsBtc ? 'Cross-chain · buy with BTC' : 'Cross-chain · sell for BTC')
+    : route.kind === 'ln'
+    ? (route.payIsBtc ? 'Lightning · instant buy' : 'Lightning · instant sell')
     : 'Same-chain · order book';
   // The rate line is filled by the quote (showQuote / showXRate); a placeholder until then.
   if (!LAST_QUOTE) $('swRate').textContent = '1 ' + tk(S.payAsset) + ' = … ' + tk(S.receiveAsset);
@@ -386,6 +429,7 @@ async function requote(){
   // Do NOT bail on an empty amount: requoteSame/requoteCross fetch and RENDER the
   // order book first (so it is visible the moment a pair is chosen), then quote
   // only if an amount is present.
+  if (route.kind === 'ln') return requoteLn(route, amtStr);
   if (route.kind === 'cross') return requoteCross(route, amtStr);
   return requoteSame(route, amtStr);
 }
@@ -746,10 +790,11 @@ function paintFee(feeAssetHex, feeAtoms, noteOverride){
   const ref = (feeAtoms != null) ? (C.refValueStr(feeAssetHex, feeAtoms) || '') : '';
   $('swFeeRef').textContent = ref;
   $('swFeeNote').textContent = noteOverride || 'Pay the fee in any asset the network prices.';
-  // The fee picker is disabled for the cross-chain (BTC-only) leg.
-  const cross = LAST_QUOTE && LAST_QUOTE.kind === 'cross';
-  $('swFeePick').disabled = !!cross;
-  $('swFeePick').style.opacity = cross ? '.5' : '';
+  // The fee picker is disabled for the cross-chain (BTC-only) leg AND the LN leg
+  // (its cost is the LP spread baked into the rate, not a taker-funded network fee).
+  const noFee = LAST_QUOTE && (LAST_QUOTE.kind === 'cross' || LAST_QUOTE.kind === 'ln');
+  $('swFeePick').disabled = !!noFee;
+  $('swFeePick').style.opacity = noFee ? '.5' : '';
 }
 
 // An asset is acceptable for fees if the node publishes a rate for it. Native is
@@ -812,7 +857,11 @@ function feeAssetSubline(hex){
 // ---------------------------------------------------------------------------
 function setFinality(kind){
   const t = C.$('swFinText'); if (!t) return;
-  t.textContent = kind === 'cross'
+  // Pure-LN is the ONLY state the DEX 0-conf policy lets us call "final" (nothing
+  // on-chain, no reorg surface). Everything else stays anchor-honest.
+  t.textContent = kind === 'ln'
+    ? (L && L.finalityCopy ? L.finalityCopy() : 'Instant and final · pure Lightning, nothing on-chain, no Bitcoin-reorg risk.')
+    : kind === 'cross'
     ? 'Settles across both chains · the Sequentia leg is anchor-bound to Bitcoin (reverts only if Bitcoin reverts).'
     : 'Settles in ~1 block · anchor-bound to Bitcoin (reverts only if Bitcoin reverts).';
 }
@@ -924,6 +973,7 @@ async function onReview(){
   const q = LAST_QUOTE;
   if (!q){ $('swErr').textContent = 'Enter an amount to get a quote first.'; return; }
   if (q.kind === 'cross-make') return postCrossOfferReview(q);
+  if (q.kind === 'ln') return reviewLn(q);
   if (q.kind === 'cross') return reviewCross(q);
   return reviewSame(q);
 }
@@ -1110,6 +1160,60 @@ async function reviewCross(q){
   if (!X.openFromComposer){ $('swErr').textContent = 'Cross-chain route unavailable in this build.'; return; }
   showCross(true);
   X.openFromComposer(q.xq);   // seeds LAST_XQUOTE in xswap.js + renders the lock step
+}
+
+// --- Instant Lightning (pure-LN) rail -------------------------------------
+// A resting LN offer is taken at the LP's fixed terms (§8.6: dynamic per-lift
+// pricing is a later refinement), so there is no per-keystroke quote round-trip
+// here — we render the rail + the honest (final) finality and enable Review. The
+// actual amounts come back in the settle response.
+async function requoteLn(route, amtStr){
+  const { $ } = C;
+  const side = route.payIsBtc ? 'buy' : 'sell';
+  LAST_QUOTE = { kind: 'ln', side, seqAsset: route.seqAsset, payIsBtc: route.payIsBtc,
+    amount: amtStr ? parseFloat(amtStr) : null };
+  setFinality('ln');
+  paintFee('BTC', null, 'The rate includes the LP spread; there is no separate network fee on the Lightning leg.');
+  const am = C.assetMeta(route.seqAsset);
+  $('swRate').textContent = `Instant ${am.ticker}/BTC over Lightning · rate includes the LP spread`;
+  $('swRoute').textContent = route.payIsBtc ? 'Lightning · instant buy' : 'Lightning · instant sell';
+  const book = $('swBook'); if (book) book.innerHTML = '';   // no on-chain order book on the LN rail
+  $('swStatus').textContent = ''; $('swErr').textContent = '';
+  setReviewEnabled(true);
+}
+
+// Execute the pure-LN swap through the LSP (the device co-signs the hosted node's
+// commitment updates over the wss link during the call). Honest finality: pure-LN
+// is the one state we may call final.
+async function reviewLn(q){
+  const { $ } = C;
+  if (!L || !L.swap){ $('swErr').textContent = 'The Lightning route is unavailable in this build.'; return; }
+  const am = C.assetMeta(q.seqAsset);
+  const dir = q.side === 'buy' ? `Buy ${am.ticker} with BTC` : `Sell ${am.ticker} for BTC`;
+  const kv = [
+    ['Route', 'Instant Lightning (pure-LN) · non-custodial, your keys stay on this device'],
+    ['Direction', dir],
+    ['Pricing', 'Best resting Lightning offer · rate includes the LP spread (no separate network fee)'],
+    ['Finality', L.finalityCopy ? L.finalityCopy() : 'Instant and final · pure Lightning, nothing on-chain, no Bitcoin-reorg risk.'],
+    ['If it stalls', 'Nothing moves · the swap unwinds atomically via the Lightning hold timeout.'],
+  ];
+  const { m: modal, ok, st } = C.modalRows({ title: 'Review Lightning swap', kv });
+  ok.onclick = async () => {
+    ok.disabled = true; st.className = 'status'; st.innerHTML = '<span class="spin"></span>Settling over Lightning…';
+    try {
+      const r = await L.swap({ side: q.side, asset: q.seqAsset, amount: q.amount });
+      const bm = C.assetMeta(r.asset || q.seqAsset);
+      const got = (r.direction === 'sold') ? `${r.quote_amount} BTC`
+        : `${r.base_amount} ${bm.ticker}`;
+      modal.remove();
+      C.toast(`Lightning swap settled (final): received ${got} · preimage ${String(r.preimage || '').slice(0, 16)}…`);
+      resetComposer();
+      await C.sync();
+      renderSwap();
+    } catch (e){
+      st.className = 'status err'; st.textContent = 'Failed: ' + C.prettyErr(e); ok.disabled = false;
+    }
+  };
 }
 
 function resetComposer(){
