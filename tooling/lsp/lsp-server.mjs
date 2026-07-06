@@ -11,19 +11,27 @@
 //        -> `seqob-cli xpln` against the hosted node's lightning-rpc; the two LN
 //           legs settle on one preimage while the device signs each commitment
 //           update; returns {preimage, amounts}.
-//   GET  /status  -> hosted node id + per-asset channel balances.
+//   GET  /status  -> both hosted nodes' ids + per-asset channel balances.
 //   GET  /health  (no auth) -> {ok:true}
+//
+// Topology: the real cross-chain shape uses TWO hosted nodes — an asset node
+// (holds the GOLD channel, Sequentia) and a BTC node (holds the BTC channel,
+// testnet4 real BTC-LN). The two legs settle atomically on one preimage. A
+// one-node stand-in (HOSTED_RPC alone) is still supported for backward compat.
 //
 // Auth: a single static bearer token (LSP_TOKEN). PRODUCTION: replace with
 // per-wallet auth (a RUNE / signed challenge bound to the device pubkey).
 //
 // Deploy config (env; machine-specific paths are REQUIRED, no laptop defaults):
 //   LSP_PORT, LSP_TOKEN
-//   LNCLI        path to lightning-cli
-//   HOSTED_RPC   path to the hosted node's lightning-rpc socket
-//   SEQOB_CLI    path to seqob-cli
-//   RELAY        seqobd relay base URL (default http://127.0.0.1:9955)
-//   GOLD, BTCX   the tradeable pair's asset ids (BTCX = the BTC/stand-in leg)
+//   LNCLI              path to lightning-cli
+//   HOSTED_ASSET_RPC   the asset (GOLD/Sequentia) hosted node's lightning-rpc
+//   HOSTED_BTC_RPC     the BTC (testnet4) hosted node's lightning-rpc
+//   HOSTED_RPC         fallback for BOTH of the above (one-node stand-in mode)
+//   SEQOB_CLI          path to seqob-cli
+//   RELAY              seqobd relay base URL (default http://127.0.0.1:9955)
+//   GOLD               the tradeable asset id
+//   BTCX               the BTC-leg asset id; UNSET/empty => real BTC-LN (-btc-asset "")
 //
 // The full laptop bring-up (keyless hosted node + WS relay + seqobd + LP maker +
 // channels + a Node end-to-end proof through the wallet SDK) lives in the harness
@@ -38,17 +46,24 @@ function reqEnv(name) {
   return v;
 }
 
+const hostedRpcFallback = process.env.HOSTED_RPC || '';
 const CFG = {
   port: Number(process.env.LSP_PORT || 9981),
   token: process.env.LSP_TOKEN || 'devtoken-lsp',
   lncli: reqEnv('LNCLI'),
-  hostedRpc: reqEnv('HOSTED_RPC'),
+  // Real cross-chain: two hosted nodes. HOSTED_RPC is a one-node fallback for both.
+  hostedAssetRpc: process.env.HOSTED_ASSET_RPC || hostedRpcFallback,
+  hostedBtcRpc: process.env.HOSTED_BTC_RPC || hostedRpcFallback,
   seqobCli: reqEnv('SEQOB_CLI'),
   relay: process.env.RELAY || 'http://127.0.0.1:9955',
   gold: reqEnv('GOLD'),
-  btcx: reqEnv('BTCX'),
+  btcx: process.env.BTCX || '', // empty => real BTC-LN (seqob-cli -btc-asset "")
   swapTimeoutMs: Number(process.env.LSP_SWAP_TIMEOUT_MS || 150000),
 };
+if (!CFG.hostedAssetRpc || !CFG.hostedBtcRpc) {
+  console.error('[lsp] missing hosted RPC: set HOSTED_ASSET_RPC + HOSTED_BTC_RPC (or HOSTED_RPC as a fallback for both)');
+  process.exit(2);
+}
 
 const ASSET_ALIAS = { GOLD: CFG.gold, gold: CFG.gold, BTC: CFG.btcx };
 function resolveAsset(a) {
@@ -63,9 +78,9 @@ function assetLabel(id) {
   return id.slice(0, 8) + '…';
 }
 
-function lnrpc(method, args = []) {
+function lnrpc(method, args = [], rpc = CFG.hostedAssetRpc) {
   return new Promise((resolve, reject) => {
-    execFile(CFG.lncli, [`--rpc-file=${CFG.hostedRpc}`, method, ...args],
+    execFile(CFG.lncli, [`--rpc-file=${rpc}`, method, ...args],
       { maxBuffer: 8 << 20 }, (err, stdout) => {
         if (err) return reject(new Error(`${method}: ${err.message}`));
         try { resolve(JSON.parse(stdout)); } catch { reject(new Error(`${method}: bad json`)); }
@@ -73,11 +88,11 @@ function lnrpc(method, args = []) {
   });
 }
 
-async function status() {
-  const info = await lnrpc('getinfo');
+async function nodeStatus(rpc, leg) {
+  const info = await lnrpc('getinfo', [], rpc);
   let channels = [];
   try {
-    const pc = await lnrpc('listpeerchannels');
+    const pc = await lnrpc('listpeerchannels', [], rpc);
     channels = (pc.channels || [])
       .filter((c) => String(c.state).startsWith('CHANNELD'))
       .map((c) => {
@@ -86,6 +101,7 @@ async function status() {
         const receivable = Math.round((c.receivable_msat
           ?? ((c.total_msat ?? 0) - (c.to_us_msat ?? 0))) / 1000);
         return {
+          leg,
           peer_id: (c.peer_id || '').slice(0, 16),
           short_channel_id: c.short_channel_id || null,
           state: c.state, asset, asset_label: assetLabel(asset),
@@ -93,8 +109,23 @@ async function status() {
         };
       });
   } catch { /* pre-channel */ }
-  return { ok: true, node_id: info.id, alias: info.alias, network: info.network,
+  return { id: info.id, alias: info.alias, network: info.network,
     blockheight: info.blockheight, channels };
+}
+
+async function status() {
+  // Aggregate BOTH hosted nodes: the asset (GOLD) node and the BTC node.
+  // In one-node fallback mode both sockets are identical and return the same data.
+  const [assetNode, btcNode] = await Promise.all([
+    nodeStatus(CFG.hostedAssetRpc, 'asset'),
+    nodeStatus(CFG.hostedBtcRpc, 'btc'),
+  ]);
+  return {
+    ok: true,
+    asset_node: assetNode,
+    btc_node: btcNode,
+    channels: [...assetNode.channels, ...btcNode.channels], // merged, leg-tagged
+  };
 }
 
 function runSwap({ side, asset, amount }) {
@@ -105,7 +136,7 @@ function runSwap({ side, asset, amount }) {
     const args = [
       'xpln', '-side', side, '-relay', CFG.relay,
       '-asset', assetId, '-btc-asset', CFG.btcx,
-      '-asset-ln-socket', CFG.hostedRpc, '-ln-socket', CFG.hostedRpc,
+      '-asset-ln-socket', CFG.hostedAssetRpc, '-ln-socket', CFG.hostedBtcRpc,
       '-terms-wait', '60s', '-hold-wait', '90s',
     ];
     const t0 = Date.now();
@@ -114,7 +145,7 @@ function runSwap({ side, asset, amount }) {
       const m = out.match(/PURE-LN SWAP SETTLED:\s+(bought|sold)\s+(\d+)\s+([0-9a-f]+)\s+for\s+(\d+)\s+BTC sats[^;]*;\s+preimage\s+([0-9a-f]+)/i);
       if (m) return resolve({
         ok: true, side, direction: m[1], asset: m[3], asset_label: assetLabel(m[3]),
-        base_amount: Number(m[2]), quote_asset: CFG.btcx, quote_amount: Number(m[4]),
+        base_amount: Number(m[2]), quote_asset: CFG.btcx || 'BTC', quote_amount: Number(m[4]),
         preimage: m[5], finality: 'final', settled_ms: Date.now() - t0, requested_amount: amount ?? null,
       });
       resolve({ ok: false, error: err ? `swap failed: ${err.message}` : 'swap did not settle',
@@ -152,7 +183,7 @@ const server = http.createServer(async (req, res) => {
   } catch (e) { send(res, 500, { ok: false, error: e.message }); }
 });
 server.listen(CFG.port, '127.0.0.1', () => {
-  console.error(`[lsp] listening http://127.0.0.1:${CFG.port}  hosted-rpc ${CFG.hostedRpc}  relay ${CFG.relay}`);
+  console.error(`[lsp] listening http://127.0.0.1:${CFG.port}  asset-rpc ${CFG.hostedAssetRpc}  btc-rpc ${CFG.hostedBtcRpc}  relay ${CFG.relay}`);
 });
 process.on('SIGTERM', () => process.exit(0));
 process.on('SIGINT', () => process.exit(0));
