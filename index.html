@@ -552,6 +552,21 @@
 </div>
 
 <script src="./jsqr.js"></script>
+<script>
+  // Cross-chain Lightning rail (Tier-2 hosted SeqLN) — the deployed demo backend.
+  // The wallet derives BOTH hosted-node device identities from the user's ONE
+  // mnemonic (seqln-keys.js) and co-signs each keyless node over these wss links,
+  // so the LSP can route but never move the user's channel funds. NO key or
+  // mnemonic is placed here: the browser derives the two device keys from the
+  // phrase the user types. The host pubkeys are the hosted proxies' pinned Noise
+  // responder identities; the bearer token is an interim shared testnet-demo token.
+  window.SEQ_LSP_URL               = 'https://sequentiatestnet.com/lsp';
+  window.SEQ_LSP_TOKEN             = 'b5b1-d848ec96d29c01d2ff1db6cf';
+  window.SEQ_LSP_WS_ASSET          = 'wss://sequentiatestnet.com/lsp-ws-asset';
+  window.SEQ_LSP_HOST_PUBKEY_ASSET = '0295374d947dc7e27382a83b2034a10b3d51b6f2fdf7e7da490893e3995141523b';
+  window.SEQ_LSP_WS_BTC            = 'wss://sequentiatestnet.com/lsp-ws-btc';
+  window.SEQ_LSP_HOST_PUBKEY_BTC   = '020a749af93e2a5a4d67ad28585cec31b55a146969eb77ca3d076eb59ff111ed51';
+</script>
 <script type="module">
 import init, { Mnemonic, Network, Signer, Wollet, EsploraClient, Address, AssetId, Txid, Contract, Pset, Transaction,
   generateSwapSecret, buildSeqHtlcRedeemScript, buildSeqHtlcClaimTx, buildSeqHtlcRefundTx }
