@@ -12,7 +12,10 @@
 // hsm_secret keeps the hosted node's identity (and its existing channels) intact.
 //
 // Usage:
-//   node device-harness.mjs <label> <wsUrl> <hsm_secret_file> <host_pub_hex> <device_priv_hex> [--enforce]
+//   node device-harness.mjs <label> <wsUrl> <hsm_secret_file> <host_pub_hex> <device_priv_hex_or_file> [--enforce]
+//
+// The device transport privkey may be given as 64-hex or as a path to a file
+// holding that hex (preferred: the secret never lands in argv/ps).
 //
 // It prints the transport pubkey the host must pin, the Noise result, the derived
 // node id (NODE_ID <hex> on stdout for the parent to compare against getinfo), a
@@ -28,12 +31,19 @@ import { SeqlnSigner } from '../../lightning/seqln-signer-sdk.js';
 const HERE = dirname(fileURLToPath(import.meta.url));
 const WASM = readFileSync(join(HERE, '..', '..', 'lightning', 'pkg', 'seqln_signer_wasm_bg.wasm'));
 
-const [label, wsUrl, secretPath, hostPubHex, devicePrivHex, ...rest] = process.argv.slice(2);
-if (!label || !wsUrl || !secretPath || !hostPubHex || !devicePrivHex) {
-  console.error('usage: node device-harness.mjs <label> <wsUrl> <hsm_secret_file> <host_pub_hex> <device_priv_hex> [--enforce]');
+const [label, wsUrl, secretPath, hostPubHex, devicePrivArg, ...rest] = process.argv.slice(2);
+if (!label || !wsUrl || !secretPath || !hostPubHex || !devicePrivArg) {
+  console.error('usage: node device-harness.mjs <label> <wsUrl> <hsm_secret_file> <host_pub_hex> <device_priv_hex_or_file> [--enforce]');
   process.exit(2);
 }
 const enforce = rest.includes('--enforce');
+// Accept the device transport privkey as raw hex or as a file path holding it
+// (a file keeps the key out of argv/ps).
+let devicePrivHex = devicePrivArg;
+if (!/^[0-9a-fA-F]{64}$/.test(devicePrivArg)) {
+  try { devicePrivHex = readFileSync(devicePrivArg, 'utf8').trim(); }
+  catch { console.error(`[${label}] device priv: not 64-hex and not a readable file: ${devicePrivArg}`); process.exit(2); }
+}
 
 // hsmd types that constitute the device actually CO-SIGNING money movement, so the
 // log makes the proof obvious (as opposed to read-only ECDH/point derivation).
