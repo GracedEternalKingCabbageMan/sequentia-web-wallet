@@ -61,21 +61,58 @@ The service assumes the rest of the hosted backend is already up:
 
 ## Wiring the wallet to a running LSP
 
-Set globals before the wallet module loads (mirrors `window.SEQ_SEQOB_URL`):
+The cross-chain rail is TWO hosted nodes (an **asset** node on Sequentia + a
+**btc** node on testnet4) co-signed by the ONE wallet. Set globals before the
+wallet module loads (mirrors `window.SEQ_SEQOB_URL`):
 
 ```js
-window.SEQ_LSP_URL         = 'https://host/lsp';   // this service (default: origin + '/lsp')
-window.SEQ_LSP_TOKEN       = '<bearer token>';
-window.SEQ_LSP_WS          = 'wss://host/lsp-signer'; // the WS↔TCP relay front
-window.SEQ_LSP_HOST_PUBKEY = '<hosted proxy static pubkey>';
-// local pinning against a fixed harness node (optional):
-window.SEQ_LSP_DEV_MNEMONIC = '<hosted node LN seed>';
-window.SEQ_LSP_DEV_KEY      = '<pinned device transport privkey>';
+window.SEQ_LSP_URL               = 'https://host/lsp';   // this service (default: origin + '/lsp')
+window.SEQ_LSP_TOKEN             = '<bearer token>';
+// per-node WS↔TCP relay front + pinned host static pubkey:
+window.SEQ_LSP_WS_ASSET          = 'wss://host/lsp-signer-asset';
+window.SEQ_LSP_HOST_PUBKEY_ASSET = '<hosted ASSET node host static pubkey>';
+window.SEQ_LSP_WS_BTC            = 'wss://host/lsp-signer-btc';
+window.SEQ_LSP_HOST_PUBKEY_BTC   = '<hosted BTC node host static pubkey>';
 ```
 
-With `SEQ_LSP_WS` + `SEQ_LSP_HOST_PUBKEY` set, the wallet connects the on-device
-signer on unlock and the Swap tab shows an **"Instant (Lightning)"** rail for any
-BTC↔asset pair.
+The wallet derives TWO device identities from the user's ONE mnemonic
+(`../../seqln-keys.js`, single source of truth) and brings up a device signer for
+each node. The **"Instant (Lightning)"** rail is offered only once **BOTH** legs
+are serving (`⚡ LN ready`); one leg shows `⚡ LN 1/2`.
+
+Derivation paths (the re-provisioning step MUST derive the SAME children):
+
+| node | Noise transport privkey | SeqLN signing seed |
+| --- | --- | --- |
+| asset | `m/1017'/0'/0'` (== legacy single-node path) | `m/1017'/1'/0'` |
+| btc   | `m/1017'/0'/1'`                              | `m/1017'/1'/1'` |
+
+The signing seed is the hex of the child privkey; the wasm `SeqlnSigner.fromMnemonic`
+builds the on-disk `32 zero bytes || <signingSeed>` hsm_secret from it, which fully
+determines the keyless node's identity (node_id + channel keys).
+
+Legacy single-node vars (`SEQ_LSP_WS` / `SEQ_LSP_HOST_PUBKEY`) still work and map to
+the **asset** slot; per-node local-pinning overrides for a fixed harness are
+`SEQ_LSP_DEV_KEY_ASSET` / `_BTC` (transport privkey) and `SEQ_LSP_DEV_SEED_ASSET` /
+`_BTC` (signing seed).
+
+### Provisioning the two hosted nodes from the same mnemonic
+
+`derive-node-keys.mjs` reproduces the wallet's per-node device keys outside the
+browser, so you can provision each keyless hosted node and drive the Node device
+harness as a browser stand-in:
+
+```sh
+node derive-node-keys.mjs <mnemonic_file> <out_dir> both
+# prints each node's device transport PUBKEY (pin as SEQLN_SIGNER_PEER_PUBKEY)
+# and writes <out>/<node>.hsm_secret + <node>.transport.hex (0600) for the harness:
+node device-harness.mjs asset <SEQ_LSP_WS_ASSET> <out>/asset.hsm_secret <SEQ_LSP_HOST_PUBKEY_ASSET> <out>/asset.transport.hex
+node device-harness.mjs btc   <SEQ_LSP_WS_BTC>   <out>/btc.hsm_secret   <SEQ_LSP_HOST_PUBKEY_BTC>   <out>/btc.transport.hex
+```
+
+The node id each harness prints is that hosted node's identity — provision the
+node keyless and pin the matching transport pubkey. The browser reaches the same
+identity via `SeqlnSigner.fromMnemonic(signingSeed)` (byte-identical hsm_secret).
 
 ## Proof
 

@@ -563,6 +563,7 @@ import { initXrswap, fetchRQuote, openReverseFromComposer, hasInFlight as hasRev
 import { initXmaker, startForwardMaker, startReverseMaker, liveMakerOffers, resumeMakerSwaps } from './xmaker.js';
 import { initSeqln, connectDevice as lnConnectDevice, disconnectDevice as lnDisconnect,
   onSeqlnStatus, seqlnState, seqlnAvailable, seqlnGetStatus, seqlnSwap, lnFinalityCopy } from './seqln.js';
+import { lnDeriveNode } from './seqln-keys.js';
 
 const ESPLORA = location.origin + '/api';
 const KEY = 'swk.sequentia.mnemonic';
@@ -1283,43 +1284,78 @@ async function openWallet(phrase){
   try{ initLightning(phrase); }catch(e){ console.warn('[ln] init failed:', e?.message??e); }
 }
 
-// ---------- Lightning (hosted-SeqLN LSP) ----------
-// Derive a stable per-wallet device transport (Noise) private key from the seed,
-// so it survives across sessions and is recoverable from the mnemonic. In a full
-// build this pubkey is registered with the LSP at onboarding; SEQ_LSP_DEV_KEY
-// overrides it for local pinning against a fixed harness node.
-function lnDeviceTransportPriv(phrase){
-  const override = (typeof window!=='undefined') && window.SEQ_LSP_DEV_KEY;
-  if (override && /^[0-9a-fA-F]{64}$/.test(override)) return override.toLowerCase();
-  const seed = mnemonicToSeedSync(phrase.trim().replace(/\s+/g,' '));
-  const k = HDKey.fromMasterSeed(seed).derive("m/1017'/0'/0'");
-  return [...k.privateKey].map(b=>b.toString(16).padStart(2,'0')).join('');
+// ---------- Lightning (hosted-SeqLN LSP, two-node cross-chain rail) ----------
+// The cross-chain pure-LN rail is TWO hosted SeqLN nodes co-signed by this ONE
+// wallet: an ASSET node (GOLD channel on Sequentia) + a BTC node (BTC channel on
+// testnet4). Both hosted nodes are KEYLESS — this device is the sole signer for
+// BOTH — so the user's ONE mnemonic deterministically yields TWO independent
+// device identities. seqln-keys.js is the single source of truth for that
+// derivation (paths documented there); the LSP operator provisions each hosted
+// node from the matching child and pins the matching device transport pubkey.
+//
+// Per node we bring up an on-device Noise signer:
+//   deviceSigningSeed      -> the keyless node's LN identity (SeqlnSigner.fromMnemonic)
+//   deviceTransportPrivkey -> the Noise static key the LSP pins for that node
+// For local pinning against a fixed harness the per-node keys can be overridden:
+//   SEQ_LSP_DEV_KEY_ASSET / _BTC   (transport privkey, 64-hex)
+//   SEQ_LSP_DEV_SEED_ASSET / _BTC  (signing seed string)
+// and the legacy single-node overrides (SEQ_LSP_DEV_KEY / _DEV_MNEMONIC) still
+// pin the ASSET slot so an existing one-node harness keeps working.
+function lnHexOverride(v){ return (typeof v==='string' && /^[0-9a-fA-F]{64}$/.test(v)) ? v.toLowerCase() : null; }
+function lnNodeIdentity(phrase, node){
+  const W = (typeof window!=='undefined') ? window : {};
+  const derived = lnDeriveNode(phrase, node);
+  // Per-node local-pinning overrides (harness), else the legacy single-node
+  // overrides for the asset slot, else the derived per-node keys.
+  const keyOv  = lnHexOverride(node==='btc' ? W.SEQ_LSP_DEV_KEY_BTC : (W.SEQ_LSP_DEV_KEY_ASSET || W.SEQ_LSP_DEV_KEY));
+  const seedOv = (node==='btc' ? W.SEQ_LSP_DEV_SEED_BTC : (W.SEQ_LSP_DEV_SEED_ASSET || W.SEQ_LSP_DEV_MNEMONIC)) || null;
+  return {
+    node,
+    deviceTransportPrivkey: keyOv || derived.transportPrivkey,
+    deviceSigningSeed: seedOv || derived.signingSeed,
+  };
+}
+// Which hosted nodes this wallet is wired to (a node is live when its wss relay +
+// host pubkey are set; the legacy vars map to the asset slot).
+function lnEnabledNodes(){
+  const W = (typeof window!=='undefined') ? window : {};
+  const out = [];
+  if ((W.SEQ_LSP_WS_ASSET || W.SEQ_LSP_WS) && (W.SEQ_LSP_HOST_PUBKEY_ASSET || W.SEQ_LSP_HOST_PUBKEY)) out.push('asset');
+  if (W.SEQ_LSP_WS_BTC && W.SEQ_LSP_HOST_PUBKEY_BTC) out.push('btc');
+  return out;
 }
 function lnStatusPill(){
   const el = $('lnStatus'); if (!el) return;
   const st = seqlnState();
-  const wsCfg = (typeof window!=='undefined') && window.SEQ_LSP_WS;
-  if (!wsCfg){ el.classList.add('hide'); return; }   // LN not deployed for this wallet
+  if (!st.deployed){ el.classList.add('hide'); return; }   // LN not deployed for this wallet
   el.classList.remove('hide');
   el.className = 'net lnpill ' + (st.connected ? 'ln-ready' : (st.phase==='error' ? 'ln-err' : 'ln-warn'));
-  el.textContent = st.connected ? '⚡ LN ready' : '⚡ LN ' + (st.phase||'…');
-  el.title = 'Lightning device signer: ' + st.phase + (st.detail?(' — '+st.detail):'');
+  // "⚡ LN ready" only when EVERY enabled leg is serving (a cross-chain swap needs
+  // both). Otherwise surface progress as connected/total, e.g. "⚡ LN 1/2".
+  el.textContent = st.connected ? '⚡ LN ready'
+    : (st.enabledCount > 1 ? `⚡ LN ${st.connectedCount}/${st.enabledCount}` : '⚡ LN ' + (st.phase||'…'));
+  const legs = ['asset','btc'].filter(n=>st.nodes[n].enabled)
+    .map(n=>`${n}: ${st.nodes[n].connected?'serving':(st.nodes[n].phase||'…')}${st.nodes[n].detail?(' ('+st.nodes[n].detail+')'):''}`);
+  el.title = 'Lightning device signers — ' + legs.join(' · ');
   // Re-quote the composer so the "Instant (Lightning)" rail appears/disappears live.
   try{ if(typeof renderSwap==='function' && $('swReview')) renderSwap(); }catch{}
 }
 function initLightning(phrase){
-  initSeqln();                       // reads window.SEQ_LSP_URL / _WS / _HOST_PUBKEY / _TOKEN
+  initSeqln();                       // reads window.SEQ_LSP_URL/_TOKEN + per-node _WS_ASSET/_BTC + _HOST_PUBKEY_ASSET/_BTC (legacy _WS/_HOST_PUBKEY -> asset)
   onSeqlnStatus(() => lnStatusPill());
   lnStatusPill();
-  const wsCfg = (typeof window!=='undefined') && window.SEQ_LSP_WS;
-  const hostPub = (typeof window!=='undefined') && window.SEQ_LSP_HOST_PUBKEY;
-  if (!wsCfg || !hostPub) return;    // LN not deployed here; composer stays on-chain-only
-  const mnemonic = ((typeof window!=='undefined') && window.SEQ_LSP_DEV_MNEMONIC) || phrase;
-  const deviceTransportPrivkey = lnDeviceTransportPriv(phrase);
+  const nodes = lnEnabledNodes();
+  if (!nodes.length) return;         // LN not deployed here; composer stays on-chain-only
   const policy = ((typeof window!=='undefined') && window.SEQ_LSP_POLICY) || 'permissive';
-  lnConnectDevice({ mnemonic, deviceTransportPrivkey, policy })
-    .then((id)=>{ if(id) console.log('[ln] device signer serving hosted node', id); })
-    .catch((e)=> console.warn('[ln] connect failed:', e?.message??e));
+  // Bring up each enabled hosted node's device signer. The rail becomes available
+  // (seqlnAvailable) only once BOTH legs are serving; each connect is independent
+  // and non-fatal so one slow/failed leg doesn't wedge the other.
+  for (const node of nodes){
+    const id = lnNodeIdentity(phrase, node);
+    lnConnectDevice({ node, deviceSigningSeed: id.deviceSigningSeed, deviceTransportPrivkey: id.deviceTransportPrivkey, policy })
+      .then((nid)=>{ if(nid) console.log(`[ln] ${node} device signer serving hosted node`, nid); })
+      .catch((e)=> console.warn(`[ln] ${node} connect failed:`, e?.message??e));
+  }
 }
 // Hand the Swap module everything it needs from the app: the wasm classes, the
 // live wallet/signer/network handles (read fresh via getters so a re-open keeps
