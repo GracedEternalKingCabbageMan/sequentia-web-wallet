@@ -7,10 +7,20 @@
 // user's channel funds. It only tells the hosted node to take a pure-LN
 // order-book offer via `seqob-cli xpln`.
 //
-//   POST /swap  {side:'buy'|'sell', asset, amount}
-//        -> `seqob-cli xpln` against the hosted node's lightning-rpc; the two LN
-//           legs settle on one preimage while the device signs each commitment
-//           update; returns {preimage, amounts}.
+//   POST /swap  {side:'buy'|'sell', asset, amount, payRail?, recvRail?}
+//        payRail/recvRail each 'ln' | 'chain' (default ln/ln):
+//          • ln  + ln    -> `seqob-cli xpln` (pure-LN, both legs Lightning). The two
+//            LN legs settle on one preimage while the device signs each commitment
+//            update; returns {preimage, amounts, finality:'final'}. UNCHANGED.
+//          • MIXED (one leg 'ln', one 'chain') -> a SUBMARINE swap: the asset leg is
+//            an anchored on-chain HTLC, the BTC leg is Lightning, bound by one
+//            preimage. Dispatched to `seqob-cli xsubbuy` (buy the asset with BTC-LN,
+//            receive it on-chain) or `xsublift` (sell the asset on-chain, receive
+//            BTC-LN). Anchor-gated: it returns finality:'confirming' (anchor-bound to
+//            Bitcoin), NOT the pure-LN instant-'final'. Only the asset-on-chain <->
+//            BTC-Lightning combos map to the deployed binaries.
+//          • chain + chain -> handled by the wallet's own on-chain rail (the SeqOB
+//            order book), NOT the LSP: the browser runs that path directly.
 //   GET  /status  -> both hosted nodes' ids + per-asset channel balances.
 //   GET  /health  (no auth) -> {ok:true}
 //
@@ -32,12 +42,26 @@
 //   RELAY              seqobd relay base URL (default http://127.0.0.1:9955)
 //   GOLD               the tradeable asset id
 //   BTCX               the BTC-leg asset id; UNSET/empty => real BTC-LN (-btc-asset "")
+//   --- MIXED (submarine) rail only ---
+//   SEQ_RPC            Sequentia node RPC http://user:pass@host:port WITH -txindex,
+//                      for the on-chain asset leg (fund/claim + BlockHashOfTx). REQUIRED
+//                      for the mixed rail; if unset, mixed swaps return "not configured".
+//   SEQ_WALLET         the hosted Sequentia node wallet for the on-chain leg (receives
+//                      the asset on a buy; funds/holds it on a sell).
+//   MIXED_BTC_RPC      the BTC-LN lightning-rpc for the submarine's Lightning leg
+//                      (default: HOSTED_BTC_RPC, i.e. the device-cosigned hosted node).
+//   MIN_ANCHOR_DEPTH   Bitcoin-anchor depth the taker requires before it pays (default 2).
+//   LSP_MIXED_TIMEOUT_MS  max wall-clock for a mixed swap incl. the anchor gate
+//                      (default 2_700_000 = 45 min; the gate is several Bitcoin blocks).
 //
 // The full laptop bring-up (keyless hosted node + WS relay + seqobd + LP maker +
 // channels + a Node end-to-end proof through the wallet SDK) lives in the harness
 // referenced by README.md.
 
 import http from 'node:http';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 import { execFile } from 'node:child_process';
 
 function reqEnv(name) {
@@ -59,6 +83,14 @@ const CFG = {
   gold: reqEnv('GOLD'),
   btcx: process.env.BTCX || '', // empty => real BTC-LN (seqob-cli -btc-asset "")
   swapTimeoutMs: Number(process.env.LSP_SWAP_TIMEOUT_MS || 150000),
+  // Mixed (submarine) rail: the on-chain asset leg needs a txindex Sequentia node.
+  seqRpc: process.env.SEQ_RPC || '',
+  seqWallet: process.env.SEQ_WALLET || '',
+  // The submarine's Lightning leg. Default: the device-cosigned hosted BTC node (so a
+  // mixed swap stays non-custodial like pure-LN); overridable to an autonomous node.
+  mixedBtcRpc: process.env.MIXED_BTC_RPC || process.env.HOSTED_BTC_RPC || hostedRpcFallback,
+  minAnchorDepth: Number(process.env.MIN_ANCHOR_DEPTH || 2),
+  mixedTimeoutMs: Number(process.env.LSP_MIXED_TIMEOUT_MS || 2_700_000),
 };
 if (!CFG.hostedAssetRpc || !CFG.hostedBtcRpc) {
   console.error('[lsp] missing hosted RPC: set HOSTED_ASSET_RPC + HOSTED_BTC_RPC (or HOSTED_RPC as a fallback for both)');
@@ -154,6 +186,74 @@ function runSwap({ side, asset, amount }) {
   });
 }
 
+// runMixed drives a SUBMARINE swap: the asset leg is an anchored on-chain HTLC and
+// the BTC leg is Lightning, bound by one preimage. Only the two combos where the
+// ASSET leg is on-chain and the BTC leg is Lightning map to the deployed binaries:
+//   • side buy,  pay ln,  recv chain -> xsubbuy  (pay BTC over LN, claim the asset on-chain)
+//   • side sell, pay chain, recv ln  -> xsublift (fund the asset HTLC on-chain, receive BTC-LN)
+// The mirror combos (asset over LN + BTC on-chain) would need a BTC-on-chain HTLC
+// submarine, which is not deployed; they fail closed with a clear message.
+//
+// It is SYNCHRONOUS through the whole anchor gate (up to LSP_MIXED_TIMEOUT_MS): the
+// taker verifies the asset HTLC, WAITS for it to bury under Bitcoin to MIN_ANCHOR_DEPTH,
+// then pays/settles the Lightning leg and claims/reveals on-chain. Honest finality:
+// 'confirming' (anchor-bound), NOT the pure-LN 'final'. (Increment 2: 0-conf fronting
+// to make the receive feel instant; an async job model to avoid the long-poll.)
+function runMixed({ side, asset, amount, payRail, recvRail }) {
+  return new Promise((resolve) => {
+    const assetId = resolveAsset(asset);
+    if (side !== 'buy' && side !== 'sell') return resolve({ ok: false, error: "side must be 'buy' or 'sell'" });
+    if (!assetId || assetId === CFG.btcx) return resolve({ ok: false, error: 'mixed swap needs a Sequentia asset id (not BTC)' });
+    if (!CFG.seqRpc || !CFG.seqWallet) {
+      return resolve({ ok: false, error: 'the mixed (submarine) rail is not configured on this LSP (set SEQ_RPC + SEQ_WALLET)' });
+    }
+    // Map (side, payRail, recvRail) -> the submarine CLI. The ASSET leg must be
+    // on-chain and the BTC leg on Lightning.
+    let cmd, extra;
+    if (side === 'buy' && payRail === 'ln' && recvRail === 'chain') {
+      cmd = 'xsubbuy';                                         // BTC-LN in, asset on-chain out
+      extra = ['-ln-socket', CFG.mixedBtcRpc, '-min-anchor-depth', String(CFG.minAnchorDepth)];
+    } else if (side === 'sell' && payRail === 'chain' && recvRail === 'ln') {
+      cmd = 'xsublift';                                        // asset on-chain in, BTC-LN out
+      extra = ['-ln-socket', CFG.mixedBtcRpc];
+    } else {
+      return resolve({ ok: false, finality: 'unsupported',
+        error: `mixed pay=${payRail}/recv=${recvRail} for a ${side} is not a deployed submarine `
+             + '(only asset-on-chain <-> BTC-Lightning). Use both-Lightning, both-on-chain, or flip the mixed legs.' });
+    }
+    const stateFile = path.join(os.tmpdir(), `lsp-mixed-${Date.now()}-${Math.random().toString(36).slice(2)}.json`);
+    const args = [cmd, '-asset', assetId, '-relay', CFG.relay,
+      '-seq-rpc', CFG.seqRpc, '-seq-wallet', CFG.seqWallet, '-state-file', stateFile, ...extra];
+    const t0 = Date.now();
+    execFile(CFG.seqobCli, args, { timeout: CFG.mixedTimeoutMs, maxBuffer: 8 << 20 }, (err, stdout, stderr) => {
+      const out = (stdout || '') + (stderr || '');
+      const settled = /SUBMARINE SWAP SETTLED/i.test(out);
+      // The preimage + funded/claim outpoints are persisted to the session file.
+      let preimage = null, htlcTxid = null;
+      try {
+        const st = JSON.parse(fs.readFileSync(stateFile, 'utf8'));
+        preimage = st.preimage_hex || st.secret_hex || null;   // xsubbuy: preimage learned; xsublift: our secret
+        htlcTxid = st.seq_leg_txid || null;
+      } catch { /* file may be absent on early failure */ }
+      const cm = out.match(/claimed the asset in ([0-9a-f]{64})/i);
+      try { fs.unlinkSync(stateFile); } catch { /* best-effort */ }
+      const dt = Date.now() - t0;
+      if (settled) return resolve({
+        ok: true, side, asset: assetId, asset_label: assetLabel(assetId),
+        rail: 'mixed', pay_rail: payRail, recv_rail: recvRail,
+        preimage, htlc_txid: htlcTxid, claim_txid: cm ? cm[1] : null,
+        // HONEST: the asset leg is an anchored on-chain HTLC — final only to its
+        // Bitcoin-anchor depth, not the instant-final of pure Lightning.
+        finality: 'confirming', anchor_bound: true, eta_seconds: Math.round(dt / 1000),
+        note: 'Mixed submarine swap: one leg on Lightning, one anchored on-chain. Anchor-bound to Bitcoin.',
+        settled_ms: dt, requested_amount: amount ?? null,
+      });
+      resolve({ ok: false, error: err ? `mixed swap failed: ${err.message}` : 'mixed swap did not settle',
+        detail: out.split('\n').filter(Boolean).slice(-6).join(' | '), settled_ms: dt });
+    });
+  });
+}
+
 function send(res, code, obj) {
   const body = JSON.stringify(obj);
   res.writeHead(code, { 'content-type': 'application/json', 'content-length': Buffer.byteLength(body) });
@@ -176,8 +276,20 @@ const server = http.createServer(async (req, res) => {
     if (req.method === 'POST' && url.pathname === '/swap') {
       const body = await readBody(req);
       if (!body) return send(res, 400, { ok: false, error: 'bad json body' });
-      const r = await runSwap(body);
-      return send(res, r.ok ? 200 : 502, r);
+      // Rails select the settlement path (default ln/ln = the unchanged pure-LN route).
+      const payRail = body.payRail || 'ln', recvRail = body.recvRail || 'ln';
+      if (payRail === 'ln' && recvRail === 'ln') {
+        const r = await runSwap(body);                          // UNCHANGED pure-LN
+        return send(res, r.ok ? 200 : 502, r);
+      }
+      if (payRail === 'chain' && recvRail === 'chain') {
+        // On-chain <-> on-chain is the SeqOB order-book HTLC path the wallet runs
+        // itself; the LSP does not settle it.
+        return send(res, 200, { ok: false, handled_by: 'wallet_onchain', finality: 'anchor-bound',
+          error: 'on-chain <-> on-chain is settled by the wallet\'s own on-chain rail (the SeqOB order book), not the LSP' });
+      }
+      const r = await runMixed({ ...body, payRail, recvRail });  // MIXED -> submarine
+      return send(res, r.ok ? 200 : (r.finality === 'unsupported' ? 422 : 502), r);
     }
     send(res, 404, { ok: false, error: 'not found' });
   } catch (e) { send(res, 500, { ok: false, error: e.message }); }

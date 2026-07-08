@@ -284,9 +284,10 @@ function findRoute(pay, receive){
     // BTC<->asset pair is routable (the book may be empty; a maker posts one).
     if (p === 'chain' && r === 'chain')
       return { kind: 'cross', seqAsset, xm, payIsBtc, payRail: p, recvRail: r };
-    // MIXED (one leg LN, one on-chain): the front end is fully built + priced, but
-    // the submarine backend that settles a mixed pair is not deployed yet. The
-    // route is returned so timing renders honestly; execution fails closed.
+    // MIXED (one leg LN, one on-chain): a submarine swap. reviewMixed dispatches to
+    // the LSP's POST /swap (payRail/recvRail) -> seqob-cli xsubbuy/xsublift. The one
+    // deployed shape is asset-on-chain <-> BTC-Lightning; the mirror combo fails
+    // closed there with an honest message.
     return { kind: 'mixed', seqAsset, xm, payIsBtc, payRail: p, recvRail: r };
   }
   // Same-chain order book: ANY two distinct Sequentia assets form a market. It may
@@ -808,10 +809,11 @@ function deriveXOpposite(route){
 }
 
 // --- MIXED rails (one leg LN, one on-chain) -------------------------------------
-// The front end is fully built + priced from the same book, and the timing banner is
-// exact — but the submarine backend that settles a mixed pair is not deployed yet, so
-// Review fails closed (see reviewMixed). This keeps the toggles + honest timing usable
-// today without a broken swap. Search: TODO(mixed-rail submarine).
+// The front end is priced from the same book and the timing banner is exact. Review
+// now runs a real submarine swap via the LSP (reviewMixed -> POST /swap with
+// payRail/recvRail -> seqob-cli xsubbuy/xsublift): the asset leg is an anchored
+// on-chain HTLC, the BTC leg is Lightning, bound by one preimage. Anchor-gated (not
+// instant-final). The one undeployed shape (asset over LN + BTC on-chain) fails closed.
 async function requoteMixed(route, amtStr){
   const { $ } = C;
   const am = C.assetMeta(route.seqAsset);
@@ -838,7 +840,7 @@ async function requoteMixed(route, amtStr){
   LAST_QUOTE = { kind: 'mixed', route, seqAsset: route.seqAsset, payIsBtc: route.payIsBtc,
     payRail: route.payRail, recvRail: route.recvRail };
   renderTiming(route);
-  setReviewEnabled(!!(amtStr && amtStr.trim()));   // clickable -> honest "landing soon" message
+  setReviewEnabled(!!(amtStr && amtStr.trim()));   // clickable -> reviewMixed runs the submarine swap
 }
 
 // --- cross-chain quote (GetXchainQuote) ---
@@ -1327,16 +1329,57 @@ async function onReview(){
   return reviewSame(q);
 }
 
-// Mixed rails (one leg LN, one on-chain). The composer + timing are fully built, but
-// the backend that settles a mixed pair is a submarine swap that is not deployed yet.
-// Fail closed with an honest message — the same graceful-degradation pattern the
-// wallet uses when LN is unconfigured — rather than attempting a broken swap.
-// TODO(mixed-rail submarine): wire this to the submarine backend when it lands, then
-// route ln+chain / chain+ln here to a real settlement instead of this message.
-function reviewMixed(q){
+// Mixed rails (one leg LN, one on-chain) — a SUBMARINE swap: the asset leg is an
+// anchored on-chain HTLC, the BTC leg is Lightning, bound by one preimage. The LSP's
+// POST /swap (payRail/recvRail) dispatches to seqob-cli xsubbuy/xsublift. Only the
+// asset-on-chain <-> BTC-Lightning combos are deployed; the mirror combo (asset over
+// LN + BTC on-chain) needs a BTC-on-chain HTLC submarine that is not built yet, so it
+// fails closed with an honest message. Anchor-gated: the receive is NOT instant-final
+// (that is the pure-LN rail) — it settles once the on-chain leg buries under Bitcoin.
+async function reviewMixed(q){
   const { $ } = C;
-  $('swErr').textContent = 'This rail combination is landing soon. For now, set both to Lightning (instant & final) or both to On-chain.';
-  try { C.toast('Mixed Lightning + on-chain rails are landing soon — set both legs the same way for now.'); } catch {}
+  if (!L || !L.swap){ $('swErr').textContent = 'The mixed (Lightning + on-chain) route needs the Lightning service, which is unavailable in this build.'; return; }
+  const am = C.assetMeta(q.seqAsset);
+  const side = q.payIsBtc ? 'buy' : 'sell';            // buy the asset (pay BTC) / sell it (pay the asset)
+  // Which leg is the ASSET, which is BTC — the deployed submarine needs asset-on-chain + BTC-LN.
+  const assetLeg = q.payIsBtc ? q.recvRail : q.payRail;
+  const btcLeg   = q.payIsBtc ? q.payRail : q.recvRail;
+  if (!(assetLeg === 'chain' && btcLeg === 'ln')){
+    $('swErr').textContent = `This mixed combination (${am.ticker} over Lightning + BTC on-chain) needs a BTC on-chain HTLC submarine, which is not deployed yet. `
+      + `For now: put ${am.ticker} on-chain and BTC on Lightning, or set both legs the same way.`;
+    try { C.toast('That mixed direction is not deployed yet — put the asset on-chain and BTC on Lightning.'); } catch {}
+    return;
+  }
+  const amount = parseFloat((($('swPayAmt').value || '') + '').trim()) || null;
+  const dir = side === 'buy'
+    ? `Buy ${am.ticker} with Bitcoin over Lightning · receive ${am.ticker} on-chain`
+    : `Sell ${am.ticker} on-chain · receive Bitcoin over Lightning`;
+  const kv = [
+    ['Route', 'Mixed rails · one leg on Lightning, one anchored on-chain (a submarine swap, bound by one preimage)'],
+    ['Direction', dir],
+    ['Pricing', 'Best resting submarine offer · whole-HTLC lift (the LP\'s fixed terms)'],
+    ['Timing', 'Anchor-gated: the on-chain HTLC must bury under Bitcoin before the Lightning leg settles — a few minutes, not instant.'],
+    ['Finality', 'Anchor-bound to Bitcoin (reverts only if Bitcoin reverts) — not the instant-final of the pure-Lightning rail.'],
+    ['If it stalls', 'Nothing is lost · each leg refunds after its own timeout.'],
+  ];
+  const { m: modal, ok, st } = C.modalRows({ title: 'Review mixed-rail swap', kv });
+  ok.onclick = async () => {
+    ok.disabled = true; st.className = 'status';
+    st.innerHTML = '<span class="spin"></span>Settling — the on-chain leg is burying under Bitcoin (anchor-gated, a few minutes)…';
+    try {
+      const r = await L.swap({ side, asset: q.seqAsset, amount, payRail: q.payRail, recvRail: q.recvRail });
+      if (!r || r.ok === false) throw new Error((r && r.error) || 'the mixed swap did not settle');
+      const mins = r.eta_seconds ? Math.max(1, Math.round(r.eta_seconds / 60)) : null;
+      modal.remove();
+      // Honest: anchor-bound, not "final". Surface the anchor-gated timing that occurred.
+      C.toast(`Mixed swap settled${mins ? ` in ~${mins} min` : ''} · anchor-bound to Bitcoin${r.preimage ? ` · preimage ${String(r.preimage).slice(0, 16)}…` : ''}`);
+      resetComposer();
+      await C.sync();
+      renderSwap();
+    } catch (e){
+      st.className = 'status err'; st.textContent = 'Failed: ' + C.prettyErr(e); ok.disabled = false;
+    }
+  };
 }
 
 // Start a CROSS market from the wallet: post a signed forward cross offer (SELL

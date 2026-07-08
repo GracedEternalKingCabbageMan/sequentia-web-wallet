@@ -218,12 +218,20 @@ async function lspFetch(path, opts = {}) {
 }
 // Both hosted nodes' ids + per-asset channel balances (spendable=send, recv=recv).
 export function seqlnGetStatus() { return lspFetch('/status'); }
-// Take a pure-LN cross-chain offer: {side:'buy'|'sell', asset, amount}. The LSP
-// drives BOTH legs; each hosted node's device signer co-signs its commitment
-// updates in the background over its wss link. Returns the settle (preimage,
-// base/quote amounts).
-export function seqlnSwap({ side, asset, amount }) {
-  return lspFetch('/swap', { method: 'POST', body: JSON.stringify({ side, asset, amount }) });
+// Take a cross-chain offer through the LSP: {side:'buy'|'sell', asset, amount,
+// payRail?, recvRail?}. payRail/recvRail each 'ln' | 'chain':
+//   • omitted / ln+ln -> pure-LN (both legs Lightning); the LSP drives BOTH legs and
+//     each hosted node's device signer co-signs its commitment updates over its wss
+//     link. Returns {preimage, base/quote amounts, finality:'final'}.
+//   • mixed (one 'ln', one 'chain') -> a SUBMARINE swap (asset on-chain HTLC <-> BTC
+//     over Lightning). Anchor-gated; returns finality:'confirming' (anchor-bound).
+// Rails are only serialized when present, so the pure-LN call is byte-identical to
+// before (the LSP treats a missing rail as ln/ln).
+export function seqlnSwap({ side, asset, amount, payRail, recvRail }) {
+  const body = { side, asset, amount };
+  if (payRail) body.payRail = payRail;
+  if (recvRail) body.recvRail = recvRail;
+  return lspFetch('/swap', { method: 'POST', body: JSON.stringify(body) });
 }
 
 export default {
