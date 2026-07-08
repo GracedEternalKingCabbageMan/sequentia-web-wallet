@@ -51,6 +51,13 @@
 //   MIXED_BTC_RPC      the BTC-LN lightning-rpc for the submarine's Lightning leg
 //                      (default: HOSTED_BTC_RPC, i.e. the device-cosigned hosted node).
 //   MIN_ANCHOR_DEPTH   Bitcoin-anchor depth the taker requires before it pays (default 2).
+//   MIXED_MAX_0CONF    0-conf LP-fronting cap (asset atoms). A mixed swap whose asset
+//                      leg is <= this settles INSTANTLY (the submarine binary skips the
+//                      anchor-bury wait; the LP fronts the small-amount reorg risk) and
+//                      POST /swap answers SYNCHRONOUSLY with the preimage. Above it (or
+//                      when body.amount is unknown) POST /swap returns HTTP 202 with a
+//                      {job_id,status:'confirming'} handle and runs the anchor-gated swap
+//                      in the background; poll GET /swap/<job_id>. 0 = always anchor-gated.
 //   LSP_MIXED_TIMEOUT_MS  max wall-clock for a mixed swap incl. the anchor gate
 //                      (default 2_700_000 = 45 min; the gate is several Bitcoin blocks).
 //
@@ -62,6 +69,7 @@ import http from 'node:http';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import crypto from 'node:crypto';
 import { execFile } from 'node:child_process';
 
 function reqEnv(name) {
@@ -91,10 +99,28 @@ const CFG = {
   mixedBtcRpc: process.env.MIXED_BTC_RPC || process.env.HOSTED_BTC_RPC || hostedRpcFallback,
   minAnchorDepth: Number(process.env.MIN_ANCHOR_DEPTH || 2),
   mixedTimeoutMs: Number(process.env.LSP_MIXED_TIMEOUT_MS || 2_700_000),
+  // 0-conf LP-fronting cap (asset atoms). A mixed swap whose asset leg is <= this
+  // settles INSTANTLY (the submarine binary skips the anchor-bury wait; the LP fronts
+  // the Bitcoin-reorg risk) so /swap can answer SYNCHRONOUSLY with the preimage. Above
+  // it (or when the amount is unknown) /swap returns a pollable 'confirming' job so the
+  // browser never hangs through the multi-block anchor gate. 0 = always anchor-gated.
+  mixedMax0conf: Number(process.env.MIXED_MAX_0CONF || 0),
 };
 if (!CFG.hostedAssetRpc || !CFG.hostedBtcRpc) {
   console.error('[lsp] missing hosted RPC: set HOSTED_ASSET_RPC + HOSTED_BTC_RPC (or HOSTED_RPC as a fallback for both)');
   process.exit(2);
+}
+
+// In-memory async job store for over-cap mixed swaps (anchor-gated, minutes-long).
+// A restart drops in-flight jobs; the underlying swap is crash-safe via its own state
+// file (the taker persists P after paying), so recovery is by re-driving the CLI.
+const jobs = new Map();
+const JOB_TTL_MS = 6 * 60 * 60 * 1000; // reap finished jobs after 6h
+function reapJobs() {
+  const now = Date.now();
+  for (const [id, j] of jobs) {
+    if (j.done_ms && now - j.done_ms > JOB_TTL_MS) jobs.delete(id);
+  }
 }
 
 const ASSET_ALIAS = { GOLD: CFG.gold, gold: CFG.gold, BTC: CFG.btcx };
@@ -194,11 +220,13 @@ function runSwap({ side, asset, amount }) {
 // The mirror combos (asset over LN + BTC on-chain) would need a BTC-on-chain HTLC
 // submarine, which is not deployed; they fail closed with a clear message.
 //
-// It is SYNCHRONOUS through the whole anchor gate (up to LSP_MIXED_TIMEOUT_MS): the
-// taker verifies the asset HTLC, WAITS for it to bury under Bitcoin to MIN_ANCHOR_DEPTH,
-// then pays/settles the Lightning leg and claims/reveals on-chain. Honest finality:
-// 'confirming' (anchor-bound), NOT the pure-LN 'final'. (Increment 2: 0-conf fronting
-// to make the receive feel instant; an async job model to avoid the long-poll.)
+// Under the 0-conf cap (MIXED_MAX_0CONF) the submarine binary skips the anchor-bury
+// wait, so this resolves in seconds and POST /swap awaits it directly (returning the
+// preimage, zero_conf:true). Over the cap the taker WAITS for the asset HTLC to bury
+// under Bitcoin to MIN_ANCHOR_DEPTH before paying/settling the Lightning leg — minutes
+// long — so the POST /swap handler runs runMixed in the BACKGROUND as a job and returns
+// immediately; this function is the same either way. Honest finality: 'confirming'
+// (anchor-bound), NOT the pure-LN instant-'final'.
 function runMixed({ side, asset, amount, payRail, recvRail }) {
   return new Promise((resolve) => {
     const assetId = resolveAsset(asset);
@@ -213,6 +241,9 @@ function runMixed({ side, asset, amount, payRail, recvRail }) {
     if (side === 'buy' && payRail === 'ln' && recvRail === 'chain') {
       cmd = 'xsubbuy';                                         // BTC-LN in, asset on-chain out
       extra = ['-ln-socket', CFG.mixedBtcRpc, '-min-anchor-depth', String(CFG.minAnchorDepth)];
+      // 0-conf cap: the taker skips the anchor-bury wait when the asset leg is <= it
+      // (instant). 0 means "use the maker offer's advertised cap".
+      if (CFG.mixedMax0conf > 0) extra.push('-max-0conf', String(CFG.mixedMax0conf));
     } else if (side === 'sell' && payRail === 'chain' && recvRail === 'ln') {
       cmd = 'xsublift';                                        // asset on-chain in, BTC-LN out
       extra = ['-ln-socket', CFG.mixedBtcRpc];
@@ -273,6 +304,13 @@ const server = http.createServer(async (req, res) => {
   if (!authed(req)) return send(res, 401, { ok: false, error: 'unauthorized (Bearer token required)' });
   try {
     if (req.method === 'GET' && url.pathname === '/status') return send(res, 200, await status());
+    // Poll an over-cap (anchor-gated) mixed swap started asynchronously by POST /swap.
+    if (req.method === 'GET' && url.pathname.startsWith('/swap/')) {
+      const id = url.pathname.slice('/swap/'.length);
+      const job = jobs.get(id);
+      if (!job) return send(res, 404, { ok: false, error: 'unknown job id' });
+      return send(res, 200, { ok: true, ...job });
+    }
     if (req.method === 'POST' && url.pathname === '/swap') {
       const body = await readBody(req);
       if (!body) return send(res, 400, { ok: false, error: 'bad json body' });
@@ -288,8 +326,40 @@ const server = http.createServer(async (req, res) => {
         return send(res, 200, { ok: false, handled_by: 'wallet_onchain', finality: 'anchor-bound',
           error: 'on-chain <-> on-chain is settled by the wallet\'s own on-chain rail (the SeqOB order book), not the LSP' });
       }
-      const r = await runMixed({ ...body, payRail, recvRail });  // MIXED -> submarine
-      return send(res, r.ok ? 200 : (r.finality === 'unsupported' ? 422 : 502), r);
+      // MIXED (one leg 'ln', one 'chain') -> a submarine swap. Only asset-on-chain <->
+      // BTC-Lightning maps to a deployed binary; reject the mirror combos synchronously.
+      const side = body.side;
+      const supported = (side === 'buy' && payRail === 'ln' && recvRail === 'chain') ||
+                        (side === 'sell' && payRail === 'chain' && recvRail === 'ln');
+      if (!supported) {
+        return send(res, 422, { ok: false, finality: 'unsupported',
+          error: `mixed pay=${payRail}/recv=${recvRail} for a ${side} is not a deployed submarine `
+               + '(only asset-on-chain <-> BTC-Lightning). Use both-Lightning, both-on-chain, or flip the mixed legs.' });
+      }
+      reapJobs();
+      // Under the 0-conf cap -> the submarine skips the anchor-bury wait, so the swap
+      // is fast: answer SYNCHRONOUSLY with the preimage. Over the cap (or unknown
+      // amount) -> the anchor gate takes many Bitcoin blocks, so run it in the
+      // background and hand back a pollable job instead of holding the connection.
+      const amt = Number(body.amount || 0);
+      const under0conf = CFG.mixedMax0conf > 0 && amt > 0 && amt <= CFG.mixedMax0conf;
+      if (under0conf) {
+        const r = await runMixed({ ...body, payRail, recvRail });
+        if (r.ok) { r.zero_conf = true; r.finality = 'confirming'; }
+        return send(res, r.ok ? 200 : 502, r);
+      }
+      const jobId = crypto.randomUUID();
+      const job = { job_id: jobId, status: 'confirming', side, asset: body.asset,
+        rail: 'mixed', pay_rail: payRail, recv_rail: recvRail, finality: 'confirming',
+        requested_amount: body.amount ?? null, started_ms: Date.now() };
+      jobs.set(jobId, job);
+      runMixed({ ...body, payRail, recvRail })
+        .then((r) => jobs.set(jobId, { ...job, ...r, status: r.ok ? 'settled' : 'failed', done_ms: Date.now() }))
+        .catch((e) => jobs.set(jobId, { ...job, status: 'failed', error: String((e && e.message) || e), done_ms: Date.now() }));
+      return send(res, 202, { ...job, ok: true,
+        poll: `/swap/${jobId}`,
+        note: 'over the 0-conf cap: the on-chain leg is anchor-gated to Bitcoin (several blocks). '
+            + 'Poll GET /swap/<job_id> for completion; the wallet stays responsive.' });
     }
     send(res, 404, { ok: false, error: 'not found' });
   } catch (e) { send(res, 500, { ok: false, error: e.message }); }
