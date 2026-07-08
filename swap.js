@@ -63,8 +63,17 @@ const S = {
   edited: 'pay',          // which side the user last typed ('pay' | 'receive')
   feeAsset: null,         // chosen fee asset hex (defaults to POLICY_HEX)
   quoting: false,
-  rail: 'cross',          // BTC<->asset settlement rail: 'cross' (on-chain HTLC) | 'ln' (instant Lightning)
+  // TWO independent settlement rails, one per leg. Each is 'ln' (instant Lightning)
+  // or 'chain' (on-chain). ln+ln -> pure-LN LSP route; chain+chain -> on-chain
+  // cross-chain HTLC; a MIXED pair (one leg each) needs the submarine backend (not
+  // yet wired) and fails closed with an honest message. Only meaningful on a
+  // BTC<->asset pair; forced to chain/chain otherwise so an LN-unconfigured wallet
+  // behaves exactly as before.
+  payRail: 'chain', recvRail: 'chain',
+  railsTouched: false,    // true once the user (or a "fix" link) picks a rail -> stop auto-defaulting
 };
+let INSTANT = {};    // ticker -> { spendable, receivable } atoms (best-effort from the LSP /status)
+let LAST_MID = null; // { price, cross } for the current pair — feeds the pair bar
 
 const TRADE_TYPE = { BUY: 0, SELL: 1 };   // seqdex.v1 TradeType enum
 
@@ -115,10 +124,10 @@ export function initSwap(ctx){
     $('swPayPick').onclick  = () => openPicker('pay');
     $('swRecvPick').onclick = () => openPicker('receive');
     $('swFeePick').onclick  = openFeePicker;
-    // Instant-Lightning vs on-chain-HTLC rail chooser (shown only for a BTC<->asset
-    // pair when the on-device signer is live).
-    if ($('swRailLn'))    $('swRailLn').onclick    = () => setRail('ln');
-    if ($('swRailCross')) $('swRailCross').onclick = () => setRail('cross');
+    // Two independent rail choosers (Pay from / Receive to), shown only for a
+    // BTC<->asset pair when the on-device signer is live (see updateRails).
+    wireRailSeg('swPayRailSeg', 'pay');
+    wireRailSeg('swRecvRailSeg', 'recv');
     if ($('swXBack')) $('swXBack').onclick = () => { showCross(false); renderSwap(); };
     // Live re-quote as the user types. The edited side is the "fixed" leg; the
     // other side is quoted. Debounced so we don't hammer the daemon per keystroke.
@@ -170,6 +179,9 @@ export async function renderSwap(){
   ensureDefaults();
   renderFeePicker();
   paintPanes();
+  renderChips();
+  renderPairBar();
+  refreshInstant();   // best-effort instant/on-chain split from the LSP /status (non-blocking)
   await requote().catch(()=>{});
 }
 
@@ -253,26 +265,35 @@ function counterpartsOf(other){
 // a market; cross-chain if exactly one side is BTC and the BTC<->asset market exists.
 function findRoute(pay, receive){
   if (!pay || !receive || pay === receive) return null;
-  const btc = (pay === 'BTC') || (receive === 'BTC');
-  if (btc){
+  if (pay === 'BTC' && receive === 'BTC') return null;   // BTC<->BTC is not a market
+  const btcPair = (pay === 'BTC') !== (receive === 'BTC');   // exactly one side is BTC
+  if (btcPair){
     const seqAsset = pay === 'BTC' ? receive : pay;
-    if (seqAsset === 'BTC') return null;   // BTC<->BTC is not a market
     const payIsBtc = pay === 'BTC';
-    // Instant Lightning rail: a pure-LN asset<->BTC trade over the hosted-signer
-    // LSP (keys on device, non-custodial). Offered only when the on-device signer
-    // is actually serving; otherwise fall through to the on-chain HTLC rail.
-    if (S.rail === 'ln' && L && L.available && L.available())
-      return { kind: 'ln', seqAsset, payIsBtc };
-    // Cross-chain order book: ANY BTC<->asset pair is routable. It may have no
-    // resting cross offers yet (the book then shows empty). A live RFQ market, if
-    // any, is attached only for its cached price; it is no longer required.
     const xm = XMARKETS.find(m => m.seq_asset === seqAsset) || null;
-    return { kind: 'cross', seqAsset, xm, payIsBtc };
+    // When the LSP isn't serving there is no rail choice: both legs are on-chain, so
+    // an LN-unconfigured wallet always takes the proven cross route (independent of
+    // any stale rail state). updateRails() also forces this in the UI.
+    const ln = lnAvailable();
+    const p = ln ? S.payRail : 'chain', r = ln ? S.recvRail : 'chain';
+    // ln + ln -> the proven pure-LN LSP route (non-custodial, keys on device).
+    // Offered only when the on-device signer is actually serving.
+    if (p === 'ln' && r === 'ln' && lnAvailable())
+      return { kind: 'ln', seqAsset, payIsBtc, xm, payRail: p, recvRail: r };
+    // chain + chain -> the proven on-chain cross-chain HTLC order book. ANY
+    // BTC<->asset pair is routable (the book may be empty; a maker posts one).
+    if (p === 'chain' && r === 'chain')
+      return { kind: 'cross', seqAsset, xm, payIsBtc, payRail: p, recvRail: r };
+    // MIXED (one leg LN, one on-chain): the front end is fully built + priced, but
+    // the submarine backend that settles a mixed pair is not deployed yet. The
+    // route is returned so timing renders honestly; execution fails closed.
+    return { kind: 'mixed', seqAsset, xm, payIsBtc, payRail: p, recvRail: r };
   }
   // Same-chain order book: ANY two distinct Sequentia assets form a market. It may
   // have no resting offers yet, in which case the user can start it by posting one.
   return { kind: 'same', pay, receive };
 }
+function lnAvailable(){ return !!(L && L.available && L.available()); }
 
 // The composer deliberately opens with NO pair preselected — both sides sit on
 // "Select asset" so no asset (least of all SEQ) is implied as a default. Here we
@@ -302,8 +323,102 @@ function balAtoms(hex){
 }
 function balStr(hex){
   if (!hex) return '';
-  const a = balAtoms(hex), m = metaOf(hex);
-  return 'Balance ' + C.fmtAtoms(a, m.precision) + ' ' + m.ticker;
+  const m = metaOf(hex);
+  const onchain = balAtoms(hex), instant = instantAtomsFor(hex);
+  let s = 'Balance ' + C.fmtAtoms(onchain, m.precision) + ' ' + m.ticker + ' on-chain';
+  if (instant > 0n) s += ' · ' + C.fmtAtoms(instant, m.precision) + ' instant';
+  return s;
+}
+
+// --- instant (in-channel / Lightning) balances, best-effort from the LSP /status ---
+function atomsOf(x){
+  if (x == null) return 0n;
+  if (typeof x === 'bigint') return x;
+  try { return BigInt(x); } catch { return BigInt(Math.trunc(Number(x) || 0)); }
+}
+function instantAtomsFor(hex){
+  const t = metaOf(hex).ticker;
+  const e = INSTANT[t];
+  return e ? atomsOf(e.spendable) : 0n;
+}
+// Refresh the instant/on-chain split from the LSP /status. Best-effort: if LN is
+// unconfigured, the call fails, or the shape is unknown, instant stays 0 and nothing
+// breaks (the wallet's known on-chain figure is always shown).
+// TODO(instant-balance units): the LSP's *_units fields are treated as the asset's
+// atoms here; confirm the unit convention when the LSP /status contract firms up.
+async function refreshInstant(){
+  INSTANT = {};
+  if (!(L && L.available && L.available() && L.status)) return;
+  try {
+    const st = await L.status();
+    const chans = (st && (st.channels || st.channel_balances)) || [];
+    for (const c of chans){
+      const t = c.asset_label || c.asset || c.ticker; if (!t) continue;
+      INSTANT[t] = {
+        spendable: (c.spendable_units ?? c.spendable ?? 0),
+        receivable: (c.receivable_units ?? c.receivable ?? 0),
+      };
+    }
+  } catch { INSTANT = {}; }
+  try { renderChips(); paintPanes(); } catch {}
+}
+
+// --- balance chips: per-asset instant (Lightning) vs on-chain split ---
+function iconClass(hex){ return hex === 'BTC' ? 'btc' : (hex === C.POLICY_HEX ? 'seq' : 'asset'); }
+function iconGlyph(hex, m){
+  if (hex === 'BTC') return '₿';
+  return (m.ticker || '?').slice(0, 1).toUpperCase();
+}
+function chipHtml(hex){
+  const m = metaOf(hex);
+  const onchain = balAtoms(hex), instant = instantAtomsFor(hex);
+  const total = onchain + instant;
+  return `<button type="button" class="swchip" data-h="${esc(hex)}">
+    <span class="swchip-ic ${iconClass(hex)}">${esc(iconGlyph(hex, m))}</span>
+    <span class="swchip-body">
+      <span class="swchip-amt mono">${esc(C.fmtAtoms(total, m.precision))} ${esc(m.ticker)}</span>
+      <span class="swchip-split"><span class="z">${esc(C.fmtAtoms(instant, m.precision))} instant</span> · ${esc(C.fmtAtoms(onchain, m.precision))} on-chain</span>
+    </span></button>`;
+}
+function renderChips(){
+  const host = C.$('swChips'); if (!host) return;
+  const bal = C.balObj() || {};
+  const held = Object.keys(bal).filter(h => big(bal[h]) > 0n && h !== 'BTC');
+  // BTC is first-class (dual-chain) — always a chip, even at 0.
+  const list = []; const seen = new Set();
+  for (const h of ['BTC', ...held]){ if (!seen.has(h)){ seen.add(h); list.push(h); } }
+  host.innerHTML = list.map(chipHtml).join('');
+  host.querySelectorAll('.swchip[data-h]').forEach(c => c.onclick = () => onChipPick(c.dataset.h));
+}
+// Clicking a chip sets it as the PAY side (a quick way to start a trade from a holding).
+function onChipPick(hex){
+  if (!hex || hex === S.payAsset) return;
+  S.payAsset = hex;
+  if (S.receiveAsset && (S.receiveAsset === hex || !counterpartsOf(hex).includes(S.receiveAsset))) S.receiveAsset = null;
+  S.railsTouched = false;
+  LAST_QUOTE = null; setReviewEnabled(false);
+  paintPanes(); requote().catch(()=>{});
+}
+
+// --- pair bar: the selected market + last price (derived from the book mid) ---
+function renderPairBar(){
+  const host = C.$('swPairBar'); if (!host) return;
+  if (!S.payAsset || !S.receiveAsset){ host.innerHTML = ''; host.classList.add('hide'); return; }
+  host.classList.remove('hide');
+  const pm = metaOf(S.payAsset), rm = metaOf(S.receiveAsset);
+  let lastStr = '—';
+  if (LAST_MID && LAST_MID.price != null && isFinite(LAST_MID.price) && LAST_MID.price > 0){
+    lastStr = LAST_MID.cross
+      ? `${trim(LAST_MID.price)} BTC/${rm.ticker}`
+      : `${trim(LAST_MID.price)} ${pm.ticker}/${rm.ticker}`;
+  }
+  host.innerHTML = `<div class="swpairsel">${esc(rm.ticker)} <span class="swpair-car">/</span> ${esc(pm.ticker)}</div>
+    <div class="swpair-last">last <b class="mono">${esc(lastStr)}</b></div>`;
+}
+// The reference value of ONE unit of an asset (for the ladder's mid line).
+function oneUnitRefStr(hex){
+  const m = metaOf(hex); const one = 10n ** BigInt(m.precision || 0);
+  return C.refValueStr(hex, one) || '';
 }
 
 function paintPanes(){
@@ -316,34 +431,50 @@ function paintPanes(){
   $('swMax').style.display = (S.payAsset && S.payAsset !== 'BTC' && balAtoms(S.payAsset) > 0n) ? '' : 'none';
   paintRefHints();
   paintRouteLine();
-  updateRailToggle();
+  updateRails();
 }
 
-// Show the Instant-Lightning / on-chain-HTLC rail chooser only for a BTC<->asset
-// pair when the on-device signer is live; otherwise hide it and fall back to the
-// on-chain cross rail so an unconfigured wallet behaves exactly as before.
-function updateRailToggle(){
-  const box = C.$('swRouteMode'); if (!box) return;
+// Show BOTH rail choosers (Pay from / Receive to) only for a BTC<->asset pair when
+// the on-device signer is live; otherwise hide them and force both legs on-chain so
+// an LN-unconfigured wallet behaves exactly as before.
+function updateRails(){
+  const box = C.$('swRailPicks'); if (!box) return;
   const pay = S.payAsset, receive = S.receiveAsset;
   const btcPair = pay && receive && pay !== receive
     && ((pay === 'BTC') !== (receive === 'BTC'));   // exactly one side is BTC
-  const lnOk = !!(L && L.available && L.available());
-  if (btcPair && lnOk){
+  if (btcPair && lnAvailable()){
     box.classList.remove('hide');
-    const ln = C.$('swRailLn'), cr = C.$('swRailCross');
-    if (ln) ln.classList.toggle('sel', S.rail === 'ln');
-    if (cr) cr.classList.toggle('sel', S.rail !== 'ln');
+    // Default each leg to the instant (LN) option when the LSP is available; the
+    // LSP submarine-funds a cold channel mid-trade, so instant is the right default
+    // even before the user holds in-channel liquidity. (Per-leg instant-balance-aware
+    // defaulting is a later refinement.)
+    if (!S.railsTouched){ S.payRail = 'ln'; S.recvRail = 'ln'; }
+    paintRailSegs();
   } else {
     box.classList.add('hide');
-    if (S.rail === 'ln') S.rail = 'cross';   // LN not applicable here
+    S.payRail = 'chain'; S.recvRail = 'chain'; S.railsTouched = false;
   }
 }
-function setRail(r){
-  if (S.rail === r) return;
-  S.rail = r;
+function wireRailSeg(id, leg){
+  const seg = C.$(id); if (!seg || seg._wired) return; seg._wired = true;
+  seg.querySelectorAll('button[data-r]').forEach(b => b.onclick = () => setRail(leg, b.dataset.r));
+}
+function paintRailSegs(){
+  const paint = (id, r) => { const seg = C.$(id); if (!seg) return;
+    seg.querySelectorAll('button[data-r]').forEach(b => b.classList.toggle('on', b.dataset.r === r)); };
+  paint('swPayRailSeg', S.payRail);
+  paint('swRecvRailSeg', S.recvRail);
+}
+// Set ONE leg's rail (leg = 'pay' | 'recv'); marks the rails as user-chosen so the
+// auto-default stops overriding them.
+function setRail(leg, r){
+  const cur = leg === 'pay' ? S.payRail : S.recvRail;
+  if (cur === r) return;
+  if (leg === 'pay') S.payRail = r; else S.recvRail = r;
+  S.railsTouched = true;
   LAST_QUOTE = null; setReviewEnabled(false);
-  updateRailToggle();
-  requote();
+  paintRailSegs();
+  requote().catch(()=>{});
 }
 function paintRefHints(){
   // Re-value the "≈ <ref>" hints against the current asset + typed amount. The
@@ -374,10 +505,10 @@ function paintRouteLine(){
     $('swRoute').textContent = '';
     return;
   }
-  $('swRoute').textContent = route.kind === 'cross'
-    ? (route.payIsBtc ? 'Cross-chain · buy with BTC' : 'Cross-chain · sell for BTC')
-    : route.kind === 'ln'
-    ? (route.payIsBtc ? 'Lightning · instant buy' : 'Lightning · instant sell')
+  $('swRoute').textContent =
+      route.kind === 'mixed' ? 'Mixed rails · Lightning + on-chain'
+    : route.kind === 'cross' ? (route.payIsBtc ? 'Cross-chain · buy with BTC' : 'Cross-chain · sell for BTC')
+    : route.kind === 'ln'    ? (route.payIsBtc ? 'Lightning · instant buy' : 'Lightning · instant sell')
     : 'Same-chain · order book';
   // The rate line is filled by the quote (showQuote / showXRate); a placeholder until then.
   if (!LAST_QUOTE) $('swRate').textContent = '1 ' + tk(S.payAsset) + ' = … ' + tk(S.receiveAsset);
@@ -422,17 +553,21 @@ function typedAmount(side){
 async function requote(){
   const { $ } = C;
   $('swErr').textContent = '';
+  LAST_MID = null;
   paintRouteLine();
   const route = findRoute(S.payAsset, S.receiveAsset);
-  if (!route){ setReviewEnabled(false); clearOpposite(); const bh = C.$('swBook'); if (bh) bh.innerHTML = ''; return; }
+  renderTiming(route);   // timing banner reflects the rails immediately, before amounts
+  if (!route){ setReviewEnabled(false); clearOpposite(); clearBook(); return; }
   const amtStr = typedAmount(S.edited);
-  // Do NOT bail on an empty amount: requoteSame/requoteCross fetch and RENDER the
-  // order book first (so it is visible the moment a pair is chosen), then quote
-  // only if an amount is present.
-  if (route.kind === 'ln') return requoteLn(route, amtStr);
+  // Do NOT bail on an empty amount: the quote functions fetch and RENDER the ONE
+  // order book first (so it is visible the moment a pair is chosen, on EVERY rail),
+  // then quote only if an amount is present.
+  if (route.kind === 'ln')    return requoteLn(route, amtStr);
   if (route.kind === 'cross') return requoteCross(route, amtStr);
+  if (route.kind === 'mixed') return requoteMixed(route, amtStr);
   return requoteSame(route, amtStr);
 }
+function clearBook(){ const b = C.$('swBook'); if (b) b.innerHTML = ''; renderPairBar(); }
 
 function clearOpposite(){
   const other = S.edited === 'pay' ? C.$('swRecvAmt') : C.$('swPayAmt');
@@ -632,6 +767,80 @@ function paintQuoteSame(){
   setFinality('same');
 }
 
+// Fetch + render the ONE (cross) order book for a BTC<->asset pair. Called on EVERY
+// rail (ln / cross / mixed) so the book is never blank and looks identical — there is
+// no on-chain/LN distinction in the book UI. Returns { offers, unreachable }.
+async function loadBtcBook(route){
+  const seqAsset = route.seqAsset;
+  let book = { forward: [], reverse: [], unreachable: false };
+  if (X && X.book) book = await X.book(seqAsset).catch(() => ({ forward: [], reverse: [], unreachable: true }));
+  const offers = route.payIsBtc ? (book.forward || []) : (book.reverse || []);
+  XBOOK = { seqAsset, payIsBtc: route.payIsBtc, offers };
+  renderXBook(seqAsset, route.payIsBtc, offers);
+  return { offers, unreachable: book.unreachable };
+}
+function numVal(el){ return parseFloat((((el && el.value) || '')).replace(/,/g, '')) || 0; }
+// Best-effort self-correcting fill for the LN / mixed rails: derive the field the
+// user did NOT edit from the best resting offer's price, so the composer is never
+// half-empty. The authoritative amounts still come from the settle response (LN) or
+// the daemon quote (cross); this is display only, and never stomps an active field.
+function deriveXOpposite(route){
+  try {
+    const o = (XBOOK.offers || [])[0]; if (!o) return;
+    const am = C.assetMeta(route.seqAsset);
+    const { asset, btc } = xOfferAmts(o, route.payIsBtc);
+    const assetU = Number(big(asset)) / Math.pow(10, am.precision || 0), btcU = Number(big(btc)) / 1e8;
+    if (!(assetU > 0 && btcU > 0)) return;
+    const btcPerAsset = btcU / assetU;
+    const pa = C.$('swPayAmt'), ra = C.$('swRecvAmt');
+    const btcIsPay = (S.payAsset === 'BTC');
+    if (S.edited === 'pay'){
+      const v = numVal(pa); if (!(v > 0)) return;
+      const other = btcIsPay ? (v / btcPerAsset) : (v * btcPerAsset);
+      if (document.activeElement !== ra) ra.value = trim(other);
+    } else {
+      const v = numVal(ra); if (!(v > 0)) return;
+      const other = btcIsPay ? (v * btcPerAsset) : (v / btcPerAsset);
+      if (document.activeElement !== pa) pa.value = trim(other);
+    }
+    paintRefHints();
+  } catch {}
+}
+
+// --- MIXED rails (one leg LN, one on-chain) -------------------------------------
+// The front end is fully built + priced from the same book, and the timing banner is
+// exact — but the submarine backend that settles a mixed pair is not deployed yet, so
+// Review fails closed (see reviewMixed). This keeps the toggles + honest timing usable
+// today without a broken swap. Search: TODO(mixed-rail submarine).
+async function requoteMixed(route, amtStr){
+  const { $ } = C;
+  const am = C.assetMeta(route.seqAsset);
+  $('swStatus').textContent = ''; $('swErr').textContent = '';
+  await loadBtcBook(route);
+  deriveXOpposite(route);
+  const o = (XBOOK.offers || [])[0];
+  if (o){
+    const { asset, btc } = xOfferAmts(o, route.payIsBtc);
+    const assetU = Number(big(asset)) / Math.pow(10, am.precision || 0), btcU = Number(big(btc)) / 1e8;
+    $('swRate').textContent = (assetU > 0 && btcU > 0)
+      ? `1 BTC = ${trim(assetU / btcU)} ${am.ticker} · best resting offer`
+      : `Mixed rails · ${am.ticker}/BTC`;
+  } else {
+    $('swRate').textContent = `No resting offers for ${am.ticker}/BTC yet.`;
+  }
+  $('swRoute').textContent = 'Mixed rails · Lightning + on-chain';
+  // Fronted case (pay on-chain -> receive on LN, within the instant-front CAP): the
+  // fee note flags the instant-settlement cover; otherwise it's quoted when the route lands.
+  const fronted = (route.recvRail === 'ln' && route.payRail === 'chain' && btcLegAtoms() <= frontCapAtoms());
+  paintFee('BTC', null, fronted
+    ? 'Includes instant-settlement cover for the fronted on-chain leg.'
+    : 'Mixed-rail settlement · fees are quoted when this route lands.');
+  LAST_QUOTE = { kind: 'mixed', route, seqAsset: route.seqAsset, payIsBtc: route.payIsBtc,
+    payRail: route.payRail, recvRail: route.recvRail };
+  renderTiming(route);
+  setReviewEnabled(!!(amtStr && amtStr.trim()));   // clickable -> honest "landing soon" message
+}
+
 // --- cross-chain quote (GetXchainQuote) ---
 async function requoteCross(route, amtStr){
   const { $ } = C;
@@ -642,23 +851,19 @@ async function requoteCross(route, amtStr){
   const status = $('swStatus'); status.className = 'status'; status.innerHTML = '<span class="spin"></span>Loading the cross-chain order book…';
   $('swErr').textContent = '';
   try {
-    // Fetch + render the cross order book for this pair, then pick the side that
-    // matches the taker's direction: buy asset with BTC = forward offers; sell
+    // Fetch + render the ONE (cross) order book for this pair, then pick the side
+    // that matches the taker's direction: buy asset with BTC = forward offers; sell
     // asset for BTC = reverse offers. "No offers" is not an error — it renders an
     // empty book (cross markets need a maker with BTC reserves, so unlike a
     // same-chain pair the wallet can't self-start one yet).
-    let book = { forward: [], reverse: [], unreachable: false };
-    if (X.book) book = await X.book(seqAsset).catch(() => ({ forward: [], reverse: [], unreachable: true }));
-    const offers = route.payIsBtc ? (book.forward || []) : (book.reverse || []);
-    XBOOK = { seqAsset, payIsBtc: route.payIsBtc, offers };
-    renderXBook(seqAsset, route.payIsBtc, offers);
+    const { offers, unreachable } = await loadBtcBook(route);
 
     // T7: cross-chain relay unreachable AND nothing to show — offer a retry, never invite first-maker.
-    if (book.unreachable && !offers.length){
+    if (unreachable && !offers.length){
       status.textContent = ''; clearOpposite(); LAST_QUOTE = null; setReviewEnabled(false);
       $('swRate').textContent = 'Cross-chain order book unreachable - retry.';
       $('swRoute').textContent = '';
-      $('swErr').textContent = 'Could not reach the cross-chain order book (' + (book.unreachable === true ? 'relay unreachable' : book.unreachable) + '). Check your connection and press Refresh.';
+      $('swErr').textContent = 'Could not reach the cross-chain order book (' + (unreachable === true ? 'relay unreachable' : unreachable) + '). Check your connection and press Refresh.';
       return;
     }
 
@@ -735,24 +940,83 @@ function xOfferAmts(o, payIsBtc){
 }
 
 // Cross-chain order book (resting cross offers for one BTC<->asset pair + direction),
-// rendered into the shared #swBook host like the same-chain book.
+// rendered as the SAME ladder as the same-chain book — no rail distinction, orders
+// look identical. Buying asset with BTC => the offers are ASKS you can take; selling
+// asset for BTC => they are BIDS you can take. Prices are BTC per asset unit.
 function renderXBook(seqAsset, payIsBtc, offers){
   const host = C.$('swBook'); if (!host) return;
   const am = C.assetMeta(seqAsset);
   offers = offers || [];
-  const rows = offers.slice(0, 12).map(o => {
+  const rows = offers.map((o, i) => {
     const { asset, btc } = xOfferAmts(o, payIsBtc);
-    const assetU = Number(asset)/Math.pow(10, am.precision||0), btcU = Number(btc)/1e8;
-    const price = assetU > 0 ? btcU/assetU : 0;
-    return `<div class="swbook-row">
-      <span class="mono">${esc(C.fmtAtoms(asset, am.precision))} ${esc(am.ticker)}</span>
-      <span class="sub">@ ${esc(trim(price))} BTC/${esc(am.ticker)}</span></div>`;
-  }).join('');
-  const dirLbl = payIsBtc ? `${esc(am.ticker)} for BTC` : `BTC for ${esc(am.ticker)}`;
-  host.innerHTML = `<div class="swbook"><div class="swbook-head">
-      <span class="lbl">Cross-chain order book · ${dirLbl}</span>
-      <span class="sub">${offers.length} resting offer${offers.length===1?'':'s'}</span></div>
-    ${rows || '<div class="sub" style="padding:6px 2px">No resting cross-chain offers yet - a market maker with BTC reserves needs to post one.</div>'}</div>`;
+    const assetU = Number(big(asset)) / Math.pow(10, am.precision || 0), btcU = Number(big(btc)) / 1e8;
+    return { price: assetU > 0 ? btcU / assetU : 0, size: assetU, _i: i };
+  }).filter(r => r.price > 0 && r.size > 0);
+  let asks = [], bids = [];
+  const total = rows.reduce((s, r) => s + r.size, 0) || 1;
+  if (payIsBtc){                       // takeable asks (give BTC, get asset)
+    rows.sort((a, b) => a.price - b.price);
+    let c = 0; rows.forEach(r => { c += r.size; r.cum = c; r.frac = c / total; });
+    asks = rows.slice().reverse();
+  } else {                             // takeable bids (give asset, get BTC)
+    rows.sort((a, b) => b.price - a.price);
+    let c = 0; rows.forEach(r => { c += r.size; r.cum = c; r.frac = c / total; });
+    bids = rows;
+  }
+  (payIsBtc ? asks : bids).forEach(r => r.onClick = () => fillFromXOffer(r._i));
+  const best = rows.length ? (payIsBtc ? Math.min(...rows.map(r => r.price)) : Math.max(...rows.map(r => r.price))) : null;
+  LAST_MID = { price: best, cross: true };
+  renderLadder(host, {
+    asks: asks.slice(0, 8), bids: bids.slice(0, 8), mid: best, spread: null,
+    priceLabel: `(BTC/${am.ticker})`, sizeLabel: am.ticker,
+    refMidStr: oneUnitRefStr(seqAsset),
+    headTitle: 'Order book', headSub: `${offers.length} offer${offers.length === 1 ? '' : 's'}`,
+    emptyMsg: 'No resting offers yet - a market maker with BTC reserves needs to post one.',
+  });
+  renderPairBar();
+}
+// Click a cross-book level: seed the composer with that offer's asset size + re-quote.
+function fillFromXOffer(i){
+  const o = (XBOOK.offers || [])[i]; if (!o) return;
+  const am = C.assetMeta(XBOOK.seqAsset);
+  const { asset } = xOfferAmts(o, XBOOK.payIsBtc);
+  if (XBOOK.payIsBtc){ S.edited = 'receive'; C.$('swRecvAmt').value = C.fmtAtoms(asset, am.precision || 0); }
+  else               { S.edited = 'pay';     C.$('swPayAmt').value  = C.fmtAtoms(asset, am.precision || 0); }
+  LAST_QUOTE = null; setReviewEnabled(false);
+  requote().catch(()=>{});
+}
+
+// The shared ladder: asks (red, high->low) · mid · bids (green, high->low), with a
+// cumulative-depth bar per row. Rows whose item carries an onClick are clickable
+// (click-a-level-to-price); the rest are display-only depth. ONE renderer for both
+// the same-chain and cross-chain books, so orders look identical on every rail.
+function renderLadder(host, o){
+  if (!host) return;
+  const rowHtml = (cls, r, i) => {
+    const clk = typeof r.onClick === 'function';
+    const w = Math.max(2, Math.min(100, Math.round((r.frac || 0) * 100)));
+    return `<button type="button" class="swlrow ${cls}${clk ? '' : ' noclick'}" data-side="${cls}" data-i="${i}"${clk ? '' : ' tabindex="-1"'}>
+      <span>${esc(trim(r.price))}</span><span>${esc(trim(r.size))}</span><span>${esc(trim(r.cum != null ? r.cum : r.size))}</span>
+      <i class="swldepth" style="width:${w}%"></i></button>`;
+  };
+  const asks = o.asks || [], bids = o.bids || [];
+  const asksHtml = asks.map((r, i) => rowHtml('ask', r, i)).join('');
+  const bidsHtml = bids.map((r, i) => rowHtml('bid', r, i)).join('');
+  const hasRows = asks.length || bids.length;
+  const cols = `<div class="swladder-cols"><span>Price ${esc(o.priceLabel || '')}</span><span>Size${o.sizeLabel ? ' (' + esc(o.sizeLabel) + ')' : ''}</span><span>Sum</span></div>`;
+  const midHtml = hasRows
+    ? `<div class="swlmid"><b>${o.mid != null ? esc(trim(o.mid)) : '—'}</b> <span class="sp">${o.spread != null ? 'spread ' + esc(trim(o.spread)) + ' · mid' : 'mid'}</span> <span>${esc(o.refMidStr || '')}</span></div>`
+    : '';
+  const empty = hasRows ? '' : `<div class="swladder-empty">${esc(o.emptyMsg || 'No resting offers yet.')}</div>`;
+  host.innerHTML = `<div class="swladder">
+    <div class="swladder-head"><span class="sub" style="color:var(--txt);font-weight:650">${esc(o.headTitle || 'Order book')}</span><span class="sub">${esc(o.headSub || '')}</span></div>
+    ${cols}${asksHtml}${midHtml}${bidsHtml}${empty}</div>`;
+  host.querySelectorAll('.swlrow').forEach(b => {
+    const side = b.dataset.side, i = +b.dataset.i;
+    const r = (side === 'ask' ? asks : bids)[i];
+    if (!r || typeof r.onClick !== 'function') return;
+    b.onclick = () => { r.onClick(); host.querySelectorAll('.swlrow').forEach(x => x.classList.remove('picked')); b.classList.add('picked'); };
+  });
   renderMyOrders();
 }
 
@@ -790,9 +1054,10 @@ function paintFee(feeAssetHex, feeAtoms, noteOverride){
   const ref = (feeAtoms != null) ? (C.refValueStr(feeAssetHex, feeAtoms) || '') : '';
   $('swFeeRef').textContent = ref;
   $('swFeeNote').textContent = noteOverride || 'Pay the fee in any asset the network prices.';
-  // The fee picker is disabled for the cross-chain (BTC-only) leg AND the LN leg
-  // (its cost is the LP spread baked into the rate, not a taker-funded network fee).
-  const noFee = LAST_QUOTE && (LAST_QUOTE.kind === 'cross' || LAST_QUOTE.kind === 'ln');
+  // The fee picker is disabled for the cross-chain (BTC-only) leg, the LN leg, and
+  // the mixed rail (their cost is the LP spread / BTC-leg fee baked into the rate,
+  // not a taker-funded open-market network fee).
+  const noFee = LAST_QUOTE && (LAST_QUOTE.kind === 'cross' || LAST_QUOTE.kind === 'ln' || LAST_QUOTE.kind === 'mixed');
   $('swFeePick').disabled = !!noFee;
   $('swFeePick').style.opacity = noFee ? '.5' : '';
 }
@@ -853,18 +1118,101 @@ function feeAssetSubline(hex){
 }
 
 // ---------------------------------------------------------------------------
-// finality line (anchor-aware; never "instant")
+// honest, actionable timing banner (keyed off the RECEIVE leg)
 // ---------------------------------------------------------------------------
-function setFinality(kind){
-  const t = C.$('swFinText'); if (!t) return;
-  // Pure-LN is the ONLY state the DEX 0-conf policy lets us call "final" (nothing
-  // on-chain, no reorg surface). Everything else stays anchor-honest.
-  t.textContent = kind === 'ln'
-    ? (L && L.finalityCopy ? L.finalityCopy() : 'Instant and final · pure Lightning, nothing on-chain, no Bitcoin-reorg risk.')
-    : kind === 'cross'
-    ? 'Settles across both chains · the Sequentia leg is anchor-bound to Bitcoin (reverts only if Bitcoin reverts).'
-    : 'Settles in ~1 block · anchor-bound to Bitcoin (reverts only if Bitcoin reverts).';
+// The LP instant-front CAP (how much on-chain PAY the LP will front so you receive
+// on Lightning NOW). Read from window.SEQ_LSP_FRONT_CAP (BTC, e.g. 0.0005); default
+// 0.0005 BTC. Compared against the BTC leg of the trade in BTC atoms.
+function frontCapAtoms(){
+  const w = (typeof window !== 'undefined') ? window : {};
+  const c = w.SEQ_LSP_FRONT_CAP;
+  if (c != null){ try { return C.parseAtoms(String(c), 8); } catch {} }
+  return 50000n;   // 0.0005 BTC
 }
+// The BTC leg amount of the current composer state, in BTC atoms (the on-chain PAY
+// exposure the CAP governs). Exactly one side of a BTC pair is BTC.
+function btcLegAtoms(){
+  const btcIsPay = (S.payAsset === 'BTC');
+  const v = ((btcIsPay ? C.$('swPayAmt') : C.$('swRecvAmt')).value || '').trim();
+  try { return C.parseAtoms(v, 8); } catch { return 0n; }
+}
+// testnet4 on-chain payment confirmation estimate (the pay leg must confirm before an
+// over-CAP LN front settles). Overridable via window.SEQ_ONCHAIN_CONF = { n, t }.
+function onchainConf(){
+  const w = (typeof window !== 'undefined') ? window : {};
+  const o = w.SEQ_ONCHAIN_CONF;
+  return (o && o.n) ? { n: o.n, t: o.t || '~10 min' } : { n: 1, t: '~10 min' };
+}
+// asset units per BTC unit, from the best resting offer (for expressing the CAP in the
+// pay asset's own units when paying an asset). 0 if unknown.
+function assetPerBtc(route){
+  const o = (XBOOK.offers || [])[0]; if (!o) return 0;
+  const am = C.assetMeta(route.seqAsset);
+  const { asset, btc } = xOfferAmts(o, route.payIsBtc);
+  const assetU = Number(big(asset)) / Math.pow(10, am.precision || 0), btcU = Number(big(btc)) / 1e8;
+  return btcU > 0 ? assetU / btcU : 0;
+}
+// The CAP expressed in the PAY asset's own units (BTC when paying BTC; the asset when
+// paying the asset, converted via the best-offer price; falls back to BTC if unknown).
+function capDisplay(route){
+  const cap = frontCapAtoms();
+  if (route.payIsBtc) return C.fmtAtoms(cap, 8) + ' BTC';
+  const r = assetPerBtc(route);
+  if (r > 0){
+    const am = C.assetMeta(route.seqAsset);
+    const capAssetUnits = (Number(cap) / 1e8) * r;
+    const capAssetAtoms = BigInt(Math.round(capAssetUnits * Math.pow(10, am.precision || 0)));
+    return C.fmtAtoms(capAssetAtoms, am.precision || 0) + ' ' + am.ticker;
+  }
+  return C.fmtAtoms(cap, 8) + ' BTC';
+}
+// Anchor-honest wording reused across the on-chain-receipt cases.
+const ANCHOR_FINAL = 'anchor-bound to Bitcoin (reverts only if Bitcoin reverts)';
+
+// Render the timing banner for the current route. The matrix is keyed off the RECEIVE
+// leg (an on-chain RECEIPT is never made instant by the CAP; the CAP only fronts an
+// on-chain PAYMENT). The inline "fix" links flip a leg to Lightning.
+function renderTiming(route){
+  const el = C.$('swTiming'), ic = C.$('swTimingIcon'), tx = C.$('swTimingText');
+  if (!el || !tx) return;
+  const wireFix = () => { el.querySelectorAll('.swfix').forEach(s => s.onclick = () => setRail(s.dataset.fix, 'ln')); };
+  const ln = lnAvailable();
+  if (!route){
+    el.className = 'swtiming ok'; if (ic) ic.textContent = '•';
+    tx.innerHTML = 'Pick two assets to see how settlement works.';
+    return;
+  }
+  if (route.kind === 'same'){
+    // Same-chain atomic swap: on-chain receipt (no LN option here), anchor-bound.
+    el.className = 'swtiming wait'; if (ic) ic.textContent = '◷';
+    tx.innerHTML = `Appears immediately, final in <b>~1 block</b> · ${ANCHOR_FINAL}.`;
+    return;
+  }
+  // BTC pair: the exact 4-case matrix keyed off the receive leg.
+  const pr = route.payRail, rr = route.recvRail;
+  const tk = esc(C.assetMeta(route.seqAsset).ticker);
+  if (rr === 'ln' && pr === 'ln'){
+    el.className = 'swtiming ok'; if (ic) ic.textContent = '✓';
+    tx.innerHTML = '<b>Instant &amp; final</b> — both legs on Lightning, nothing on-chain, no reorg risk.';
+  } else if (rr === 'ln' && pr === 'chain' && btcLegAtoms() <= frontCapAtoms()){
+    el.className = 'swtiming ok'; if (ic) ic.textContent = '✓';
+    tx.innerHTML = `<b>Instant.</b> Your on-chain payment is fronted; you receive final ${tk} now.`;
+  } else if (rr === 'ln' && pr === 'chain'){
+    const { n, t } = onchainConf();
+    el.className = 'swtiming wait'; if (ic) ic.textContent = '◷';
+    tx.innerHTML = `<b>~${n} confirmation${n > 1 ? 's' : ''} (${esc(t)}):</b> your on-chain payment must confirm first. `
+      + `Settle instantly by <span class="swfix" data-fix="pay">paying from Lightning</span>, or trade under ${esc(capDisplay(route))}.`;
+    wireFix();
+  } else {   // rr === 'chain' (any pay rail): on-chain receipt, inherent — CAP can't make it instant
+    el.className = 'swtiming wait'; if (ic) ic.textContent = '◷';
+    tx.innerHTML = `Appears immediately, final in <b>~1 block</b> · ${ANCHOR_FINAL}.`
+      + (ln ? ` To receive instantly &amp; finally, <span class="swfix" data-fix="recv">switch Receive to Lightning</span>.` : '');
+    wireFix();
+  }
+}
+// Back-compat shim: older call sites pass a kind string; the banner now derives its
+// state from the live route + rails, so the argument is ignored.
+function setFinality(_kind){ renderTiming(findRoute(S.payAsset, S.receiveAsset)); }
 
 // ---------------------------------------------------------------------------
 // asset picker popover (searchable; ticker · balance · ≈ ref)
@@ -974,8 +1322,21 @@ async function onReview(){
   if (!q){ $('swErr').textContent = 'Enter an amount to get a quote first.'; return; }
   if (q.kind === 'cross-make') return postCrossOfferReview(q);
   if (q.kind === 'ln') return reviewLn(q);
+  if (q.kind === 'mixed') return reviewMixed(q);
   if (q.kind === 'cross') return reviewCross(q);
   return reviewSame(q);
+}
+
+// Mixed rails (one leg LN, one on-chain). The composer + timing are fully built, but
+// the backend that settles a mixed pair is a submarine swap that is not deployed yet.
+// Fail closed with an honest message — the same graceful-degradation pattern the
+// wallet uses when LN is unconfigured — rather than attempting a broken swap.
+// TODO(mixed-rail submarine): wire this to the submarine backend when it lands, then
+// route ln+chain / chain+ln here to a real settlement instead of this message.
+function reviewMixed(q){
+  const { $ } = C;
+  $('swErr').textContent = 'This rail combination is landing soon. For now, set both to Lightning (instant & final) or both to On-chain.';
+  try { C.toast('Mixed Lightning + on-chain rails are landing soon — set both legs the same way for now.'); } catch {}
 }
 
 // Start a CROSS market from the wallet: post a signed forward cross offer (SELL
@@ -1169,17 +1530,20 @@ async function reviewCross(q){
 // actual amounts come back in the settle response.
 async function requoteLn(route, amtStr){
   const { $ } = C;
+  // ONE book: the SAME resting SeqOB (cross) book shows on the Lightning rail too —
+  // no rail distinction in the book UI. (Prior bug: the LN rail blanked the book.)
+  await loadBtcBook(route);
+  deriveXOpposite(route);
   const side = route.payIsBtc ? 'buy' : 'sell';
   LAST_QUOTE = { kind: 'ln', side, seqAsset: route.seqAsset, payIsBtc: route.payIsBtc,
     amount: amtStr ? parseFloat(amtStr) : null };
-  setFinality('ln');
   paintFee('BTC', null, 'The rate includes the LP spread; there is no separate network fee on the Lightning leg.');
   const am = C.assetMeta(route.seqAsset);
   $('swRate').textContent = `Instant ${am.ticker}/BTC over Lightning · rate includes the LP spread`;
   $('swRoute').textContent = route.payIsBtc ? 'Lightning · instant buy' : 'Lightning · instant sell';
-  const book = $('swBook'); if (book) book.innerHTML = '';   // no on-chain order book on the LN rail
   $('swStatus').textContent = ''; $('swErr').textContent = '';
-  setReviewEnabled(true);
+  renderTiming(route);
+  setReviewEnabled(true);   // LP fixed terms (proven path) — Review is offerable
 }
 
 // Execute the pure-LN swap through the LSP (the device co-signs the hosted node's
@@ -1318,33 +1682,46 @@ async function postOfferReview(q){
 function short(s){ s = s || ''; return s.length > 14 ? s.slice(0,8) + '…' + s.slice(-4) : s; }
 function esc(s){ return String(s == null ? '' : s).replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c])); }
 
+// Same-chain SeqOB book, rendered as the shared ladder. Prices are PAY per 1 RECEIVE
+// (the conventional quote, matching the mid). ASKS are the offers we can take (give
+// pay, get receive) — clickable to lift; BIDS are the opposite side (display-only
+// depth, since the taker can't lift them).
 function renderBook(pay, receive){
   const host = C.$('swBook'); if (!host) return;
-  const offers = BOOK.offers || [];
   const pm = C.assetMeta(pay), rm = C.assetMeta(receive);
-  const rows = offers.slice(0, 12).map(o => {
-    const offerAmt = big(o.offer_amount||o.offerAmount), wantAmt = big(o.want_amount||o.wantAmount);
-    const recvU = Number(offerAmt)/Math.pow(10, rm.precision||0), payU = Number(wantAmt)/Math.pow(10, pm.precision||0);
-    const price = payU > 0 ? recvU/payU : 0;
-    return `<button type="button" class="swbook-row" data-id="${esc(o.offer_id||o.offerId)}" data-maker="${esc(o.maker_pubkey||o.makerPubkey)}">
-      <span class="mono">${esc(C.fmtAtoms(offerAmt, rm.precision))} ${esc(rm.ticker)}</span>
-      <span class="sub">@ ${esc(trim(price))} ${esc(rm.ticker)}/${esc(pm.ticker)}</span></button>`;
-  }).join('');
-  // T14: spread/mid/depth summary where the data allows (degrades gracefully to just the side present).
-  const st = bookStats(offers, BOOK.otherOffers || [], pm, rm);
-  const stParts = [];
-  if (st.bestAsk != null) stParts.push(`ask 1 ${esc(rm.ticker)} = ${esc(trim(st.bestAsk))} ${esc(pm.ticker)}`);
-  if (st.bestBid != null) stParts.push(`bid ${esc(trim(st.bestBid))}`);
-  if (st.mid != null)     stParts.push(`mid ${esc(trim(st.mid))}`);
-  if (st.spread != null)  stParts.push(`spread ${esc(trim(st.spread))}`);
-  if (st.depthRecv > 0)   stParts.push(`depth ${esc(trim(st.depthRecv))} ${esc(rm.ticker)}`);
-  const statLine = stParts.length ? `<div class="sub" style="margin:2px 0 4px">${stParts.join(' · ')}</div>` : '';
-  host.innerHTML = `<div class="swbook"><div class="swbook-head">
-      <span class="lbl">Order book · ${esc(rm.ticker)} for ${esc(pm.ticker)}</span>
-      <span class="sub">${offers.length} resting offer${offers.length===1?'':'s'}</span></div>
-    ${statLine}${rows || '<div class="sub" style="padding:6px 2px">No resting offers - enter an amount and Review to start this market.</div>'}</div>`;
-  host.querySelectorAll('.swbook-row').forEach(b => b.onclick = () => fillFromOffer(b.dataset.id, b.dataset.maker, pay, receive));
-  renderMyOrders();
+  const toU = (a, p) => Number(big(a)) / Math.pow(10, p || 0);
+  let asks = (BOOK.offers || []).map(o => {
+    const recvSize = toU(o.offer_amount || o.offerAmount, rm.precision);   // offer asset = receive
+    const payWanted = toU(o.want_amount || o.wantAmount, pm.precision);    // want asset  = pay
+    return { price: recvSize > 0 ? payWanted / recvSize : 0, size: recvSize,
+             id: o.offer_id || o.offerId, maker: o.maker_pubkey || o.makerPubkey };
+  }).filter(r => r.price > 0 && r.size > 0);
+  let bids = (BOOK.otherOffers || []).map(o => {
+    const payGiven = toU(o.offer_amount || o.offerAmount, pm.precision);   // offer asset = pay
+    const recvWanted = toU(o.want_amount || o.wantAmount, rm.precision);   // want asset  = receive
+    return { price: recvWanted > 0 ? payGiven / recvWanted : 0, size: recvWanted };
+  }).filter(r => r.price > 0 && r.size > 0);
+  const bestAsk = asks.length ? Math.min(...asks.map(a => a.price)) : null;
+  const bestBid = bids.length ? Math.max(...bids.map(b => b.price)) : null;
+  const mid = (bestAsk != null && bestBid != null) ? (bestAsk + bestBid) / 2 : (bestAsk != null ? bestAsk : bestBid);
+  const spread = (bestAsk != null && bestBid != null) ? (bestAsk - bestBid) : null;
+  // cumulate from the mid outward; display asks high->low, bids high->low
+  asks.sort((a, b) => a.price - b.price);
+  { let c = 0; const t = asks.reduce((s, r) => s + r.size, 0) || 1; asks.forEach(r => { c += r.size; r.cum = c; r.frac = c / t; }); }
+  asks.reverse();
+  bids.sort((a, b) => b.price - a.price);
+  { let c = 0; const t = bids.reduce((s, r) => s + r.size, 0) || 1; bids.forEach(r => { c += r.size; r.cum = c; r.frac = c / t; }); }
+  asks = asks.slice(0, 8); bids = bids.slice(0, 8);
+  asks.forEach(r => r.onClick = () => fillFromOffer(r.id, r.maker, pay, receive));   // takeable
+  LAST_MID = { price: mid, cross: false };
+  renderLadder(host, {
+    asks, bids, mid, spread,
+    priceLabel: `(${pm.ticker}/${rm.ticker})`, sizeLabel: rm.ticker,
+    refMidStr: oneUnitRefStr(receive),
+    headTitle: 'Order book', headSub: `${(BOOK.offers || []).length} offer${(BOOK.offers || []).length === 1 ? '' : 's'}`,
+    emptyMsg: 'No resting offers - enter an amount and Review to start this market.',
+  });
+  renderPairBar();
 }
 
 function fillFromOffer(id, maker, pay, receive){
