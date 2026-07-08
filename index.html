@@ -424,11 +424,12 @@
           <!-- RIGHT: the composer (the signature). -->
           <div class="swdesk-compose">
 
-            <!-- Take (lift the book at its price) vs Post (rest a LIMIT order at your OWN
-                 price — both amount fields become independent, and the pay÷receive ratio
-                 is your price). Auto-defaults to Post when the pair has no resting orders,
-                 so you can start the market's first order. Rendered by swap.js/paintModeSeg. -->
-            <div class="swmode hide" id="swModeWrap">
+            <!-- No Take vs Post, no maker vs taker: every order is just "Place order".
+                 The two amount fields are the user's own limit (their ratio is the
+                 price); placing rests a self-enforcing covenant that fills whenever it
+                 is crossed, even offline. The hidden #swModeWrap is retained only as an
+                 internal auto-mode hook for the cross-chain route (never shown). -->
+            <div class="swmode hide" id="swModeWrap" aria-hidden="true">
               <div class="swseg swmode-seg" id="swModeSeg">
                 <button type="button" data-m="take">Take</button>
                 <button type="button" data-m="post">Post</button>
@@ -542,7 +543,7 @@
             <span class="swtiming-tx" id="swTimingText">Pick two assets to see how settlement works.</span>
           </div>
 
-          <button class="primary swreview" id="swReview" disabled>Review swap</button>
+          <button class="primary swreview" id="swReview" disabled>Place order</button>
           <div class="status" id="swStatus"></div>
           <div class="status err" id="swErr"></div>
         </div>
@@ -699,10 +700,11 @@
 </script>
 <script type="module">
 import init, { Mnemonic, Network, Signer, Wollet, EsploraClient, Address, AssetId, Txid, Contract, Pset, Transaction,
-  generateSwapSecret, buildSeqHtlcRedeemScript, buildSeqHtlcClaimTx, buildSeqHtlcRefundTx }
+  generateSwapSecret, buildSeqHtlcRedeemScript, buildSeqHtlcClaimTx, buildSeqHtlcRefundTx,
+  scriptToAddress, buildCovenantFillTx }
   from './pkg/lwk_wasm.js';
 import { HDKey, mnemonicToSeedSync, btc, schnorr } from './btc.js';
-import { initSwap, renderSwap, resumeCrossMakers } from './swap.js';
+import { initSwap, renderSwap, resumeCrossMakers, resumeCovenantOrders, scanCovenantCompanion } from './swap.js';
 import { initXswap, renderXswap, fetchXmarkets, fetchXquote, fetchXbook, openFromComposer, hasInFlight } from './xswap.js';
 import { initXrswap, fetchRQuote, openReverseFromComposer, hasInFlight as hasReverseInFlight, renderReverse } from './xrswap.js';
 import { initXmaker, startForwardMaker, startReverseMaker, liveMakerOffers, resumeMakerSwaps } from './xmaker.js';
@@ -1488,6 +1490,9 @@ async function openWallet(phrase){
   // T11: after the wallet is up, re-launch any maker settlement/refund watcher that a prior session
   // persisted mid-flow (fund-loss safety) and surface the interrupted swap for recovery.
   try{ resumeCrossMakers(); }catch(e){ console.warn('[resume] cross-maker resume failed:', e?.message??e); }
+  // Passive-CLOB covenant orders rest ON-CHAIN and can fill while the tab is closed;
+  // rehydrate them, rescan the maker-credit companion wollet, and re-arm the fill watcher.
+  try{ resumeCovenantOrders(); }catch(e){ console.warn('[resume] covenant-order resume failed:', e?.message??e); }
   // Lightning (LSP): bring the on-device signer online so the "Instant (Lightning)"
   // swap rail becomes available. Non-fatal + opt-in: if the wss endpoint / host key
   // aren't configured, LN stays off and the composer uses the on-chain rail.
@@ -1623,12 +1628,18 @@ function initSwapTab(){
   // discovers same-chain markets itself, and reaches the cross-chain wizard
   // through the `xroute` bridge below (markets/quote/openFromComposer/hasInFlight).
   initSwap({
-    wasm: { Wollet, Signer, AssetId, Address, Pset, Txid },
+    // scriptToAddress + buildCovenantFillTx are module-level pkg exports; they ride
+    // alongside the classes so the passive-CLOB covenant flow (place + FILL) can reach them.
+    wasm: { Wollet, Signer, AssetId, Address, Pset, Txid, scriptToAddress, buildCovenantFillTx },
     get wollet(){ return wollet; }, get signer(){ return signer; },
     get network(){ return network; }, get client(){ return client; },
     get POLICY(){ return POLICY; }, get POLICY_HEX(){ return POLICY_HEX; },
     get addrIndex(){ return addrIndex; },
     get btcBalance(){ return btcBalance; },   // parent-chain balance, so BTC shows a balance like any other asset
+    // The recovery phrase (in-memory; used only to re-derive taker funding keys for a
+    // covenant FILL) + a fetch against the wallet's OWN Sequentia esplora /api.
+    get mnemonic(){ return localStorage.getItem(KEY) || ''; },
+    esploraFetch: (path, opts) => fetch(ESPLORA + path, opts),
     el, $, assetMeta, balObj, fmtAtoms, parseAtoms,
     refValueStr, attachRefHint, assetAmountOf, feeRateFor, prettyErr,
     DEFAULT_FEERATE, EXCHANGE_RATE_SCALE,   // for the order-book swap's open-fee-market fee estimate
@@ -1685,7 +1696,9 @@ async function sync(){
   $('syncStatus').className='status'; $('syncStatus').innerHTML='<span class="spin"></span>Syncing…';
   try{
     // scan both chains + refresh fee-asset rates + restricted-asset balances in parallel
-    const [update] = await Promise.all([client.fullScan(wollet), btcScan(), fetchFeeRates(), oampRefreshBalances()]);
+    const [update] = await Promise.all([client.fullScan(wollet), btcScan(), fetchFeeRates(), oampRefreshBalances(),
+      // Rescan the covenant maker-credit companion wollet so filled-order proceeds stay fresh.
+      Promise.resolve(typeof scanCovenantCompanion==='function' ? scanCovenantCompanion() : null).catch(()=>{})]);
     if(update) wollet.applyUpdate(update);
     // Cross-chain address cycling: advance the shared receive address past anything
     // that's been used on either chain (never backward, so a manual "New address" sticks).

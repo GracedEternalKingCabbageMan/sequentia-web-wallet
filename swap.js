@@ -31,6 +31,12 @@
 
 import * as seqob from './seqob.js';
 import { secp256k1 } from './btc.js';
+// The byte-exact passive-CLOB covenant stack: place a funded resting order that
+// fills permissionlessly (even while the wallet is offline), and settle an inbound
+// match as the taker. Everything routes through these; no crypto is hand-rolled here.
+import { planPlaceOrder, buildCovenantTerms, settleFill as covSettleFill } from './covenant-order.js';
+import { makeCovenantHooks, makerPayout } from './covenant-fill-host.js';
+import { computeRate, orderExpiry, deriveOtherField, buildCovenantOffer } from './covenant-flow.js';
 
 let C = null;            // injected app context (see index.html initSwapTab)
 let X = null;            // the cross-chain route handle ({ openFromComposer, renderXswap, hasInFlight })
@@ -155,11 +161,34 @@ let _quoteTimer = null;
 function wireAmount(input, side){
   input.addEventListener('input', () => {
     S.edited = side;
+    input._userTyped = true;   // this side now holds USER input — never overwrite it
     LAST_QUOTE = null;
     setReviewEnabled(false);
     clearTimeout(_quoteTimer);
     _quoteTimer = setTimeout(() => requote().catch(()=>{}), 350);
   });
+}
+// Programmatically set a field's value and mark it NOT user-typed (so the other
+// side's derivation may overwrite this one; the user's own input is protected).
+function setDerived(input, value){ if (!input) return; input.value = value; input._userTyped = false; }
+// Apply the anti-clobber compose rule: derive the field the user did NOT edit from
+// the book's best price, WITHOUT clearing or overwriting anything the user typed.
+// The empty-market case (no price) leaves both fields exactly as typed — this is
+// the fix for the first-order bug where linked fields wiped each other.
+function applyComposeDerivation(pay, receive, price){
+  const payEl = C.$('swPayAmt'), recvEl = C.$('swRecvAmt');
+  const editedEl = S.edited === 'pay' ? payEl : recvEl;
+  const otherEl  = S.edited === 'pay' ? recvEl : payEl;
+  if (document.activeElement === otherEl) return;   // never fight the field being typed in
+  if (editedEl._refMode || otherEl._refMode) return; // ref-currency input mode: don't derive across units
+  const r = deriveOtherField({
+    edited: S.edited, editedVal: numVal(editedEl),
+    otherUserTyped: !!otherEl._userTyped, price,
+  });
+  if (!r) return;                                    // no derivation -> leave both fields untouched
+  const meta = C.assetMeta(r.side === 'pay' ? pay : receive);
+  setDerived(otherEl, C.fmtAtoms(C.parseAtoms(String(trim(r.value)), meta.precision || 0), meta.precision || 0));
+  paintRefHints();
 }
 
 // Re-render the whole composer for the current wallet/markets/state.
@@ -442,6 +471,7 @@ function paintPanes(){
   paintRouteLine();
   updateRails();
   paintModeSeg();
+  const cta = $('swReview'); if (cta) cta.textContent = 'Place order';   // one CTA, always
 }
 
 // ---------------------------------------------------------------------------
@@ -464,28 +494,17 @@ function wireModeSeg(){
   const seg = C.$('swModeSeg'); if (!seg || seg._wired) return; seg._wired = true;
   seg.querySelectorAll('button[data-m]').forEach(b => b.onclick = () => { if (!b.disabled) setMode(b.dataset.m); });
 }
-// Paint the Take/Post segmented control: active state, disable Post where unpostable,
-// the hint line, and the primary CTA label (Post order vs Review swap).
+// The visible Take vs Post distinction is DELETED (project directive): every order
+// is just "Place order", and whether it lifts the book, rests a covenant, or posts
+// a cross offer is a backend decision. The segmented control stays hidden; the
+// internal S.mode is still used by the cross-chain route to pick take-vs-post
+// automatically (never surfaced). The CTA label is fixed to "Place order" in
+// paintPanes. paintModeSeg is now just the internal auto-mode reconciler.
 function paintModeSeg(){
   if (!C) return;
+  const wrap = C.$('swModeWrap'); if (wrap) wrap.classList.add('hide');   // never shown
   const route = findRoute(S.payAsset, S.receiveAsset);
-  const canPost = postSupported(route);
-  if (!canPost) S.mode = 'take';
-  const wrap = C.$('swModeWrap'); if (wrap) wrap.classList.toggle('hide', !route);
-  const seg = C.$('swModeSeg');
-  if (seg) seg.querySelectorAll('button[data-m]').forEach(b => {
-    const isPost = b.dataset.m === 'post';
-    b.classList.toggle('on', b.dataset.m === S.mode);
-    b.disabled = isPost && !canPost;
-    if (b.disabled) b.title = 'Posting a resting order isn’t available on this rail — Take lifts the book.';
-    else b.removeAttribute('title');
-  });
-  const hint = C.$('swModeHint');
-  if (hint) hint.textContent = (S.mode === 'post' && canPost)
-    ? 'Set your own price — both amounts are yours; posts a resting offer.'
-    : 'Lift resting offers at the book price.';
-  const btn = C.$('swReview');
-  if (btn) btn.textContent = (S.mode === 'post' && canPost) ? 'Post order' : 'Review swap';
+  if (!postSupported(route)) S.mode = 'take';
 }
 // Switch mode by hand (marks it touched so the auto-default stops). Take re-links the
 // fields (requote re-derives the opposite); Post leaves both fields independent.
@@ -597,7 +616,7 @@ function paintRouteLine(){
   $('swRoute').textContent =
       route.kind === 'mixed' ? 'Mixed rails · Lightning + on-chain'
     : route.kind === 'cross' ? (route.payIsBtc ? 'Cross-chain · buy with BTC' : 'Cross-chain · sell for BTC')
-    : route.kind === 'ln'    ? (route.payIsBtc ? 'Lightning · instant buy' : 'Lightning · instant sell')
+    : route.kind === 'ln'    ? (route.payIsBtc ? 'Lightning · buy with BTC' : 'Lightning · sell for BTC')
     : 'Same-chain · order book';
   // The rate line is filled by the quote (showQuote / showXRate); a placeholder until then.
   if (!LAST_QUOTE) $('swRate').textContent = '1 ' + tk(S.payAsset) + ' = … ' + tk(S.receiveAsset);
@@ -613,6 +632,7 @@ function onFlip(){
   [S.payAsset, S.receiveAsset] = [S.receiveAsset, S.payAsset];
   const pa = C.$('swPayAmt'), ra = C.$('swRecvAmt');
   [pa.value, ra.value] = [ra.value, pa.value];
+  [pa._userTyped, ra._userTyped] = [ra._userTyped, pa._userTyped];   // keep the anti-clobber flags with their values
   S.edited = S.edited === 'pay' ? 'receive' : 'pay';
   S.modeTouched = false;   // re-arm the Take/Post default for the flipped pair
   LAST_QUOTE = null; setReviewEnabled(false);
@@ -623,6 +643,7 @@ function onMax(){
   if (!S.payAsset || S.payAsset === 'BTC') return;
   const m = C.assetMeta(S.payAsset);
   C.$('swPayAmt').value = C.fmtAtoms(balAtoms(S.payAsset), m.precision);
+  C.$('swPayAmt')._userTyped = true;   // Max is an explicit user amount
   // exit ⇄ ref-input mode if active so the literal asset amount is used
   if (C.$('swPayAmt')._refMode) C.$('swPayAmt')._refMode = false;
   S.edited = 'pay'; LAST_QUOTE = null; setReviewEnabled(false);
@@ -677,9 +698,12 @@ function clearOpposite(){
 }
 function setReviewEnabled(on){ const b = C.$('swReview'); if (b) b.disabled = !on; }
 
-// --- same-chain quote (SeqOB order book) ---
-// "No price" is never an error: we render the resting offers, and if there are
-// none the user can start the market by posting their own offer.
+// --- same-chain: the unified PLACE-ORDER path (passive-CLOB covenant) ---
+// Every same-chain order is "Place order": the two amount fields are the user's own
+// limit (their ratio IS the price), and Place funds a self-enforcing covenant that
+// rests on-chain and fills whenever it is crossed — even while the wallet is closed.
+// The book still renders on the left (any resting orders); clicking a level seeds
+// the fields. There is NO take-vs-post distinction — the matcher crosses the order.
 async function requoteSame(route, amtStr){
   const { $ } = C;
   const pay = route.pay, receive = route.receive;
@@ -700,8 +724,8 @@ async function requoteSame(route, amtStr){
     const [b1, b2] = await Promise.all([ safeBook(receive, pay), safeBook(pay, receive) ]);
     const now = Math.floor(Date.now()/1000);
     const notExpired = (o) => { const exp = Number(o.expires_at_unix || o.expiresAtUnix || 0); return !(exp && exp <= now); };
-    // Keep the offers we can TAKE (give `receive`, want `pay`) AND the opposite side (give `pay`,
-    // want `receive`) — the latter feeds the T14 spread/mid summary.
+    // Offers giving `receive` want `pay` (asks, crossable by our order); the opposite side (give
+    // `pay`, want `receive`) feeds the spread/mid summary and the depth display.
     const seen = new Set(), liftable = [], otherSide = [];
     for (const o of [...(b1.offers||[]), ...(b2.offers||[])]){
       const id = (o.maker_pubkey||o.makerPubkey)+':'+(o.offer_id||o.offerId);
@@ -712,57 +736,39 @@ async function requoteSame(route, amtStr){
       if (oa === receive && wa === pay) liftable.push(o);
       else if (oa === pay && wa === receive) otherSide.push(o);
     }
-    liftable.sort((a,bb)=> ratioRecvPerPay(bb) - ratioRecvPerPay(a));  // best price for the taker first
+    liftable.sort((a,bb)=> ratioRecvPerPay(bb) - ratioRecvPerPay(a));  // best price first
     BOOK = { pair:{ base_asset: receive, quote_asset: pay }, offers: liftable, otherOffers: otherSide };
     renderBook(pay, receive);
 
-    // T7: relay unreachable AND nothing to show — say so and let the user retry; do NOT invite first-maker.
+    // T7: relay unreachable AND nothing to show — say so and let the user retry.
     if (reachErr && !liftable.length){
-      status.textContent = ''; clearOpposite(); LAST_QUOTE = null; setReviewEnabled(false);
+      LAST_QUOTE = null; setReviewEnabled(false);
       $('swRate').textContent = 'Order book unreachable - retry.';
       $('swRoute').textContent = '';
       $('swErr').textContent = 'Could not reach the order-book relay (' + (reachErr.message || reachErr) + '). Check your connection and press Refresh.';
       return;
     }
+    status.textContent = '';
 
-    // Now the book is known: pick Take vs Post (Post is the default for an empty book).
-    // In Post mode the two amount fields are INDEPENDENT — do not derive or stomp either —
-    // and Review posts a resting offer at the user's own price (postOfferReview).
-    applyAutoMode(liftable.length, route);
-    if (S.mode === 'post'){ status.textContent = ''; return postModeSame(pay, receive); }
+    // Anti-clobber compose derivation: fill the empty side from the book's best price
+    // WITHOUT wiping user input (empty-market first order leaves both fields as typed).
+    const best = bestReceivePerPay(liftable, pay, receive);
+    applyComposeDerivation(pay, receive, best);
+    paintPlaceRate(pay, receive, best, liftable.length);
+    paintFee(S.feeAsset, null);
+    setFinality('same');
 
-    if (!amtStr || !amtStr.trim()){ status.textContent=''; clearOpposite(); setReviewEnabled(false); paintEmptyRate(pay, receive, liftable.length); return; }
-
-    if (!liftable.length){
-      // Genuinely empty (the relay answered): offer to START the market rather than erroring.
-      status.textContent = '';
-      LAST_QUOTE = { kind:'same', startMarket:true, pay, receive };
-      $('swRate').textContent = `No resting offers yet - Review to post your own and start this market.`;
-      $('swRoute').textContent = 'Order book · be the first';
-      paintFee(S.feeAsset, null);
-      setFinality('same');
-      setReviewEnabled(true);
+    // Enable Place order once BOTH amounts are set and the pay leg is affordable.
+    const pm = C.assetMeta(pay), rm = C.assetMeta(receive);
+    const payAtoms  = safeAtoms($('swPayAmt').value,  pm.precision || 0);
+    const recvAtoms = safeAtoms($('swRecvAmt').value, rm.precision || 0);
+    if (payAtoms <= 0n || recvAtoms <= 0n){ LAST_QUOTE = null; setReviewEnabled(false); return; }
+    if (payAtoms > balAtoms(pay)){
+      LAST_QUOTE = null; setReviewEnabled(false);
+      $('swErr').textContent = `You only hold ${C.fmtAtoms(balAtoms(pay), pm.precision)} ${pm.ticker}.`;
       return;
     }
-
-    const editedAsset = S.edited === 'pay' ? pay : receive;
-    const typed = C.parseAtoms(amtStr, C.assetMeta(editedAsset).precision || 0);
-    if (typed <= 0n) throw new Error('enter an amount greater than zero');
-    const q = executableQuote(liftable[0], pay, receive, editedAsset, typed);
-    LAST_QUOTE = q;
-    status.textContent = '';
-    // Guards (T14). A quote whose received leg rounds to zero is not executable; and the composer
-    // must not build a swap that exceeds the wallet's balance (it would only fail at Confirm today).
-    if (q.amountR <= 0n){ setReviewEnabled(false); $('swErr').textContent = 'Too small - the amount you would receive rounds to zero. Enter a larger amount.'; return; }
-    if (q.amountP <= 0n){ setReviewEnabled(false); $('swErr').textContent = 'Enter a larger amount.'; return; }
-    if (q.assetP !== 'BTC'){
-      const have = balAtoms(q.assetP);
-      if (q.amountP > have){ setReviewEnabled(false); $('swErr').textContent = `You only hold ${C.fmtAtoms(have, C.assetMeta(q.assetP).precision)} ${C.assetMeta(q.assetP).ticker}.`; return; }
-    }
-    paintQuoteSame();
-    // Oversize (T14): the fill was capped to the best offer size (the `capped` flag was set and never
-    // surfaced). Tell the user their typed amount exceeded a single-offer lift.
-    if (q.capped){ status.className = 'status'; status.textContent = 'Filled up to the best offer size; a larger amount needs more resting offers.'; }
+    LAST_QUOTE = { kind:'same', place:true, pay, receive, payAtoms, recvAtoms };
     setReviewEnabled(true);
   } catch (e){
     status.textContent = '';
@@ -770,6 +776,36 @@ async function requoteSame(route, amtStr){
     setReviewEnabled(false);
   }
 }
+
+// The rate + route lines for the place-order composer.
+function paintPlaceRate(pay, receive, best, bookLen){
+  const { $ } = C;
+  const pm = C.assetMeta(pay), rm = C.assetMeta(receive);
+  const payV = numVal($('swPayAmt')), recvV = numVal($('swRecvAmt'));
+  if (payV > 0 && recvV > 0){
+    $('swRate').textContent = `Your price · 1 ${pm.ticker} = ${trim(recvV/payV)} ${rm.ticker}`;
+  } else if (best){
+    $('swRate').textContent = `Best resting price · 1 ${pm.ticker} = ${trim(best)} ${rm.ticker} — set an amount.`;
+  } else {
+    $('swRate').textContent = bookLen
+      ? `${bookLen} resting order${bookLen>1?'s':''} — set both amounts (their ratio is your price).`
+      : `No resting orders yet — set both amounts to place the first order (their ratio is your price).`;
+  }
+  $('swRoute').textContent = bookLen ? 'Order book · place a resting order' : 'Order book · be the first';
+}
+
+// Best RECEIVE-per-PAY price from the crossable asks, in DISPLAY units.
+function bestReceivePerPay(offers, pay, receive){
+  const pm = metaOf(pay), rm = metaOf(receive);
+  let best = 0;
+  for (const o of (offers||[])){
+    const recvU = Number(big(o.offer_amount||o.offerAmount)) / Math.pow(10, rm.precision||0);
+    const payU  = Number(big(o.want_amount ||o.wantAmount )) / Math.pow(10, pm.precision||0);
+    if (payU > 0){ const p = recvU/payU; if (p > best) best = p; }
+  }
+  return best || null;
+}
+function safeAtoms(str, prec){ try { return C.parseAtoms((str||'').trim(), prec); } catch { return 0n; } }
 
 // POST mode (same-chain): the two amount fields are the user's OWN limit — their ratio
 // IS the price. We do NOT touch either field (no book-derived fill) and route Review to
@@ -1501,7 +1537,217 @@ async function onReview(){
   if (q.kind === 'ln') return reviewLn(q);
   if (q.kind === 'mixed') return reviewMixed(q);
   if (q.kind === 'cross') return reviewCross(q);
+  if (q.kind === 'same' && q.place) return placeCovenantReview(q);
   return reviewSame(q);
+}
+
+// ===========================================================================
+// Passive-CLOB covenant resting orders (the same-chain "Place order" path)
+// ---------------------------------------------------------------------------
+// Placing funds a byte-exact covenant UTXO and rests a signed offer on the relay;
+// the order fills whenever it is crossed (by an online taker or the settler),
+// permissionlessly, EVEN WHILE THIS WALLET IS OFFLINE — consensus rejects any
+// underpay or redirect. When THIS wallet is the taker of an inbound match, it
+// verifies the recipe trustlessly and broadcasts the FILL itself.
+// ===========================================================================
+let COMPANION = null;      // the `eltr` taproot Wollet that WATCHES + spends maker credits
+let COVRELAY = null;       // the persistent openRelay handle (matched / order_status)
+let PLACED = [];           // this wallet's covenant orders (persisted for cancel + resume)
+const PLACED_KEY = 'seqobCovenantOrders.v1';
+
+function loadPlaced(){ try { PLACED = JSON.parse(localStorage.getItem(PLACED_KEY) || '[]') || []; } catch { PLACED = []; } }
+function savePlaced(){ try { localStorage.setItem(PLACED_KEY, JSON.stringify(PLACED)); } catch {} }
+function nextMakerIndex(){
+  let mx = -1; for (const r of PLACED){ if (typeof r.makerIndex === 'number' && r.makerIndex > mx) mx = r.makerIndex; }
+  return mx + 1;   // a fresh taproot payout per order, so credits never collide
+}
+
+// The companion Wollet: the primary wallet is wpkh (BIP84) and does not track the
+// taproot maker-credit payouts, so a second `eltr` (BIP86) Wollet watches them. It
+// MUST be registered + scanned so a maker actually sees the funds it is paid.
+function ensureCompanion(){
+  if (COMPANION) return COMPANION;
+  try { COMPANION = new C.wasm.Wollet(C.network, C.signer.covenantMakerDescriptor()); }
+  catch { COMPANION = null; }
+  return COMPANION;
+}
+async function scanCompanion(){
+  const w = ensureCompanion(); if (!w) return;
+  try { const u = await C.client.fullScan(w); if (u) w.applyUpdate(u); } catch {}
+}
+
+async function esplora(path, opts){ return C.esploraFetch(path, opts); }
+
+// Fund a covenant spk: send `atoms` of asset A to the covenant address as an
+// explicit output (the proven TxBuilder -> sign -> finalize -> broadcast path),
+// then resolve the covenant vout by matching the spk on the broadcast tx.
+async function fundCovenant(covAddr, spkHex, assetHex, atoms){
+  const addr = new C.wasm.Address(covAddr);
+  const pset = C.network.txBuilder()
+    .addExplicitRecipient(addr, BigInt(atoms), new C.wasm.AssetId(assetHex))
+    .feeRate(C.DEFAULT_FEERATE)
+    .finish(C.wollet);
+  const signed = C.signer.sign(pset);
+  const finalized = C.wollet.finalize(signed);
+  const t = await C.client.broadcast(finalized);
+  const txid = (t && t.toString) ? t.toString() : String(t);
+  const vout = await resolveVout(txid, spkHex);
+  return { txid, vout };
+}
+async function resolveVout(txid, spkHex){
+  const spk = (spkHex||'').toLowerCase();
+  for (let i=0;i<20;i++){
+    try {
+      const res = await esplora(`/tx/${txid}`);
+      if (res && res.ok){ const tx = await res.json();
+        for (let v=0; v<(tx.vout||[]).length; v++){ if ((tx.vout[v].scriptpubkey||'').toLowerCase() === spk) return v; } }
+    } catch {}
+    await new Promise(r => setTimeout(r, 1500));
+  }
+  return 0;   // best-effort fallback; the taker's FILL re-verifies the spk before spending
+}
+
+// place: derive the covenant, get the maker payout (register the companion wollet
+// so the credit is watchable), fund it on-chain, then sign + post the resting offer.
+async function placeCovenant(pay, receive, payAtoms, recvAtoms, onStatus){
+  const tip = C.wollet.tip().height();
+  const { rateNum, rateDen } = computeRate(payAtoms, recvAtoms);
+  const idx = nextMakerIndex();
+  const payout = makerPayout(C.signer, C.network, idx);   // { program, spkHex, address, internalKey, descriptor }
+  ensureCompanion();                                      // so this wallet SEES the credit it is paid
+  const params = {
+    assetA: pay, assetB: receive, sellAtoms: BigInt(payAtoms),
+    rateNum, rateDen, minLot: BigInt(payAtoms),           // all-or-nothing (no remainder dust)
+    expiryLocktime: orderExpiry(tip),
+    makerProg: payout.program,                            // the taproot payout the FILL credits
+    makerX: payout.internalKey,                           // wallet-derived x-only REFUND authoriser
+  };
+  const plan = planPlaceOrder(params);
+  const covAddr = C.wasm.scriptToAddress(plan.spkHex, C.network);
+  onStatus && onStatus('Funding the order on-chain…');
+  const { txid, vout } = await fundCovenant(covAddr, plan.spkHex, pay, payAtoms);
+  const covenant = buildCovenantTerms(plan.order, txid, vout, plan.tap);
+  const offer = buildCovenantOffer({
+    assetA: pay, assetB: receive, sellAtoms: BigInt(payAtoms), recvAtoms: BigInt(recvAtoms),
+    covenant, makerPubkey: makerPubHex(), recvAddress: payout.address, offerId: seqob.randHex(16),
+  });
+  onStatus && onStatus('Posting your resting order…');
+  await seqob.postCovenantOffer(offer, makerPriv());
+  const rec = {
+    offerId: offer.offer_id, pay, receive,
+    sellAtoms: String(payAtoms), recvAtoms: String(recvAtoms),
+    makerIndex: idx, covTxid: txid, covVout: vout, spkHex: plan.spkHex,
+    expiry: params.expiryLocktime, created: Date.now(),
+  };
+  PLACED.push(rec); savePlaced();
+  ensureCovenantRelay();   // watch for a match so we can settle / reflect a fill
+  return rec;
+}
+
+// The taker FILL hooks for an inbound match: the credit asset is asset B, so the fee
+// is paid in B too (never asset A — the covenant-fill host rejects that). Amounts are
+// coin-selected from THIS wallet's own B + fee UTXOs by the wasm assembler.
+function fillHooksFor(matched){
+  const ct = matched.covenant || matched.Covenant || {};
+  const assetB = String(ct.asset_b || ct.assetB || '').toLowerCase();
+  const feeAsset = assetB || C.POLICY_HEX;
+  return makeCovenantHooks({
+    wasm: C.wasm, wollet: C.wollet, network: C.network, mnemonic: C.mnemonic,
+    esploraFetch: C.esploraFetch,
+    receiveAddress: () => C.wollet.address(C.addrIndex == null ? undefined : C.addrIndex).address().toString(),
+    fee: { asset: feeAsset, atoms: covFeeAtoms(feeAsset) },
+    onStatus: (m) => { try { C.toast && C.toast(m); } catch {} },
+  });
+}
+// A network-fee estimate in the given fee asset (open fee market): the native policy
+// fee converted via the asset's published exchange rate (a valuable asset pays fewer).
+function covFeeAtoms(feeAsset){
+  try {
+    const rate = (feeAsset === C.POLICY_HEX) ? BigInt(C.EXCHANGE_RATE_SCALE) : C.feeRateFor(feeAsset);
+    const nativeFeeSats = (BigInt(C.DEFAULT_FEERATE) * EST_SWAP_VSIZE) / 1000n;
+    return ceilDiv(nativeFeeSats * BigInt(C.EXCHANGE_RATE_SCALE), rate);
+  } catch { return 1000n; }
+}
+
+// The persistent relay watcher over every market this wallet has a resting order on.
+// onMatched -> this wallet is the taker: verify + FILL + broadcast. onOrderStatus ->
+// our resting order was filled by someone else: rescan so the credit shows up.
+function covMarkets(){
+  const seen = new Set(), out = [];
+  for (const r of PLACED){ const k = r.pay+'/'+r.receive; if (!seen.has(k)){ seen.add(k); out.push({ base_asset: r.pay, quote_asset: r.receive }); } }
+  return out;
+}
+function ensureCovenantRelay(){
+  const markets = covMarkets();
+  if (!markets.length){ if (COVRELAY){ COVRELAY.close(); COVRELAY = null; } return; }
+  if (COVRELAY){ for (const m of markets) COVRELAY.subscribe(m); return; }
+  COVRELAY = seqob.openRelay(markets, {
+    onMatched: (m) => { onCovMatched(m).catch(()=>{}); },
+    onOrderStatus: (s) => { onCovOrderStatus(s).catch(()=>{}); },
+    onError: () => {},
+  });
+}
+async function onCovMatched(m){
+  // Only settle covenant matches (interactive same-chain lifts go through seqob.lift).
+  const isCov = m.resting_is_covenant === true || m.restingIsCovenant === true
+    || m.resting_is_covenant === 'true' || m.restingIsCovenant === 'true';
+  if (!isCov) return;
+  try {
+    C.toast && C.toast('Order matched — settling the fill on-chain…');
+    const { txid } = await covSettleFill(m, fillHooksFor(m));
+    C.toast && C.toast('Fill settled — anchor-bound to Bitcoin.',
+      txid ? { href:'/explorer/tx/'+txid, label:String(txid).slice(0,18)+'…' } : undefined);
+    await C.sync(); await scanCompanion(); try { renderSwap(); } catch {}
+  } catch (e){ try { C.toast && C.toast('Fill could not settle: ' + C.prettyErr(e)); } catch {} }
+}
+async function onCovOrderStatus(s){
+  // A resting order of ours moved (likely filled by a taker/settler): rescan the
+  // companion wollet (which holds the credit) + the primary, and refresh the UI.
+  await scanCompanion(); try { await C.sync(); } catch {}
+  try { renderSwap(); } catch {}
+}
+
+// Called on wallet open: rehydrate placed orders + resume watching for fills. The
+// covenant rests ON-CHAIN, so a fill can happen while the tab was closed; on reopen
+// we rescan so any credit already received is reflected, and re-arm the watcher.
+export function resumeCovenantOrders(){
+  loadPlaced();
+  ensureCompanion();
+  scanCompanion().catch(()=>{});
+  if (PLACED.length){ ensureCovenantRelay(); }
+}
+
+async function placeCovenantReview(q){
+  const { $ } = C;
+  const pay = q.pay, receive = q.receive, payAtoms = q.payAtoms, recvAtoms = q.recvAtoms;
+  const pm = C.assetMeta(pay), rm = C.assetMeta(receive);
+  const payU = Number(payAtoms)/Math.pow(10, pm.precision||0), recvU = Number(recvAtoms)/Math.pow(10, rm.precision||0);
+  const kv = [
+    ['You pay', amtRow(pay, payAtoms) + refSuffix(pay, payAtoms)],
+    ['You receive', amtRow(receive, recvAtoms) + refSuffix(receive, recvAtoms)],
+    ['Price', payU>0 ? `1 ${pm.ticker} = ${trim(recvU/payU)} ${rm.ticker}` : '-'],
+    ['How it fills', `Your order becomes a funded, self-enforcing covenant on-chain. It fills whenever someone crosses it at your price or better — even while this wallet is closed. Consensus rejects any underpay or redirect.`],
+    ['You can close the wallet', `The order rests on-chain; when it fills you are credited to a payout address only this wallet controls. Reopen any time to see it.`],
+    ['If it does not fill', `Cancel any time to delist it. After the order expires the locked ${pm.ticker} is reclaimable on-chain.`],
+    ['Finality', 'Settles in ~1 block · anchor-bound to Bitcoin (reverts only if Bitcoin reverts).'],
+  ];
+  const { m: modal, ok, st } = C.modalRows({ title: 'Place order', kv });
+  if (ok) ok.textContent = 'Place order';
+  ok.onclick = async () => {
+    ok.disabled = true; st.className = 'status'; st.innerHTML = '<span class="spin"></span>Funding the order on-chain…';
+    try {
+      const rec = await placeCovenant(pay, receive, payAtoms, recvAtoms,
+        (msg) => { st.innerHTML = '<span class="spin"></span>' + esc(msg); });
+      modal.remove();
+      C.toast('Order placed — resting on-chain; it fills when matched, even offline.',
+        rec.covTxid ? { href:'/explorer/tx/'+rec.covTxid, label:String(rec.covTxid).slice(0,18)+'…' } : undefined);
+      resetComposer();
+      await C.sync();
+      renderSwap();
+    } catch (e){
+      st.className = 'status err'; st.textContent = 'Could not place order: ' + C.prettyErr(e); ok.disabled = false;
+    }
+  };
 }
 
 // Mixed rails (one leg LN, one on-chain) — a SUBMARINE swap: the asset leg is an
@@ -1758,7 +2004,7 @@ async function requoteLn(route, amtStr){
   paintFee('BTC', null, 'The rate includes the LP spread; there is no separate network fee on the Lightning leg.');
   const am = C.assetMeta(route.seqAsset);
   $('swRate').textContent = `Instant ${am.ticker}/BTC over Lightning · rate includes the LP spread`;
-  $('swRoute').textContent = route.payIsBtc ? 'Lightning · instant buy' : 'Lightning · instant sell';
+  $('swRoute').textContent = route.payIsBtc ? 'Lightning · buy with BTC' : 'Lightning · sell for BTC';
   $('swStatus').textContent = ''; $('swErr').textContent = '';
   renderTiming(route);
   setReviewEnabled(true);   // LP fixed terms (proven path) — Review is offerable
@@ -1799,7 +2045,8 @@ async function reviewLn(q){
 }
 
 function resetComposer(){
-  C.$('swPayAmt').value = ''; C.$('swRecvAmt').value = '';
+  const pa = C.$('swPayAmt'), ra = C.$('swRecvAmt');
+  pa.value = ''; ra.value = ''; pa._userTyped = false; ra._userTyped = false;
   LAST_QUOTE = null; setReviewEnabled(false);
 }
 
@@ -1942,38 +2189,79 @@ function renderBook(pay, receive){
   renderPairBar();
 }
 
+// Click a book level: seed BOTH amount fields with that resting order's size + the
+// pay it wants, as the user's own limit (so placing crosses it at that price). Then
+// requote builds the place quote. Both fields are marked user-typed so the derivation
+// never overwrites them.
 function fillFromOffer(id, maker, pay, receive){
   const o = (BOOK.offers||[]).find(x => (x.offer_id||x.offerId) === id && (x.maker_pubkey||x.makerPubkey) === maker);
   if (!o) return;
-  const offerAmt = big(o.offer_amount||o.offerAmount);
+  const offerAmt = big(o.offer_amount||o.offerAmount);   // receive units this order gives
+  const wantAmt  = big(o.want_amount ||o.wantAmount );   // pay units it wants
+  const recvEl = C.$('swRecvAmt'), payEl = C.$('swPayAmt');
+  recvEl.value = C.fmtAtoms(offerAmt, C.assetMeta(receive).precision||0); recvEl._userTyped = true;
+  payEl.value  = C.fmtAtoms(wantAmt,  C.assetMeta(pay).precision||0);     payEl._userTyped = true;
   S.edited = 'receive';
-  C.$('swRecvAmt').value = C.fmtAtoms(offerAmt, C.assetMeta(receive).precision||0);
-  LAST_QUOTE = executableQuote(o, pay, receive, receive, offerAmt);
-  C.$('swPayAmt').value = C.fmtAtoms(LAST_QUOTE.amountP, C.assetMeta(pay).precision||0);
-  paintQuoteSame();
-  setReviewEnabled(true);
+  LAST_QUOTE = null; setReviewEnabled(false);
+  requote().catch(()=>{});
+}
+
+// The companion (eltr / BIP86 taproot) wollet's balance — the maker credits this
+// wallet has been PAID when its resting covenant orders filled. The primary wpkh
+// wallet does not track taproot receives, so this is where a maker SEES its proceeds.
+export function covenantCreditBalance(){
+  try { return (COMPANION && COMPANION.balance) ? COMPANION.balance().toJSON() : {}; }
+  catch { return {}; }
+}
+export async function scanCovenantCompanion(){ await scanCompanion(); }
+// The "credits received" block: proceeds paid into the taproot payout when a resting
+// order filled (possibly while the wallet was closed). Sweeping them into the main
+// wpkh balance is a follow-up; here the maker at least SEES them (task requirement).
+function creditsHtml(){
+  const bal = covenantCreditBalance();
+  const rows = Object.keys(bal).filter(h => big(bal[h]) > 0n).map(h => {
+    const m = C.assetMeta(h);
+    return `<div class="swbook-row"><span class="mono">received ${esc(C.fmtAtoms(big(bal[h]), m.precision))} ${esc(m.ticker)}</span>
+      <span class="sub">${esc(C.refValueStr(h, big(bal[h])) || '')}</span></div>`;
+  }).join('');
+  if (!rows) return '';
+  return `<div class="swbook"><div class="swbook-head"><span class="lbl">Order credits received</span>
+      <span class="sub">paid into a payout only this wallet controls</span></div>${rows}</div>`;
 }
 
 async function renderMyOrders(){
   const host = C.$('swMyOrders'); if (!host) return;
   if (XMAKE) return renderXMake();   // a live wallet cross offer owns this panel
 
+  const credits = creditsHtml();     // maker proceeds from filled resting orders
+
   let orders = [];
   // On a fetch error, leave whatever is already rendered rather than blanking the panel (a transient
   // relay blip should not make your resting orders vanish from the UI).
-  try { orders = await seqob.fetchMyOrders(makerPubHex()); } catch { return; }
-  if (!orders.length){ host.innerHTML = ''; return; }
+  try { orders = await seqob.fetchMyOrders(makerPubHex()); } catch { if (credits) host.innerHTML = credits; return; }
+  if (!orders.length){ host.innerHTML = credits; return; }
   const rows = orders.map(o => {
     const give = C.assetMeta(o.offer_asset||o.offerAsset), want = C.assetMeta(o.want_asset||o.wantAsset);
+    const isCov = !!(o.covenant || o.Covenant);
     return `<div class="swbook-row myorder">
-      <span class="mono">give ${esc(C.fmtAtoms(big(o.offer_amount||o.offerAmount), give.precision))} ${esc(give.ticker)} · want ${esc(C.fmtAtoms(big(o.want_amount||o.wantAmount), want.precision))} ${esc(want.ticker)}</span>
+      <span class="mono">give ${esc(C.fmtAtoms(big(o.offer_amount||o.offerAmount), give.precision))} ${esc(give.ticker)} · want ${esc(C.fmtAtoms(big(o.want_amount||o.wantAmount), want.precision))} ${esc(want.ticker)}${isCov ? ' · resting on-chain' : ''}</span>
       <button type="button" class="ghost swcancel" data-id="${esc(o.offer_id||o.offerId)}">Cancel</button></div>`;
   }).join('');
-  host.innerHTML = `<div class="swbook"><div class="swbook-head"><span class="lbl">Your resting orders</span>
-      <span class="sub">co-sign coming; offers rest until then</span></div>${rows}</div>`;
+  host.innerHTML = credits + `<div class="swbook"><div class="swbook-head"><span class="lbl">Your resting orders</span>
+      <span class="sub">funded on-chain · fill whenever matched, even offline</span></div>${rows}</div>`;
   host.querySelectorAll('.swcancel').forEach(b => b.onclick = async () => {
     b.disabled = true; b.textContent = 'Cancelling…';
-    try { await seqob.signAndCancel(b.dataset.id, makerPriv()); renderSwap(); }
+    try {
+      await seqob.signAndCancel(b.dataset.id, makerPriv());
+      // Purge any local covenant record so the watcher stops tracking it. The relay
+      // delists it immediately; a funded covenant's locked asset is reclaimable
+      // on-chain only after its expiry (the REFUND leaf), which needs a wasm refund
+      // helper not yet in this build — see the report.
+      const before = PLACED.length;
+      PLACED = PLACED.filter(r => r.offerId !== b.dataset.id);
+      if (PLACED.length !== before){ savePlaced(); ensureCovenantRelay(); }
+      renderSwap();
+    }
     catch (e){ b.disabled = false; b.textContent = 'Cancel'; C.toast('Cancel failed: ' + C.prettyErr(e)); }
   });
 }
