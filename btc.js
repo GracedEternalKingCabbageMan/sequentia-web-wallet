@@ -8193,6 +8193,7 @@ export {
   HDKey,
   btc_signer_exports as btc,
   mnemonicToSeedSync,
+  schnorr,
   secp256k1,
   sha256
 };
