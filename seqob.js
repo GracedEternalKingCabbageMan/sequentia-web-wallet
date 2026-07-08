@@ -197,6 +197,32 @@ function encodeSameChain(s){
   return w.bytes();
 }
 
+// seqob.v1.CovenantTerms (offer settlement oneof field 23): a FUNDED, self-
+// enforcing resting order (passive CLOB). Byte-identical to the Go relay's
+// deterministic marshal so a maker-signed covenant offer verifies here and the
+// signature the relay checks matches. The `bytes` fields (maker_prog, maker_x,
+// internal_key, merkle_path) are carried as HEX in the offer object and encoded
+// as raw bytes here for signing; convert to base64 for the grpc-gateway JSON POST
+// (covenantOfferForPost below).
+function encodeCovenantTerms(c){
+  if (!c) return null;
+  const w = new PW();
+  w.str(1, O(c,'covenant_txid','covenantTxid'));
+  w.uint(2, O(c,'covenant_vout','covenantVout'));
+  w.str(3, O(c,'asset_a','assetA'));
+  w.str(4, O(c,'asset_b','assetB'));
+  w.uint(5, O(c,'rate_num','rateNum'));
+  w.uint(6, O(c,'rate_den','rateDen'));
+  w.lenbytes(7, hexToBytes(O(c,'maker_prog','makerProg')));
+  w.uint(8, O(c,'maker_prog_ver','makerProgVer'));
+  w.uint(9, O(c,'min_lot','minLot'));
+  w.uint(10, O(c,'expiry_locktime','expiryLocktime'));
+  w.lenbytes(11, hexToBytes(O(c,'maker_x','makerX')));
+  w.lenbytes(12, hexToBytes(O(c,'internal_key','internalKey')));
+  for (const p of (O(c,'merkle_path','merklePath') || [])) w.lenbytes(13, hexToBytes(p));
+  return w.bytes();
+}
+
 // seqob.v1.CrossChainTerms (offer settlement oneof field 21). Field numbers and
 // proto3 omit-zero semantics match the Go relay's deterministic marshal exactly,
 // so a maker-signed CROSS offer verifies here byte-for-byte (direction 0 =
@@ -245,6 +271,8 @@ export function canonicalOfferBytes(o){
   // lightning = 22 is reserved and not yet encoded.
   w.msg(20, encodeSameChain(O(o,'same_chain','sameChain')));
   w.msg(21, encodeCrossChain(O(o,'cross_chain','crossChain')));
+  // lightning = 22 reserved. covenant = 23: passive-CLOB funded resting order.
+  w.msg(23, encodeCovenantTerms(O(o,'covenant')));
   // maker_sig (31) is deliberately omitted.
   return w.bytes();
 }
@@ -352,6 +380,27 @@ export async function fetchMyOrders(makerPubkey){
 }
 export async function postOffer(offer){ return postJSON('/v1/offers', offer); }
 export async function cancelOffer(cancel){ return postJSON('/v1/offers/cancel', cancel); }
+
+// A covenant offer's CovenantTerms `bytes` fields are HEX in the signed object
+// (so canonicalOfferBytes hashes the raw bytes exactly like the Go relay); the
+// grpc-gateway JSON wants base64 for proto `bytes`. covenantOfferForPost returns
+// a shallow copy safe to POST without disturbing the signed object.
+function covenantOfferForPost(offer){
+  const c = O(offer,'covenant'); if (!c) return offer;
+  const b64 = (h) => b64encode(hexToBytes(h));
+  const cc = { ...c };
+  if (cc.maker_prog != null)   cc.maker_prog   = b64(cc.maker_prog);
+  if (cc.maker_x != null)      cc.maker_x      = b64(cc.maker_x);
+  if (cc.internal_key != null) cc.internal_key = b64(cc.internal_key);
+  if (Array.isArray(cc.merkle_path)) cc.merkle_path = cc.merkle_path.map(b64);
+  return { ...offer, covenant: cc };
+}
+
+// Sign (over the raw-bytes canonical form) then POST a covenant resting offer.
+export async function postCovenantOffer(offer, priv){
+  const signed = priv ? signOffer(offer, priv) : offer;
+  return postJSON('/v1/offers', covenantOfferForPost(signed));
+}
 
 // Sign + post an OfferCancel for an offer the wallet made.
 export async function signAndCancel(offerId, priv, nonce){
@@ -471,6 +520,41 @@ export async function lift(offer, takeAtoms, feeAsset, hooks){
   }
 }
 
+// Watch-for-fill: open a persistent relay WS, subscribe to a market, and
+// dispatch the matcher's crossings. The passive-CLOB replacement for the old
+// take/post round-trip — a covenant maker can watch its rest fill (order_status)
+// while offline-capable, and a taker settles on `matched`.
+//   markets : [{ base_asset, quote_asset }]  to subscribe (optional)
+//   handlers: { onMatched(m), onOrderStatus(s), onOfferRemoved(r), onError(e), onOpen(), onClose() }
+// Returns { ws, subscribe(pair), close() }.
+export function openRelay(markets, handlers){
+  handlers = handlers || {};
+  const ws = new WebSocket(wsURL());
+  ws.binaryType = 'arraybuffer';
+  const send = (obj) => { try { ws.send(JSON.stringify(obj)); } catch {} };
+  ws.onopen = () => {
+    for (const m of (markets || [])) send({ market_subscribe: { base_asset: O(m,'base_asset','baseAsset'), quote_asset: O(m,'quote_asset','quoteAsset') } });
+    try { handlers.onOpen && handlers.onOpen(); } catch {}
+  };
+  ws.onmessage = (ev) => {
+    let m; try { m = JSON.parse(typeof ev.data === 'string' ? ev.data : td.decode(new Uint8Array(ev.data))); } catch { return; }
+    const matched = m.matched || m.Matched;
+    const status = m.order_status || m.orderStatus;
+    const removed = m.public_order_removed || m.publicOrderRemoved;
+    if (matched && handlers.onMatched)         { try { handlers.onMatched(matched); } catch {} }
+    if (status && handlers.onOrderStatus)      { try { handlers.onOrderStatus(status); } catch {} }
+    if (removed && handlers.onOfferRemoved)    { try { handlers.onOfferRemoved(removed); } catch {} }
+    if (m.error && handlers.onError)           { try { handlers.onError(m.error); } catch {} }
+  };
+  ws.onclose = () => { try { handlers.onClose && handlers.onClose(); } catch {} };
+  ws.onerror = () => { try { handlers.onError && handlers.onError({ message: 'relay connection error' }); } catch {} };
+  return {
+    ws,
+    subscribe: (pair) => send({ market_subscribe: { base_asset: O(pair,'base_asset','baseAsset'), quote_asset: O(pair,'quote_asset','quoteAsset') } }),
+    close: () => { try { ws.close(); } catch {} },
+  };
+}
+
 export function randHex(n){
   const a = new Uint8Array(n); (crypto || window.crypto).getRandomValues(a);
   return [...a].map(b => b.toString(16).padStart(2,'0')).join('');
@@ -485,4 +569,4 @@ export function makerKeyFromSeed(seedHex){
 }
 
 // test surface
-export const __test__ = { encodeSwapRequest, decodeSwapAccept, encodeSwapComplete, canonicalOfferBytes, signOffer, verifyOffer, bytesToHex, hexToBytes, derEncode, derDecode };
+export const __test__ = { encodeSwapRequest, decodeSwapAccept, encodeSwapComplete, canonicalOfferBytes, encodeCovenantTerms, signOffer, verifyOffer, bytesToHex, hexToBytes, derEncode, derDecode };
