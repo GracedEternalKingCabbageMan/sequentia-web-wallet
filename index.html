@@ -803,7 +803,7 @@ function sendPrecision(hex){
 let OAMP_XONLY='';        // 32-byte x-only pubkey hex (this wallet's enclave identity key)
 let OAMP_SECRET='';       // matching 32-byte secret hex — signs enclave sighashes (BIP340 schnorr)
 let OAMP_AID='';          // enclave account id, from POST /v1/users
-let oampAssets={};        // assetId -> { id, ticker, name, precision, tier, clawback, ... }
+let oampAssets={};        // assetId -> { id, ticker, name, precision, clawback, confidential, ... }
 let oampBalances={};      // assetId -> { atoms:BigInt, utxos }
 function isOampAsset(v){ return typeof v==='string' && v.startsWith('oamp:'); }
 function oampId(v){ return v.slice(5); }
