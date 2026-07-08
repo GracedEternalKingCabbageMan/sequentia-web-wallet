@@ -100,6 +100,18 @@
   /* ===== SeqDEX swap composer (the symmetric Pay -> Receive signature) ===== */
   /* The card holds two weighted-equal panes with a circular flip on the seam. */
   .swcard{position:relative;padding:0;overflow:visible}
+  /* Two-column trading desk: order book on the LEFT, composer on the RIGHT.
+     Stacks to a single column on narrow/mobile widths (see the media query below). */
+  .swdesk{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1.02fr);gap:20px;align-items:start}
+  .swdesk-book{min-width:0;display:flex;flex-direction:column}
+  /* zero the first ladder/book's top margin so its head aligns with the compose column */
+  .swdesk-book #swBook .swladder,.swdesk-book #swBook .swbook{margin-top:0}
+  .swdesk-compose{min-width:0;display:flex;flex-direction:column;gap:14px}
+  .swdesk-compose>.card{margin-top:0}
+  /* Take (lift the book at its price) vs Post (rest a limit order at your own price). */
+  .swmode{display:flex;align-items:center;gap:12px;flex-wrap:wrap}
+  .swmode-seg{max-width:200px}
+  .swmode-hint{font-size:12px;color:var(--dim)}
   .swpane{padding:18px 20px}
   /* A hairline seam between the two panes — the balance's pivot line. */
   #swRecvPane{border-top:1px solid var(--line)}
@@ -148,6 +160,10 @@
   .swseg button:hover{filter:none;color:var(--txt);transform:none}
   .swseg button.on{background:#1d242d;color:var(--txt);box-shadow:0 1px 0 #0006}
   .swseg button .z{color:var(--amber2)}
+  /* A rail toggle that would form an unsupported mixed combo is greyed + non-clickable. */
+  .swseg button:disabled{opacity:.4;cursor:not-allowed;color:var(--dim);background:transparent;box-shadow:none}
+  .swseg button:disabled:hover{color:var(--dim);filter:none}
+  .swseg button:disabled.on{color:var(--dim)}
   .swfee{border:1px solid var(--line);border-radius:12px;padding:12px 14px;background:var(--panel2)}
   .swfee-head{display:flex;align-items:baseline;gap:10px;flex-wrap:wrap}
   .swfee-body{display:flex;align-items:center;gap:12px;margin-top:9px;flex-wrap:wrap}
@@ -229,6 +245,8 @@
   /* trust line: one book, no labels */
   .swtrust{display:flex;align-items:flex-start;gap:11px;margin-top:16px;font-size:12.5px;color:var(--dim);padding:12px 15px;background:var(--panel);border:1px solid var(--line);border-radius:13px}
   .swtrust svg{flex:0 0 auto;color:var(--amber2);margin-top:1px} .swtrust b{color:var(--txt);font-weight:650}
+  /* Below the desk breakpoint the book stacks above the composer (single column). */
+  @media (max-width:860px){ .swdesk{grid-template-columns:1fr;gap:16px} }
   @media (max-width:480px){
     .swamt{font-size:26px}
     .swpane{padding:16px}
@@ -377,11 +395,37 @@
       <!-- ===== the composer (the signature) ===== -->
       <div id="swComposer">
 
-        <!-- balance chips: per-asset instant (Lightning) vs on-chain split; BTC is
+        <!-- balance chips: per-asset Lightning vs on-chain split; BTC is
              first-class (dual-chain). Rendered by swap.js/renderChips. -->
         <div class="swchips" id="swChips"></div>
         <!-- pair bar: the selected market + last price (derived from the book). -->
         <div class="swpairbar hide" id="swPairBar"></div>
+
+        <!-- the desk: order book on the LEFT, composer on the RIGHT (stacks on mobile) -->
+        <div class="swdesk">
+
+          <!-- LEFT: the SeqOB order book for the selected pair (resting offers; click a
+               level to price) + your own resting orders. ONE book, always rendered — the
+               same offers on every rail; no on-chain/LN distinction. Rendered by swap.js. -->
+          <div class="swdesk-book">
+            <div id="swBook"></div>
+            <div id="swMyOrders"></div>
+          </div>
+
+          <!-- RIGHT: the composer (the signature). -->
+          <div class="swdesk-compose">
+
+            <!-- Take (lift the book at its price) vs Post (rest a LIMIT order at your OWN
+                 price — both amount fields become independent, and the pay÷receive ratio
+                 is your price). Auto-defaults to Post when the pair has no resting orders,
+                 so you can start the market's first order. Rendered by swap.js/paintModeSeg. -->
+            <div class="swmode hide" id="swModeWrap">
+              <div class="swseg swmode-seg" id="swModeSeg">
+                <button type="button" data-m="take">Take</button>
+                <button type="button" data-m="post">Post</button>
+              </div>
+              <span class="sub swmode-hint" id="swModeHint"></span>
+            </div>
 
         <div class="card swcard">
           <!-- PAY pane -->
@@ -494,12 +538,8 @@
           <div class="status err" id="swErr"></div>
         </div>
 
-        <!-- SeqOB order book for the selected pair (resting offers; click to take)
-             + your own resting orders. Rendered by swap.js from the seqobd relay.
-             ONE book, always rendered — same offers on every rail; no on-chain/LN
-             distinction in the book UI (orders look identical). -->
-        <div id="swBook"></div>
-        <div id="swMyOrders"></div>
+          </div><!-- /.swdesk-compose -->
+        </div><!-- /.swdesk -->
 
         <!-- trust line: one book, no labels; funding lives in the Balance tab -->
         <div class="swtrust">

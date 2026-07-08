@@ -71,6 +71,12 @@ const S = {
   // behaves exactly as before.
   payRail: 'chain', recvRail: 'chain',
   railsTouched: false,    // true once the user (or a "fix" link) picks a rail -> stop auto-defaulting
+  // TAKE = lift resting offers (fields LINKED via the book price; today's behavior).
+  // POST = rest a LIMIT order at your OWN price (fields INDEPENDENT; pay÷receive IS the
+  // price). Auto-defaults to 'post' for a pair with no resting orders so the market can be
+  // started; 'take' when there is a book to lift. modeTouched stops the auto-default once
+  // the user picks a mode. Only 'same' + 'cross' routes can be posted (LN/mixed are take-only).
+  mode: 'take', modeTouched: false,
 };
 let INSTANT = {};    // ticker -> { spendable, receivable } atoms (best-effort from the LSP /status)
 let LAST_MID = null; // { price, cross } for the current pair — feeds the pair bar
@@ -128,6 +134,8 @@ export function initSwap(ctx){
     // BTC<->asset pair when the on-device signer is live (see updateRails).
     wireRailSeg('swPayRailSeg', 'pay');
     wireRailSeg('swRecvRailSeg', 'recv');
+    // Take / Post chooser (switching to Post unlinks the two amount fields).
+    wireModeSeg();
     if ($('swXBack')) $('swXBack').onclick = () => { showCross(false); renderSwap(); };
     // Live re-quote as the user types. The edited side is the "fixed" leg; the
     // other side is quoted. Debounced so we don't hammer the daemon per keystroke.
@@ -327,7 +335,7 @@ function balStr(hex){
   const m = metaOf(hex);
   const onchain = balAtoms(hex), instant = instantAtomsFor(hex);
   let s = 'Balance ' + C.fmtAtoms(onchain, m.precision) + ' ' + m.ticker + ' on-chain';
-  if (instant > 0n) s += ' · ' + C.fmtAtoms(instant, m.precision) + ' instant';
+  if (instant > 0n) s += ' · ' + C.fmtAtoms(instant, m.precision) + ' Lightning';
   return s;
 }
 
@@ -364,7 +372,7 @@ async function refreshInstant(){
   try { renderChips(); paintPanes(); } catch {}
 }
 
-// --- balance chips: per-asset instant (Lightning) vs on-chain split ---
+// --- balance chips: per-asset Lightning vs on-chain split ---
 function iconClass(hex){ return hex === 'BTC' ? 'btc' : (hex === C.POLICY_HEX ? 'seq' : 'asset'); }
 function iconGlyph(hex, m){
   if (hex === 'BTC') return '₿';
@@ -378,7 +386,7 @@ function chipHtml(hex){
     <span class="swchip-ic ${iconClass(hex)}">${esc(iconGlyph(hex, m))}</span>
     <span class="swchip-body">
       <span class="swchip-amt mono">${esc(C.fmtAtoms(total, m.precision))} ${esc(m.ticker)}</span>
-      <span class="swchip-split"><span class="z">${esc(C.fmtAtoms(instant, m.precision))} instant</span> · ${esc(C.fmtAtoms(onchain, m.precision))} on-chain</span>
+      <span class="swchip-split"><span class="z">${esc(C.fmtAtoms(instant, m.precision))} Lightning</span> · ${esc(C.fmtAtoms(onchain, m.precision))} on-chain</span>
     </span></button>`;
 }
 function renderChips(){
@@ -396,7 +404,7 @@ function onChipPick(hex){
   if (!hex || hex === S.payAsset) return;
   S.payAsset = hex;
   if (S.receiveAsset && (S.receiveAsset === hex || !counterpartsOf(hex).includes(S.receiveAsset))) S.receiveAsset = null;
-  S.railsTouched = false;
+  S.railsTouched = false; S.modeTouched = false;
   LAST_QUOTE = null; setReviewEnabled(false);
   paintPanes(); requote().catch(()=>{});
 }
@@ -433,6 +441,60 @@ function paintPanes(){
   paintRefHints();
   paintRouteLine();
   updateRails();
+  paintModeSeg();
+}
+
+// ---------------------------------------------------------------------------
+// Take / Post (lift the book vs. rest a limit order at your own price)
+// ---------------------------------------------------------------------------
+// A route can be POSTED only when the wallet already has an offer-post path for it:
+// same-chain (postOfferReview -> seqob.signOffer/postOffer) and cross-chain
+// (postCrossOfferReview -> X.makerStart/makerStartReverse). LN + mixed rails are
+// taker-only (LP fixed terms / submarine), so they stay in Take.
+function postSupported(route){ return !!route && (route.kind === 'same' || route.kind === 'cross'); }
+// After the book is known, pick the default mode for a fresh pair: Post when there is
+// nothing resting to lift (start the market), Take when there is. Once the user picks a
+// mode (modeTouched) we stop overriding it. Unsupported routes are forced to Take.
+function applyAutoMode(bookLen, route){
+  if (!postSupported(route)) S.mode = 'take';
+  else if (!S.modeTouched) S.mode = bookLen > 0 ? 'take' : 'post';
+  paintModeSeg();
+}
+function wireModeSeg(){
+  const seg = C.$('swModeSeg'); if (!seg || seg._wired) return; seg._wired = true;
+  seg.querySelectorAll('button[data-m]').forEach(b => b.onclick = () => { if (!b.disabled) setMode(b.dataset.m); });
+}
+// Paint the Take/Post segmented control: active state, disable Post where unpostable,
+// the hint line, and the primary CTA label (Post order vs Review swap).
+function paintModeSeg(){
+  if (!C) return;
+  const route = findRoute(S.payAsset, S.receiveAsset);
+  const canPost = postSupported(route);
+  if (!canPost) S.mode = 'take';
+  const wrap = C.$('swModeWrap'); if (wrap) wrap.classList.toggle('hide', !route);
+  const seg = C.$('swModeSeg');
+  if (seg) seg.querySelectorAll('button[data-m]').forEach(b => {
+    const isPost = b.dataset.m === 'post';
+    b.classList.toggle('on', b.dataset.m === S.mode);
+    b.disabled = isPost && !canPost;
+    if (b.disabled) b.title = 'Posting a resting order isn’t available on this rail — Take lifts the book.';
+    else b.removeAttribute('title');
+  });
+  const hint = C.$('swModeHint');
+  if (hint) hint.textContent = (S.mode === 'post' && canPost)
+    ? 'Set your own price — both amounts are yours; posts a resting offer.'
+    : 'Lift resting offers at the book price.';
+  const btn = C.$('swReview');
+  if (btn) btn.textContent = (S.mode === 'post' && canPost) ? 'Post order' : 'Review swap';
+}
+// Switch mode by hand (marks it touched so the auto-default stops). Take re-links the
+// fields (requote re-derives the opposite); Post leaves both fields independent.
+function setMode(m){
+  if (m !== 'take' && m !== 'post') return;
+  S.mode = m; S.modeTouched = true;
+  LAST_QUOTE = null; setReviewEnabled(false);
+  paintModeSeg();
+  requote().catch(()=>{});
 }
 
 // Show BOTH rail choosers (Pay from / Receive to) only for a BTC<->asset pair when
@@ -445,34 +507,60 @@ function updateRails(){
     && ((pay === 'BTC') !== (receive === 'BTC'));   // exactly one side is BTC
   if (btcPair && lnAvailable()){
     box.classList.remove('hide');
-    // Default each leg to the instant (LN) option when the LSP is available; the
-    // LSP submarine-funds a cold channel mid-trade, so instant is the right default
-    // even before the user holds in-channel liquidity. (Per-leg instant-balance-aware
-    // defaulting is a later refinement.)
+    // Default each leg to the Lightning option when the LSP is available; the LSP
+    // submarine-funds a cold channel mid-trade, so Lightning is the right default even
+    // before the user holds in-channel liquidity. (Per-leg balance-aware defaulting is a
+    // later refinement.) both-LN is always a supported combo, so this never lands unsupported.
     if (!S.railsTouched){ S.payRail = 'ln'; S.recvRail = 'ln'; }
+    // Safety: never sit on the undeployed mixed shape (asset over LN + BTC on-chain).
+    else if (!railSupported(S.payRail, S.recvRail)){ S.payRail = 'ln'; S.recvRail = 'ln'; S.railsTouched = false; }
     paintRailSegs();
   } else {
     box.classList.add('hide');
     S.payRail = 'chain'; S.recvRail = 'chain'; S.railsTouched = false;
   }
 }
+// Is (payRail, recvRail) a rail combination with a backend for the current pair? Both
+// legs the same (pure-LN or fully on-chain) always work. The only mixed shape deployed
+// is asset-on-chain <-> BTC-Lightning; its mirror (asset over LN + BTC on-chain) has no
+// maker and fails closed (HTTP 422), so it must never be selectable.
+function railSupported(p, r){
+  if (p === r) return true;                       // both-LN or both-on-chain
+  const payIsBtc = (S.payAsset === 'BTC');        // buy asset (pay BTC) vs sell asset (pay the asset)
+  return payIsBtc ? (p === 'ln' && r === 'chain')     // buy: BTC over LN + asset on-chain
+                  : (p === 'chain' && r === 'ln');    // sell: asset on-chain + BTC over LN
+}
 function wireRailSeg(id, leg){
   const seg = C.$(id); if (!seg || seg._wired) return; seg._wired = true;
-  seg.querySelectorAll('button[data-r]').forEach(b => b.onclick = () => setRail(leg, b.dataset.r));
+  // Guard on b.disabled at click time so a greyed (unsupported) combo can't be picked.
+  seg.querySelectorAll('button[data-r]').forEach(b => b.onclick = () => { if (!b.disabled) setRail(leg, b.dataset.r); });
 }
 function paintRailSegs(){
-  const paint = (id, r) => { const seg = C.$(id); if (!seg) return;
-    seg.querySelectorAll('button[data-r]').forEach(b => b.classList.toggle('on', b.dataset.r === r)); };
-  paint('swPayRailSeg', S.payRail);
-  paint('swRecvRailSeg', S.recvRail);
+  const badTip = 'Coming soon — this asset-over-Lightning with BTC on-chain shape has no maker yet. '
+    + 'Keep the asset on-chain and BTC on Lightning, or set both legs the same way.';
+  const paint = (id, leg) => { const seg = C.$(id); if (!seg) return;
+    const cur = leg === 'pay' ? S.payRail : S.recvRail;
+    seg.querySelectorAll('button[data-r]').forEach(b => {
+      const r = b.dataset.r;
+      b.classList.toggle('on', r === cur);
+      // Would selecting THIS button (other leg held fixed) form an unsupported combo?
+      const p2 = leg === 'pay' ? r : S.payRail;
+      const r2 = leg === 'pay' ? S.recvRail : r;
+      const bad = !railSupported(p2, r2);
+      b.disabled = bad;
+      if (bad) b.title = badTip; else b.removeAttribute('title');
+    }); };
+  paint('swPayRailSeg', 'pay');
+  paint('swRecvRailSeg', 'recv');
 }
 // Set ONE leg's rail (leg = 'pay' | 'recv'); marks the rails as user-chosen so the
-// auto-default stops overriding them.
+// auto-default stops overriding them. Changing rails can change the route kind, so the
+// Take/Post default is re-armed too.
 function setRail(leg, r){
   const cur = leg === 'pay' ? S.payRail : S.recvRail;
   if (cur === r) return;
   if (leg === 'pay') S.payRail = r; else S.recvRail = r;
-  S.railsTouched = true;
+  S.railsTouched = true; S.modeTouched = false;
   LAST_QUOTE = null; setReviewEnabled(false);
   paintRailSegs();
   requote().catch(()=>{});
@@ -526,6 +614,7 @@ function onFlip(){
   const pa = C.$('swPayAmt'), ra = C.$('swRecvAmt');
   [pa.value, ra.value] = [ra.value, pa.value];
   S.edited = S.edited === 'pay' ? 'receive' : 'pay';
+  S.modeTouched = false;   // re-arm the Take/Post default for the flipped pair
   LAST_QUOTE = null; setReviewEnabled(false);
   paintPanes();
   requote().catch(()=>{});
@@ -558,6 +647,9 @@ async function requote(){
   paintRouteLine();
   const route = findRoute(S.payAsset, S.receiveAsset);
   renderTiming(route);   // timing banner reflects the rails immediately, before amounts
+  // LN / mixed / no-route are take-only; keep the mode control honest before we quote.
+  if (!postSupported(route)) S.mode = 'take';
+  paintModeSeg();
   if (!route){ setReviewEnabled(false); clearOpposite(); clearBook(); return; }
   const amtStr = typedAmount(S.edited);
   // Do NOT bail on an empty amount: the quote functions fetch and RENDER the ONE
@@ -568,7 +660,15 @@ async function requote(){
   if (route.kind === 'mixed') return requoteMixed(route, amtStr);
   return requoteSame(route, amtStr);
 }
-function clearBook(){ const b = C.$('swBook'); if (b) b.innerHTML = ''; renderPairBar(); }
+function clearBook(){ renderBookPlaceholder(); renderPairBar(); }
+// A muted stand-in so the desk's LEFT (book) column is never a blank void before a pair
+// is chosen. Replaced by the live ladder the moment a pair + book load.
+function renderBookPlaceholder(){
+  const host = C.$('swBook'); if (!host) return;
+  host.innerHTML = `<div class="swladder"><div class="swladder-head">`
+    + `<span class="sub" style="color:var(--txt);font-weight:650">Order book</span><span class="sub"></span></div>`
+    + `<div class="swladder-empty">Pick two assets to see the order book.</div></div>`;
+}
 
 function clearOpposite(){
   const other = S.edited === 'pay' ? C.$('swRecvAmt') : C.$('swPayAmt');
@@ -625,6 +725,12 @@ async function requoteSame(route, amtStr){
       return;
     }
 
+    // Now the book is known: pick Take vs Post (Post is the default for an empty book).
+    // In Post mode the two amount fields are INDEPENDENT — do not derive or stomp either —
+    // and Review posts a resting offer at the user's own price (postOfferReview).
+    applyAutoMode(liftable.length, route);
+    if (S.mode === 'post'){ status.textContent = ''; return postModeSame(pay, receive); }
+
     if (!amtStr || !amtStr.trim()){ status.textContent=''; clearOpposite(); setReviewEnabled(false); paintEmptyRate(pay, receive, liftable.length); return; }
 
     if (!liftable.length){
@@ -663,6 +769,30 @@ async function requoteSame(route, amtStr){
     $('swErr').textContent = 'Order book: ' + (e.message || e);
     setReviewEnabled(false);
   }
+}
+
+// POST mode (same-chain): the two amount fields are the user's OWN limit — their ratio
+// IS the price. We do NOT touch either field (no book-derived fill) and route Review to
+// postOfferReview (seqob.signOffer + seqob.postOffer), the proven offer-post path. The
+// book (with any resting rows) still renders on the left; this rests a new order into it.
+function postModeSame(pay, receive){
+  const { $ } = C;
+  if (!S.feeAsset) S.feeAsset = defaultFeeAsset();
+  const pm = C.assetMeta(pay), rm = C.assetMeta(receive);
+  const pv = numVal($('swPayAmt')), rv = numVal($('swRecvAmt'));
+  const hasBook = !!(BOOK.offers && BOOK.offers.length);
+  LAST_QUOTE = { kind:'same', startMarket:true, post:true, pay, receive };
+  if (pv > 0 && rv > 0){
+    $('swRate').textContent = `Your price · 1 ${pm.ticker} = ${trim(rv/pv)} ${rm.ticker} — Post to rest this offer.`;
+  } else {
+    $('swRate').textContent = hasBook
+      ? `Set both amounts — their ratio is your limit price — then Post a resting offer.`
+      : `No resting offers yet — set both amounts (their ratio is your price) to post the first order.`;
+  }
+  $('swRoute').textContent = hasBook ? 'Order book · post a limit order' : 'Order book · be the first';
+  paintFee(S.feeAsset, null);
+  setFinality('same');
+  setReviewEnabled(pv > 0 && rv > 0);
 }
 
 function ratioRecvPerPay(o){
@@ -818,6 +948,19 @@ async function requoteMixed(route, amtStr){
   const { $ } = C;
   const am = C.assetMeta(route.seqAsset);
   $('swStatus').textContent = ''; $('swErr').textContent = '';
+  // Defensive: the rail toggles already grey out the undeployed mixed shape (asset over LN
+  // + BTC on-chain), but if state ever lands there, don't offer a doomed Review — render
+  // the book, then nudge the user to a supported combo instead of hitting an HTTP 422.
+  if (!railSupported(route.payRail, route.recvRail)){
+    await loadBtcBook(route);
+    $('swRate').textContent = 'This rail combination isn’t available yet.';
+    $('swRoute').textContent = 'Mixed rails · coming soon';
+    $('swErr').textContent = `Asset-over-Lightning with BTC on-chain has no maker yet. `
+      + `Put ${am.ticker} on-chain and BTC on Lightning, or set both legs the same way.`;
+    setReviewEnabled(false);
+    renderTiming(route);
+    return;
+  }
   await loadBtcBook(route);
   deriveXOpposite(route);
   const o = (XBOOK.offers || [])[0];
@@ -844,6 +987,32 @@ async function requoteMixed(route, amtStr){
 }
 
 // --- cross-chain quote (GetXchainQuote) ---
+// POST mode (cross-chain BTC<->asset): the fields are the user's OWN price. Review posts a
+// resting cross offer via the maker path (postCrossOfferReview -> X.makerStart/makerStartReverse).
+// reverse = pay BTC (post a BID: buy the asset with BTC); forward = pay the asset (post an ASK:
+// sell the asset for BTC) — mirroring the "be the first" branch in requoteCross.
+function postModeCross(route){
+  const { $ } = C;
+  const am = C.assetMeta(route.seqAsset);
+  const reverse = !!route.payIsBtc;
+  const start = reverse ? (X && X.makerStartReverse) : (X && X.makerStart);
+  if (!start){
+    LAST_QUOTE = null; setReviewEnabled(false);
+    $('swRate').textContent = `Posting a ${am.ticker}/BTC offer isn’t available in this build.`;
+    $('swRoute').textContent = '';
+    setFinality('cross');
+    return;
+  }
+  LAST_QUOTE = { kind:'cross-make', reverse, assetHex: route.seqAsset };
+  const both = numVal($('swPayAmt')) > 0 && numVal($('swRecvAmt')) > 0;
+  $('swRate').textContent = both
+    ? `Your price · ${reverse ? `buy ${am.ticker} with BTC` : `sell ${am.ticker} for BTC`} — Post to rest this offer.`
+    : `Set both amounts (the ${am.ticker} and the BTC) — their ratio is your price — then Post.`;
+  $('swRoute').textContent = reverse ? 'Cross-chain · post a bid (buy with BTC)' : 'Cross-chain · post an offer (sell for BTC)';
+  setFinality('cross');
+  setReviewEnabled(both);
+}
+
 async function requoteCross(route, amtStr){
   const { $ } = C;
   if (!X || !X.quote){ $('swErr').textContent = 'Cross-chain route unavailable in this build.'; setReviewEnabled(false); return; }
@@ -868,6 +1037,11 @@ async function requoteCross(route, amtStr){
       $('swErr').textContent = 'Could not reach the cross-chain order book (' + (unreachable === true ? 'relay unreachable' : unreachable) + '). Check your connection and press Refresh.';
       return;
     }
+
+    // Take vs Post (Post defaults for an empty cross book). In Post mode the fields are the
+    // user's own price; Review posts a resting cross offer via the maker (postCrossOfferReview).
+    applyAutoMode(offers.length, route);
+    if (S.mode === 'post'){ status.textContent = ''; return postModeCross(route); }
 
     if (!offers.length){
       status.textContent = ''; clearOpposite(); setFinality('cross');
@@ -1245,6 +1419,7 @@ function openPicker(side){
     // If the other side no longer trades against the new pick, clear it.
     const o = side === 'pay' ? S.receiveAsset : S.payAsset;
     if (o && !counterpartsOf(hex).includes(o)){ if (side === 'pay') S.receiveAsset = null; else S.payAsset = null; }
+    S.railsTouched = false; S.modeTouched = false;   // re-arm rail + Take/Post defaults for the new pair
     LAST_QUOTE = null; setReviewEnabled(false);
     paintPanes();
     requote().catch(()=>{});
@@ -1886,5 +2061,7 @@ export const __test__ = { stripBip32, dexPost,
   composerRoute: (pay, receive) => findRoute(pay, receive),
   counterpartsOf, startableAssets, allTradableAssets: startableAssets,
   acceptedFee, defaultFeeAsset,
+  // Take/Post + rail-combo helpers, for headless verification of the composer's gating.
+  postSupported, railSupported, applyAutoMode,
   state: S,
 };
