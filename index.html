@@ -1691,7 +1691,17 @@ function initSwapTab(){
 function renderActiveSwap(){ renderSwap(); }
 
 // ---------- sync + balance ----------
-async function sync(){
+let _syncInFlight = null;
+// Coalesce concurrent sync() calls. The covenant relay replays every resting order on
+// subscribe, and each relay event handler calls sync(); without coalescing those pile up
+// into overlapping wasm scans that block the main thread (frozen UI) and re-enter the
+// shared esplora client. Reuse a single in-flight scan until it settles.
+function sync(){
+  if (_syncInFlight) return _syncInFlight;
+  _syncInFlight = _syncImpl().finally(() => { _syncInFlight = null; });
+  return _syncInFlight;
+}
+async function _syncImpl(){
   const btn=$('btnSync'); if(btn) btn.disabled=true;
   $('syncStatus').className='status'; $('syncStatus').innerHTML='<span class="spin"></span>Syncing…';
   try{
