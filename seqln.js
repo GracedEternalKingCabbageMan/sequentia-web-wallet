@@ -234,7 +234,76 @@ export function seqlnSwap({ side, asset, amount, payRail, recvRail }) {
   return lspFetch('/swap', { method: 'POST', body: JSON.stringify(body) });
 }
 
+// Just the channel list from /status (leg-tagged, per-asset spendable/receivable), for
+// the Balance tab's in-channel ("Lightning") balance + the real channel count.
+export async function seqlnChannels() {
+  const st = await seqlnGetStatus();
+  return st.channels || [];
+}
+
+// Which chains/assets the LSP can fund a channel for (Move to Lightning). SeqLN nodes
+// are single-asset, so `assets` lists exactly the Sequentia assets that have a hosted
+// node today (dynamic; grows as per-asset nodes are provisioned). The Balance tab reads
+// this to offer Move-to-Lightning ONLY where a node exists.
+export async function seqlnFunding() {
+  const st = await seqlnGetStatus();
+  return st.funding || { btc: false, assets: [] };
+}
+
+// -- "Move to Lightning": non-custodial channel funding --------------------------
+// Move BTC (testnet4) or a Sequentia asset from on-chain into a Lightning channel on
+// the user's hosted node. NON-CUSTODIAL: the wallet signs the on-chain deposit itself
+// (via the `sendOnchain` hook the wallet supplies, so this module never depends on the
+// wallet's signer), and the channel funding tx is co-signed by the on-device signer
+// (the hosted node is keyless), so the LSP orchestrates fundchannel but can never move
+// the funds. The device signer for this chain's leg MUST be serving.
+//
+//   chain        'btc' | 'seq'
+//   asset        (seq only) 'GOLD' or a 32-byte hex id — the asset to fund the channel with
+//   amount       base units to move (BTC sats / asset atoms)
+//   sendOnchain  async ({ chain, asset, amount, address }) => { txid } — the wallet's
+//                own on-chain send to the hosted node's deposit address (it signs it)
+//   onProgress   (evt) => void — { phase, ... }: 'deposit-address' | 'sending' | 'sent' |
+//                'pending_deposit' | 'opening' | 'awaiting_lockin' | 'active' | 'failed'
+// Resolves with the final active job ({ short_channel_id, spendable_msat, ... }).
+export async function fundChannel({ chain, asset, amount, sendOnchain, onProgress,
+  pollMs = 5000, timeoutMs = 3_600_000 } = {}) {
+  if (chain !== 'btc' && chain !== 'seq') throw new Error("fundChannel: chain must be 'btc' or 'seq'");
+  if (typeof sendOnchain !== 'function') throw new Error('fundChannel: a sendOnchain hook is required (the wallet signs the deposit)');
+  const emit = (phase, extra) => { try { onProgress && onProgress({ phase, ...extra }); } catch {} };
+
+  // 1. The hosted node's on-chain deposit address for this chain.
+  emit('deposit-address');
+  const dep = await lspFetch(`/channel/deposit?chain=${encodeURIComponent(chain)}`);
+  if (!dep.address) throw new Error('LSP returned no deposit address');
+
+  // 2. The WALLET sends the deposit on-chain (it signs it — the LSP never holds the key).
+  emit('sending', { address: dep.address });
+  const sent = await sendOnchain({ chain, asset, amount, address: dep.address });
+  emit('sent', { address: dep.address, deposit_txid: sent && sent.txid });
+
+  // 3. Tell the LSP to watch for the deposit + fundchannel (device co-signs the funding).
+  emit('opening-request');
+  const body = { chain, amount };
+  if (asset) body.asset = asset;
+  const started = await lspFetch('/channel/open', { method: 'POST', body: JSON.stringify(body) });
+  const jobUrl = started.poll || `/channel/open/${started.job_id}`;
+
+  // 4. Poll to completion, surfacing each phase for the UI.
+  const deadline = Date.now() + timeoutMs;
+  let job = started;
+  for (;;) {
+    emit(job.status, { job, deposit_txid: sent && sent.txid });
+    if (job.status === 'active') return job;
+    if (job.status === 'failed') throw new Error(job.error || 'channel open failed');
+    if (Date.now() > deadline) throw new Error('channel open timed out');
+    await new Promise((r) => setTimeout(r, pollMs));
+    job = await lspFetch(jobUrl);
+  }
+}
+
 export default {
   initSeqln, seqlnConfigured, seqlnDeployed, seqlnState, onSeqlnStatus, seqlnAvailable,
   lnFinalityCopy, connectDevice, disconnectDevice, seqlnGetStatus, seqlnSwap,
+  seqlnChannels, seqlnFunding, fundChannel,
 };

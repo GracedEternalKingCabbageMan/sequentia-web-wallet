@@ -23,6 +23,15 @@
 //            order book), NOT the LSP: the browser runs that path directly.
 //   GET  /status  -> both hosted nodes' ids + per-asset channel balances.
 //   GET  /health  (no auth) -> {ok:true}
+//   --- "Move to Lightning" non-custodial channel funding ---
+//   GET  /channel/deposit?chain=btc|seq -> the hosted node's on-chain deposit
+//        address. The wallet sends the chosen amount there (signed by the user's OWN
+//        wallet); the LSP never holds the on-chain keys.
+//   POST /channel/open {chain, asset?, amount} -> watches for that deposit to confirm
+//        then `fundchannel` to the routing peer. Non-custodial: the hosted node is
+//        keyless, so the funding tx's SIGN_WITHDRAWAL is served by the DEVICE — the LSP
+//        can command fundchannel but cannot sign it. Returns 202 {job_id, poll}.
+//   GET  /channel/open/<id> -> pending_deposit | opening | awaiting_lockin | active | failed.
 //
 // Topology: the real cross-chain shape uses TWO hosted nodes — an asset node
 // (holds the GOLD channel, Sequentia) and a BTC node (holds the BTC channel,
@@ -42,6 +51,10 @@
 //   RELAY              seqobd relay base URL (default http://127.0.0.1:9955)
 //   GOLD               the tradeable asset id
 //   BTCX               the BTC-leg asset id; UNSET/empty => real BTC-LN (-btc-asset "")
+//   --- "Move to Lightning" channel funding ---
+//   CHANNEL_PEER_BTC   routing peer the BTC hosted node opens its channel to (id@host:port)
+//   CHANNEL_PEER_ASSET routing peer the asset hosted node opens its channel to (id@host:port)
+//   CHANNEL_WATCH_MS   how long POST /channel/open waits for the deposit + lock-in (default 1h)
 //   --- MIXED (submarine) rail only ---
 //   SEQ_RPC            Sequentia node RPC http://user:pass@host:port WITH -txindex,
 //                      for the on-chain asset leg (fund/claim + BlockHashOfTx). REQUIRED
@@ -105,6 +118,16 @@ const CFG = {
   // it (or when the amount is unknown) /swap returns a pollable 'confirming' job so the
   // browser never hangs through the multi-block anchor gate. 0 = always anchor-gated.
   mixedMax0conf: Number(process.env.MIXED_MAX_0CONF || 0),
+  // --- "Move to Lightning" channel funding (GET /channel/deposit, POST /channel/open) ---
+  // The routing peer each hosted node opens its channel TO (id@host:port). The channel
+  // is funded from the hosted node's OWN on-chain wallet, whose only signer is the user's
+  // device (keyless node + hsmd proxy), so the funding tx is device-co-signed: the LSP
+  // orchestrates fundchannel but can never move the funds. Blank => that chain can't open.
+  channelPeerBtc: process.env.CHANNEL_PEER_BTC || '',
+  channelPeerAsset: process.env.CHANNEL_PEER_ASSET || '',
+  // How long POST /channel/open watches for the on-chain deposit to confirm + the
+  // channel to reach CHANNELD_NORMAL before it gives up (deposit never arrived, etc.).
+  channelWatchMs: Number(process.env.CHANNEL_WATCH_MS || 3_600_000),
 };
 if (!CFG.hostedAssetRpc || !CFG.hostedBtcRpc) {
   console.error('[lsp] missing hosted RPC: set HOSTED_ASSET_RPC + HOSTED_BTC_RPC (or HOSTED_RPC as a fallback for both)');
@@ -183,7 +206,171 @@ async function status() {
     asset_node: assetNode,
     btc_node: btcNode,
     channels: [...assetNode.channels, ...btcNode.channels], // merged, leg-tagged
+    // Which chains/assets "Move to Lightning" can fund on THIS LSP. SeqLN nodes are
+    // single-asset, so each Sequentia asset needs its OWN hosted node; today only the
+    // one asset node (GOLD) is provisioned, so `assets` lists exactly what has a node.
+    // The wallet reads this to offer Move-to-Lightning ONLY for funded-able assets.
+    funding: {
+      btc: !!(CFG.channelPeerBtc && CFG.hostedBtcRpc),
+      assets: CFG.channelPeerAsset ? [{ id: CFG.gold, label: assetLabel(CFG.gold) }] : [],
+    },
   };
+}
+
+// ---------------------------------------------------------------------------
+// "Move to Lightning" — non-custodial channel funding.
+//
+// The user moves BTC (testnet4) or a Sequentia asset from on-chain into a
+// Lightning channel on THEIR hosted node. The flow is:
+//   1. GET  /channel/deposit?chain=btc|seq -> the hosted node's on-chain address.
+//   2. The WALLET sends the chosen amount on-chain to that address, signed by the
+//      user's OWN wallet (index.html's BTC / asset send path). The LSP never sees
+//      or holds the user's on-chain keys.
+//   3. POST /channel/open watches for that deposit to confirm in the hosted node's
+//      on-chain wallet, then calls `fundchannel` to the routing peer. Because the
+//      hosted node is KEYLESS (subdaemon=hsmd proxy -> the device's wasm signer),
+//      the funding transaction's SIGN_WITHDRAWAL is served by the DEVICE. The LSP
+//      can command fundchannel but cannot produce the funding signature, so it can
+//      never move the deposited funds. Fail-closed: no device signer -> no funding
+//      signature -> no channel.
+//   4. GET /channel/open/<id> reports pending_deposit -> opening -> awaiting_lockin
+//      -> active (CHANNELD_NORMAL), at which point /status shows spendable_msat.
+// ---------------------------------------------------------------------------
+const CHAINS = { btc: 'btc', seq: 'seq', sequentia: 'seq', asset: 'seq' };
+function chainRpc(chain) { return chain === 'btc' ? CFG.hostedBtcRpc : CFG.hostedAssetRpc; }
+function chainPeer(chain) { return chain === 'btc' ? CFG.channelPeerBtc : CFG.channelPeerAsset; }
+
+// The hosted node's confirmed on-chain balance (base units: BTC sats / asset atoms)
+// available to fund a channel. For an asset channel only outputs of `assetId` count;
+// for BTC every confirmed output counts. Returns { units, outpoints } (outpoints of
+// the matching confirmed outputs, so fundchannel can pin exactly the user's deposit).
+async function confirmedOnchain(rpc, chain, assetId) {
+  const lf = await lnrpc('listfunds', [], rpc);
+  let units = 0; const outpoints = [];
+  for (const o of (lf.outputs || [])) {
+    if (o.status !== 'confirmed') continue;
+    if (chain === 'seq' && assetId && (o.asset || '').toLowerCase() !== assetId.toLowerCase()) continue;
+    const sats = Math.round(Number(o.amount_msat ?? 0) / 1000);
+    if (!sats) continue;
+    units += sats;
+    outpoints.push(`${o.txid}:${o.output}`);
+  }
+  return { units, outpoints };
+}
+
+// Find the channel opened to `peerId` (optionally matching funding_txid) on this node.
+async function findChannel(rpc, peerId, fundingTxid) {
+  const pc = await lnrpc('listpeerchannels', [], rpc).catch(() => ({ channels: [] }));
+  const cands = (pc.channels || []).filter((c) =>
+    (c.peer_id || '').toLowerCase() === peerId.toLowerCase() &&
+    (!fundingTxid || (c.funding_txid || '').toLowerCase() === fundingTxid.toLowerCase()));
+  // Prefer a NORMAL channel, else the most-recent opening one.
+  return cands.find((c) => c.state === 'CHANNELD_NORMAL')
+    || cands.find((c) => String(c.state).startsWith('CHANNELD')) || cands[0] || null;
+}
+
+const channelJobs = new Map();
+function reapChannelJobs() {
+  const now = Date.now();
+  for (const [id, j] of channelJobs) if (j.done_ms && now - j.done_ms > JOB_TTL_MS) channelJobs.delete(id);
+}
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+// GET /channel/deposit?chain=btc|seq -> the hosted node's on-chain deposit address.
+async function channelDeposit(chain) {
+  const rpc = chainRpc(chain);
+  const info = await lnrpc('getinfo', [], rpc);
+  const na = await lnrpc('newaddr', ['bech32'], rpc);
+  return { ok: true, chain, node_id: info.id, network: info.network,
+    address: na.bech32 || na.address || na.p2tr };
+}
+
+// The background worker: watch for the deposit, then fundchannel (device-co-signed).
+async function runChannelOpen(job) {
+  const rpc = chainRpc(job.chain);
+  const peer = chainPeer(job.chain);
+  const [peerId, peerAddr] = peer.split('@');
+  const deadline = Date.now() + CFG.channelWatchMs;
+  const need = Number(job.requested_amount);
+
+  // 1. Wait for confirmed on-chain funds >= the requested channel amount. (Funds the
+  //    user just deposited; if the node already holds enough, this passes at once.)
+  for (;;) {
+    if (Date.now() > deadline) throw new Error('deposit did not confirm before timeout');
+    const { units, outpoints } = await confirmedOnchain(rpc, job.chain, job.asset_id);
+    job.confirmed_units = units;
+    if (units >= need) { job.deposit_outpoints = outpoints; break; }
+    job.status = 'pending_deposit';
+    await sleep(15000);
+  }
+
+  // 2. Connect to the routing peer + fundchannel. The funding tx SIGN_WITHDRAWAL is
+  //    served by the DEVICE over the hsmd proxy; a missing device fails this closed.
+  job.status = 'opening';
+  try { await lnrpc('connect', [peerAddr ? `${peerId}@${peerAddr}` : peerId], rpc); }
+  catch (e) { job.connect_note = e.message; /* often already connected */ }
+  const fcArgs = ['fundchannel', `id=${peerId}`, `amount=${need}`, 'announce=true'];
+  // Pin the exact deposit outputs so an asset channel funds from the right asset UTXOs
+  // (the seqln fork picks the channel asset from the funding UTXOs) and BTC never
+  // sweeps unrelated coins.
+  if (job.deposit_outpoints && job.deposit_outpoints.length) {
+    fcArgs.push(`utxos=${JSON.stringify(job.deposit_outpoints)}`);
+  }
+  const fc = await lnrpc(fcArgs[0], fcArgs.slice(1), rpc);
+  job.funding_txid = fc.txid || (fc.txids && fc.txids[0]) || null;
+  job.channel_id = fc.channel_id || null;
+
+  // 3. Watch the channel to CHANNELD_NORMAL.
+  job.status = 'awaiting_lockin';
+  for (;;) {
+    if (Date.now() > deadline) throw new Error('channel did not reach CHANNELD_NORMAL before timeout');
+    const ch = await findChannel(rpc, peerId, job.funding_txid);
+    if (ch) {
+      job.state = ch.state;
+      job.short_channel_id = ch.short_channel_id || null;
+      job.spendable_msat = ch.spendable_msat ?? ch.to_us_msat ?? null;
+      job.channel_asset = ch.channel_asset || ch.asset || 'policy';
+      if (ch.state === 'CHANNELD_NORMAL') { job.status = 'active'; break; }
+    }
+    await sleep(15000);
+  }
+  job.done_ms = Date.now();
+  return job;
+}
+
+// POST /channel/open {chain, asset?, amount}. Validates + starts the background job.
+function startChannelOpen(body) {
+  const chain = CHAINS[String(body.chain || '').toLowerCase()];
+  if (!chain) return { ok: false, error: "chain must be 'btc' or 'seq'" };
+  const peer = chainPeer(chain);
+  if (!peer) return { ok: false, error: `no routing peer configured for ${chain} (set CHANNEL_PEER_${chain === 'btc' ? 'BTC' : 'ASSET'})` };
+  const amount = Number(body.amount);
+  if (!Number.isFinite(amount) || amount <= 0) return { ok: false, error: 'amount must be a positive number (base units: BTC sats / asset atoms)' };
+  // For an asset channel resolve the asset so the deposit watch only counts that asset.
+  // SeqLN nodes are single-asset: the one provisioned asset node is denominated in
+  // CFG.gold, so it can ONLY fund a channel in that asset. A request for any other
+  // asset fails closed (per-asset node provisioning is the missing infra) rather than
+  // silently funding the wrong asset.
+  let assetId = null;
+  if (chain === 'seq') {
+    assetId = body.asset ? resolveAsset(body.asset) : CFG.gold; // default to the node's asset
+    if (!assetId) return { ok: false, error: 'unknown asset (want GOLD or a 32-byte hex id)' };
+    if (assetId !== CFG.gold) {
+      return { ok: false, error: `this LSP has no hosted Lightning node for ${assetLabel(assetId)} yet `
+        + `(SeqLN nodes are single-asset; only ${assetLabel(CFG.gold)} is provisioned). Per-asset node provisioning is pending.` };
+    }
+  }
+  reapChannelJobs();
+  const jobId = crypto.randomUUID();
+  const job = { ok: true, job_id: jobId, chain, asset_id: assetId,
+    asset_label: assetId ? assetLabel(assetId) : (chain === 'btc' ? 'BTC' : null),
+    requested_amount: amount, peer_id: peer.split('@')[0], status: 'pending_deposit',
+    state: null, funding_txid: null, short_channel_id: null, started_ms: Date.now() };
+  channelJobs.set(jobId, job);
+  runChannelOpen(job)
+    .then(() => { /* job mutated in place */ })
+    .catch((e) => { job.status = 'failed'; job.error = String((e && e.message) || e); job.done_ms = Date.now(); });
+  return { ...job, poll: `/channel/open/${jobId}` };
 }
 
 function runSwap({ side, asset, amount }) {
@@ -304,6 +491,29 @@ const server = http.createServer(async (req, res) => {
   if (!authed(req)) return send(res, 401, { ok: false, error: 'unauthorized (Bearer token required)' });
   try {
     if (req.method === 'GET' && url.pathname === '/status') return send(res, 200, await status());
+    // "Move to Lightning": the hosted node's on-chain deposit address for a chain.
+    if (req.method === 'GET' && url.pathname === '/channel/deposit') {
+      const chain = CHAINS[String(url.searchParams.get('chain') || '').toLowerCase()];
+      if (!chain) return send(res, 400, { ok: false, error: "chain must be 'btc' or 'seq'" });
+      if (!chainPeer(chain)) return send(res, 501, { ok: false, error: `channel funding is not configured for ${chain} on this LSP` });
+      return send(res, 200, await channelDeposit(chain));
+    }
+    // Poll a "Move to Lightning" channel-open job.
+    if (req.method === 'GET' && url.pathname.startsWith('/channel/open/')) {
+      const id = url.pathname.slice('/channel/open/'.length);
+      const job = channelJobs.get(id);
+      if (!job) return send(res, 404, { ok: false, error: 'unknown channel job id' });
+      // ok:true = the poll succeeded; the job's own `status` (active|failed|…) is the
+      // source of truth, so the wallet can read a failed job's error without a throw.
+      return send(res, 200, { ...job, ok: true });
+    }
+    // Start a "Move to Lightning" channel-open (background: watch deposit -> fundchannel).
+    if (req.method === 'POST' && url.pathname === '/channel/open') {
+      const body = await readBody(req);
+      if (!body) return send(res, 400, { ok: false, error: 'bad json body' });
+      const r = startChannelOpen(body);
+      return send(res, r.ok ? 202 : 400, r);
+    }
     // Poll an over-cap (anchor-gated) mixed swap started asynchronously by POST /swap.
     if (req.method === 'GET' && url.pathname.startsWith('/swap/')) {
       const id = url.pathname.slice('/swap/'.length);

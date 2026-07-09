@@ -14,20 +14,47 @@ import assert from 'node:assert';
 import {
   initSeqln, seqlnConfigured, seqlnState, seqlnAvailable,
   connectDevice, disconnectDevice, seqlnGetStatus, seqlnSwap, lnFinalityCopy,
+  seqlnChannels, seqlnFunding, fundChannel,
 } from './seqln.js';
 import { lnDeriveNode, lnDeriveAll, LN_PATHS } from './seqln-keys.js';
 
 let seen = [];
+// A fake channel-open job that transitions pending_deposit -> active over a few polls,
+// so the fundChannel poll loop is exercised end-to-end (Part 3).
+const chanJobs = new Map();
 const srv = http.createServer((req, res) => {
   let b = ''; req.on('data', (c) => b += c); req.on('end', () => {
+    const u = new URL(req.url, 'http://x');
     seen.push({ method: req.method, path: req.url, auth: req.headers['authorization'], body: b });
-    if (req.url === '/status') return res.end(JSON.stringify({ ok: true, node_id: 'ab'.repeat(33), channels: [
+    if (u.pathname === '/status') return res.end(JSON.stringify({ ok: true, node_id: 'ab'.repeat(33), channels: [
       { peer_id: 'ln3', asset_label: 'GOLD', spendable_units: 0, receivable_units: 2000000, state: 'CHANNELD_NORMAL' },
       { peer_id: 'ln2', asset_label: 'BTC', spendable_units: 1000000, receivable_units: 1000000, state: 'CHANNELD_NORMAL' },
-    ] }));
-    if (req.url === '/swap') return res.end(JSON.stringify({ ok: true, side: 'buy', direction: 'bought',
+    ], funding: { btc: true, assets: [{ id: 'aa'.repeat(32), label: 'GOLD' }] } }));
+    if (u.pathname === '/swap') return res.end(JSON.stringify({ ok: true, side: 'buy', direction: 'bought',
       asset_label: 'GOLD', base_amount: 100000, quote_amount: 200000,
       preimage: 'cd'.repeat(32), finality: 'final', settled_ms: 2100 }));
+    if (u.pathname === '/channel/deposit') {
+      const chain = u.searchParams.get('chain');
+      return res.end(JSON.stringify({ ok: true, chain, node_id: 'cc'.repeat(33), address: chain === 'btc' ? 'tb1qdeposit' : 'tb1qseqdeposit' }));
+    }
+    if (u.pathname === '/channel/open' && req.method === 'POST') {
+      const body = JSON.parse(b || '{}');
+      const id = 'job-' + (chanJobs.size + 1);
+      const job = { ok: true, job_id: id, chain: body.chain, asset_id: body.asset || null,
+        requested_amount: body.amount, status: 'pending_deposit', polls: 0, poll: `/channel/open/${id}` };
+      chanJobs.set(id, job);
+      res.statusCode = 202; return res.end(JSON.stringify(job));
+    }
+    if (u.pathname.startsWith('/channel/open/')) {
+      const id = u.pathname.slice('/channel/open/'.length);
+      const job = chanJobs.get(id);
+      if (!job) { res.statusCode = 404; return res.end(JSON.stringify({ ok: false, error: 'unknown job' })); }
+      job.polls++;
+      // pending_deposit -> opening -> awaiting_lockin -> active
+      job.status = ['pending_deposit', 'opening', 'awaiting_lockin', 'active'][Math.min(job.polls, 3)];
+      if (job.status === 'active') { job.short_channel_id = '999x1x0'; job.spendable_msat = 30000000; job.state = 'CHANNELD_NORMAL'; }
+      return res.end(JSON.stringify({ ...job, ok: true }));
+    }
     res.statusCode = 404; res.end(JSON.stringify({ ok: false, error: 'nope' }));
   });
 });
@@ -156,6 +183,61 @@ console.log('ok: two device signers connected — distinct keys, seeds, endpoint
 disconnectDevice();
 assert.equal(seqlnAvailable(), false, 'disconnect() drops both legs');
 console.log('ok: disconnectDevice() tears down both legs and the rail goes unavailable');
+
+// ===========================================================================
+// Part 3 — "Move to Lightning" channel funding (fundChannel + seqlnChannels)
+// ===========================================================================
+initSeqln({ lspUrl: `http://127.0.0.1:${port}`, token: 'T0KEN' });
+
+// seqlnChannels() surfaces just the channel list for the Balance UI.
+const chans = await seqlnChannels();
+assert.equal(chans.length, 2, 'seqlnChannels() returns the /status channel list');
+console.log('ok: seqlnChannels() returns the leg-tagged channel list for the Balance tab');
+
+// seqlnFunding() surfaces which chains/assets Move-to-Lightning can fund (dynamic).
+const funding = await seqlnFunding();
+assert.equal(funding.btc, true, 'funding.btc advertises the BTC leg');
+assert.equal(funding.assets.length, 1, 'funding.assets lists the one provisioned asset node (GOLD)');
+assert.equal(funding.assets[0].label, 'GOLD', 'the provisioned asset is GOLD');
+console.log('ok: seqlnFunding() advertises the fundable chains/assets (single-asset-node reality)');
+
+// fundChannel: gets the deposit address, calls the wallet's OWN send hook (the wallet
+// signs the deposit — the LSP never holds the key), starts the open, polls to active.
+const progress = [];
+let sentArgs = null;
+const result = await fundChannel({
+  chain: 'btc', amount: 30000,
+  // The wallet-supplied on-chain send hook — proves seqln.js delegates signing.
+  sendOnchain: async (a) => { sentArgs = a; return { txid: 'ee'.repeat(32) }; },
+  onProgress: (e) => progress.push(e.phase),
+  pollMs: 5,
+});
+assert.equal(sentArgs.chain, 'btc', 'send hook got the chain');
+assert.equal(sentArgs.amount, 30000, 'send hook got the amount');
+assert.equal(sentArgs.address, 'tb1qdeposit', 'send hook got the hosted node deposit address');
+assert.equal(result.status, 'active', 'fundChannel resolves once the channel is active');
+assert.equal(result.short_channel_id, '999x1x0', 'active job carries the short_channel_id');
+assert.equal(result.spendable_msat, 30000000, 'active job reports spendable_msat');
+assert.ok(progress.includes('deposit-address') && progress.includes('sending') && progress.includes('sent'),
+  'progress surfaced deposit-address -> sending -> sent');
+assert.ok(progress.includes('awaiting_lockin') && progress.at(-1) === 'active',
+  'progress surfaced the lock-in -> active transition');
+// The deposit address was fetched, the open POSTed with {chain,amount}, and polled.
+const depReq = seen.find((s) => s.path.startsWith('/channel/deposit'));
+assert.ok(depReq && depReq.auth === 'Bearer T0KEN', 'deposit fetch sent the bearer token');
+const openReq = seen.find((s) => s.method === 'POST' && s.path === '/channel/open');
+assert.deepEqual(JSON.parse(openReq.body), { chain: 'btc', amount: 30000 }, 'POST /channel/open body');
+console.log('ok: fundChannel() delegates the deposit to the wallet hook, then opens + polls to active');
+
+// A missing send hook is rejected (the wallet MUST sign the deposit; the LSP cannot).
+await assert.rejects(() => fundChannel({ chain: 'btc', amount: 1000 }), /sendOnchain hook is required/,
+  'fundChannel refuses to proceed without the wallet send hook (non-custodial)');
+// An asset channel passes the asset through to /channel/open.
+await fundChannel({ chain: 'seq', asset: 'GOLD', amount: 5000,
+  sendOnchain: async () => ({ txid: 'ab'.repeat(32) }), pollMs: 5 });
+const openSeq = seen.filter((s) => s.method === 'POST' && s.path === '/channel/open').at(-1);
+assert.deepEqual(JSON.parse(openSeq.body), { chain: 'seq', amount: 5000, asset: 'GOLD' }, 'asset open forwards the asset');
+console.log('ok: fundChannel() forwards the asset for a Sequentia asset channel; refuses without a send hook');
 
 srv.close();
 console.log('\nALL PASS');

@@ -337,6 +337,17 @@
         <div class="status" id="syncStatus"></div>
         <div class="list" id="assetList"><div class="muted">No assets yet.</div></div>
       </div>
+      <!-- Lightning: move on-chain funds into a Lightning channel (non-custodial).
+           Rendered by renderLightningBalance(); hidden until an LSP is configured. -->
+      <div class="card hide" id="lnBalanceCard">
+        <div class="row" style="justify-content:space-between;align-items:center;margin-bottom:2px">
+          <label class="lbl" style="margin:0">Lightning</label>
+          <span class="sub" id="lnBalSummary"></span>
+        </div>
+        <p class="sub" id="lnBalIntro" style="margin:0 0 12px">Move BTC or a Sequentia asset into a Lightning channel on your hosted node. Your wallet signs the on-chain deposit, and your device co-signs the channel funding, so no one else can move your funds.</p>
+        <div class="list" id="lnBalList"></div>
+        <div class="status" id="lnBalStatus" style="margin-top:10px"></div>
+      </div>
       <div class="card">
         <label class="lbl">Testnet faucet</label>
         <p class="sub" style="margin:0 0 12px">Get free testnet assets to try out the wallet, sent straight to this wallet (tSEQ for fees + staking; the others for asset sends and paying fees in an asset).</p>
@@ -559,7 +570,7 @@
         <!-- trust line: one book, no labels; funding lives in the Balance tab -->
         <div class="swtrust">
           <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><path d="M12 3l7 3v5c0 4.5-3 7.6-7 9-4-1.4-7-4.5-7-9V6l7-3z"/><path d="M9 12l2 2 4-4"/></svg>
-          <span><b>One book, no labels.</b> Every order looks identical — no one can tell if it was funded on-chain or on Lightning. Move funds into a Lightning channel any time from the <b>Balance</b> tab; here you just choose how you pay and how you receive.</span>
+          <span><b>One book, no labels.</b> Every order looks identical, so no one can tell if it was funded on-chain or on Lightning. Move BTC or an asset into a Lightning channel any time from the <b>Balance</b> tab; here you just choose how you pay and how you receive.</span>
         </div>
       </div>
 
@@ -714,7 +725,8 @@ import { initXswap, renderXswap, fetchXmarkets, fetchXquote, fetchXbook, openFro
 import { initXrswap, fetchRQuote, openReverseFromComposer, hasInFlight as hasReverseInFlight, renderReverse } from './xrswap.js';
 import { initXmaker, startForwardMaker, startReverseMaker, liveMakerOffers, resumeMakerSwaps } from './xmaker.js';
 import { initSeqln, connectDevice as lnConnectDevice, disconnectDevice as lnDisconnect,
-  onSeqlnStatus, seqlnState, seqlnAvailable, seqlnGetStatus, seqlnSwap, lnFinalityCopy } from './seqln.js';
+  onSeqlnStatus, seqlnState, seqlnAvailable, seqlnGetStatus, seqlnSwap, lnFinalityCopy,
+  seqlnChannels, seqlnFunding, fundChannel } from './seqln.js';
 import { lnDeriveNode } from './seqln-keys.js';
 
 const ESPLORA = location.origin + '/api';
@@ -1549,11 +1561,19 @@ function lnStatusPill(){
   const st = seqlnState();
   if (!st.deployed){ el.classList.add('hide'); return; }   // LN not deployed for this wallet
   el.classList.remove('hide');
-  el.className = 'net lnpill ' + (st.connected ? 'ln-ready' : (st.phase==='error' ? 'ln-err' : 'ln-warn'));
-  // "⚡ LN ready" only when EVERY enabled leg is serving (a cross-chain swap needs
-  // both). Otherwise surface progress as connected/total, e.g. "⚡ LN 1/2".
-  el.textContent = st.connected ? '⚡ LN ready'
-    : (st.enabledCount > 1 ? `⚡ LN ${st.connectedCount}/${st.enabledCount}` : '⚡ LN ' + (st.phase||'…'));
+  // Prefer the REAL channel count (from the last /status poll) once channels exist —
+  // dynamic (N), never a hardcoded leg total. Fall back to signer-connect progress
+  // while there are no channels yet.
+  const activeChannels = (lnLastStatus && lnLastStatus.channels)
+    ? lnLastStatus.channels.filter(c=>String(c.state||'').startsWith('CHANNELD')).length : 0;
+  el.className = 'net lnpill ' + (activeChannels ? 'ln-ready' : (st.connected ? 'ln-ready' : (st.phase==='error' ? 'ln-err' : 'ln-warn')));
+  if(activeChannels){
+    el.textContent = '⚡ LN '+activeChannels+' ch';
+  } else {
+    // No channels yet: surface the device-signer connect progress (readiness to fund).
+    el.textContent = st.connected ? '⚡ LN ready'
+      : (st.enabledCount > 1 ? `⚡ LN ${st.connectedCount}/${st.enabledCount}` : '⚡ LN ' + (st.phase||'…'));
+  }
   const legs = ['asset','btc'].filter(n=>st.nodes[n].enabled)
     .map(n=>`${n}: ${st.nodes[n].connected?'serving':(st.nodes[n].phase||'…')}${st.nodes[n].detail?(' ('+st.nodes[n].detail+')'):''}`);
   el.title = 'Lightning device signers — ' + legs.join(' · ');
@@ -1573,9 +1593,150 @@ function initLightning(phrase){
   for (const node of nodes){
     const id = lnNodeIdentity(phrase, node);
     lnConnectDevice({ node, deviceSigningSeed: id.deviceSigningSeed, deviceTransportPrivkey: id.deviceTransportPrivkey, policy })
-      .then((nid)=>{ if(nid) console.log(`[ln] ${node} device signer serving hosted node`, nid); })
+      .then((nid)=>{ if(nid){ console.log(`[ln] ${node} device signer serving hosted node`, nid); renderLightningBalance(); } })
       .catch((e)=> console.warn(`[ln] ${node} connect failed:`, e?.message??e));
   }
+  renderLightningBalance();
+}
+
+// ---------- Move to Lightning (non-custodial channel funding) ----------
+// The on-chain DEPOSIT send hook handed to seqln.js's fundChannel. The WALLET signs
+// the deposit to the hosted node's address (the LSP never holds the key); seqln.js
+// then has the LSP fundchannel it (device co-signs the funding). BTC -> the parent-chain
+// (testnet4) send path; a Sequentia asset -> the lwk explicit-recipient send path.
+async function lnSendDeposit({ chain, asset, amount, address }){
+  if(chain==='btc'){
+    const built = await btcBuildTx([{ address, amount: BigInt(amount) }], btcFeeRate());
+    const r = await fetch(`${T4_API}/tx`, { method:'POST', body: built.hex });
+    const txt = (await r.text()).trim();
+    if(!r.ok) throw new Error(txt || ('HTTP '+r.status));
+    if(!/^[0-9a-fA-F]{64}$/.test(txt)) throw new Error('unexpected broadcast response: '+txt.slice(0,80));
+    if(built.changeIndex!=null) btcChangeNext = Math.max(btcChangeNext, built.changeIndex+1);
+    return { txid: txt };
+  }
+  // Sequentia asset deposit: send `amount` atoms of `asset` to the hosted node's address.
+  const a = new Address(address);                          // throws on a non-Sequentia / malformed address
+  const assetId = new AssetId(asset);
+  let b = network.txBuilder();
+  b = a.isBlinded() ? b.addRecipient(a, BigInt(amount), assetId) : b.addExplicitRecipient(a, BigInt(amount), assetId);
+  const pset = b.feeRate(DEFAULT_FEERATE).finish(wollet);
+  const signed = signer.sign(pset);
+  const finalized = wollet.finalize(signed);
+  const txid = await client.broadcast(finalized);
+  return { txid: (txid && txid.toString) ? txid.toString() : String(txid) };
+}
+
+// Cache of the last /status so the Balance card + the pill share one poll.
+let lnLastStatus = null;
+// Sum in-channel spendable (send-side) balance, in base units, for a chain/asset. BTC
+// legs are tagged asset_label 'BTC'; a Sequentia asset channel is tagged channel_asset.
+function lnSpendableFor(kind /* 'BTC' | assetHex */){
+  const chs = (lnLastStatus && lnLastStatus.channels) || [];
+  let units = 0, n = 0;
+  for(const c of chs){
+    const isBtc = (c.asset_label==='BTC' || c.leg==='btc');
+    const match = kind==='BTC' ? isBtc : (!isBtc && (c.asset===kind || c.asset_label===assetMeta(kind).ticker));
+    if(match && String(c.state||'').startsWith('CHANNELD')){ units += Number(c.spendable_units||0); n++; }
+  }
+  return { units, channels: n };
+}
+
+// Render the Balance-tab "Lightning" card: for BTC and every asset the LSP can fund
+// (dynamic — one row per hosted node, NOT hardcoded), show the in-channel balance and
+// a Move-to-Lightning action. Reads /status live; hides itself if LN isn't deployed.
+async function renderLightningBalance(){
+  const card=$('lnBalanceCard'); const list=$('lnBalList'); const summ=$('lnBalSummary');
+  if(!card||!list) return;
+  if(!seqlnState().deployed){ card.classList.add('hide'); return; }
+  card.classList.remove('hide');
+  let funding, chans;
+  try{ lnLastStatus = await seqlnGetStatus(); funding = lnLastStatus.funding || { btc:false, assets:[] }; chans = lnLastStatus.channels||[]; }
+  catch(e){ list.innerHTML=''; summ.textContent=''; $('lnBalStatus').className='status err'; $('lnBalStatus').textContent='Lightning status unavailable: '+prettyErr(e); lnStatusPill(); return; }
+  $('lnBalStatus').textContent='';
+  const active = chans.filter(c=>String(c.state||'').startsWith('CHANNELD')).length;
+  summ.textContent = active ? (active+' channel'+(active>1?'s':'')) : 'no channels yet';
+  list.innerHTML='';
+  // One movable row per fundable leg: BTC first, then each provisioned asset node.
+  const legs=[];
+  if(funding.btc) legs.push({ kind:'BTC', ticker:'BTC', precision:8, onchain:btcBalance, chain:'btc', asset:null });
+  for(const a of (funding.assets||[])){
+    const meta=assetMeta(a.id); const bal=balObj()[a.id]||0n;
+    legs.push({ kind:a.id, ticker:meta.ticker||a.label, precision:meta.precision, onchain:bal, chain:'seq', asset:a.id });
+  }
+  if(!legs.length){ list.appendChild(el('div','muted','Lightning funding is not available on this network yet.')); lnStatusPill(); return; }
+  for(const leg of legs){
+    const sp=lnSpendableFor(leg.kind);
+    const r=el('div','asset-row');
+    r.appendChild(el('span','tk', leg.ticker));
+    const mid=el('div','grow'); const sub=el('div','sub');
+    sub.textContent = sp.channels
+      ? ('In Lightning: '+fmtAtoms(BigInt(Math.round(sp.units)), leg.precision)+' '+leg.ticker+' spendable · '+sp.channels+' channel'+(sp.channels>1?'s':''))
+      : 'No Lightning channel yet';
+    mid.appendChild(sub); r.appendChild(mid);
+    const act=el('span','amt');
+    const onchainStr=el('div','sub','On-chain: '+fmtAtoms(BigInt(leg.onchain||0n), leg.precision)+' '+leg.ticker);
+    const btn=el('button','ghost', sp.channels?'Add funds':'Move to Lightning');
+    btn.style.cssText='padding:4px 12px;font-size:12px;margin-top:4px';
+    btn.disabled = !(BigInt(leg.onchain||0n) > 0n) || !seqlnStateLegReady(leg.chain);
+    if(btn.disabled && !(BigInt(leg.onchain||0n) > 0n)) btn.title='No on-chain '+leg.ticker+' to move';
+    else if(btn.disabled) btn.title='The Lightning device signer for this leg is still connecting';
+    btn.onclick=()=>moveToLightningDialog(leg);
+    act.appendChild(onchainStr); act.appendChild(btn); r.appendChild(act);
+    list.appendChild(r);
+  }
+  lnStatusPill();
+}
+// Is the device signer for a given leg ('btc' -> btc node, 'seq' -> asset node) serving?
+// Funding needs it, because the funding tx is co-signed by that node's device.
+function seqlnStateLegReady(chain){
+  const st=seqlnState(); const node = chain==='btc' ? 'btc' : 'asset';
+  const n=st.nodes[node]; return !!(n && n.enabled && n.connected);
+}
+
+// Modal: choose an amount, then run the non-custodial Move-to-Lightning flow.
+function moveToLightningDialog(leg){
+  const avail = BigInt(leg.onchain||0n);
+  const m=el('div','modal'); const c=el('div','card');
+  c.appendChild(el('label','lbl','Move '+leg.ticker+' to Lightning'));
+  c.appendChild(el('div','sub','Your wallet sends this amount on-chain to your hosted node, then your device co-signs opening a Lightning channel with it. Non-custodial: only your device can spend these funds.'));
+  c.appendChild(el('label','lbl','Amount ('+leg.ticker+')'));
+  const inp=el('input','mono'); inp.placeholder='0.0'; inp.style.marginTop='4px'; c.appendChild(inp);
+  c.appendChild(el('div','sub','Available on-chain: '+fmtAtoms(avail, leg.precision)+' '+leg.ticker));
+  const act=el('div','row'); act.style.marginTop='14px';
+  const ok=el('button','primary','Move to Lightning'); const no=el('button','ghost','Cancel');
+  act.appendChild(ok); act.appendChild(no); c.appendChild(act);
+  const st=el('div','status'); c.appendChild(st);
+  m.appendChild(c); document.body.appendChild(m);
+  no.onclick=()=>{ if(!ok.disabled) m.remove(); };
+  ok.onclick=async()=>{
+    let atoms;
+    try{ atoms = parseAtoms((inp.value||'').trim(), leg.precision); }catch{ st.className='status err'; st.textContent='Enter a valid amount.'; return; }
+    if(!(atoms>0n)){ st.className='status err'; st.textContent='Enter an amount greater than zero.'; return; }
+    if(atoms>avail){ st.className='status err'; st.textContent='Amount exceeds your on-chain '+leg.ticker+' balance.'; return; }
+    if(leg.chain==='btc' && atoms < 546n){ st.className='status err'; st.textContent='Minimum channel is 546 sats (the dust limit).'; return; }
+    ok.disabled=true; no.disabled=true;
+    const say=(txt)=>{ st.className='status'; st.innerHTML='<span class="spin"></span>'+txt; };
+    const phaseCopy={ 'deposit-address':'Getting your hosted node deposit address…', 'sending':'Signing and sending the on-chain deposit…',
+      'sent':'Deposit sent; waiting for confirmation…', 'pending_deposit':'Waiting for the deposit to confirm on-chain…',
+      'opening':'Opening the Lightning channel (your device is co-signing the funding)…', 'awaiting_lockin':'Channel funding broadcast; waiting for it to confirm…' };
+    try{
+      say('Starting…');
+      const res = await fundChannel({
+        chain: leg.chain, asset: leg.asset || undefined, amount: Number(atoms),
+        sendOnchain: lnSendDeposit,
+        onProgress: (e)=>{ if(phaseCopy[e.phase]) say(phaseCopy[e.phase]); },
+      });
+      st.className='status ok';
+      st.textContent = 'Done. Lightning channel '+(res.short_channel_id||'')+' is active'
+        + (res.spendable_msat!=null ? (' with '+fmtAtoms(BigInt(Math.round(res.spendable_msat/1000)), leg.precision)+' '+leg.ticker+' spendable.') : '.');
+      toast('Moved '+leg.ticker+' to Lightning');
+      no.disabled=false; no.textContent='Close';
+      await sync(); renderBalance(); renderLightningBalance();
+    }catch(e){
+      st.className='status err'; st.textContent='Failed: '+prettyErr(e);
+      ok.disabled=false; no.disabled=false;
+    }
+  };
 }
 // Hand the Swap module everything it needs from the app: the wasm classes, the
 // live wallet/signer/network handles (read fresh via getters so a re-open keeps
@@ -1795,6 +1956,7 @@ function renderBalance(){
     row(a.ticker||id.slice(0,8)+'…', sub, fmtAtoms(oampBalances[id].atoms, a.precision||0), '');
   }
   refreshAllAvail();   // keep the Send tab's "Available:" lines in sync with balances
+  try{ renderLightningBalance(); }catch{}   // refresh the Move-to-Lightning card (on-chain balances changed)
 }
 // Wallet-local "label this asset" affordance (T9 / W2): give a received-but-unknown asset a ticker,
 // name, and PRECISION so it can be read and SENT. Stored in localStorage (LBL) marked local:true and
