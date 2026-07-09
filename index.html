@@ -1270,7 +1270,10 @@ async function btcHtlcSpend({ branch, txid, vout, amount, redeem_script, locktim
   const out = BigInt(amount) - fee;
   if (out <= 0n) throw new Error(branch + ' amount is below the tx fee');
   const p2shSpk = btc.p2sh({ script: redeem }, btc.TEST_NETWORK).script;
-  const tx = new btc.Transaction({ allowUnknownInputs:true, allowUnknownOutputs:true });
+  // @scure/btc-signer exposes tx.lockTime as a READ-ONLY getter (backed by the PSBT global
+  // fallbackLocktime), so the refund's nLockTime must be set at construction — assigning
+  // tx.lockTime later throws "Cannot set property lockTime … which has only a getter".
+  const tx = new btc.Transaction({ allowUnknownInputs:true, allowUnknownOutputs:true, lockTime: branch === 'refund' ? (locktime >>> 0) : 0 });
   tx.addInput({
     txid, index: vout,
     // refund needs a non-final sequence (0xfffffffd: BIP68-disabled so absolute
@@ -1279,7 +1282,7 @@ async function btcHtlcSpend({ branch, txid, vout, amount, redeem_script, locktim
     witnessUtxo: { script: p2shSpk, amount: BigInt(amount) },
   });
   tx.addOutputAddress(dest, out, btc.TEST_NETWORK);
-  if (branch === 'refund') tx.lockTime = locktime;
+  // (nLockTime for the refund branch is set in the Transaction constructor above.)
   const sighash = tx.preimageLegacy(0, redeem, 1);      // legacy SIGHASH_ALL over the redeemScript
   const sigPlus = concatU8(derFromCompact(signNode.sign(sighash)), Uint8Array.of(0x01));
   const items = branch === 'claim'
