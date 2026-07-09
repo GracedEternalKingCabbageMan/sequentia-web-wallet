@@ -4,7 +4,7 @@
 //
 // Run: node covenant-order.test.mjs
 
-import { planPlaceOrder, buildCovenantTerms, orderFromCovenantTerms, planFillFromMatched } from './covenant-order.js';
+import { planPlaceOrder, buildCovenantTerms, orderFromCovenantTerms, planFillFromMatched, __test__ as covOrderTest } from './covenant-order.js';
 import { deriveTaptree, bytesToHex } from './covenant.js';
 import * as seqob from './seqob.js';
 import { secp256k1 } from './btc.js';
@@ -100,6 +100,53 @@ check('fill_part_rem_idx', String(recPart.plan.remainderIndex), '1');
   // The covenant field is load-bearing in the signature: mutating rate breaks it.
   const tampered = { ...signed, covenant: { ...ct, rate_num: '5' } };
   ok('cov_offer_tamper_detected', !seqob.__test__.verifyOffer(tampered), 'mutated covenant must fail verify');
+}
+
+// --- REFUND: planRefund derives the byte-exact reclaim recipe ---------------
+{
+  const refund = covOrderTest.planRefund(plan.order, { txid: 'cd'.repeat(32), vout: 1, locked: 90n*100000000n });
+  // The reclaim prevout spk is the covenant scriptPubKey the FILL side also uses.
+  check('refund_covenant_spk', refund.covenantSpkHex, plan.spkHex);
+  check('refund_covenant_locked', refund.covenantLocked, String(90n*100000000n));
+  check('refund_expiry', String(refund.expiryLocktime), '400');
+  // The REFUND leaf is <expiry>CLTV DROP <maker_x> CHECKSIG (byte-exact vs leaf.go).
+  check('refund_leaf', refund.refundLeafHex, '029001b175202222222222222222222222222222222222222222222222222222222222222222ac');
+  // Its control block commits the sibling (FILL) leaf hash, NOT the refund hash.
+  check('refund_control_block', refund.controlBlockHex,
+    'c550929b74c1a04954b78b4b6035e97a5e078a5a0f28ec96d547bfee9ace803ac04d1a21f10826870560f07e69520416221c532fb8744bc0a0b2bf38032cd03343');
+  // Maker-key agreement: the leaf's maker_x (last 32 bytes before CHECKSIG) equals
+  // the order's makerX — the key the wasm helper signs the reclaim with.
+  const leafMakerX = refund.refundLeafHex.slice(-66, -2);
+  check('refund_leaf_maker_x_eq_order', leafMakerX, refund.makerX);
+}
+
+// --- mocked place -> cancel -> refund-broadcast (mature CLTV) ----------------
+{
+  const order = plan.order;
+  const recipe = covOrderTest.planRefund(order, { txid: 'ef'.repeat(32), vout: 0, locked: 90n*100000000n });
+  recipe.makerKeyPath = "m/86'/1'/0'/0/0";
+
+  let delisted = false, built = null, broadcasted = null;
+  const hooks = {
+    relayCancel: async () => { delisted = true; },
+    buildCovenantRefundTx: async (r) => { built = r; return { rawHex: 'aa'+'bb'.repeat(20), txid: 'refundtxid' }; },
+    broadcast: async (hex) => { broadcasted = hex; return 'refundtxid'; },
+  };
+  // Matured (tip >= expiry): delist AND broadcast the REFUND.
+  const outMature = await covOrderTest.cancel('off-1', { recipe, tipHeight: 401, expiryLocktime: 400 }, hooks);
+  ok('cancel_mature_delisted', outMature.delisted === true, 'relay delist');
+  ok('cancel_mature_matured', outMature.matured === true, 'tip >= expiry is matured');
+  check('cancel_mature_refund_txid', outMature.refundTxid, 'refundtxid');
+  ok('cancel_mature_broadcast', broadcasted !== null, 'refund tx broadcast');
+  check('cancel_mature_recipe_spk', built.covenantSpkHex, plan.spkHex);
+
+  // Immature (tip < expiry): delist only, surface reclaimable-after-expiry.
+  delisted = false; broadcasted = null;
+  const outImm = await covOrderTest.cancel('off-2', { recipe, tipHeight: 100, expiryLocktime: 400 }, hooks);
+  ok('cancel_immature_delisted', outImm.delisted === true, 'relay delist still happens');
+  ok('cancel_immature_not_matured', outImm.matured === false, 'tip < expiry not matured');
+  ok('cancel_immature_no_broadcast', broadcasted === null && outImm.refundTxid === null, 'no on-chain refund pre-expiry');
+  check('cancel_immature_reclaim_after', String(outImm.reclaimable && outImm.reclaimable.afterHeight), '400');
 }
 
 console.log(fails ? `\n${fails} FAILED` : '\nALL PASS');

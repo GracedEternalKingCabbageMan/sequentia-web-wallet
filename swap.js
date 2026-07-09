@@ -34,7 +34,7 @@ import { secp256k1 } from './btc.js';
 // The byte-exact passive-CLOB covenant stack: place a funded resting order that
 // fills permissionlessly (even while the wallet is offline), and settle an inbound
 // match as the taker. Everything routes through these; no crypto is hand-rolled here.
-import { planPlaceOrder, buildCovenantTerms, settleFill as covSettleFill } from './covenant-order.js';
+import { planPlaceOrder, buildCovenantTerms, settleFill as covSettleFill, planRefund as covPlanRefund, cancel as covCancel } from './covenant-order.js';
 import { makeCovenantHooks, makerPayout } from './covenant-fill-host.js';
 import { computeRate, orderExpiry, deriveOtherField, buildCovenantOffer } from './covenant-flow.js';
 
@@ -1669,6 +1669,35 @@ function covFeeAtoms(feeAsset){
   } catch { return 1000n; }
 }
 
+// Reconstruct the exact covenant Order a local PLACED record placed, so its
+// scriptPubKey / taptree re-derive byte-identically for the REFUND reclaim. Throws
+// if the re-derived spk does not match the funded one (a corrupt/foreign record).
+function orderFromPlaced(rec){
+  const payout = makerPayout(C.signer, C.network, rec.makerIndex);
+  const { rateNum, rateDen } = computeRate(BigInt(rec.sellAtoms), BigInt(rec.recvAtoms));
+  const order = {
+    assetA: rec.pay, assetB: rec.receive,
+    rateNum, rateDen, minLot: BigInt(rec.sellAtoms),
+    makerProg: payout.program, makerVer: 1,
+    expiryLocktime: Number(rec.expiry), makerX: payout.internalKey,
+  };
+  return { order, payout };
+}
+
+// The maker REFUND hooks: reclaim an expired covenant's locked asset A. The fee is
+// paid in the policy asset (universally accepted) from the wallet's own coins; the
+// covenant asset A is never the fee asset here, so the reclaimed A is returned whole.
+function refundHooksFor(){
+  const feeAsset = C.POLICY_HEX;
+  return makeCovenantHooks({
+    wasm: C.wasm, wollet: C.wollet, network: C.network, mnemonic: C.mnemonic,
+    esploraFetch: C.esploraFetch,
+    receiveAddress: () => C.wollet.address(C.addrIndex == null ? undefined : C.addrIndex).address().toString(),
+    fee: { asset: feeAsset, atoms: covFeeAtoms(feeAsset) },
+    onStatus: (m) => { try { C.toast && C.toast(m); } catch {} },
+  });
+}
+
 // The persistent relay watcher over every market this wallet has a resting order on.
 // onMatched -> this wallet is the taker: verify + FILL + broadcast. onOrderStatus ->
 // our resting order was filled by someone else: rescan so the credit shows up.
@@ -2251,15 +2280,38 @@ async function renderMyOrders(){
       <span class="sub">funded on-chain · fill whenever matched, even offline</span></div>${rows}</div>`;
   host.querySelectorAll('.swcancel').forEach(b => b.onclick = async () => {
     b.disabled = true; b.textContent = 'Cancelling…';
+    const id = b.dataset.id;
+    const rec = PLACED.find(r => (r.offerId === id));
     try {
-      await seqob.signAndCancel(b.dataset.id, makerPriv());
-      // Purge any local covenant record so the watcher stops tracking it. The relay
-      // delists it immediately; a funded covenant's locked asset is reclaimable
-      // on-chain only after its expiry (the REFUND leaf), which needs a wasm refund
-      // helper not yet in this build — see the report.
-      const before = PLACED.length;
-      PLACED = PLACED.filter(r => r.offerId !== b.dataset.id);
-      if (PLACED.length !== before){ savePlaced(); ensureCovenantRelay(); }
+      // A funded covenant's locked asset is reclaimable on-chain only via the CLTV
+      // REFUND leaf: once expired (tip >= expiry) broadcast the reclaim; before that
+      // delist + tell the maker when the funds become reclaimable. A non-covenant
+      // (no local funded record) just delists on the relay.
+      if (rec && rec.covTxid != null){
+        const { order } = orderFromPlaced(rec);
+        const payout = makerPayout(C.signer, C.network, rec.makerIndex);
+        const recipe = covPlanRefund(order, { txid: rec.covTxid, vout: rec.covVout, locked: BigInt(rec.sellAtoms) });
+        recipe.makerKeyPath = payout.path;   // m/86'/coin'/0'/0/index — the leaf's key
+        const tipHeight = C.wollet.tip().height();
+        const out = await covCancel(id, { recipe, tipHeight, expiryLocktime: Number(rec.expiry) },
+          { relayCancel: async (offerId) => seqob.signAndCancel(offerId, makerPriv()), ...refundHooksFor() });
+        if (out.refundTxid){
+          C.toast('Order cancelled — reclaimed on-chain (' + String(out.refundTxid).slice(0,12) + '…).');
+        } else if (out.reclaimable){
+          const meta = C.assetMeta(rec.pay);
+          C.toast('Order delisted. The locked ' + esc(meta.ticker) + ' is reclaimable on-chain after block ' + out.reclaimable.afterHeight + '.');
+        }
+      } else {
+        await seqob.signAndCancel(id, makerPriv());
+      }
+      // Drop the local record only once the funds are back (or there were none to
+      // reclaim); keep it while still-locked so a later Cancel can reclaim at expiry.
+      const stillLocked = rec && rec.covTxid != null && C.wollet.tip().height() < Number(rec.expiry);
+      if (!stillLocked){
+        const before = PLACED.length;
+        PLACED = PLACED.filter(r => r.offerId !== id);
+        if (PLACED.length !== before){ savePlaced(); ensureCovenantRelay(); }
+      }
       renderSwap();
     }
     catch (e){ b.disabled = false; b.textContent = 'Cancel'; C.toast('Cancel failed: ' + C.prettyErr(e)); }

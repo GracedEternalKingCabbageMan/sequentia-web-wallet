@@ -29,11 +29,26 @@
 //   changeAddress,              // () -> address string for change (defaults to receiveAddress)
 //   fee: { asset, atoms },      // the on-chain network fee (open fee market)
 //   opts,                       // forwarded to planFillFromMatched (e.g. makerCancellableOK)
+//   genesisHash,                // optional () -> Promise<hexString>; defaults to esplora /block-height/0
 //   onStatus,                   // optional progress callback
 // }
 export function makeCovenantHooks(ctx){
   const receive = () => (ctx.receiveAddress ? ctx.receiveAddress() : ctx.wollet.address(undefined).address().toString());
   const change  = () => (ctx.changeAddress ? ctx.changeAddress() : receive());
+
+  // The Elements taproot sighash (used by the REFUND script-path spend) is
+  // domain-separated by the network genesis block hash. Fetch it once from the
+  // wallet's own node (esplora returns the height-0 block hash as text) unless the
+  // caller supplied it.
+  let _genesis = null;
+  const genesisHash = ctx.genesisHash || (async () => {
+    if (_genesis) return _genesis;
+    const res = await ctx.esploraFetch('/block-height/0');
+    const txt = (await res.text()).trim();
+    if (!res.ok || !/^[0-9a-fA-F]{64}$/.test(txt)) throw new Error(`could not fetch genesis hash: ${txt}`);
+    _genesis = txt.toLowerCase();
+    return _genesis;
+  });
 
   return {
     opts: ctx.opts,
@@ -129,6 +144,60 @@ export function makeCovenantHooks(ctx){
       };
       // wasm returns { rawHex, txid }.
       return ctx.wasm.buildCovenantFillTx(full, ctx.network);
+    },
+
+    // THE refund seam. `recipe` is the verified output of planRefund; we add the
+    // maker's fee funding, addresses, the network genesis hash, and the seed, then
+    // call the wasm assembler to sign the CLTV script-path reclaim.
+    buildCovenantRefundTx: async (recipe) => {
+      const covAsset = recipe.covenantAsset;
+      const feeAsset = ctx.fee.asset;
+      const feeAtoms = BigInt(ctx.fee.atoms);
+
+      // Fund the fee ONLY when it is a different asset than the covenant (asset A):
+      // when the fee IS asset A it is taken from the reclaimed coins, no fee input.
+      const extraFeeUtxos = [];
+      if (feeAsset !== covAsset && feeAtoms > 0n){
+        const utxos = ctx.wollet.utxos();
+        const cands = utxos
+          .filter(u => u.unblinded().asset().toString() === feeAsset)
+          .sort((a,b) => (b.unblinded().value() > a.unblinded().value() ? 1 : -1));
+        let sum = 0n;
+        for (const u of cands){
+          if (sum >= feeAtoms) break;
+          const op = u.outpoint(); const spk = u.scriptPubkey();
+          extraFeeUtxos.push({
+            txid: op.txid().toString(), vout: op.vout(),
+            value: String(u.unblinded().value()), asset: feeAsset,
+            spkHex: (spk.toString ? spk.toString() : bytesHex(spk.bytes())),
+            chain: (u.extInt && String(u.extInt()).toLowerCase().includes('internal')) ? 1 : 0,
+            index: u.wildcardIndex(),
+          });
+          sum += BigInt(u.unblinded().value());
+        }
+        if (sum < feeAtoms) throw new Error(`insufficient ${feeAsset} for the refund fee: need ${feeAtoms}, have ${sum}`);
+      }
+
+      const genesisHex = await genesisHash();
+      const full = {
+        covenantTxid: recipe.covenantTxid,
+        covenantVout: recipe.covenantVout,
+        covenantAsset: covAsset,
+        covenantLocked: String(recipe.covenantLocked),
+        covenantSpkHex: recipe.covenantSpkHex,
+        refundLeafHex: recipe.refundLeafHex,
+        controlBlockHex: recipe.controlBlockHex,
+        expiryLocktime: recipe.expiryLocktime,
+        genesisHex,
+        makerReclaimAddr: receive(),
+        makerKeyPath: recipe.makerKeyPath,        // m/86'/coin'/0'/0/index — the leaf's key
+        feeAtoms: String(feeAtoms),
+        feeAsset,
+        extraFeeUtxos,
+        changeAddr: change(),
+        mnemonic: ctx.mnemonic,
+      };
+      return ctx.wasm.buildCovenantRefundTx(full, ctx.network);
     },
 
     // Broadcast a raw Elements tx hex against the wallet's OWN node; returns txid.

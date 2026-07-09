@@ -250,7 +250,10 @@ export function deriveTaptree(order){
   const { outKey, negated } = tweakOutputKey(internalKey, root);
   const spk = concat(Uint8Array.of(OP_1, 0x20), outKey);
 
+  // Each leaf's control block carries its SIBLING's hash as the merkle branch:
+  // the FILL spend proves inclusion via the REFUND leaf hash, and vice-versa.
   const controlBlock = concat(Uint8Array.of(LEAF_VERSION + negated), internalKey, refundH);
+  const refundControlBlock = concat(Uint8Array.of(LEAF_VERSION + negated), internalKey, fillH);
 
   return {
     fillLeaf: fill, refundLeaf: refund,
@@ -258,7 +261,7 @@ export function deriveTaptree(order){
     merkleRoot: root, merklePath: [refundH],
     outputKey: outKey, negated,
     scriptPubKey: spk,
-    controlBlock,
+    controlBlock, refundControlBlock,
     internalKey,
     // FILL is introspection-driven: witness is just [leaf, control_block].
     fillWitness: [fill, controlBlock],

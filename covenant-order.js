@@ -215,21 +215,59 @@ export async function settleFill(matched, hooks){
 
 function pickCt(matched){ return orderFromCovenantTerms(matched.covenant || matched.Covenant || {}); }
 
-// --- cancel -----------------------------------------------------------------
+// --- refund / cancel --------------------------------------------------------
+
+// planRefund re-derives the covenant an order placed and returns the REFUND recipe
+// the wasm helper (buildCovenantRefundTx) consumes to reclaim the locked asset A.
+// It is the maker's mirror of planFillFromMatched: pure derivation, no wallet I/O.
+//   order        the covenant Order this wallet placed (assetA/B, rate, minLot,
+//                expiryLocktime, makerProg, makerX, internalKey)
+//   utxo         { txid, vout, locked }  — the funded covenant UTXO being reclaimed
+// Returns every byte-exact field the refund tx needs: the covenant scriptPubKey
+// (the sighash prevout), the REFUND leaf, its control block, and the CLTV expiry.
+export function planRefund(order, utxo){
+  const tap = deriveTaptree(order);
+  return {
+    covenantTxid: utxo.txid,
+    covenantVout: (utxo.vout >>> 0),
+    covenantAsset: hexOf(order.assetA),
+    covenantLocked: String(BigInt(utxo.locked)),
+    covenantSpkHex: bytesToHex(tap.scriptPubKey),
+    refundLeafHex: bytesToHex(tap.refundLeaf),
+    controlBlockHex: bytesToHex(tap.refundControlBlock),
+    expiryLocktime: Number(order.expiryLocktime) >>> 0,
+    // The maker key the REFUND leaf commits to (== order.makerX) is the wallet's
+    // BIP86 internal key; makerKeyPath tells the helper which key to sign with.
+    makerX: hexOf(order.makerX),
+    tap,
+  };
+}
 
 // cancel stops advertising the order on the relay immediately (OfferCancel), and,
-// once the covenant has expired, reclaims the locked asset A via the REFUND leaf.
-// Pre-expiry the on-chain funds are untouchable by anyone but a taker paying the
-// price — that is the point — so the relay cancel just delists it.
+// once the covenant has expired (tip >= expiry), reclaims the locked asset A via
+// the REFUND leaf. Pre-expiry the on-chain funds are untouchable by anyone but a
+// taker paying the price — that is the point — so the relay cancel just delists it
+// and reports the funds as reclaimable-after-expiry (never a failure).
 //   hooks.relayCancel(offerId) -> Promise<any>              (seqob.signAndCancel)
-//   hooks.buildCovenantRefundTx({order, txid, vout, locked, destSpkHex}) -> Promise<{rawHex}>  (wasm seam; needs maker_x sig)
+//   hooks.buildCovenantRefundTx(recipe) -> Promise<{rawHex, txid?}>  (wasm seam; maker sig)
 //   hooks.broadcast(rawHex) -> Promise<txid>
+//   refundParams: { recipe, tipHeight, expiryLocktime }  (recipe from planRefund
+//                  merged with fee/addresses; tipHeight decides mature vs immature)
 export async function cancel(offerId, refundParams, hooks){
-  const out = { delisted: false, refundTxid: null };
+  const out = { delisted: false, refundTxid: null, reclaimable: null, matured: false };
   if (hooks.relayCancel){ try { await hooks.relayCancel(offerId); out.delisted = true; } catch (e){ out.delistError = e.message; } }
-  if (refundParams && hooks.buildCovenantRefundTx && refundParams.expired){
-    const built = await hooks.buildCovenantRefundTx(refundParams);
-    out.refundTxid = await hooks.broadcast(built.rawHex);
+  if (refundParams){
+    const expiry = Number(refundParams.expiryLocktime != null ? refundParams.expiryLocktime : (refundParams.recipe && refundParams.recipe.expiryLocktime));
+    const tip = Number(refundParams.tipHeight);
+    out.matured = Number.isFinite(tip) && Number.isFinite(expiry) && tip >= expiry;
+    if (out.matured && hooks.buildCovenantRefundTx){
+      const built = await hooks.buildCovenantRefundTx(refundParams.recipe || refundParams);
+      out.refundTxid = await hooks.broadcast(built.rawHex);
+    } else {
+      // Not yet matured (or no on-chain funds): surface WHEN the maker may reclaim,
+      // rather than failing — the delist already stopped new fills.
+      out.reclaimable = { afterHeight: expiry };
+    }
   }
   return out;
 }
@@ -239,4 +277,4 @@ export async function cancel(offerId, refundParams, hooks){
 function truthy(...vs){ for (const v of vs) if (v === true || v === 'true' || v === 1) return true; return false; }
 function pick(obj, ...names){ for (const n of names){ if (obj && obj[n] !== undefined && obj[n] !== null) return obj[n]; } return undefined; }
 
-export const __test__ = { buildCovenantTerms, orderFromCovenantTerms, planPlaceOrder, planFillFromMatched, hexOf };
+export const __test__ = { buildCovenantTerms, orderFromCovenantTerms, planPlaceOrder, planFillFromMatched, planRefund, cancel, hexOf };
