@@ -1696,10 +1696,12 @@ async function sync(){
   $('syncStatus').className='status'; $('syncStatus').innerHTML='<span class="spin"></span>Syncing…';
   try{
     // scan both chains + refresh fee-asset rates + restricted-asset balances in parallel
-    const [update] = await Promise.all([client.fullScan(wollet), btcScan(), fetchFeeRates(), oampRefreshBalances(),
-      // Rescan the covenant maker-credit companion wollet so filled-order proceeds stay fresh.
-      Promise.resolve(typeof scanCovenantCompanion==='function' ? scanCovenantCompanion() : null).catch(()=>{})]);
+    const [update] = await Promise.all([client.fullScan(wollet), btcScan(), fetchFeeRates(), oampRefreshBalances()]);
     if(update) wollet.applyUpdate(update);
+    // Rescan the covenant maker-credit companion wollet AFTER the main scan: it shares the same esplora
+    // client, and wasm-bindgen forbids re-entrant &mut use of one object (a concurrent fullScan throws
+    // "recursive use of an object detected"), so it must run sequentially, not inside the Promise.all above.
+    try { if (typeof scanCovenantCompanion==='function') await scanCovenantCompanion(); } catch {}
     // Cross-chain address cycling: advance the shared receive address past anything
     // that's been used on either chain (never backward, so a manual "New address" sticks).
     addrIndex = Math.max(addrIndex ?? 0, unifiedNextUnused());
