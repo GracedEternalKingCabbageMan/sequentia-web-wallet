@@ -110,6 +110,11 @@
   .swdesk-compose>.card{margin-top:0}
   /* Take (lift the book at its price) vs Post (rest a limit order at your own price). */
   .swmode{display:flex;align-items:center;gap:12px;flex-wrap:wrap}
+  /* Unified DEX: no visible Take/Post, ever — every order is just "Place order". #swModeWrap
+     is retained only as an internal auto-mode hook (read by JS), never shown. The generic
+     .swmode{display:flex} above was overriding the .hide class and leaking the buttons into
+     view, so force it hidden unconditionally. */
+  #swModeWrap{display:none!important}
   .swmode-seg{max-width:200px}
   .swmode-hint{font-size:12px;color:var(--dim)}
   .swpane{padding:18px 20px}
