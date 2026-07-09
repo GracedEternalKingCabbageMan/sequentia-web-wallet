@@ -32,6 +32,12 @@
 //        keyless, so the funding tx's SIGN_WITHDRAWAL is served by the DEVICE — the LSP
 //        can command fundchannel but cannot sign it. Returns 202 {job_id, poll}.
 //   GET  /channel/open/<id> -> pending_deposit | opening | awaiting_lockin | active | failed.
+//   --- per-asset node provisioning (SeqLN is single-asset, so any asset needs its own node) ---
+//   POST /node/provision {asset, device_transport_pubkey} -> boots (or re-attaches) a
+//        keyless hosted SeqLN node for that asset, keyed to the device (the node pins the
+//        device pubkey). Returns {node_id, host_pubkey, ws_port, public_ws_path}. The
+//        wallet then attaches its on-device signer over the ws front and funds a channel.
+//   GET  /node/list -> the provisioned per-asset nodes (dynamic; the "M" in "LN N/M").
 //
 // Topology: the real cross-chain shape uses TWO hosted nodes — an asset node
 // (holds the GOLD channel, Sequentia) and a BTC node (holds the BTC channel,
@@ -84,6 +90,7 @@ import os from 'node:os';
 import path from 'node:path';
 import crypto from 'node:crypto';
 import { execFile } from 'node:child_process';
+import { makeProvisioner } from './provision.mjs';
 
 function reqEnv(name) {
   const v = process.env[name];
@@ -128,7 +135,33 @@ const CFG = {
   // How long POST /channel/open watches for the on-chain deposit to confirm + the
   // channel to reach CHANNELD_NORMAL before it gives up (deposit never arrived, etc.).
   channelWatchMs: Number(process.env.CHANNEL_WATCH_MS || 3_600_000),
+  // The routing peer a NEWLY-PROVISIONED per-asset node opens its channel to. SeqLN
+  // nodes are single-asset, so this LP node is the counterparty for provisioned assets.
+  channelPeerProvisioned: process.env.CHANNEL_PEER_PROVISIONED || '',
+  // --- per-asset node provisioning (POST /node/provision) ---
+  provDir: process.env.PROV_DIR || '',
+  lightningd: process.env.LIGHTNINGD || '',
+  hsmdProxy: process.env.HSMD_PROXY || '',
+  wsRelay: process.env.WS_RELAY || '',
+  nodeBin: process.env.NODE_BIN || process.execPath,
+  elementsCli: process.env.ELEMENTS_CLI || '',
+  seqRpcPort: Number(process.env.SEQ_RPC_PORT || 0),
+  seqRpcUser: process.env.SEQ_RPC_USER || '',
+  seqRpcPass: process.env.SEQ_RPC_PASS || '',
 };
+
+// The per-asset node provisioner (enabled when the boot binaries + dir are configured).
+// SeqLN nodes are single-asset, so "move ANY asset into Lightning" needs a hosted node
+// per asset spun up on demand, keyed to the connecting device. This is that mechanism.
+let PROV = null;
+if (CFG.provDir && CFG.lightningd && CFG.hsmdProxy && CFG.wsRelay && CFG.elementsCli && CFG.seqRpcPort) {
+  PROV = makeProvisioner({
+    dir: CFG.provDir, lightningd: CFG.lightningd, hsmdProxy: CFG.hsmdProxy, wsRelay: CFG.wsRelay,
+    node: CFG.nodeBin, lncli: CFG.lncli, elementsCli: CFG.elementsCli,
+    rpcPort: CFG.seqRpcPort, rpcUser: CFG.seqRpcUser, rpcPass: CFG.seqRpcPass,
+  });
+  console.error(`[lsp] per-asset node provisioning ENABLED (dir ${CFG.provDir})`);
+}
 if (!CFG.hostedAssetRpc || !CFG.hostedBtcRpc) {
   console.error('[lsp] missing hosted RPC: set HOSTED_ASSET_RPC + HOSTED_BTC_RPC (or HOSTED_RPC as a fallback for both)');
   process.exit(2);
@@ -162,8 +195,14 @@ function assetLabel(id) {
 function lnrpc(method, args = [], rpc = CFG.hostedAssetRpc) {
   return new Promise((resolve, reject) => {
     execFile(CFG.lncli, [`--rpc-file=${rpc}`, method, ...args],
-      { maxBuffer: 8 << 20 }, (err, stdout) => {
-        if (err) return reject(new Error(`${method}: ${err.message}`));
+      { maxBuffer: 8 << 20 }, (err, stdout, stderr) => {
+        // lightning-cli prints the JSON-RPC error (with a human "message") to stdout
+        // even on a non-zero exit, so surface that instead of the bare "Command failed".
+        if (err) {
+          let detail = (stderr || '').trim();
+          try { const j = JSON.parse(stdout); if (j && j.message) detail = j.message; } catch { /* not json */ }
+          return reject(new Error(`${method}: ${detail || err.message}`));
+        }
         try { resolve(JSON.parse(stdout)); } catch { reject(new Error(`${method}: bad json`)); }
       });
   });
@@ -207,12 +246,14 @@ async function status() {
     btc_node: btcNode,
     channels: [...assetNode.channels, ...btcNode.channels], // merged, leg-tagged
     // Which chains/assets "Move to Lightning" can fund on THIS LSP. SeqLN nodes are
-    // single-asset, so each Sequentia asset needs its OWN hosted node; today only the
-    // one asset node (GOLD) is provisioned, so `assets` lists exactly what has a node.
-    // The wallet reads this to offer Move-to-Lightning ONLY for funded-able assets.
+    // single-asset, so each Sequentia asset needs its OWN hosted node; `assets` lists
+    // the demo GOLD node PLUS every asset the provisioner has booted a node for, and
+    // grows as the wallet provisions more. `provisioning` tells the wallet it can spin
+    // up a node for any other asset on demand (POST /node/provision).
     funding: {
       btc: !!(CFG.channelPeerBtc && CFG.hostedBtcRpc),
-      assets: CFG.channelPeerAsset ? [{ id: CFG.gold, label: assetLabel(CFG.gold) }] : [],
+      assets: fundableAssets(),
+      provisioning: !!PROV,
     },
   };
 }
@@ -237,8 +278,32 @@ async function status() {
 //      -> active (CHANNELD_NORMAL), at which point /status shows spendable_msat.
 // ---------------------------------------------------------------------------
 const CHAINS = { btc: 'btc', seq: 'seq', sequentia: 'seq', asset: 'seq' };
-function chainRpc(chain) { return chain === 'btc' ? CFG.hostedBtcRpc : CFG.hostedAssetRpc; }
-function chainPeer(chain) { return chain === 'btc' ? CFG.channelPeerBtc : CFG.channelPeerAsset; }
+
+// Resolve the hosted node RPC + routing peer for a (chain, assetId). BTC -> the demo BTC
+// node. seq GOLD -> the demo asset node (the one in active use). seq OTHER asset -> the
+// per-asset node the provisioner booted for it (single-asset SeqLN reality). Returns
+// { rpc, peer, provisioned } or { rpc:null } if there is no hosted node for that asset.
+function targetFor(chain, assetId) {
+  if (chain === 'btc') return { rpc: CFG.hostedBtcRpc, peer: CFG.channelPeerBtc, provisioned: false };
+  // seq: the demo GOLD node stays the canonical GOLD node (in active use).
+  if (assetId && assetId === CFG.gold) return { rpc: CFG.hostedAssetRpc, peer: CFG.channelPeerAsset, provisioned: false };
+  if (PROV && assetId) {
+    const rec = PROV.get(assetId);
+    if (rec) return { rpc: rec.rpc, peer: rec.lp_peer || CFG.channelPeerProvisioned, provisioned: true, rec };
+  }
+  return { rpc: null, peer: '', provisioned: false };
+}
+// The assets Move-to-Lightning can fund right now: the demo GOLD node + every asset the
+// provisioner has a node for. Dynamic — grows as the wallet provisions more assets.
+function fundableAssets() {
+  const out = [];
+  if (CFG.channelPeerAsset) out.push({ id: CFG.gold, label: assetLabel(CFG.gold), provisioned: false });
+  if (PROV) for (const rec of PROV.list()) {
+    if (rec.asset_id === CFG.gold) continue;
+    out.push({ id: rec.asset_id, label: rec.label, provisioned: true, node_id: rec.node_id, status: rec.status });
+  }
+  return out;
+}
 
 // The hosted node's confirmed on-chain balance (base units: BTC sats / asset atoms)
 // available to fund a channel. For an asset channel only outputs of `assetId` count;
@@ -276,9 +341,10 @@ function reapChannelJobs() {
 }
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-// GET /channel/deposit?chain=btc|seq -> the hosted node's on-chain deposit address.
-async function channelDeposit(chain) {
-  const rpc = chainRpc(chain);
+// GET /channel/deposit?chain=btc|seq[&asset=<id>] -> the hosted node's deposit address.
+async function channelDeposit(chain, assetId) {
+  const { rpc } = targetFor(chain, chain === 'seq' ? (assetId || CFG.gold) : null);
+  if (!rpc) throw new Error('no hosted node for that asset (provision it first)');
   const info = await lnrpc('getinfo', [], rpc);
   const na = await lnrpc('newaddr', ['bech32'], rpc);
   return { ok: true, chain, node_id: info.id, network: info.network,
@@ -287,8 +353,9 @@ async function channelDeposit(chain) {
 
 // The background worker: watch for the deposit, then fundchannel (device-co-signed).
 async function runChannelOpen(job) {
-  const rpc = chainRpc(job.chain);
-  const peer = chainPeer(job.chain);
+  const { rpc, peer } = targetFor(job.chain, job.asset_id);
+  if (!rpc) throw new Error('no hosted node for that asset');
+  if (!peer) throw new Error('no routing peer configured for that asset');
   const [peerId, peerAddr] = peer.split('@');
   const deadline = Date.now() + CFG.channelWatchMs;
   const need = Number(job.requested_amount);
@@ -342,24 +409,22 @@ async function runChannelOpen(job) {
 function startChannelOpen(body) {
   const chain = CHAINS[String(body.chain || '').toLowerCase()];
   if (!chain) return { ok: false, error: "chain must be 'btc' or 'seq'" };
-  const peer = chainPeer(chain);
-  if (!peer) return { ok: false, error: `no routing peer configured for ${chain} (set CHANNEL_PEER_${chain === 'btc' ? 'BTC' : 'ASSET'})` };
   const amount = Number(body.amount);
   if (!Number.isFinite(amount) || amount <= 0) return { ok: false, error: 'amount must be a positive number (base units: BTC sats / asset atoms)' };
-  // For an asset channel resolve the asset so the deposit watch only counts that asset.
-  // SeqLN nodes are single-asset: the one provisioned asset node is denominated in
-  // CFG.gold, so it can ONLY fund a channel in that asset. A request for any other
-  // asset fails closed (per-asset node provisioning is the missing infra) rather than
-  // silently funding the wrong asset.
+  // Resolve the asset so the deposit watch counts only that asset + we route to the
+  // correct single-asset node. seq with no asset defaults to the GOLD node.
   let assetId = null;
   if (chain === 'seq') {
-    assetId = body.asset ? resolveAsset(body.asset) : CFG.gold; // default to the node's asset
+    assetId = body.asset ? resolveAsset(body.asset) : CFG.gold;
     if (!assetId) return { ok: false, error: 'unknown asset (want GOLD or a 32-byte hex id)' };
-    if (assetId !== CFG.gold) {
-      return { ok: false, error: `this LSP has no hosted Lightning node for ${assetLabel(assetId)} yet `
-        + `(SeqLN nodes are single-asset; only ${assetLabel(CFG.gold)} is provisioned). Per-asset node provisioning is pending.` };
-    }
+    if (assetId === CFG.btcx) return { ok: false, error: 'that id is the BTC leg; use chain=btc' };
   }
+  const { rpc, peer } = targetFor(chain, assetId);
+  if (!rpc) {
+    return { ok: false, error: `this LSP has no hosted Lightning node for ${assetLabel(assetId)} yet. `
+      + 'SeqLN nodes are single-asset, so provision one first: POST /node/provision {asset}.' };
+  }
+  if (!peer) return { ok: false, error: `no routing peer configured for ${chain === 'btc' ? 'BTC' : assetLabel(assetId)}` };
   reapChannelJobs();
   const jobId = crypto.randomUUID();
   const job = { ok: true, job_id: jobId, chain, asset_id: assetId,
@@ -491,12 +556,43 @@ const server = http.createServer(async (req, res) => {
   if (!authed(req)) return send(res, 401, { ok: false, error: 'unauthorized (Bearer token required)' });
   try {
     if (req.method === 'GET' && url.pathname === '/status') return send(res, 200, await status());
-    // "Move to Lightning": the hosted node's on-chain deposit address for a chain.
+    // Per-asset hosted-node provisioning: spin up (or re-attach) a SeqLN node for an
+    // asset, keyed to the connecting device. Non-custodial (keyless node + device pin).
+    if (req.method === 'POST' && url.pathname === '/node/provision') {
+      if (!PROV) return send(res, 501, { ok: false, error: 'per-asset node provisioning is not enabled on this LSP' });
+      const body = await readBody(req);
+      if (!body) return send(res, 400, { ok: false, error: 'bad json body' });
+      const assetId = resolveAsset(body.asset);
+      if (!assetId || assetId === CFG.btcx) return send(res, 400, { ok: false, error: 'asset must be a Sequentia asset (GOLD or a 32-byte hex id)' });
+      if (!/^[0-9a-fA-F]{66}$/.test(body.device_transport_pubkey || '')) {
+        return send(res, 400, { ok: false, error: 'device_transport_pubkey (33-byte compressed hex) is required — the node pins it so only your device can sign' });
+      }
+      try {
+        const rec = await PROV.provision({ assetId, deviceTransportPubkey: body.device_transport_pubkey, label: body.label || assetLabel(assetId) });
+        return send(res, 200, { ok: true, asset_id: rec.asset_id, label: rec.label, status: rec.status,
+          node_id: rec.node_id, host_pubkey: rec.host_pubkey, ws_port: rec.ws_port,
+          public_ws_path: rec.public_ws_path, network: rec.network });
+      } catch (e) { return send(res, 409, { ok: false, error: String((e && e.message) || e) }); }
+    }
+    // List the provisioned per-asset nodes (with a live node-id refresh).
+    if (req.method === 'GET' && url.pathname === '/node/list') {
+      if (!PROV) return send(res, 200, { ok: true, nodes: [] });
+      const nodes = [];
+      for (const rec of PROV.list()) {
+        const r = await PROV.refresh(rec.asset_id);
+        nodes.push({ asset_id: r.asset_id, label: r.label, status: r.status, node_id: r.node_id,
+          host_pubkey: r.host_pubkey, ws_port: r.ws_port, public_ws_path: r.public_ws_path, network: r.network });
+      }
+      return send(res, 200, { ok: true, nodes });
+    }
+    // "Move to Lightning": the hosted node's on-chain deposit address for a chain/asset.
     if (req.method === 'GET' && url.pathname === '/channel/deposit') {
       const chain = CHAINS[String(url.searchParams.get('chain') || '').toLowerCase()];
       if (!chain) return send(res, 400, { ok: false, error: "chain must be 'btc' or 'seq'" });
-      if (!chainPeer(chain)) return send(res, 501, { ok: false, error: `channel funding is not configured for ${chain} on this LSP` });
-      return send(res, 200, await channelDeposit(chain));
+      const assetId = chain === 'seq' ? (resolveAsset(url.searchParams.get('asset') || 'GOLD') || CFG.gold) : null;
+      const { rpc } = targetFor(chain, assetId);
+      if (!rpc) return send(res, 501, { ok: false, error: `no hosted Lightning node for that asset — provision it first (POST /node/provision)` });
+      return send(res, 200, await channelDeposit(chain, assetId));
     }
     // Poll a "Move to Lightning" channel-open job.
     if (req.method === 'GET' && url.pathname.startsWith('/channel/open/')) {
