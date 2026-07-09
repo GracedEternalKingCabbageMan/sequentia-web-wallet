@@ -534,6 +534,9 @@
                 <button type="button" data-r="chain">On-chain</button>
               </div>
             </div>
+            <!-- HONEST gating: when a leg has no usable Lightning channel, its LN button
+                 is disabled and this note says why + routes to Move-to-Lightning. -->
+            <div class="sub swrail-note hide" id="swRailNote" style="grid-column:1/-1;margin-top:2px"></div>
           </div>
 
           <!-- open fee market: pay the network fee in any asset the node prices -->
@@ -606,6 +609,13 @@
         <div id="xrStepper"></div>
         <span id="xrExpiry" class="hide"></span>
         <div class="status err" id="xrswapErr" style="margin-top:8px"></div>
+      </div>
+
+      <!-- mixed-rail (SUBMARINE) swap host: the asset leg is an anchored on-chain HTLC,
+           the BTC leg is Lightning. PERSISTED + resumed on reload so its on-chain leg
+           can always be refunded after its CLTV timeout. Rendered by swap.js. -->
+      <div id="swapMixedWrap" class="hide" style="margin-top:16px">
+        <div id="swMixedStepper"></div>
       </div>
     </section>
 
@@ -720,13 +730,13 @@ import init, { Mnemonic, Network, Signer, Wollet, EsploraClient, Address, AssetI
   scriptToAddress, buildCovenantFillTx }
   from './pkg/lwk_wasm.js';
 import { HDKey, mnemonicToSeedSync, btc, schnorr } from './btc.js';
-import { initSwap, renderSwap, resumeCrossMakers, resumeCovenantOrders, scanCovenantCompanion } from './swap.js';
+import { initSwap, renderSwap, resumeCrossMakers, resumeCovenantOrders, resumeMixedSwap, scanCovenantCompanion } from './swap.js';
 import { initXswap, renderXswap, fetchXmarkets, fetchXquote, fetchXbook, openFromComposer, hasInFlight } from './xswap.js';
 import { initXrswap, fetchRQuote, openReverseFromComposer, hasInFlight as hasReverseInFlight, renderReverse } from './xrswap.js';
 import { initXmaker, startForwardMaker, startReverseMaker, liveMakerOffers, resumeMakerSwaps } from './xmaker.js';
 import { initSeqln, connectDevice as lnConnectDevice, disconnectDevice as lnDisconnect,
   onSeqlnStatus, seqlnState, seqlnAvailable, seqlnGetStatus, seqlnSwap, lnFinalityCopy,
-  seqlnChannels, seqlnFunding, fundChannel } from './seqln.js';
+  seqlnChannels, seqlnFunding, fundChannel, provisionedState } from './seqln.js';
 import { lnDeriveNode } from './seqln-keys.js';
 
 const ESPLORA = location.origin + '/api';
@@ -1513,6 +1523,10 @@ async function openWallet(phrase){
   // Passive-CLOB covenant orders rest ON-CHAIN and can fill while the tab is closed;
   // rehydrate them, rescan the maker-credit companion wollet, and re-arm the fill watcher.
   try{ resumeCovenantOrders(); }catch(e){ console.warn('[resume] covenant-order resume failed:', e?.message??e); }
+  // Mixed-rail (submarine) swap: its asset leg is an on-chain HTLC recoverable only via
+  // its CLTV timeout, so a persisted in-flight swap MUST resume its trade-process view +
+  // Refund off-ramp after a reload (fund-safety).
+  try{ resumeMixedSwap(); }catch(e){ console.warn('[resume] submarine-swap resume failed:', e?.message??e); }
   // Lightning (LSP): bring the on-device signer online so the "Instant (Lightning)"
   // swap rail becomes available. Non-fatal + opt-in: if the wss endpoint / host key
   // aren't configured, LN stays off and the composer uses the on-chain rail.
@@ -1857,9 +1871,15 @@ function initSwapTab(){
     ln: {
       available: () => seqlnAvailable(),
       status: () => seqlnGetStatus(),
+      // The per-asset provisioned-node signer state — a provisioned-but-channel-less
+      // node informs the composer's "node ready, fund a channel" gating nuance.
+      provisioned: () => provisionedState(),
       swap: (p) => seqlnSwap(p),
       finalityCopy: () => lnFinalityCopy(),
     },
+    // Route the user to Move-to-Lightning (the Balance tab's Lightning card) when a leg
+    // has no usable channel — the honest fix for an unavailable LN rail.
+    gotoLightning: () => { tab('balance'); const c=$('lnBalanceCard'); if(c && c.scrollIntoView) try{ c.scrollIntoView({behavior:'smooth', block:'center'}); }catch{} },
   });
 }
 function renderActiveSwap(){ renderSwap(); }

@@ -37,6 +37,11 @@ import { secp256k1 } from './btc.js';
 import { planPlaceOrder, buildCovenantTerms, settleFill as covSettleFill, planRefund as covPlanRefund, cancel as covCancel } from './covenant-order.js';
 import { makeCovenantHooks, makerPayout } from './covenant-fill-host.js';
 import { computeRate, orderExpiry, deriveOtherField, buildCovenantOffer } from './covenant-flow.js';
+// HONEST per-asset Lightning-rail gating (offer LN only with a real usable channel).
+import { railAvailability } from './ln-rail.js';
+// The mixed-rail (submarine) swap state machine + localStorage resume (fund-safety:
+// an in-flight on-chain HTLC leg must survive a reload so it can be refunded).
+import * as sub from './submarine.js';
 
 let C = null;            // injected app context (see index.html initSwapTab)
 let X = null;            // the cross-chain route handle ({ openFromComposer, renderXswap, hasInFlight })
@@ -86,6 +91,13 @@ const S = {
 };
 let INSTANT = {};    // ticker -> { spendable, receivable } atoms (best-effort from the LSP /status)
 let LAST_MID = null; // { price, cross } for the current pair — feeds the pair bar
+// The last LSP /status channel snapshot + provisioned-node state — the GROUND TRUTH the
+// composer gates the Lightning rail on (a real per-asset channel, NOT "LSP configured").
+// Refreshed by refreshInstant(); read synchronously by findRoute/updateRails.
+let LNSTATUS = { channels: [], funding: null };
+let LNPROV = {};     // provisionedState(): assetHexLower -> { connected, phase }
+let MIXED = null;    // the in-flight mixed-rail (submarine) swap (persisted; see submarine.js)
+const MIXED_KEY = 'swk.sequentia.submarine';   // localStorage key for the in-flight submarine swap
 
 const TRADE_TYPE = { BUY: 0, SELL: 1 };   // seqdex.v1 TradeType enum
 
@@ -194,6 +206,13 @@ function applyComposeDerivation(pay, receive, price){
 // Re-render the whole composer for the current wallet/markets/state.
 export async function renderSwap(){
   if (!C.wollet) return;
+  // A persisted mixed-rail (submarine) swap owns the tab until it is terminal or
+  // dismissed: its on-chain HTLC leg is recoverable only via the Refund off-ramp, so
+  // the trade-process view (not the composer) must show on entry — including after a reload.
+  if (hasMixedInFlight()){
+    showMixed(true); renderMixedSwap();
+    return;
+  }
   // If a cross-chain swap is already in flight, jump straight to its stepper —
   // the composer's single entry point also resumes an interrupted BTC swap. Two
   // directions, two wizards: forward (pay BTC, get asset) and reverse (sell asset).
@@ -207,7 +226,7 @@ export async function renderSwap(){
     X.renderReverse();
     return;
   }
-  showCross(false); showReverse(false);
+  showCross(false); showReverse(false); showMixed(false);
   const _bh = C.$('swBook'); if (_bh) _bh.innerHTML = '';   // cleared; requote re-renders for the selected pair
   renderMyOrders();
   await loadMarkets();
@@ -312,10 +331,16 @@ function findRoute(pay, receive){
     // an LN-unconfigured wallet always takes the proven cross route (independent of
     // any stale rail state). updateRails() also forces this in the UI.
     const ln = lnAvailable();
-    const p = ln ? S.payRail : 'chain', r = ln ? S.recvRail : 'chain';
+    // HONEST gating: a leg may sit on 'ln' ONLY when THAT asset (or BTC) has a real,
+    // usable channel with the liquidity the leg's direction needs — never merely
+    // "LSP configured". Any 'ln' leg without a channel is downgraded to 'chain' here,
+    // so a stale rail state can never silently route into a dead LN path.
+    const ra = ln ? railAvail(pay, receive) : null;
+    const p = (ln && S.payRail === 'ln' && ra.payLn.ok) ? 'ln' : 'chain';
+    const r = (ln && S.recvRail === 'ln' && ra.recvLn.ok) ? 'ln' : 'chain';
     // ln + ln -> the proven pure-LN LSP route (non-custodial, keys on device).
-    // Offered only when the on-device signer is actually serving.
-    if (p === 'ln' && r === 'ln' && lnAvailable())
+    // Offered only when BOTH legs have a real usable channel.
+    if (p === 'ln' && r === 'ln')
       return { kind: 'ln', seqAsset, payIsBtc, xm, payRail: p, recvRail: r };
     // chain + chain -> the proven on-chain cross-chain HTLC order book. ANY
     // BTC<->asset pair is routable (the book may be empty; a maker posts one).
@@ -386,10 +411,13 @@ function instantAtomsFor(hex){
 // atoms here; confirm the unit convention when the LSP /status contract firms up.
 async function refreshInstant(){
   INSTANT = {};
+  LNSTATUS = { channels: [], funding: null };
+  LNPROV = (L && L.provisioned) ? (L.provisioned() || {}) : {};
   if (!(L && L.available && L.available() && L.status)) return;
   try {
     const st = await L.status();
     const chans = (st && (st.channels || st.channel_balances)) || [];
+    LNSTATUS = { channels: chans, funding: (st && st.funding) || null };   // ground truth for rail gating
     for (const c of chans){
       const t = c.asset_label || c.asset || c.ticker; if (!t) continue;
       INSTANT[t] = {
@@ -397,8 +425,21 @@ async function refreshInstant(){
         receivable: (c.receivable_units ?? c.receivable ?? 0),
       };
     }
-  } catch { INSTANT = {}; }
+  } catch { INSTANT = {}; LNSTATUS = { channels: [], funding: null }; }
   try { renderChips(); paintPanes(); } catch {}
+}
+
+// --- per-asset Lightning-rail gating (ln-rail.js) ---------------------------------
+// The composer's leg descriptor for the gating helpers: 'BTC' for the parent leg, else
+// { hex, ticker } so a channel can be matched by asset id OR its ticker label.
+function railTarget(hexOrBtc){ return hexOrBtc === 'BTC' ? 'BTC' : { hex: hexOrBtc, ticker: metaOf(hexOrBtc).ticker }; }
+// The live per-leg LN verdict for the current pay/receive legs (real channel liquidity,
+// direction-aware). Safe to call any time; reads the last /status snapshot synchronously.
+function railAvail(payHex, receiveHex){
+  return railAvailability({
+    channels: LNSTATUS.channels || [], provisioned: LNPROV,
+    payTarget: railTarget(payHex), recvTarget: railTarget(receiveHex),
+  });
 }
 
 // --- balance chips: per-asset Lightning vs on-chain split ---
@@ -526,18 +567,45 @@ function updateRails(){
     && ((pay === 'BTC') !== (receive === 'BTC'));   // exactly one side is BTC
   if (btcPair && lnAvailable()){
     box.classList.remove('hide');
-    // Default each leg to the Lightning option when the LSP is available; the LSP
-    // submarine-funds a cold channel mid-trade, so Lightning is the right default even
-    // before the user holds in-channel liquidity. (Per-leg balance-aware defaulting is a
-    // later refinement.) both-LN is always a supported combo, so this never lands unsupported.
-    if (!S.railsTouched){ S.payRail = 'ln'; S.recvRail = 'ln'; }
-    // Safety: never sit on the undeployed mixed shape (asset over LN + BTC on-chain).
-    else if (!railSupported(S.payRail, S.recvRail)){ S.payRail = 'ln'; S.recvRail = 'ln'; S.railsTouched = false; }
-    paintRailSegs();
+    // HONEST per-asset gating: a leg may sit on Lightning ONLY when THAT asset (or BTC)
+    // has a real, usable channel with the liquidity the leg's direction needs. There is
+    // no silent submarine-funding of a cold channel — a leg with no channel defaults to
+    // (and is pinned to) on-chain, and the LN button is disabled with a Move-to-Lightning
+    // explanation. This kills the old "LSP configured => flash the LN rail" bug.
+    const ra = railAvail(pay, receive);
+    if (!S.railsTouched){
+      S.payRail  = ra.payLn.ok  ? 'ln' : 'chain';
+      S.recvRail = ra.recvLn.ok ? 'ln' : 'chain';
+    } else {
+      // The user chose rails; still force any 'ln' leg that lost/lacks a channel to chain.
+      if (S.payRail  === 'ln' && !ra.payLn.ok)  S.payRail  = 'chain';
+      if (S.recvRail === 'ln' && !ra.recvLn.ok) S.recvRail = 'chain';
+    }
+    // Never sit on the undeployed mixed shape (asset over LN + BTC on-chain): if the
+    // channel-reconciled combo is unsupported, fall all the way back to the proven
+    // on-chain cross route (both legs on-chain), which is always available.
+    if (!railSupported(S.payRail, S.recvRail)){ S.payRail = 'chain'; S.recvRail = 'chain'; }
+    paintRailSegs(ra);
+    renderRailNote(ra);
   } else {
     box.classList.add('hide');
+    renderRailNote(null);
     S.payRail = 'chain'; S.recvRail = 'chain'; S.railsTouched = false;
   }
+}
+// An honest inline note under the rail choosers when the Lightning option is NOT
+// offerable for a leg (no channel / wrong-side liquidity): says why + links to
+// Move-to-Lightning. Cleared when both legs' LN options are live (or LN is off).
+function renderRailNote(ra){
+  const note = C.$('swRailNote'); if (!note) return;
+  if (!ra || (ra.payLn.ok && ra.recvLn.ok)){ note.innerHTML = ''; note.classList.add('hide'); return; }
+  const bad = !ra.payLn.ok ? ra.payLn : ra.recvLn;   // surface the first blocked leg
+  const canMove = bad.cta === 'move' || bad.cta === 'add';
+  note.classList.remove('hide');
+  note.innerHTML = `<span>${esc(bad.reason)} ${esc(bad.hint || '')}</span>`
+    + (canMove ? ` <button type="button" class="swfix" id="swRailMove">${esc(bad.ctaLabel || 'Move to Lightning')}</button>` : '');
+  const b = C.$('swRailMove');
+  if (b) b.onclick = () => { if (C.gotoLightning) C.gotoLightning(); else try { C.toast('Move funds to Lightning from the Balance tab.'); } catch {} };
 }
 // Is (payRail, recvRail) a rail combination with a backend for the current pair? Both
 // legs the same (pure-LN or fully on-chain) always work. The only mixed shape deployed
@@ -554,20 +622,29 @@ function wireRailSeg(id, leg){
   // Guard on b.disabled at click time so a greyed (unsupported) combo can't be picked.
   seg.querySelectorAll('button[data-r]').forEach(b => b.onclick = () => { if (!b.disabled) setRail(leg, b.dataset.r); });
 }
-function paintRailSegs(){
+function paintRailSegs(ra){
+  ra = ra || railAvail(S.payAsset, S.receiveAsset);
   const badTip = 'Coming soon — this asset-over-Lightning with BTC on-chain shape has no maker yet. '
     + 'Keep the asset on-chain and BTC on Lightning, or set both legs the same way.';
   const paint = (id, leg) => { const seg = C.$(id); if (!seg) return;
     const cur = leg === 'pay' ? S.payRail : S.recvRail;
+    const legLn = leg === 'pay' ? ra.payLn : ra.recvLn;   // real per-asset LN verdict for this leg
     seg.querySelectorAll('button[data-r]').forEach(b => {
       const r = b.dataset.r;
       b.classList.toggle('on', r === cur);
-      // Would selecting THIS button (other leg held fixed) form an unsupported combo?
-      const p2 = leg === 'pay' ? r : S.payRail;
-      const r2 = leg === 'pay' ? S.recvRail : r;
-      const bad = !railSupported(p2, r2);
+      // The Lightning button is offerable ONLY with a real usable channel for this leg;
+      // otherwise disable it and say why (no channel -> Move to Lightning; empty side ->
+      // add liquidity). On-chain is always available.
+      let bad = false, tip = '';
+      if (r === 'ln' && !legLn.ok){ bad = true; tip = legLn.reason + (legLn.hint ? ' ' + legLn.hint : ''); }
+      else {
+        // Also never let a pick form the undeployed mixed shape (asset over LN + BTC on-chain).
+        const p2 = leg === 'pay' ? r : S.payRail;
+        const r2 = leg === 'pay' ? S.recvRail : r;
+        if (!railSupported(p2, r2)){ bad = true; tip = badTip; }
+      }
       b.disabled = bad;
-      if (bad) b.title = badTip; else b.removeAttribute('title');
+      if (bad) b.title = tip; else b.removeAttribute('title');
     }); };
   paint('swPayRailSeg', 'pay');
   paint('swRecvRailSeg', 'recv');
@@ -1389,6 +1466,9 @@ function renderTiming(route){
   if (!el || !tx) return;
   const wireFix = () => { el.querySelectorAll('.swfix').forEach(s => s.onclick = () => setRail(s.dataset.fix, 'ln')); };
   const ln = lnAvailable();
+  // Only offer a "switch this leg to Lightning" fix when that leg has a REAL usable
+  // channel — otherwise the link would be a dead no-op (the rail stays on-chain).
+  const ra = ln ? railAvail(S.payAsset, S.receiveAsset) : { payLn: { ok: false }, recvLn: { ok: false } };
   if (!route){
     el.className = 'swtiming ok'; if (ic) ic.textContent = '•';
     tx.innerHTML = 'Pick two assets to see how settlement works.';
@@ -1412,14 +1492,19 @@ function renderTiming(route){
   } else if (rr === 'ln' && pr === 'chain'){
     const { n, t } = onchainConf();
     el.className = 'swtiming wait'; if (ic) ic.textContent = '◷';
+    // The "pay from Lightning" fix only helps when the PAY leg has a usable channel.
+    const canFixPay = ra.payLn.ok;
     tx.innerHTML = `<b>~${n} confirmation${n > 1 ? 's' : ''} (${esc(t)}):</b> your on-chain payment must confirm first. `
-      + `Settle instantly by <span class="swfix" data-fix="pay">paying from Lightning</span>, or trade under ${esc(capDisplay(route))}.`;
-    wireFix();
+      + (canFixPay ? `Settle instantly by <span class="swfix" data-fix="pay">paying from Lightning</span>, or trade under ${esc(capDisplay(route))}.`
+                   : `Trade under ${esc(capDisplay(route))} to be fronted instantly.`);
+    if (canFixPay) wireFix();
   } else {   // rr === 'chain' (any pay rail): on-chain receipt, inherent — CAP can't make it instant
     el.className = 'swtiming wait'; if (ic) ic.textContent = '◷';
+    // Offer "switch Receive to Lightning" only when the RECEIVE leg has a usable channel.
+    const canFixRecv = ra.recvLn.ok;
     tx.innerHTML = `Appears immediately, final in <b>~1 block</b> · ${ANCHOR_FINAL}.`
-      + (ln ? ` To receive instantly &amp; finally, <span class="swfix" data-fix="recv">switch Receive to Lightning</span>.` : '');
-    wireFix();
+      + (canFixRecv ? ` To receive instantly &amp; finally, <span class="swfix" data-fix="recv">switch Receive to Lightning</span>.` : '');
+    if (canFixRecv) wireFix();
   }
 }
 // Back-compat shim: older call sites pass a kind string; the banner now derives its
@@ -1814,22 +1899,171 @@ async function reviewMixed(q){
   ];
   const { m: modal, ok, st } = C.modalRows({ title: 'Review mixed-rail swap', kv });
   ok.onclick = async () => {
-    ok.disabled = true; st.className = 'status';
-    st.innerHTML = '<span class="spin"></span>Settling — the on-chain leg is burying under Bitcoin (anchor-gated, a few minutes)…';
+    modal.remove();
+    resetComposer();
+    // Hand off to the persisted, RESUMABLE submarine stepper. The on-chain HTLC leg
+    // must survive a page reload (it is only recoverable via its CLTV timeout otherwise),
+    // so from here the swap lives in localStorage + the trade-process view, not a modal.
+    await startMixed({ side, asset: q.seqAsset, amount, payRail: q.payRail, recvRail: q.recvRail, payIsBtc: q.payIsBtc });
+  };
+}
+
+// ===========================================================================
+// Mixed-rail (submarine) swap — PERSISTED + RESUMABLE trade-process view.
+// The asset leg is an anchored on-chain HTLC; if the swap stalls the ONLY recovery is
+// to refund that HTLC after its CLTV timeout. So (like the cross-chain wizard) the
+// in-flight swap is persisted to localStorage and resumed on load, with a live "Refund
+// BTC leg" off-ramp — never a fire-and-forget modal that a refresh strands.
+// ===========================================================================
+function saveMixed(){ try { sub.saveSwap(localStorage, MIXED_KEY, MIXED); } catch {} }
+function clearMixed(){ MIXED = null; try { sub.clearSwap(localStorage, MIXED_KEY); } catch {} }
+// True while a submarine swap is persisted and NOT terminal — the composer resumes the
+// stepper (instead of the composer) on tab entry, exactly like the cross-chain wizards.
+export function hasMixedInFlight(){ return !!MIXED && !sub.isTerminal(MIXED); }
+// The Sequentia tip height, against which the asset-leg HTLC's CLTV refund locktime is
+// judged (the asset HTLC is on Sequentia; its refund matures at that height).
+function mixedTip(){ try { return C.wollet ? C.wollet.tip().height() : 0; } catch { return 0; } }
+
+// Start (and drive) a submarine swap: persist a live record FIRST (so a refresh mid-call
+// still resumes), show the stepper, then command the LSP and fold the result back in.
+async function startMixed(params){
+  MIXED = sub.newSwap(params); saveMixed();
+  showMixed(true); renderMixedSwap();
+  try {
+    const r = await L.swap({ side: params.side, asset: params.asset, amount: params.amount,
+      payRail: params.payRail, recvRail: params.recvRail });
+    MIXED = sub.applyStatus(MIXED, r || {}); saveMixed();
+    renderMixedSwap();
+    if (!sub.isTerminal(MIXED)) pollMixed();
+    else if (MIXED.state === sub.ST.SETTLED){
+      try { C.toast(`Mixed swap settled · anchor-bound to Bitcoin${MIXED.preimage ? ` · preimage ${String(MIXED.preimage).slice(0, 16)}…` : ''}`); } catch {}
+      try { await C.sync(); } catch {}
+    }
+  } catch (e){
+    // A thrown swap: if an on-chain HTLC leg exists it stays SETTLING (refundable at its
+    // timeout); with no leg to reclaim it is a clean failure.
+    if (MIXED && MIXED.htlc){ MIXED = { ...MIXED, detail: C.prettyErr(e) }; saveMixed(); pollMixed(); }
+    else { MIXED = sub.markFailed(MIXED, C.prettyErr(e)); saveMixed(); }
+    renderMixedSwap();
+  }
+}
+
+// Poll the LSP for the swap's progress until terminal (best-effort: needs L.swapStatus).
+let _mixedPoll = null;
+function pollMixed(){
+  if (!MIXED || sub.isTerminal(MIXED) || !(L && L.swapStatus)) return;
+  clearTimeout(_mixedPoll);
+  _mixedPoll = setTimeout(async () => {
+    if (!MIXED || sub.isTerminal(MIXED)) return;
     try {
-      const r = await L.swap({ side, asset: q.seqAsset, amount, payRail: q.payRail, recvRail: q.recvRail });
-      if (!r || r.ok === false) throw new Error((r && r.error) || 'the mixed swap did not settle');
-      const mins = r.eta_seconds ? Math.max(1, Math.round(r.eta_seconds / 60)) : null;
+      const r = await L.swapStatus(MIXED.id);
+      MIXED = sub.applyStatus(MIXED, r || {}); saveMixed(); renderMixedSwap();
+      if (MIXED.state === sub.ST.SETTLED){ try { await C.sync(); } catch {} }
+    } catch {}
+    if (!sub.isTerminal(MIXED)) pollMixed();
+  }, 8000);
+}
+
+// Show/hide the submarine stepper (mutually exclusive with the composer + the other
+// wizard hosts), mirroring showCross/showReverse.
+function showMixed(on){
+  const mw = C.$('swapMixedWrap'), cw = C.$('swapCrossWrap'), rw = C.$('swapReverseWrap'), comp = C.$('swComposer');
+  if (mw) mw.classList.toggle('hide', !on);
+  if (on){ if (cw) cw.classList.add('hide'); if (rw) rw.classList.add('hide'); }
+  if (comp) comp.classList.toggle('hide', on);
+}
+
+// The trade-process view for the in-flight submarine swap: the phase, the on-chain HTLC
+// leg, a "Refund BTC leg" off-ramp (live once the HTLC's CLTV timeout is buried), and an
+// Abandon/Clear. Rendered on start AND on resume-after-reload.
+function renderMixedSwap(){
+  const host = C.$('swMixedStepper'); if (!host || !MIXED) return;
+  const am = metaOf(MIXED.asset);
+  const terminal = sub.isTerminal(MIXED);
+  const tip = mixedTip();
+  const refundable = sub.isRefundable(MIXED, tip);
+  const phase = {
+    [sub.ST.SETTLING]:  'Settling — the on-chain HTLC leg is burying under Bitcoin (anchor-gated).',
+    [sub.ST.REFUNDING]: 'Refunding the on-chain HTLC leg…',
+    [sub.ST.REFUNDED]:  'Refunded — the on-chain HTLC leg was reclaimed; your funds are back.',
+    [sub.ST.SETTLED]:   'Settled — anchor-bound to Bitcoin (reverts only if Bitcoin reverts).',
+    [sub.ST.FAILED]:    'Failed — nothing further to reclaim on-chain.',
+  }[MIXED.state] || MIXED.state;
+  const dir = MIXED.side === 'buy'
+    ? `Buy ${esc(am.ticker)} with BTC over Lightning · receive ${esc(am.ticker)} on-chain`
+    : `Sell ${esc(am.ticker)} on-chain · receive BTC over Lightning`;
+  const lock = MIXED.htlc && MIXED.htlc.refund_locktime;
+  const legLine = MIXED.htlc
+    ? (refundable
+        ? `On-chain HTLC leg is past its refund timeout (block ${lock}) — reclaimable now.`
+        : `On-chain HTLC leg refundable after block ${lock}${tip ? ` (tip ${tip})` : ''}.`)
+    : 'The LSP is driving both legs; no separate on-chain leg to reclaim.';
+  host.innerHTML = `<div class="swbook"><div class="swbook-head">
+      <span class="lbl">${dir}</span>
+      <span class="sub">${esc(phase)}</span></div>
+    <div class="swbook-row"><span class="sub">${esc(legLine)}${MIXED.detail && !terminal ? ' · ' + esc(MIXED.detail) : ''}</span></div>
+    <div class="swbook-row" id="swMixedBtns"></div></div>`;
+  const btns = C.$('swMixedBtns');
+  if (MIXED.htlc && !terminal && MIXED.state !== sub.ST.REFUNDING){
+    const rb = C.el('button', 'danger', 'Refund BTC leg'); rb.id = 'swMixedRefund';
+    rb.disabled = !refundable;
+    if (!refundable) rb.title = `The on-chain HTLC leg is only refundable after its CLTV timeout (block ${lock}).`;
+    rb.onclick = onRefundMixed;
+    btns.appendChild(rb);
+  }
+  const done = terminal;
+  const clr = C.el('button', 'ghost', done ? 'Clear' : 'Dismiss');
+  clr.onclick = () => {
+    // Dismiss only HIDES a live swap (it keeps recovering + resumes next open); Clear
+    // drops a terminal one.
+    if (done) clearMixed(); else { /* keep persisted */ }
+    showMixed(false); renderSwap();
+  };
+  btns.appendChild(clr);
+}
+
+// Refund the on-chain HTLC leg after its CLTV timeout (a real on-chain reclaim). Mirrors
+// xswap.js onRefundBtc: mark refunding, broadcast via the refund hook, mark refunded.
+async function onRefundMixed(){
+  if (!MIXED || !MIXED.htlc){ return; }
+  if (!sub.isRefundable(MIXED, mixedTip())){
+    try { C.toast('The on-chain HTLC leg is not refundable until its CLTV timeout is buried.'); } catch {}
+    return;
+  }
+  const kv = [
+    ['Network', '⚠ Refunding the on-chain HTLC leg via its CLTV branch (anchor-bound).'],
+    ['Refund amount', (MIXED.htlc.amount != null ? MIXED.htlc.amount + ' base units' : 'the locked HTLC amount') + ' (minus the refund tx fee)'],
+    ['After this', 'The swap is terminal (refunded); the Lightning leg unwinds on its own hold timeout.'],
+  ];
+  const { m: modal, ok, st } = C.modalRows({ title: 'Refund the on-chain leg', kv });
+  ok.onclick = async () => {
+    ok.disabled = true; st.className = 'status'; st.innerHTML = '<span class="spin"></span>Refunding the on-chain HTLC leg…';
+    MIXED = sub.markRefunding(MIXED); saveMixed(); renderMixedSwap();
+    try {
+      let txid = null;
+      if (L && L.refund) txid = await L.refund({ id: MIXED.id, htlc: MIXED.htlc });
+      MIXED = sub.markRefunded(MIXED, txid); saveMixed();
       modal.remove();
-      // Honest: anchor-bound, not "final". Surface the anchor-gated timing that occurred.
-      C.toast(`Mixed swap settled${mins ? ` in ~${mins} min` : ''} · anchor-bound to Bitcoin${r.preimage ? ` · preimage ${String(r.preimage).slice(0, 16)}…` : ''}`);
-      resetComposer();
-      await C.sync();
-      renderSwap();
+      C.toast(txid ? `On-chain HTLC leg refunded: ${String(txid).slice(0, 18)}…` : 'On-chain HTLC leg refund broadcast.');
+      try { await C.sync(); } catch {}
+      renderMixedSwap();
     } catch (e){
-      st.className = 'status err'; st.textContent = 'Failed: ' + C.prettyErr(e); ok.disabled = false;
+      // Refund failed: revert to SETTLING so the off-ramp stays available to retry.
+      MIXED = { ...MIXED, state: sub.ST.SETTLING }; saveMixed();
+      st.className = 'status err'; st.textContent = 'Refund failed: ' + C.prettyErr(e); ok.disabled = false;
+      renderMixedSwap();
     }
   };
+}
+
+// On wallet open: rehydrate any non-terminal submarine swap so its trade-process view +
+// Refund off-ramp come back after a reload (fund-safety). Mirrors resumeCrossMakers.
+export function resumeMixedSwap(){
+  MIXED = sub.resume(localStorage, MIXED_KEY);
+  if (!MIXED) return;
+  try { showMixed(true); renderMixedSwap(); } catch {}
+  if (!sub.isTerminal(MIXED)) pollMixed();
+  if (C.toast) try { C.toast('Resuming an interrupted Lightning+on-chain swap — refund the on-chain leg here if it stalls.'); } catch {}
 }
 
 // Start a CROSS market from the wallet: post a signed forward cross offer (SELL
@@ -2045,6 +2279,16 @@ async function requoteLn(route, amtStr){
 async function reviewLn(q){
   const { $ } = C;
   if (!L || !L.swap){ $('swErr').textContent = 'The Lightning route is unavailable in this build.'; return; }
+  // Defense-in-depth: never proceed on a pure-LN swap without a real usable channel on
+  // BOTH legs (findRoute already gates this; this catches a stale quote). Fail CLOSED
+  // with a clear message + a route to Move-to-Lightning — never a silent flash.
+  const ra = railAvail(S.payAsset, S.receiveAsset);
+  if (!ra.pureLnOk){
+    const bad = !ra.payLn.ok ? ra.payLn : ra.recvLn;
+    $('swErr').textContent = bad.reason + ' ' + (bad.hint || 'Move funds to Lightning from the Balance tab first.');
+    try { C.toast(bad.reason + ' Move to Lightning first.'); } catch {}
+    return;
+  }
   const am = C.assetMeta(q.seqAsset);
   const dir = q.side === 'buy' ? `Buy ${am.ticker} with BTC` : `Sell ${am.ticker} for BTC`;
   const kv = [

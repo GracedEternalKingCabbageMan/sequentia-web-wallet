@@ -248,8 +248,13 @@ node --test
 
 This runs `seqln.test.mjs` (LSP client, key derivation, two-leg availability logic against a
 mock SDK), `xcourier.test.mjs` (courier codec, sealed round-trips, maker listener,
-single-flight refusal), and `xmaker.test.mjs` (maker happy paths in both directions plus the
-resume-after-reload fund-safety logic). All three pass as of 2026-07-08 on Node v22.
+single-flight refusal), `xmaker.test.mjs` (maker happy paths in both directions plus the
+resume-after-reload fund-safety logic), `ln-rail.test.mjs` (HONEST per-asset Lightning-rail
+gating — the LN rail is offered for a leg only with a real usable channel of the right
+direction, from a mock `/status`), `submarine.test.mjs` (the mixed-rail submarine-swap state
+machine + localStorage persistence + resume + on-chain-HTLC refund path), and
+`swap-mixed.test.mjs` (the composer's submarine-swap resume glue against a mock stored state).
+All pass on Node v22.
 
 The real WASM + WebSocket + Noise signer path is exercised separately by
 `tooling/lsp/device-harness.mjs` against a running backend; see
