@@ -57,6 +57,29 @@ export const LN_PATHS = {
 
 export const LN_NODES = ['asset', 'btc'];
 
+// Per-asset provisioned hosted nodes (SeqLN is single-asset, so any asset the user
+// moves into Lightning gets its OWN keyless node). Their device identities live on a
+// DEDICATED branch so they never collide with the legacy asset(0')/btc(1') leaves:
+//   m/1017'/2'/<assetIndex>'   provisioned node  Noise transport privkey
+//   m/1017'/3'/<assetIndex>'   provisioned node  SeqLN signing seed
+// assetIndex is a deterministic 31-bit index derived from the 32-byte asset id, so the
+// same asset always re-derives the SAME device identity (its provisioned node_id +
+// channels survive across sessions and are recoverable from the mnemonic). The index
+// space is 2^31; a distinct asset colliding to the same index needs ~2^15.5 assets in
+// one wallet (birthday) and is astronomically unlikely in practice.
+export const LN_ASSET_BRANCH = { transport: "m/1017'/2'", signing: "m/1017'/3'" };
+
+// FNV-1a 32-bit over the asset-id bytes, folded to a 31-bit hardened-path index.
+function assetPathIndex(assetIdHex) {
+  const hex = String(assetIdHex).toLowerCase().replace(/[^0-9a-f]/g, '');
+  let h = 0x811c9dc5;
+  for (let i = 0; i + 1 < hex.length; i += 2) {
+    h ^= parseInt(hex.substr(i, 2), 16);
+    h = Math.imul(h, 0x01000193) >>> 0;
+  }
+  return h & 0x7fffffff;
+}
+
 function normPhrase(phrase) {
   return String(phrase).trim().replace(/\s+/g, ' ');
 }
@@ -101,4 +124,23 @@ export function lnDeriveAll(phrase) {
   return out;
 }
 
-export default { LN_PATHS, LN_NODES, lnDeriveNode, lnDeriveAll };
+// Derive the device identity for a PROVISIONED per-asset node from the wallet mnemonic
+// + the asset id. Deterministic + unique per asset (see LN_ASSET_BRANCH). Returns the
+// same shape as lnDeriveNode plus { assetId, index }.
+export function lnDeriveAsset(phrase, assetId) {
+  if (!/^[0-9a-fA-F]{64}$/.test(String(assetId || ''))) throw new Error('assetId must be a 32-byte hex id');
+  const idx = assetPathIndex(assetId);
+  const tPath = `${LN_ASSET_BRANCH.transport}/${idx}'`;
+  const sPath = `${LN_ASSET_BRANCH.signing}/${idx}'`;
+  const master = HDKey.fromMasterSeed(mnemonicToSeedSync(normPhrase(phrase)));
+  return {
+    node: 'asset:' + String(assetId).toLowerCase(),
+    assetId: String(assetId).toLowerCase(),
+    index: idx,
+    transportPrivkey: childPriv(master, tPath),
+    signingSeed: childPriv(master, sPath),
+    paths: { transport: tPath, signing: sPath },
+  };
+}
+
+export default { LN_PATHS, LN_NODES, LN_ASSET_BRANCH, lnDeriveNode, lnDeriveAll, lnDeriveAsset };

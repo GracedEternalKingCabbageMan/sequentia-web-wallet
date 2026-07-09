@@ -206,6 +206,92 @@ export function disconnectDevice(node) {
   }
 }
 
+// -- provisioned per-asset nodes (dynamic N/M, beyond the fixed asset+btc rail) -----
+// SeqLN is single-asset, so moving a NEW asset into Lightning provisions its own hosted
+// node; the device attaches a signer to it exactly like the fixed nodes, but there can
+// be arbitrarily many, so they live in a dynamic map (keyed by asset id) rather than the
+// fixed asset/btc slots.
+const provNodes = {};   // assetId -> { signer, connected, nodeId, phase, detail }
+
+// Device transport pubkey (33-byte compressed hex) for a privkey — what the hosted node
+// PINS (SEQLN_SIGNER_PEER_PUBKEY). Derived via the wasm SDK (same curve the node uses).
+export async function deviceTransportPubkey(transportPrivkey) {
+  const mod = await import(CFG.sdkPath);
+  const S = mod.SeqlnSigner || mod.default;
+  return S.devicePubkey(transportPrivkey);
+}
+
+// The wss URL a browser uses to reach a provisioned node's Noise responder (through the
+// TLS front's per-node path). Deploy prerequisite: a Caddy wildcard mapping public_ws_path
+// -> the node's private ws port. Overridable via SEQ_LSP_WS_BASE for local/test wiring.
+function provWsUrl(publicWsPath) {
+  const base = W.SEQ_LSP_WS_BASE
+    || (typeof location !== 'undefined' ? location.origin.replace(/^http/, 'ws') : 'ws://127.0.0.1');
+  return base.replace(/\/$/, '') + publicWsPath;
+}
+
+// Connect the on-device signer to a PROVISIONED node's responder (arbitrary asset).
+export async function connectProvisioned({ assetId, deviceSigningSeed, deviceTransportPrivkey,
+  wsUrl, hostStaticPubkey, policy = 'permissive' } = {}) {
+  if (!/^[0-9a-fA-F]{64}$/.test(String(assetId || ''))) throw new Error('connectProvisioned: assetId must be a 32-byte hex id');
+  const key = String(assetId).toLowerCase();
+  const s = provNodes[key] || (provNodes[key] = { signer: null, connected: false, nodeId: null, phase: 'idle', detail: '' });
+  if (!wsUrl || !hostStaticPubkey) { s.phase = 'unconfigured'; s.detail = 'no wss endpoint / host key'; return null; }
+  if (!deviceSigningSeed || !deviceTransportPrivkey) { s.phase = 'unconfigured'; s.detail = 'no device identity'; return null; }
+  if (s.signer) return s.nodeId;
+  s.phase = 'connecting';
+  const mod = await import(CFG.sdkPath);
+  const SeqlnSigner = mod.SeqlnSigner || mod.default;
+  const signer = await SeqlnSigner.fromMnemonic(deviceSigningSeed);
+  signer.setPolicy(policy);
+  s.signer = signer;
+  signer.onStatus = (st) => {
+    if (st.state === 'node_id') { s.nodeId = st.nodeId; s.phase = 'node_id'; }
+    else s.phase = st.state;
+    if (st.state === 'closed' || st.state === 'error') s.connected = false;
+    if (onChange) { try { onChange(seqlnState()); } catch {} }
+  };
+  try {
+    await signer.connect({ wsUrl, hostStaticPubkey, deviceStaticPrivkey: deviceTransportPrivkey });
+    const id = await signer.whenNodeId(30000);
+    s.nodeId = id; s.connected = true; s.phase = 'ready';
+    if (onChange) { try { onChange(seqlnState()); } catch {} }
+    return id;
+  } catch (e) {
+    s.signer = null; s.connected = false; s.phase = 'error'; s.detail = e.message || String(e);
+    return null;
+  }
+}
+
+// One call the Balance tab uses to move an asset into Lightning end to end (client side):
+// derive this asset's device identity, provision its hosted node keyed to that device,
+// and bring the signer online. Returns { node, nodeId } (the wallet then funds a channel).
+//   deriveIdentity(assetId) -> { transportPrivkey, signingSeed }  (seqln-keys.lnDeriveAsset)
+export async function provisionAndConnect({ assetId, deriveIdentity, policy = 'permissive', label } = {}) {
+  if (typeof deriveIdentity !== 'function') throw new Error('provisionAndConnect: deriveIdentity(assetId) is required');
+  const id = deriveIdentity(assetId);
+  const devicePubkey = await deviceTransportPubkey(id.transportPrivkey);
+  const node = await provisionNode({ asset: assetId, deviceTransportPubkey: devicePubkey, label });
+  const wsUrl = provWsUrl(node.public_ws_path);
+  const nodeId = await connectProvisioned({
+    assetId, deviceSigningSeed: id.signingSeed, deviceTransportPrivkey: id.transportPrivkey,
+    wsUrl, hostStaticPubkey: node.host_pubkey, policy,
+  });
+  return { node, nodeId, connected: !!nodeId };
+}
+
+// Snapshot of the provisioned-node signers (for the dynamic N/M leg display).
+export function provisionedState() {
+  const out = {};
+  for (const [k, s] of Object.entries(provNodes)) out[k] = { connected: s.connected, nodeId: s.nodeId, phase: s.phase, detail: s.detail };
+  return out;
+}
+
+export function disconnectProvisioned(assetId) {
+  const keys = assetId ? [String(assetId).toLowerCase()] : Object.keys(provNodes);
+  for (const k of keys) { const s = provNodes[k]; if (!s) continue; try { s.signer?.disconnect(); } catch {} s.signer = null; s.connected = false; s.phase = 'idle'; }
+}
+
 // -- 2. LSP HTTP client (plain fetch; Node-testable) ---------------------------
 async function lspFetch(path, opts = {}) {
   const headers = { 'content-type': 'application/json', ...(opts.headers || {}) };
@@ -324,4 +410,5 @@ export default {
   initSeqln, seqlnConfigured, seqlnDeployed, seqlnState, onSeqlnStatus, seqlnAvailable,
   lnFinalityCopy, connectDevice, disconnectDevice, seqlnGetStatus, seqlnSwap,
   seqlnChannels, seqlnFunding, seqlnNodes, provisionNode, fundChannel,
+  deviceTransportPubkey, connectProvisioned, provisionAndConnect, provisionedState, disconnectProvisioned,
 };

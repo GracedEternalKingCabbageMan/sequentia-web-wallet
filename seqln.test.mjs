@@ -16,7 +16,10 @@ import {
   connectDevice, disconnectDevice, seqlnGetStatus, seqlnSwap, lnFinalityCopy,
   seqlnChannels, seqlnFunding, seqlnNodes, provisionNode, fundChannel,
 } from './seqln.js';
-import { lnDeriveNode, lnDeriveAll, LN_PATHS } from './seqln-keys.js';
+import { lnDeriveNode, lnDeriveAll, lnDeriveAsset, LN_PATHS, LN_ASSET_BRANCH } from './seqln-keys.js';
+import {
+  connectProvisioned, provisionAndConnect, provisionedState,
+} from './seqln.js';
 
 let seen = [];
 // A fake channel-open job that transitions pending_deposit -> active over a few polls,
@@ -136,6 +139,7 @@ const MOCK_SRC = `
 globalThis.__seqlnMockConnects = globalThis.__seqlnMockConnects || [];
 export class SeqlnSigner {
   static async fromMnemonic(seed){ const s = new SeqlnSigner(); s._seed = seed; return s; }
+  static async devicePubkey(priv){ return '02' + String(priv).slice(0, 64).padEnd(64, '0'); }
   setPolicy(m){ this._policy = m; return this; }
   async connect({ wsUrl, hostStaticPubkey, deviceStaticPrivkey }){
     this._nodeId = 'node-' + String(deviceStaticPrivkey).slice(0, 16);
@@ -259,6 +263,44 @@ await fundChannel({ chain: 'seq', asset: 'GOLD', amount: 5000,
 const openSeq = seen.filter((s) => s.method === 'POST' && s.path === '/channel/open').at(-1);
 assert.deepEqual(JSON.parse(openSeq.body), { chain: 'seq', amount: 5000, asset: 'GOLD' }, 'asset open forwards the asset');
 console.log('ok: fundChannel() forwards the asset for a Sequentia asset channel; refuses without a send hook');
+
+// ===========================================================================
+// Part 4 — per-asset device identities + provisioned-node connect (dynamic N/M)
+// ===========================================================================
+// Re-init with the mock SDK (Part 3 reset sdkPath to the default) so the provisioned
+// signer connect is exercised in Node without the real wasm.
+initSeqln({ lspUrl: `http://127.0.0.1:${port}`, token: 'T0KEN', sdkPath: MOCK });
+// A provisioned node's identity is derived on the dedicated per-asset branch and is
+// deterministic + distinct per asset (and distinct from the fixed asset/btc leaves).
+const ASSET_A = 'aa'.repeat(32), ASSET_B = 'bc'.repeat(32);
+const da = lnDeriveAsset(PHRASE, ASSET_A);
+const db = lnDeriveAsset(PHRASE, ASSET_B);
+assert.ok(da.paths.transport.startsWith(LN_ASSET_BRANCH.transport + '/'), 'asset transport on the per-asset branch');
+assert.ok(da.paths.signing.startsWith(LN_ASSET_BRANCH.signing + '/'), 'asset signing on the per-asset branch');
+assert.deepEqual(lnDeriveAsset(PHRASE, ASSET_A), da, 'per-asset identity is deterministic');
+const keys4 = [da.transportPrivkey, da.signingSeed, db.transportPrivkey, db.signingSeed,
+  asset.transportPrivkey, btc.transportPrivkey];
+assert.equal(new Set(keys4).size, keys4.length, 'per-asset keys are distinct across assets AND from the fixed asset/btc keys');
+console.log('ok: lnDeriveAsset derives deterministic, per-asset-distinct device identities on a dedicated branch');
+
+// The mock SDK is still installed from Part 2b (CFG.sdkPath = MOCK). provisionAndConnect
+// derives the identity, provisions the node (POST /node/provision), and connects the
+// signer to the provisioned node's ws — all through the same testable seams.
+globalThis.__seqlnMockConnects = [];
+const res = await provisionAndConnect({
+  assetId: ASSET_A,
+  deriveIdentity: (id) => lnDeriveAsset(PHRASE, id),
+  label: 'NEWX',
+});
+assert.ok(res.node && res.node.host_pubkey, 'provisionAndConnect returned the provisioned node wiring');
+assert.ok(res.connected && /^node-/.test(res.nodeId), 'the provisioned signer connected and derived a node id');
+assert.equal(provisionedState()[ASSET_A].connected, true, 'provisioned-node state reflects the live signer');
+// It POSTed the provision with the derived device pubkey and connected to that node's ws.
+const provPost = seen.filter((s) => s.method === 'POST' && s.path === '/node/provision').at(-1);
+assert.equal(JSON.parse(provPost.body).asset, ASSET_A, 'provisionAndConnect provisioned the right asset');
+const conn = globalThis.__seqlnMockConnects.at(-1);
+assert.ok(conn.wsUrl.endsWith('/lsp-ws-node/X-0'), 'signer connected to the provisioned node public_ws_path');
+console.log('ok: provisionAndConnect provisions a per-asset node keyed to the device + brings its signer online');
 
 srv.close();
 console.log('\nALL PASS');
