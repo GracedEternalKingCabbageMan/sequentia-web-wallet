@@ -243,11 +243,29 @@ export async function seqlnChannels() {
 
 // Which chains/assets the LSP can fund a channel for (Move to Lightning). SeqLN nodes
 // are single-asset, so `assets` lists exactly the Sequentia assets that have a hosted
-// node today (dynamic; grows as per-asset nodes are provisioned). The Balance tab reads
-// this to offer Move-to-Lightning ONLY where a node exists.
+// node today (dynamic; grows as per-asset nodes are provisioned). `provisioning` is true
+// when the LSP can spin up a node for ANY other asset (incl. a freshly-issued one) on
+// demand. The Balance tab reads this to offer Move-to-Lightning per asset.
 export async function seqlnFunding() {
   const st = await seqlnGetStatus();
-  return st.funding || { btc: false, assets: [] };
+  return st.funding || { btc: false, assets: [], provisioning: false };
+}
+
+// The provisioned per-asset hosted nodes (the dynamic "M" in "LN N/M"). Each is a
+// single-asset keyless SeqLN node keyed to this device.
+export async function seqlnNodes() {
+  return (await lspFetch('/node/list')).nodes || [];
+}
+
+// Provision (or re-attach) a hosted SeqLN node for `asset`, keyed to THIS device. SeqLN
+// nodes are single-asset, so moving a new asset into Lightning first needs its own node.
+// `deviceTransportPubkey` is the device's per-node Noise static pubkey (seqln-keys.js);
+// the node pins it so only this device can sign. Returns the node wiring the wallet then
+// attaches its signer to (host_pubkey, public_ws_path) before funding a channel.
+export function provisionNode({ asset, deviceTransportPubkey, label }) {
+  const body = { asset, device_transport_pubkey: deviceTransportPubkey };
+  if (label) body.label = label;
+  return lspFetch('/node/provision', { method: 'POST', body: JSON.stringify(body) });
 }
 
 // -- "Move to Lightning": non-custodial channel funding --------------------------
@@ -305,5 +323,5 @@ export async function fundChannel({ chain, asset, amount, sendOnchain, onProgres
 export default {
   initSeqln, seqlnConfigured, seqlnDeployed, seqlnState, onSeqlnStatus, seqlnAvailable,
   lnFinalityCopy, connectDevice, disconnectDevice, seqlnGetStatus, seqlnSwap,
-  seqlnChannels, seqlnFunding, fundChannel,
+  seqlnChannels, seqlnFunding, seqlnNodes, provisionNode, fundChannel,
 };

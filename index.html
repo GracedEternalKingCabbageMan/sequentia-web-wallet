@@ -344,7 +344,7 @@
           <label class="lbl" style="margin:0">Lightning</label>
           <span class="sub" id="lnBalSummary"></span>
         </div>
-        <p class="sub" id="lnBalIntro" style="margin:0 0 12px">Move BTC or a Sequentia asset into a Lightning channel on your hosted node. Your wallet signs the on-chain deposit, and your device co-signs the channel funding, so no one else can move your funds.</p>
+        <p class="sub" id="lnBalIntro" style="margin:0 0 12px">Move BTC or a Sequentia asset into a Lightning channel on your hosted node. Your wallet signs the on-chain deposit and your device co-signs the channel funding, so no one else can move your funds. An asset is movable to Lightning when the on-chain funding transaction can pay an accepted fee (in that asset or another asset you hold); a brand-new asset that no block producer accepts for fees yet cannot be moved until one does.</p>
         <div class="list" id="lnBalList"></div>
         <div class="status" id="lnBalStatus" style="margin-top:10px"></div>
       </div>
@@ -1701,7 +1701,7 @@ function moveToLightningDialog(leg){
   const avail = BigInt(leg.onchain||0n);
   const m=el('div','modal'); const c=el('div','card');
   c.appendChild(el('label','lbl','Move '+leg.ticker+' to Lightning'));
-  c.appendChild(el('div','sub','Your wallet sends this amount on-chain to your hosted node, then your device co-signs opening a Lightning channel with it. Non-custodial: only your device can spend these funds.'));
+  c.appendChild(el('div','sub','Your wallet sends this amount on-chain to your hosted node, then your device co-signs opening a Lightning channel with it. Non-custodial: only your device can spend these funds. The on-chain funding pays a network fee through the open fee market; if no block producer accepts a fee you can pay, the move cannot be mined and will fail with a clear message.'));
   c.appendChild(el('label','lbl','Amount ('+leg.ticker+')'));
   const inp=el('input','mono'); inp.placeholder='0.0'; inp.style.marginTop='4px'; c.appendChild(inp);
   c.appendChild(el('div','sub','Available on-chain: '+fmtAtoms(avail, leg.precision)+' '+leg.ticker));
@@ -1736,7 +1736,12 @@ function moveToLightningDialog(leg){
       no.disabled=false; no.textContent='Close';
       await sync(); renderBalance(); renderLightningBalance();
     }catch(e){
-      st.className='status err'; st.textContent='Failed: '+prettyErr(e);
+      // Surface the open-fee-market outcome honestly: a funding tx that no producer will
+      // mine (no accepted fee asset) is the fee market working as designed, not a bug.
+      let msg = prettyErr(e);
+      if(/fee asset is not accepted|no exchange rate|not accepted .*fee/i.test(msg))
+        msg = 'No block producer currently accepts '+leg.ticker+' (or your other assets) for the on-chain funding fee, so it cannot be moved into Lightning yet. It becomes movable once a producer accepts a fee you can pay.';
+      st.className='status err'; st.textContent='Failed: '+msg;
       ok.disabled=false; no.disabled=false;
     }
   };

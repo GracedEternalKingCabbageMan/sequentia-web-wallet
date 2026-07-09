@@ -14,7 +14,7 @@ import assert from 'node:assert';
 import {
   initSeqln, seqlnConfigured, seqlnState, seqlnAvailable,
   connectDevice, disconnectDevice, seqlnGetStatus, seqlnSwap, lnFinalityCopy,
-  seqlnChannels, seqlnFunding, fundChannel,
+  seqlnChannels, seqlnFunding, seqlnNodes, provisionNode, fundChannel,
 } from './seqln.js';
 import { lnDeriveNode, lnDeriveAll, LN_PATHS } from './seqln-keys.js';
 
@@ -33,6 +33,17 @@ const srv = http.createServer((req, res) => {
     if (u.pathname === '/swap') return res.end(JSON.stringify({ ok: true, side: 'buy', direction: 'bought',
       asset_label: 'GOLD', base_amount: 100000, quote_amount: 200000,
       preimage: 'cd'.repeat(32), finality: 'final', settled_ms: 2100 }));
+    if (u.pathname === '/node/provision' && req.method === 'POST') {
+      const body = JSON.parse(b || '{}');
+      return res.end(JSON.stringify({ ok: true, asset_id: body.asset, label: body.label || 'X',
+        status: 'booting', node_id: null, host_pubkey: 'ee'.repeat(33),
+        public_ws_path: '/lsp-ws-node/X-0', ws_port: 18800, network: 'sequentia-testnet' }));
+    }
+    if (u.pathname === '/node/list') {
+      return res.end(JSON.stringify({ ok: true, nodes: [
+        { asset_id: 'aa'.repeat(32), label: 'USDX', status: 'running', node_id: 'dd'.repeat(33) },
+      ] }));
+    }
     if (u.pathname === '/channel/deposit') {
       const chain = u.searchParams.get('chain');
       return res.end(JSON.stringify({ ok: true, chain, node_id: 'cc'.repeat(33), address: chain === 'btc' ? 'tb1qdeposit' : 'tb1qseqdeposit' }));
@@ -200,6 +211,16 @@ assert.equal(funding.btc, true, 'funding.btc advertises the BTC leg');
 assert.equal(funding.assets.length, 1, 'funding.assets lists the one provisioned asset node (GOLD)');
 assert.equal(funding.assets[0].label, 'GOLD', 'the provisioned asset is GOLD');
 console.log('ok: seqlnFunding() advertises the fundable chains/assets (single-asset-node reality)');
+
+// provisionNode() POSTs {asset, device_transport_pubkey} to spin up a per-asset node.
+const prov = await provisionNode({ asset: 'ab'.repeat(32), deviceTransportPubkey: 'cc'.repeat(33), label: 'NEWX' });
+assert.ok(prov.ok && prov.host_pubkey && prov.public_ws_path, 'provisionNode returns node wiring');
+const provReq = seen.filter((s) => s.method === 'POST' && s.path === '/node/provision').at(-1);
+assert.deepEqual(JSON.parse(provReq.body), { asset: 'ab'.repeat(32), device_transport_pubkey: 'cc'.repeat(33), label: 'NEWX' },
+  'provisionNode forwards asset + device pubkey + label');
+const nodes = await seqlnNodes();
+assert.equal(nodes.length, 1, 'seqlnNodes lists the provisioned nodes (the dynamic M)');
+console.log('ok: provisionNode()/seqlnNodes() drive per-asset node provisioning (dynamic N/M)');
 
 // fundChannel: gets the deposit address, calls the wallet's OWN send hook (the wallet
 // signs the deposit — the LSP never holds the key), starts the open, polls to active.
