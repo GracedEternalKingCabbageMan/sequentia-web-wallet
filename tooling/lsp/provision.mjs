@@ -75,12 +75,18 @@ export function makeProvisioner(opts) {
   const load = () => { try { return JSON.parse(fs.readFileSync(REG, 'utf8')); } catch { return { nodes: {}, seq: 0 }; } };
   const save = (r) => fs.writeFileSync(REG, JSON.stringify(r, null, 2));
 
-  // Registry key. A seq node is keyed by ASSET (one hosted node per Sequentia asset,
-  // matching the existing registry); a btc node is keyed by DEVICE, so a real wallet
-  // gets its OWN non-custodial testnet4 BTC node (different users never share one).
-  // The device pubkey is recorded + must match on re-provision (fail closed otherwise).
+  // Registry key. BOTH chains are keyed by (asset, DEVICE) so each user gets their OWN
+  // non-custodial hosted node with their own funds/channels — two different devices
+  // provisioning the same asset get two DISTINCT nodes, and the same device re-provisioning
+  // re-attaches its existing node (idempotent). A btc node is device-only (`btc:<pub>`, one
+  // native testnet4 node per device); a seq node is asset+device (`seq:<assetId>:<pub>`).
+  // The device pubkey is baked into the key, so a cross-device collision is impossible.
+  // Back-compat: legacy seq nodes keyed by a bare asset id remain resolvable via getByKey /
+  // the asset scan below; they are never orphaned, only superseded per device going forward.
   const keyOf = (chain, assetId, devicePub) =>
-    chain === 'btc' ? `btc:${(devicePub || '').toLowerCase()}` : assetId.toLowerCase();
+    chain === 'btc'
+      ? `btc:${(devicePub || '').toLowerCase()}`
+      : `seq:${assetId.toLowerCase()}:${(devicePub || '').toLowerCase()}`;
 
   function nodeRpcAlive(rec) {
     try { execFile(CFG.lncli, [`--rpc-file=${rec.rpc}`, 'getinfo']); return true; } catch { return false; }
@@ -198,18 +204,30 @@ export function makeProvisioner(opts) {
   }
 
   function list() { const reg = load(); return Object.values(reg.nodes); }
-  function get(assetId) { const reg = load(); return reg.nodes[keyOf('seq', assetId, '')] || null; }
-  // Direct registry-key lookup (e.g. `btc:<devicepub>` for a per-user BTC node).
+  // First seq node for `assetId` on ANY device — a coarse legacy fallback (targetFor uses
+  // it only when the caller passes no device-scoped node key). Nodes are now device-scoped
+  // (`seq:<assetId>:<pub>`), so this scans by asset id and also matches legacy bare-asset
+  // keyed nodes (never orphaned). Per-device resolution goes through getByKey(node key).
+  function get(assetId) {
+    const reg = load(); const want = String(assetId).toLowerCase();
+    return Object.values(reg.nodes).find((r) => (r.chain || 'seq') !== 'btc' && r.asset_id === want)
+      || reg.nodes[want] || null;
+  }
+  // Direct registry-key lookup (`seq:<assetId>:<pub>` or `btc:<pub>`, or a legacy bare id).
   function getByKey(key) { const reg = load(); return reg.nodes[String(key).toLowerCase()] || null; }
   // Resolve the node whose public_ws_path is `${publicWsBase}/<id>` — the lookup the
   // central ws-router does to bridge `GET /lsp-ws-node/<id>` to that node's responder.
+  // public_ws_path carries the unique per-node `<label>-<idx>`, so it stays 1:1 even when
+  // several device-scoped nodes share one asset.
   function getByWsId(id) {
     const want = `${CFG.publicWsBase}/${id}`;
     const reg = load();
     return Object.values(reg.nodes).find((r) => r.public_ws_path === want) || null;
   }
-  async function refresh(assetId) {
-    const rec = get(assetId); if (!rec) return null;
+  // Refresh ONE node's live node_id/status by its registry KEY (not asset id — several
+  // device-scoped nodes can share an asset id, so each must be refreshed independently).
+  async function refresh(key) {
+    const reg0 = load(); const rec = reg0.nodes[String(key).toLowerCase()]; if (!rec) return null;
     const info = await getinfo(rec);
     if (info) { const reg = load(); reg.nodes[rec.key].node_id = info.id; reg.nodes[rec.key].status = 'running'; save(reg); return reg.nodes[rec.key]; }
     return rec;

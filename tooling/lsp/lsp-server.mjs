@@ -333,9 +333,14 @@ function targetFor(chain, assetId, nodeKey) {
 // provisioner has a node for. Dynamic — grows as the wallet provisions more assets.
 function fundableAssets() {
   const out = [];
-  if (CFG.channelPeerAsset) out.push({ id: CFG.gold, label: assetLabel(CFG.gold), provisioned: false });
+  const seen = new Set();
+  if (CFG.channelPeerAsset) { out.push({ id: CFG.gold, label: assetLabel(CFG.gold), provisioned: false }); seen.add(CFG.gold); }
+  // Nodes are per-DEVICE now (several nodes can share one asset), so advertise ONE row per
+  // asset — the wallet provisions its own device-scoped node for that asset on the click.
   if (PROV) for (const rec of PROV.list()) {
-    if (rec.asset_id === CFG.gold) continue;
+    if ((rec.chain || 'seq') === 'btc') continue;          // a btc node isn't a Sequentia asset
+    if (seen.has(rec.asset_id)) continue;
+    seen.add(rec.asset_id);
     out.push({ id: rec.asset_id, label: rec.label, provisioned: true, node_id: rec.node_id, status: rec.status });
   }
   return out;
@@ -621,13 +626,14 @@ const server = http.createServer(async (req, res) => {
           public_ws_path: rec.public_ws_path, network: rec.network });
       } catch (e) { return send(res, 409, { ok: false, error: String((e && e.message) || e) }); }
     }
-    // List the provisioned per-asset nodes (with a live node-id refresh).
+    // List the provisioned per-device nodes (with a live node-id refresh). Refresh by KEY:
+    // several device-scoped nodes can share one asset id, so each is refreshed on its own key.
     if (req.method === 'GET' && url.pathname === '/node/list') {
       if (!PROV) return send(res, 200, { ok: true, nodes: [] });
       const nodes = [];
       for (const rec of PROV.list()) {
-        const r = await PROV.refresh(rec.asset_id);
-        nodes.push({ asset_id: r.asset_id, label: r.label, status: r.status, node_id: r.node_id,
+        const r = await PROV.refresh(rec.key);
+        nodes.push({ key: r.key, chain: r.chain || 'seq', asset_id: r.asset_id, label: r.label, status: r.status, node_id: r.node_id,
           host_pubkey: r.host_pubkey, ws_port: r.ws_port, public_ws_path: r.public_ws_path, network: r.network });
       }
       return send(res, 200, { ok: true, nodes });
