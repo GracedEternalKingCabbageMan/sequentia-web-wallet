@@ -1678,6 +1678,7 @@ function lnSpendableFor(kind /* 'BTC' | assetHex */){
 // (device pubkey derivation is wasm — cheap, but not free).
 let _ownLnKeysSig='';
 async function refreshOwnLnNodeKeys(){
+  const phrase=(localStorage.getItem(KEY)||'').trim();   // module-scoped read (the mnemonic is not in scope here)
   if(!phrase) return;
   const held=Object.keys(balObj()).filter(h=>feeRateEntry(h)&&feeRateEntry(h).rate>0);
   const sig=held.slice().sort().join(',');
