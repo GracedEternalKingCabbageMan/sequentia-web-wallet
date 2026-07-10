@@ -1674,12 +1674,33 @@ async function renderLightningBalance(){
   const active = chans.filter(c=>String(c.state||'').startsWith('CHANNELD')).length;
   summ.textContent = active ? (active+' channel'+(active>1?'s':'')) : 'no channels yet';
   list.innerHTML='';
-  // One movable row per fundable leg: BTC first, then each provisioned asset node.
   const legs=[];
   if(funding.btc) legs.push({ kind:'BTC', ticker:'BTC', precision:8, onchain:btcBalance, chain:'btc', asset:null });
-  for(const a of (funding.assets||[])){
-    const meta=assetMeta(a.id); const bal=balObj()[a.id]||0n;
-    legs.push({ kind:a.id, ticker:meta.ticker||a.label, precision:meta.precision, onchain:bal, chain:'seq', asset:a.id });
+  // One movable row per Sequentia asset the user can ACTUALLY move to Lightning: any asset HELD
+  // on-chain that some block producer accepts for fees (so the funding tx — whose fee is paid IN
+  // that asset — will be mined), plus any asset already backing a live channel (so existing
+  // channels stay visible at 0 on-chain). This is what lets a freshly issued/received asset be
+  // moved to Lightning on demand — the LSP provisions the device's OWN node for it on the click.
+  // The ONLY gate is producer acceptance, read from the published fee feed: NO asset is
+  // privileged — tSEQ is judged by the exact same feed as every issued asset (first-principle #3;
+  // a node whose fee reference is USD and ignores SEQ would make tSEQ unmovable here, correctly).
+  // Legs are deliberately NOT taken from the LSP's funding.assets list: that only knows GOLD +
+  // previously-provisioned assets, so it both hid freshly-held assets and surfaced stale
+  // pre-re-genesis phantoms (wrong asset ids).
+  {
+    const bals=balObj();
+    const ids=new Set();
+    for(const h of Object.keys(bals)){
+      if(!(BigInt(bals[h]||0n)>0n)) continue;                        // must actually hold some
+      if(feeRateEntry(h) && feeRateEntry(h).rate>0) ids.add(h);      // ...that a producer prices for fees — uniform, no policy-asset exception
+    }
+    for(const a of (funding.assets||[])){                            // keep assets already backing a live channel
+      if(a && a.id && lnSpendableFor(a.id).channels>0) ids.add(a.id);
+    }
+    for(const h of ids){
+      const meta=assetMeta(h);
+      legs.push({ kind:h, ticker:meta.ticker||(h.slice(0,8)+'…'), precision:meta.precision, onchain:bals[h]||0n, chain:'seq', asset:h });
+    }
   }
   if(!legs.length){ list.appendChild(el('div','muted','Lightning funding is not available on this network yet.')); lnStatusPill(); return; }
   for(const leg of legs){
