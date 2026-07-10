@@ -48,12 +48,22 @@ export function makeProvisioner(opts) {
     wsRelay: opts.wsRelay,               // seqln-ws-relay.mjs
     node: opts.node,                     // node22 binary (to run the relay)
     lncli: opts.lncli,                   // lightning-cli
-    network: opts.network || 'sequentia-testnet',
-    elementsCli: opts.elementsCli,       // bitcoin-cli= for the config (elements-cli)
-    rpcConnect: opts.rpcConnect || '127.0.0.1',
-    rpcPort: opts.rpcPort,               // Sequentia (elements) node RPC port
-    rpcUser: opts.rpcUser, rpcPass: opts.rpcPass,
+    // Per-chain bitcoin backend. 'seq' (Sequentia/elements) is the default asset
+    // chain; 'btc' (testnet4) is added by the LSP env so ONE provisioner can boot
+    // BOTH a per-asset Sequentia node AND a per-user testnet4 BTC node. Each chain
+    // carries its own bitcoin RPC (port/user/pass), bitcoin-cli, lightningd network,
+    // funding feerate, and extra config lines.
+    chains: {
+      seq: {
+        network: opts.network || 'sequentia-testnet',
+        rpcConnect: opts.rpcConnect || '127.0.0.1',
+        rpcPort: opts.rpcPort, rpcUser: opts.rpcUser, rpcPass: opts.rpcPass,
+        cli: opts.elementsCli, feerate: 5000, extra: ['rescan=-1'],
+      },
+      ...(opts.chains || {}),
+    },
     // Port bases: each node claims addrPort, signerPort, wsPort from these ranges.
+    // Env-overridable so a second (live) LSP can avoid colliding with a running one.
     addrBase: opts.addrBase || 9760,
     signerBase: opts.signerBase || 9800,
     wsBase: opts.wsBase || 18800,
@@ -65,9 +75,12 @@ export function makeProvisioner(opts) {
   const load = () => { try { return JSON.parse(fs.readFileSync(REG, 'utf8')); } catch { return { nodes: {}, seq: 0 }; } };
   const save = (r) => fs.writeFileSync(REG, JSON.stringify(r, null, 2));
 
-  // A stable key per (asset, device). One device today, so keyed by asset; the device
-  // pubkey is recorded + must match on re-provision (a different device => a new node).
-  const keyOf = (assetId) => assetId.toLowerCase();
+  // Registry key. A seq node is keyed by ASSET (one hosted node per Sequentia asset,
+  // matching the existing registry); a btc node is keyed by DEVICE, so a real wallet
+  // gets its OWN non-custodial testnet4 BTC node (different users never share one).
+  // The device pubkey is recorded + must match on re-provision (fail closed otherwise).
+  const keyOf = (chain, assetId, devicePub) =>
+    chain === 'btc' ? `btc:${(devicePub || '').toLowerCase()}` : assetId.toLowerCase();
 
   function nodeRpcAlive(rec) {
     try { execFile(CFG.lncli, [`--rpc-file=${rec.rpc}`, 'getinfo']); return true; } catch { return false; }
@@ -85,18 +98,25 @@ export function makeProvisioner(opts) {
 
   // Provision (or return the existing) hosted node for `assetId`, keyed to the device's
   // transport pubkey. Boots lightningd + the relay if not already running.
-  async function provision({ assetId, deviceTransportPubkey, label }) {
-    if (!/^[0-9a-fA-F]{64}$/.test(assetId)) throw new Error('assetId must be a 32-byte hex id');
+  async function provision({ assetId, deviceTransportPubkey, label, chain = 'seq' }) {
+    const chainCfg = CFG.chains[chain];
+    if (!chainCfg) throw new Error(`unknown chain '${chain}' (want 'seq' or 'btc')`);
     if (!/^[0-9a-fA-F]{66}$/.test(deviceTransportPubkey || '')) throw new Error('deviceTransportPubkey must be a 33-byte compressed pubkey hex');
+    // A seq node is asset-denominated; a btc node holds native testnet4 BTC (no asset id).
+    if (chain === 'seq') {
+      if (!/^[0-9a-fA-F]{64}$/.test(assetId)) throw new Error('assetId must be a 32-byte hex id');
+    } else {
+      assetId = 'btc';
+    }
     const reg = load();
-    const key = keyOf(assetId);
+    const key = keyOf(chain, assetId, deviceTransportPubkey);
     let rec = reg.nodes[key];
 
     if (rec) {
       // Idempotent: the SAME device re-attaching gets the same node. A DIFFERENT device
       // is refused (its funds would live under a different node identity) — fail closed.
       if (rec.deviceTransportPubkey.toLowerCase() !== deviceTransportPubkey.toLowerCase()) {
-        throw new Error('this asset node is already provisioned for a different device');
+        throw new Error(`this ${chain} node is already provisioned for a different device`);
       }
       const info = await getinfo(rec);
       if (info) { rec.node_id = info.id; rec.status = 'running'; save(reg); return rec; }
@@ -111,7 +131,8 @@ export function makeProvisioner(opts) {
     const addrPort = CFG.addrBase + idx;
     const signerPort = CFG.signerBase + idx;
     const wsPort = CFG.wsBase + idx;
-    const id = `${(label || assetId.slice(0, 8))}-${idx}`.replace(/[^a-zA-Z0-9._-]/g, '');
+    const baseLabel = label || (chain === 'btc' ? 'BTC' : assetId.slice(0, 8));
+    const id = `${baseLabel}-${idx}`.replace(/[^a-zA-Z0-9._-]/g, '');
     const dir = path.join(CFG.dir, `node-${id}`);
     fs.mkdirSync(dir, { recursive: true });
 
@@ -122,29 +143,29 @@ export function makeProvisioner(opts) {
     fs.writeFileSync(path.join(dir, 'host_pub'), hostPub + '\n', { mode: 0o644 });
 
     const config = [
-      `bitcoin-rpcuser=${CFG.rpcUser}`,
-      `bitcoin-rpcpassword=${CFG.rpcPass}`,
-      `bitcoin-rpcconnect=${CFG.rpcConnect}`,
-      `bitcoin-rpcport=${CFG.rpcPort}`,
-      `bitcoin-cli=${CFG.elementsCli}`,
+      `bitcoin-rpcuser=${chainCfg.rpcUser}`,
+      `bitcoin-rpcpassword=${chainCfg.rpcPass}`,
+      `bitcoin-rpcconnect=${chainCfg.rpcConnect || CFG.chains.seq.rpcConnect || '127.0.0.1'}`,
+      `bitcoin-rpcport=${chainCfg.rpcPort}`,
+      `bitcoin-cli=${chainCfg.cli}`,
       `addr=127.0.0.1:${addrPort}`,
       'funding-confirms=1',
       'allow-deprecated-apis=true',
-      'force-feerates=5000',
+      `force-feerates=${chainCfg.feerate}`,
       'log-level=debug',
       `log-file=${path.join(dir, 'lightningd.log')}`,
       `subdaemon=hsmd:${CFG.hsmdProxy}`,
-      'rescan=-1',
+      ...(chainCfg.extra || []),
     ].join('\n') + '\n';
     fs.writeFileSync(path.join(dir, 'config'), config);
 
     rec = {
-      key, asset_id: assetId.toLowerCase(), label: label || assetId.slice(0, 8),
+      key, chain, asset_id: chain === 'btc' ? 'btc' : assetId.toLowerCase(), label: baseLabel,
       dir, addrPort, signerPort, wsPort,
       ws_port: wsPort, public_ws_path: `${CFG.publicWsBase}/${id}`,
       host_pubkey: hostPub, deviceTransportPubkey: deviceTransportPubkey.toLowerCase(),
-      rpc: path.join(dir, CFG.network, 'lightning-rpc'),
-      network: CFG.network, node_id: null, status: 'booting', created_ms: Date.now(),
+      rpc: path.join(dir, chainCfg.network, 'lightning-rpc'),
+      network: chainCfg.network, node_id: null, status: 'booting', created_ms: Date.now(),
     };
     reg.nodes[key] = rec;
     save(reg);
@@ -163,7 +184,7 @@ export function makeProvisioner(opts) {
     };
     const lnLog = fs.openSync(path.join(rec.dir, 'boot.out'), 'a');
     const ld = spawn(CFG.lightningd,
-      [`--lightning-dir=${rec.dir}`, `--network=${CFG.network}`, '--developer'],
+      [`--lightning-dir=${rec.dir}`, `--network=${rec.network}`, '--developer'],
       { env, detached: true, stdio: ['ignore', lnLog, lnLog] });
     ld.unref();
     // The relay: ws front -> the proxy's Noise responder. --tcp-retry-ms rides out the
@@ -177,7 +198,16 @@ export function makeProvisioner(opts) {
   }
 
   function list() { const reg = load(); return Object.values(reg.nodes); }
-  function get(assetId) { const reg = load(); return reg.nodes[keyOf(assetId)] || null; }
+  function get(assetId) { const reg = load(); return reg.nodes[keyOf('seq', assetId, '')] || null; }
+  // Direct registry-key lookup (e.g. `btc:<devicepub>` for a per-user BTC node).
+  function getByKey(key) { const reg = load(); return reg.nodes[String(key).toLowerCase()] || null; }
+  // Resolve the node whose public_ws_path is `${publicWsBase}/<id>` — the lookup the
+  // central ws-router does to bridge `GET /lsp-ws-node/<id>` to that node's responder.
+  function getByWsId(id) {
+    const want = `${CFG.publicWsBase}/${id}`;
+    const reg = load();
+    return Object.values(reg.nodes).find((r) => r.public_ws_path === want) || null;
+  }
   async function refresh(assetId) {
     const rec = get(assetId); if (!rec) return null;
     const info = await getinfo(rec);
@@ -185,7 +215,7 @@ export function makeProvisioner(opts) {
     return rec;
   }
 
-  return { provision, list, get, refresh, getinfo, pubkeyOf, CFG };
+  return { provision, list, get, getByKey, getByWsId, refresh, getinfo, pubkeyOf, CFG };
 }
 
 export { pubkeyOf };

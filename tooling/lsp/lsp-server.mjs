@@ -91,6 +91,7 @@ import path from 'node:path';
 import crypto from 'node:crypto';
 import { execFile } from 'node:child_process';
 import { makeProvisioner } from './provision.mjs';
+import { acceptUpgrade, bridgeWsToTcp } from './ws-bridge.mjs';
 
 function reqEnv(name) {
   const v = process.env[name];
@@ -148,6 +149,22 @@ const CFG = {
   seqRpcPort: Number(process.env.SEQ_RPC_PORT || 0),
   seqRpcUser: process.env.SEQ_RPC_USER || '',
   seqRpcPass: process.env.SEQ_RPC_PASS || '',
+  // --- per-USER BTC (testnet4) node provisioning (POST /node/provision {chain:'btc'}) ---
+  // A real wallet gets its OWN keyless testnet4 node — non-custodial, device-signed —
+  // NOT the shared demo-btc node. These point the provisioner's 'btc' chain at the
+  // testnet4 bitcoind + bitcoin-cli. Unset => BTC provisioning disabled (seq only).
+  btcRpcPort: Number(process.env.BTC_RPC_PORT || 0),
+  btcRpcUser: process.env.BTC_RPC_USER || process.env.SEQ_RPC_USER || '',
+  btcRpcPass: process.env.BTC_RPC_PASS || process.env.SEQ_RPC_PASS || '',
+  btcCli: process.env.BTC_CLI || '',
+  btcNetwork: process.env.BTC_NETWORK || 'testnet4',
+  btcFeerate: Number(process.env.BTC_FEERATE || 1000),
+  // The routing peer a provisioned per-user BTC node opens its channel to.
+  channelPeerBtcProvisioned: process.env.CHANNEL_PEER_BTC_PROVISIONED || process.env.CHANNEL_PEER_BTC || '',
+  // Optional port-base overrides so a second LSP never collides on 9760/9800/18800.
+  provAddrBase: Number(process.env.PROV_ADDR_BASE || 0) || undefined,
+  provSignerBase: Number(process.env.PROV_SIGNER_BASE || 0) || undefined,
+  provWsBase: Number(process.env.PROV_WS_BASE || 0) || undefined,
 };
 
 // The per-asset node provisioner (enabled when the boot binaries + dir are configured).
@@ -155,12 +172,24 @@ const CFG = {
 // per asset spun up on demand, keyed to the connecting device. This is that mechanism.
 let PROV = null;
 if (CFG.provDir && CFG.lightningd && CFG.hsmdProxy && CFG.wsRelay && CFG.elementsCli && CFG.seqRpcPort) {
+  // Per-chain backends. 'seq' (elements) is always configured; 'btc' (testnet4) is
+  // added only when BTC_RPC_PORT + BTC_CLI are set, enabling per-user BTC nodes.
+  const chains = {};
+  if (CFG.btcRpcPort && CFG.btcCli) {
+    chains.btc = {
+      network: CFG.btcNetwork, rpcConnect: '127.0.0.1',
+      rpcPort: CFG.btcRpcPort, rpcUser: CFG.btcRpcUser, rpcPass: CFG.btcRpcPass,
+      cli: CFG.btcCli, feerate: CFG.btcFeerate, extra: ['min-emergency-msat=1000sat'],
+    };
+  }
   PROV = makeProvisioner({
     dir: CFG.provDir, lightningd: CFG.lightningd, hsmdProxy: CFG.hsmdProxy, wsRelay: CFG.wsRelay,
     node: CFG.nodeBin, lncli: CFG.lncli, elementsCli: CFG.elementsCli,
     rpcPort: CFG.seqRpcPort, rpcUser: CFG.seqRpcUser, rpcPass: CFG.seqRpcPass,
+    chains,
+    addrBase: CFG.provAddrBase, signerBase: CFG.provSignerBase, wsBase: CFG.provWsBase,
   });
-  console.error(`[lsp] per-asset node provisioning ENABLED (dir ${CFG.provDir})`);
+  console.error(`[lsp] per-asset node provisioning ENABLED (dir ${CFG.provDir}; chains: seq${chains.btc ? ',btc' : ''})`);
 }
 if (!CFG.hostedAssetRpc || !CFG.hostedBtcRpc) {
   console.error('[lsp] missing hosted RPC: set HOSTED_ASSET_RPC + HOSTED_BTC_RPC (or HOSTED_RPC as a fallback for both)');
@@ -283,7 +312,14 @@ const CHAINS = { btc: 'btc', seq: 'seq', sequentia: 'seq', asset: 'seq' };
 // node. seq GOLD -> the demo asset node (the one in active use). seq OTHER asset -> the
 // per-asset node the provisioner booted for it (single-asset SeqLN reality). Returns
 // { rpc, peer, provisioned } or { rpc:null } if there is no hosted node for that asset.
-function targetFor(chain, assetId) {
+function targetFor(chain, assetId, nodeKey) {
+  // An explicit provisioned-node key (e.g. `btc:<devicepub>`) wins: it routes to the
+  // user's OWN provisioned node (non-custodial), not a shared demo node. This is how a
+  // per-user BTC channel is funded — the request names the device's provisioned node.
+  if (PROV && nodeKey) {
+    const rec = PROV.getByKey(nodeKey);
+    if (rec) return { rpc: rec.rpc, peer: rec.lp_peer || (rec.chain === 'btc' ? CFG.channelPeerBtcProvisioned : CFG.channelPeerProvisioned), provisioned: true, rec };
+  }
   if (chain === 'btc') return { rpc: CFG.hostedBtcRpc, peer: CFG.channelPeerBtc, provisioned: false };
   // seq: the demo GOLD node stays the canonical GOLD node (in active use).
   if (assetId && assetId === CFG.gold) return { rpc: CFG.hostedAssetRpc, peer: CFG.channelPeerAsset, provisioned: false };
@@ -342,8 +378,8 @@ function reapChannelJobs() {
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 // GET /channel/deposit?chain=btc|seq[&asset=<id>] -> the hosted node's deposit address.
-async function channelDeposit(chain, assetId) {
-  const { rpc } = targetFor(chain, chain === 'seq' ? (assetId || CFG.gold) : null);
+async function channelDeposit(chain, assetId, nodeKey) {
+  const { rpc } = targetFor(chain, chain === 'seq' ? (assetId || CFG.gold) : null, nodeKey);
   if (!rpc) throw new Error('no hosted node for that asset (provision it first)');
   const info = await lnrpc('getinfo', [], rpc);
   const na = await lnrpc('newaddr', ['bech32'], rpc);
@@ -353,7 +389,7 @@ async function channelDeposit(chain, assetId) {
 
 // The background worker: watch for the deposit, then fundchannel (device-co-signed).
 async function runChannelOpen(job) {
-  const { rpc, peer } = targetFor(job.chain, job.asset_id);
+  const { rpc, peer } = targetFor(job.chain, job.asset_id, job.node_key);
   if (!rpc) throw new Error('no hosted node for that asset');
   if (!peer) throw new Error('no routing peer configured for that asset');
   const [peerId, peerAddr] = peer.split('@');
@@ -419,7 +455,9 @@ function startChannelOpen(body) {
     if (!assetId) return { ok: false, error: 'unknown asset (want GOLD or a 32-byte hex id)' };
     if (assetId === CFG.btcx) return { ok: false, error: 'that id is the BTC leg; use chain=btc' };
   }
-  const { rpc, peer } = targetFor(chain, assetId);
+  // A provisioned-node key (e.g. `btc:<devicepub>`) routes to the user's OWN node.
+  const nodeKey = body.node || null;
+  const { rpc, peer } = targetFor(chain, assetId, nodeKey);
   if (!rpc) {
     return { ok: false, error: `this LSP has no hosted Lightning node for ${assetLabel(assetId)} yet. `
       + 'SeqLN nodes are single-asset, so provision one first: POST /node/provision {asset}.' };
@@ -427,7 +465,7 @@ function startChannelOpen(body) {
   if (!peer) return { ok: false, error: `no routing peer configured for ${chain === 'btc' ? 'BTC' : assetLabel(assetId)}` };
   reapChannelJobs();
   const jobId = crypto.randomUUID();
-  const job = { ok: true, job_id: jobId, chain, asset_id: assetId,
+  const job = { ok: true, job_id: jobId, chain, asset_id: assetId, node_key: nodeKey,
     asset_label: assetId ? assetLabel(assetId) : (chain === 'btc' ? 'BTC' : null),
     requested_amount: amount, peer_id: peer.split('@')[0], status: 'pending_deposit',
     state: null, funding_txid: null, short_channel_id: null, started_ms: Date.now() };
@@ -562,14 +600,23 @@ const server = http.createServer(async (req, res) => {
       if (!PROV) return send(res, 501, { ok: false, error: 'per-asset node provisioning is not enabled on this LSP' });
       const body = await readBody(req);
       if (!body) return send(res, 400, { ok: false, error: 'bad json body' });
-      const assetId = resolveAsset(body.asset);
-      if (!assetId || assetId === CFG.btcx) return send(res, 400, { ok: false, error: 'asset must be a Sequentia asset (GOLD or a 32-byte hex id)' });
+      const chain = CHAINS[String(body.chain || 'seq').toLowerCase()] || 'seq';
       if (!/^[0-9a-fA-F]{66}$/.test(body.device_transport_pubkey || '')) {
         return send(res, 400, { ok: false, error: 'device_transport_pubkey (33-byte compressed hex) is required — the node pins it so only your device can sign' });
       }
+      let provArgs;
+      if (chain === 'btc') {
+        // Per-user BTC: a keyless testnet4 node keyed to THIS device (not the shared demo).
+        if (!PROV.CFG.chains.btc) return send(res, 501, { ok: false, error: 'per-user BTC provisioning is not enabled on this LSP (set BTC_RPC_PORT + BTC_CLI)' });
+        provArgs = { chain: 'btc', deviceTransportPubkey: body.device_transport_pubkey, label: body.label || 'BTC' };
+      } else {
+        const assetId = resolveAsset(body.asset);
+        if (!assetId || assetId === CFG.btcx) return send(res, 400, { ok: false, error: 'asset must be a Sequentia asset (GOLD or a 32-byte hex id), or pass chain:"btc"' });
+        provArgs = { chain: 'seq', assetId, deviceTransportPubkey: body.device_transport_pubkey, label: body.label || assetLabel(assetId) };
+      }
       try {
-        const rec = await PROV.provision({ assetId, deviceTransportPubkey: body.device_transport_pubkey, label: body.label || assetLabel(assetId) });
-        return send(res, 200, { ok: true, asset_id: rec.asset_id, label: rec.label, status: rec.status,
+        const rec = await PROV.provision(provArgs);
+        return send(res, 200, { ok: true, chain: rec.chain || 'seq', key: rec.key, asset_id: rec.asset_id, label: rec.label, status: rec.status,
           node_id: rec.node_id, host_pubkey: rec.host_pubkey, ws_port: rec.ws_port,
           public_ws_path: rec.public_ws_path, network: rec.network });
       } catch (e) { return send(res, 409, { ok: false, error: String((e && e.message) || e) }); }
@@ -589,10 +636,11 @@ const server = http.createServer(async (req, res) => {
     if (req.method === 'GET' && url.pathname === '/channel/deposit') {
       const chain = CHAINS[String(url.searchParams.get('chain') || '').toLowerCase()];
       if (!chain) return send(res, 400, { ok: false, error: "chain must be 'btc' or 'seq'" });
+      const nodeKey = url.searchParams.get('node') || null;
       const assetId = chain === 'seq' ? (resolveAsset(url.searchParams.get('asset') || 'GOLD') || CFG.gold) : null;
-      const { rpc } = targetFor(chain, assetId);
-      if (!rpc) return send(res, 501, { ok: false, error: `no hosted Lightning node for that asset — provision it first (POST /node/provision)` });
-      return send(res, 200, await channelDeposit(chain, assetId));
+      const { rpc } = targetFor(chain, assetId, nodeKey);
+      if (!rpc) return send(res, 501, { ok: false, error: `no hosted Lightning node for that ${chain === 'btc' ? 'BTC node' : 'asset'} — provision it first (POST /node/provision)` });
+      return send(res, 200, await channelDeposit(chain, assetId, nodeKey));
     }
     // Poll a "Move to Lightning" channel-open job.
     if (req.method === 'GET' && url.pathname.startsWith('/channel/open/')) {
@@ -670,6 +718,39 @@ const server = http.createServer(async (req, res) => {
     send(res, 404, { ok: false, error: 'not found' });
   } catch (e) { send(res, 500, { ok: false, error: e.message }); }
 });
+// ---------------------------------------------------------------------------
+// GAP B — the central device-signer WS-ROUTER.
+//
+// ONE endpoint, `GET /lsp-ws-node/<id>` (WebSocket upgrade), reaches EVERY
+// provisioned node: it looks <id> up in the provision registry and byte-bridges
+// the browser's WebSocket to that node's Noise responder (127.0.0.1:<signerPort>,
+// the hsmd proxy's SEQLN_SIGNER_LISTEN). So a SINGLE static Caddy rule
+// `wss://…/lsp-ws-node/*  ->  reverse_proxy 127.0.0.1:<LSP_PORT>` serves all
+// nodes — no per-node Caddy edits, ever. Each provision's `public_ws_path` is
+// exactly this path. The router is keyless: the Noise_XK handshake + signer
+// frames flow end-to-end browser<->proxy; the LSP never sees a plaintext byte.
+// ---------------------------------------------------------------------------
+let wsConnSeq = 0;
+server.on('upgrade', (req, socket) => {
+  try {
+    const u = new URL(req.url, `http://127.0.0.1:${CFG.port}`);
+    const m = u.pathname.match(/^\/lsp-ws-node\/([A-Za-z0-9._-]+)$/);
+    if (!m) { socket.end('HTTP/1.1 404 Not Found\r\n\r\n'); return; }
+    if (!PROV) { socket.end('HTTP/1.1 501 Not Implemented\r\n\r\n'); return; }
+    const rec = PROV.getByWsId(m[1]);
+    if (!rec) { socket.end('HTTP/1.1 404 Not Found\r\n\r\n'); return; }
+    if (!acceptUpgrade(req, socket)) return;
+    const id = ++wsConnSeq;
+    bridgeWsToTcp(socket, req, {
+      tcpHost: '127.0.0.1', tcpPort: rec.signerPort, tcpRetryMs: 120000, id,
+      log: (...a) => console.error('[ws-router]', `[${rec.public_ws_path}]`, ...a),
+    });
+  } catch (e) {
+    try { socket.end('HTTP/1.1 500 Internal Server Error\r\n\r\n'); } catch {}
+    console.error('[ws-router] upgrade error:', e.message);
+  }
+});
+
 server.listen(CFG.port, '127.0.0.1', () => {
   console.error(`[lsp] listening http://127.0.0.1:${CFG.port}  asset-rpc ${CFG.hostedAssetRpc}  btc-rpc ${CFG.hostedBtcRpc}  relay ${CFG.relay}`);
 });
