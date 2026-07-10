@@ -644,7 +644,15 @@ function railSupported(p, r){
   const payIsBtc = (S.payAsset === 'BTC');        // buy asset (pay BTC) vs sell asset (pay the asset)
   if (payIsBtc){
     if (p === 'ln' && r === 'chain') return true;                       // buy: BTC over LN + asset on-chain
-    if (p === 'chain' && r === 'ln') return subassetCapable(S.receiveAsset); // buy: BTC on-chain + asset over LN (sub-asset)
+    if (p === 'chain' && r === 'ln')
+      // Sub-asset (buy asset over Lightning + BTC on-chain): a deployed maker is NECESSARY
+      // but not sufficient — the wallet must actually be able to RECEIVE the asset over
+      // Lightning, which needs real inbound liquidity on that asset's channel. Until the
+      // JIT-inbound receive is wired, also require a usable receive channel so the toggle
+      // never silently downgrades to the on-chain cross route (findRoute would otherwise
+      // recompute recv=chain and fall through to kind:'cross').
+      return subassetCapable(S.receiveAsset)
+        && lnAvailable() && railAvail(S.payAsset, S.receiveAsset).recvLn.ok;
     return false;
   }
   return (p === 'chain' && r === 'ln');           // sell: asset on-chain + BTC over LN
@@ -671,7 +679,16 @@ function paintRailSegs(ra){
       let bad = false, tip = '';
       const p2 = leg === 'pay' ? r : S.payRail;
       const r2 = leg === 'pay' ? S.recvRail : r;
-      if (r !== 'chain' && !railSupported(p2, r2)){ bad = true; tip = badTip; }
+      if (r !== 'chain' && !railSupported(p2, r2)){ bad = true;
+        // Distinguish "no maker for this shape at all" from "a sub-asset maker exists but
+        // you have no inbound Lightning liquidity to receive the asset" — the latter is the
+        // sub-asset buy case, and saying "no maker" there would be wrong.
+        const subAssetNoInbound = leg === 'recv' && S.payAsset === 'BTC' && p2 === 'chain'
+          && subassetCapable(S.receiveAsset);
+        tip = subAssetNoInbound
+          ? `Receiving ${C.assetMeta(S.receiveAsset).ticker} over Lightning needs inbound Lightning liquidity for it (coming soon). For now, receive it on-chain.`
+          : badTip;
+      }
       else if (r === 'ln' && !legLn.ok){ tip = legLn.cta === 'add'
         ? (legLn.reason + (legLn.hint ? ' ' + legLn.hint : ''))
         : 'No channel yet — one is opened for you when you place the order.'; }
