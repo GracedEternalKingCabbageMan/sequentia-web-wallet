@@ -441,16 +441,20 @@ async function runChannelOpen(job) {
   job.status = 'opening';
   try { await lnrpc('connect', [peerAddr ? `${peerId}@${peerAddr}` : peerId], rpc); }
   catch (e) { job.connect_note = e.message; /* often already connected */ }
-  // Plain fundchannel with amount=all and NO utxos pin. The provisioned node is
-  // SINGLE-ASSET (it holds only the deposited asset), so fundchannel's own coin-selection
-  // funds the channel with that asset and pays the on-chain fee IN THAT ASSET (it is
-  // fee-rated) — one all-asset funding tx (asset channel + asset fee), byte-shape matching
-  // the working demo GOLD channel. Pinning `utxos` forced fundchannel to denominate the fee
-  // output in the POLICY asset (tSEQ), which a single-asset node holds none of, so the tx
-  // could not balance -> `bad-txns-in-ne-out`. `amount=all` moves the whole deposit into the
-  // channel minus the (tiny, in-asset) fee, so the wallet never needs to over-deposit a fee
-  // buffer. The node being single-asset is what guarantees the channel asset (no pin needed).
-  const fc = await lnrpc('fundchannel', [`id=${peerId}`, 'amount=all', 'announce=true'], rpc);
+  // Plain fundchannel with an EXPLICIT asset amount and NO utxos pin. The provisioned node
+  // is SINGLE-ASSET (it holds only the deposited asset, whose atoms ARE the node's "sats"),
+  // so fundchannel's own coin-selection funds the channel with that asset AND pays the
+  // on-chain fee IN THAT ASSET (it is fee-rated) — one all-asset funding tx (asset channel +
+  // asset change + asset fee), byte-shape matching the working demo GOLD channel. Two traps
+  // avoided: (1) pinning `utxos` forced the fee output into the POLICY asset (tSEQ), which a
+  // single-asset node holds none of -> the tx could not balance -> `bad-txns-in-ne-out`; and
+  // (2) `amount=all` is NOT usable — CLN treats it as "all POLICY-asset funds", of which a
+  // single-asset node has zero -> "Could not afford ... 0 available UTXOs". So we fund an
+  // explicit amount = the confirmed deposit minus a tiny reserve that leaves room for the
+  // (few-atom, fee-rated) asset fee; the leftover stays on the node's wallet (recoverable).
+  const FEE_RESERVE = 20000; // atoms held back for the in-asset on-chain fee (fee is ~1 atom)
+  const fundAmount = Math.max(1, (job.confirmed_units || need) - FEE_RESERVE);
+  const fc = await lnrpc('fundchannel', [`id=${peerId}`, `amount=${fundAmount}`, 'announce=true'], rpc);
   job.funding_txid = fc.txid || (fc.txids && fc.txids[0]) || null;
   job.channel_id = fc.channel_id || null;
 
