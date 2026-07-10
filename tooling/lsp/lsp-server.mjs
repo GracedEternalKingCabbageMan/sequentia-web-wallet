@@ -632,12 +632,11 @@ function runMixed({ side, asset, amount, payRail, recvRail }) {
     const assetId = resolveAsset(asset);
     if (side !== 'buy' && side !== 'sell') return resolve({ ok: false, error: "side must be 'buy' or 'sell'" });
     if (!assetId || assetId === CFG.btcx) return resolve({ ok: false, error: 'mixed swap needs a Sequentia asset id (not BTC)' });
-    if (!CFG.seqRpc || !CFG.seqWallet) {
-      return resolve({ ok: false, error: 'the mixed (submarine) rail is not configured on this LSP (set SEQ_RPC + SEQ_WALLET)' });
-    }
     // Map (side, payRail, recvRail) -> the submarine CLI. The three deployed shapes:
     //   asset-on-chain <-> BTC-LN (xsubbuy/xsublift, via -seq-rpc/-seq-wallet), and
     //   the MIRROR asset-over-LN + BTC-on-chain (xsubas, via -btc-rpc/-asset-ln-socket).
+    // The SEQ_RPC/SEQ_WALLET config is required ONLY by the on-chain-asset submarine
+    // branches; the sub-asset branch has no on-chain asset leg, so it is checked there.
     const stateFile = path.join(os.tmpdir(), `lsp-mixed-${Date.now()}-${Math.random().toString(36).slice(2)}.json`);
     let args;
     if (side === 'buy' && payRail === 'chain' && recvRail === 'ln') {
@@ -654,6 +653,9 @@ function runMixed({ side, asset, amount, payRail, recvRail }) {
         '-asset-ln-socket', CFG.subasAssetLn, '-min-btc-conf', String(CFG.subasMinBtcConf),
         '-asset-invoice', 'plain', '-state-file', stateFile];
     } else {
+      if (!CFG.seqRpc || !CFG.seqWallet) {
+        return resolve({ ok: false, error: 'the mixed (submarine) rail is not configured on this LSP (set SEQ_RPC + SEQ_WALLET)' });
+      }
       let cmd, extra;
       if (side === 'buy' && payRail === 'ln' && recvRail === 'chain') {
         cmd = 'xsubbuy';                                       // BTC-LN in, asset on-chain out
