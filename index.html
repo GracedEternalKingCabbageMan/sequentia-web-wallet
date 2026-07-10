@@ -1882,7 +1882,11 @@ function moveToLightningDialog(leg){
       // mine (no accepted fee asset) is the fee market working as designed, not a bug.
       let msg = prettyErr(e);
       if(/fee asset is not accepted|no exchange rate|not accepted .*fee/i.test(msg))
-        msg = 'No block producer currently accepts '+leg.ticker+' (or your other assets) for the on-chain funding fee, so it cannot be moved into Lightning yet. It becomes movable once a producer accepts a fee you can pay.';
+        msg = 'No block producer currently accepts '+leg.ticker+' for the on-chain funding fee, so it cannot be moved into Lightning yet. It becomes movable once a producer accepts it for fees.';
+      else if(/insufficient funds|missing \d+ units/i.test(msg))
+        // The funding fee is paid in this same asset, so moving the FULL balance leaves nothing for
+        // the fee. Guide the user to leave a little behind rather than showing a raw shortfall.
+        msg = 'Not enough '+leg.ticker+' to cover the amount plus the on-chain network fee (the fee is paid in '+leg.ticker+'). Move a slightly smaller amount so a little '+leg.ticker+' is left for the fee.';
       st.className='status err'; st.textContent='Failed: '+msg;
       ok.disabled=false; no.disabled=false;
     }
