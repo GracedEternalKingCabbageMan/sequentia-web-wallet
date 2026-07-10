@@ -317,12 +317,22 @@ async function lspFetch(path, opts = {}) {
   if (!r.ok || j.ok === false) throw new Error(j.error || ('HTTP ' + r.status));
   return j;
 }
+// Registry keys for the device's OWN provisioned nodes to also read in /status, BEYOND the ones
+// connected this session (provNodes). The wallet reconstructs these from its mnemonic on load
+// (`registerOwnStatusKeys`), so a REOPENED wallet still reads back channels on its own nodes —
+// else a just-moved balance looks gone after a refresh. Self-scoped: only keys this device could
+// derive are added, and the LSP resolves a key ONLY if this device actually provisioned that node,
+// so a candidate key for a node that was never opened simply returns nothing.
+const ownStatusKeys = new Set();
+export function registerOwnStatusKeys(keys) { for (const k of (keys || [])) if (k) ownStatusKeys.add(String(k).toLowerCase()); }
+
 // Both hosted nodes' ids + per-asset channel balances (spendable=send, recv=recv). Passes THIS
 // device's provisioned-node keys (`?nodes=`) so /status also reports the device's OWN per-asset
-// channels — so the Balance card reflects a channel the user just created on their own node
-// (not only the shared demo nodes). Only keys this device derived are sent, so it stays self-scoped.
+// channels — so the Balance card reflects a channel the user created on their own node (not only
+// the shared demo nodes), including across page reloads. Only keys this device derived are sent,
+// so it stays self-scoped.
 export function seqlnGetStatus() {
-  const keys = Object.keys(provNodes);
+  const keys = [...new Set([...Object.keys(provNodes), ...ownStatusKeys])];
   return lspFetch('/status' + (keys.length ? ('?nodes=' + encodeURIComponent(keys.join(','))) : ''));
 }
 // Take a cross-chain offer through the LSP: {side:'buy'|'sell', asset, amount,

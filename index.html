@@ -736,7 +736,8 @@ import { initXrswap, fetchRQuote, openReverseFromComposer, hasInFlight as hasRev
 import { initXmaker, startForwardMaker, startReverseMaker, liveMakerOffers, resumeMakerSwaps } from './xmaker.js';
 import { initSeqln, connectDevice as lnConnectDevice, disconnectDevice as lnDisconnect,
   onSeqlnStatus, seqlnState, seqlnAvailable, seqlnGetStatus, seqlnSwap, lnFinalityCopy,
-  seqlnChannels, seqlnFunding, fundChannel, provisionAndConnect, waitNodeReady, provisionedState } from './seqln.js';
+  seqlnChannels, seqlnFunding, fundChannel, provisionAndConnect, waitNodeReady, provisionedState,
+  deviceTransportPubkey, registerOwnStatusKeys } from './seqln.js';
 import { lnDeriveNode, lnDeriveAsset } from './seqln-keys.js';
 
 const ESPLORA = location.origin + '/api';
@@ -1669,11 +1670,34 @@ function lnSpendableFor(kind /* 'BTC' | assetHex */){
 // Render the Balance-tab "Lightning" card: for BTC and every asset the LSP can fund
 // (dynamic — one row per hosted node, NOT hardcoded), show the in-channel balance and
 // a Move-to-Lightning action. Reads /status live; hides itself if LN isn't deployed.
+// Reconstruct THIS wallet's OWN provisioned-node registry keys (BTC + each held fee-rated asset)
+// from the mnemonic, so /status reads back channels on the user's own nodes even after a page
+// reload (seqln.js's provNodes only holds nodes connected THIS session). The LSP resolves a key
+// only if this device actually provisioned that node, so listing candidates is safe + self-scoped;
+// a never-opened candidate simply returns nothing. Recomputed only when the held-asset set changes
+// (device pubkey derivation is wasm — cheap, but not free).
+let _ownLnKeysSig='';
+async function refreshOwnLnNodeKeys(){
+  if(!phrase) return;
+  const held=Object.keys(balObj()).filter(h=>feeRateEntry(h)&&feeRateEntry(h).rate>0);
+  const sig=held.slice().sort().join(',');
+  if(sig===_ownLnKeysSig) return;
+  const keys=[];
+  try{ const k=lnNodeIdentity(phrase,'btc'); const pub=await deviceTransportPubkey(k.deviceTransportPrivkey);
+    if(pub) keys.push('btc:'+String(pub).toLowerCase()); }catch{}
+  for(const a of held){
+    try{ const id=lnDeriveAsset(phrase,a); const pub=await deviceTransportPubkey(id.transportPrivkey);
+      if(pub) keys.push('seq:'+a.toLowerCase()+':'+String(pub).toLowerCase()); }catch{}
+  }
+  registerOwnStatusKeys(keys);
+  _ownLnKeysSig=sig;
+}
 async function renderLightningBalance(){
   const card=$('lnBalanceCard'); const list=$('lnBalList'); const summ=$('lnBalSummary');
   if(!card||!list) return;
   if(!seqlnState().deployed){ card.classList.add('hide'); return; }
   card.classList.remove('hide');
+  try{ await refreshOwnLnNodeKeys(); }catch{}   // so /status includes this device's own nodes across reloads
   let funding, chans;
   try{ lnLastStatus = await seqlnGetStatus(); funding = lnLastStatus.funding || { btc:false, assets:[] }; chans = lnLastStatus.channels||[]; }
   catch(e){ list.innerHTML=''; summ.textContent=''; $('lnBalStatus').className='status err'; $('lnBalStatus').textContent='Lightning status unavailable: '+prettyErr(e); lnStatusPill(); return; }
