@@ -375,6 +375,31 @@ export function provisionNode({ asset, chain, deviceTransportPubkey, label }) {
   return lspFetch('/node/provision', { method: 'POST', body: JSON.stringify(body) });
 }
 
+// Readiness of ONE provisioned node (by its registry key). A freshly-provisioned node boots
+// + rescans, so its rpc is not answerable for the first seconds; the wallet polls this after
+// provisionAndConnect (showing a "preparing your node…" progress) before it asks to fund a
+// channel. Returns { ready, node_id, blockheight, synced }.
+export function nodeGetinfo(nodeKey) {
+  return lspFetch(`/node/getinfo?node=${encodeURIComponent(nodeKey)}`);
+}
+
+// Poll nodeGetinfo until the node's rpc answers (ready), emitting progress. Throws past the
+// timeout with a clean message. This is what turns "still connecting" dead ends into an
+// honest, bounded "preparing your node…" wait before funding.
+export async function waitNodeReady({ nodeKey, onProgress, timeoutMs = 180_000, pollMs = 2500 } = {}) {
+  if (!nodeKey) throw new Error('waitNodeReady: a node key is required');
+  const emit = (extra) => { try { onProgress && onProgress({ phase: 'preparing', ...extra }); } catch {} };
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    let st = null;
+    try { st = await nodeGetinfo(nodeKey); } catch { /* transient */ }
+    if (st && st.ready) return st;
+    emit({ ready: false });
+    if (Date.now() > deadline) throw new Error('your Lightning node is still preparing (booting + syncing); try again in a moment');
+    await new Promise((r) => setTimeout(r, pollMs));
+  }
+}
+
 // -- "Move to Lightning": non-custodial channel funding --------------------------
 // Move BTC (testnet4) or a Sequentia asset from on-chain into a Lightning channel on
 // the user's hosted node. NON-CUSTODIAL: the wallet signs the on-chain deposit itself
@@ -441,4 +466,5 @@ export default {
   lnFinalityCopy, connectDevice, disconnectDevice, seqlnGetStatus, seqlnSwap,
   seqlnChannels, seqlnFunding, seqlnNodes, provisionNode, fundChannel,
   deviceTransportPubkey, connectProvisioned, provisionAndConnect, provisionedState, disconnectProvisioned,
+  nodeGetinfo, waitNodeReady,
 };

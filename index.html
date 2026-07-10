@@ -736,7 +736,7 @@ import { initXrswap, fetchRQuote, openReverseFromComposer, hasInFlight as hasRev
 import { initXmaker, startForwardMaker, startReverseMaker, liveMakerOffers, resumeMakerSwaps } from './xmaker.js';
 import { initSeqln, connectDevice as lnConnectDevice, disconnectDevice as lnDisconnect,
   onSeqlnStatus, seqlnState, seqlnAvailable, seqlnGetStatus, seqlnSwap, lnFinalityCopy,
-  seqlnChannels, seqlnFunding, fundChannel, provisionAndConnect, provisionedState } from './seqln.js';
+  seqlnChannels, seqlnFunding, fundChannel, provisionAndConnect, waitNodeReady, provisionedState } from './seqln.js';
 import { lnDeriveNode, lnDeriveAsset } from './seqln-keys.js';
 
 const ESPLORA = location.origin + '/api';
@@ -1750,7 +1750,12 @@ function moveToLightningDialog(leg){
             deriveIdentity: (id)=>lnDeriveAsset(phrase, id) });
       if(!(prov && prov.connected)) throw new Error('Could not bring your device signer online for your hosted node. Check your connection and try again.');
       renderLightningBalance();
-      // 2. Fund a channel ON THAT node: the deposit address + the device-co-signed
+      // 2. A freshly-provisioned node boots + rescans, so its RPC is not answerable for the
+      //    first seconds. Wait for it (honest, bounded progress) so the deposit/channel step
+      //    never hits a "node not ready" error mid-flow.
+      say('Preparing your Lightning node (booting and syncing)…');
+      await waitNodeReady({ nodeKey: prov.key, onProgress: ()=>say('Preparing your Lightning node (booting and syncing)…') });
+      // 3. Fund a channel ON THAT node: the deposit address + the device-co-signed
       //    fundchannel are both routed to prov.key (the user's provisioned node), never the
       //    shared demo node. The wallet signs the on-chain deposit itself (lnSendDeposit).
       say('Your Lightning node is ready. Preparing the on-chain deposit…');

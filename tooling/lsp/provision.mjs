@@ -203,18 +203,25 @@ export function makeProvisioner(opts) {
     rec.pids = { lightningd: ld.pid, relay: rl.pid };
   }
 
-  function list() { const reg = load(); return Object.values(reg.nodes); }
+  // Guarantee a record always exposes a correct absolute rpc path. provision() sets it, but
+  // this backfills any legacy/partial record (dir + network are always present) so targetFor
+  // can never hand out a falsy rpc and silently target the wrong node.
+  function withRpc(rec) {
+    if (rec && !rec.rpc && rec.dir && rec.network) rec.rpc = path.join(rec.dir, rec.network, 'lightning-rpc');
+    return rec;
+  }
+  function list() { const reg = load(); return Object.values(reg.nodes).map(withRpc); }
   // First seq node for `assetId` on ANY device — a coarse legacy fallback (targetFor uses
   // it only when the caller passes no device-scoped node key). Nodes are now device-scoped
   // (`seq:<assetId>:<pub>`), so this scans by asset id and also matches legacy bare-asset
   // keyed nodes (never orphaned). Per-device resolution goes through getByKey(node key).
   function get(assetId) {
     const reg = load(); const want = String(assetId).toLowerCase();
-    return Object.values(reg.nodes).find((r) => (r.chain || 'seq') !== 'btc' && r.asset_id === want)
-      || reg.nodes[want] || null;
+    return withRpc(Object.values(reg.nodes).find((r) => (r.chain || 'seq') !== 'btc' && r.asset_id === want)
+      || reg.nodes[want] || null);
   }
   // Direct registry-key lookup (`seq:<assetId>:<pub>` or `btc:<pub>`, or a legacy bare id).
-  function getByKey(key) { const reg = load(); return reg.nodes[String(key).toLowerCase()] || null; }
+  function getByKey(key) { const reg = load(); return withRpc(reg.nodes[String(key).toLowerCase()] || null); }
   // Resolve the node whose public_ws_path is `${publicWsBase}/<id>` — the lookup the
   // central ws-router does to bridge `GET /lsp-ws-node/<id>` to that node's responder.
   // public_ws_path carries the unique per-node `<label>-<idx>`, so it stays 1:1 even when
@@ -227,9 +234,9 @@ export function makeProvisioner(opts) {
   // Refresh ONE node's live node_id/status by its registry KEY (not asset id — several
   // device-scoped nodes can share an asset id, so each must be refreshed independently).
   async function refresh(key) {
-    const reg0 = load(); const rec = reg0.nodes[String(key).toLowerCase()]; if (!rec) return null;
+    const reg0 = load(); const rec = withRpc(reg0.nodes[String(key).toLowerCase()]); if (!rec) return null;
     const info = await getinfo(rec);
-    if (info) { const reg = load(); reg.nodes[rec.key].node_id = info.id; reg.nodes[rec.key].status = 'running'; save(reg); return reg.nodes[rec.key]; }
+    if (info) { const reg = load(); reg.nodes[rec.key].node_id = info.id; reg.nodes[rec.key].status = 'running'; save(reg); return withRpc(reg.nodes[rec.key]); }
     return rec;
   }
 

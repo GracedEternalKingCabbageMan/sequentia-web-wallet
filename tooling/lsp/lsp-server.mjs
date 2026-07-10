@@ -221,8 +221,12 @@ function assetLabel(id) {
   return id.slice(0, 8) + '…';
 }
 
-function lnrpc(method, args = [], rpc = CFG.hostedAssetRpc) {
+function lnrpc(method, args = [], rpc) {
   return new Promise((resolve, reject) => {
+    // Fail LOUD on a missing rpc path: never silently default to the demo node (that would
+    // target the wrong node) or to a bare `lightning-rpc` in cwd. A falsy rpc here is a
+    // programming/registry bug, so surface it clearly instead of hitting the wrong socket.
+    if (!rpc) return reject(new Error(`internal: no rpc path for lnrpc '${method}' (node record is missing its rpc)`));
     execFile(CFG.lncli, [`--rpc-file=${rpc}`, method, ...args],
       { maxBuffer: 8 << 20 }, (err, stdout, stderr) => {
         // lightning-cli prints the JSON-RPC error (with a human "message") to stdout
@@ -383,10 +387,27 @@ function reapChannelJobs() {
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 // GET /channel/deposit?chain=btc|seq[&asset=<id>] -> the hosted node's deposit address.
+// Poll getinfo until the node's rpc answers (a freshly-provisioned node boots + rescans, so
+// its lightning-rpc SOCKET does not exist for the first seconds — lightning-cli then reports
+// `Connecting to 'lightning-rpc': No such file or directory`, i.e. NOT ready, not an empty
+// rpc). Returns getinfo once the node responds; throws a clean "still preparing" past the
+// bound. The wallet polls /node/getinfo for progress, so this is a short safety net.
+async function waitGetinfo(rpc, timeoutMs = 45000) {
+  if (!rpc) throw new Error('internal: no rpc path for node (cannot wait for readiness)');
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    try { return await lnrpc('getinfo', [], rpc); }
+    catch (e) {
+      if (Date.now() > deadline) throw new Error(`your Lightning node is still preparing (booting + syncing) — try again in a moment (${e.message})`);
+      await sleep(1500);
+    }
+  }
+}
+
 async function channelDeposit(chain, assetId, nodeKey) {
   const { rpc } = targetFor(chain, chain === 'seq' ? (assetId || CFG.gold) : null, nodeKey);
   if (!rpc) throw new Error('no hosted node for that asset (provision it first)');
-  const info = await lnrpc('getinfo', [], rpc);
+  const info = await waitGetinfo(rpc);            // tolerate a just-booted node's missing socket
   const na = await lnrpc('newaddr', ['bech32'], rpc);
   return { ok: true, chain, node_id: info.id, network: info.network,
     address: na.bech32 || na.address || na.p2tr };
@@ -400,6 +421,9 @@ async function runChannelOpen(job) {
   const [peerId, peerAddr] = peer.split('@');
   const deadline = Date.now() + CFG.channelWatchMs;
   const need = Number(job.requested_amount);
+
+  // 0. Wait for the node's rpc to answer (a fresh node's socket may not exist yet).
+  await waitGetinfo(rpc);
 
   // 1. Wait for confirmed on-chain funds >= the requested channel amount. (Funds the
   //    user just deposited; if the node already holds enough, this passes at once.)
@@ -625,6 +649,20 @@ const server = http.createServer(async (req, res) => {
           node_id: rec.node_id, host_pubkey: rec.host_pubkey, ws_port: rec.ws_port,
           public_ws_path: rec.public_ws_path, network: rec.network });
       } catch (e) { return send(res, 409, { ok: false, error: String((e && e.message) || e) }); }
+    }
+    // Readiness of ONE provisioned node (the wallet polls this after provisioning, showing a
+    // "preparing your node…" progress, before it asks for a deposit address). A fresh node
+    // boots + rescans, so its rpc socket is absent for the first seconds; `ready` flips true
+    // once getinfo answers. Fast + non-blocking (a single getinfo attempt with an 8s cap).
+    if (req.method === 'GET' && url.pathname === '/node/getinfo') {
+      if (!PROV) return send(res, 501, { ok: false, error: 'per-asset node provisioning is not enabled on this LSP' });
+      const nodeKey = url.searchParams.get('node') || '';
+      const rec = PROV.getByKey(nodeKey);
+      if (!rec) return send(res, 404, { ok: false, error: 'unknown node key' });
+      const info = await PROV.getinfo(rec);        // null while the node is still booting
+      return send(res, 200, { ok: true, ready: !!info, node_id: (info && info.id) || rec.node_id || null,
+        blockheight: (info && info.blockheight) || null,
+        synced: !!(info && info.warning_lightningd_sync == null && info.blockheight != null) });
     }
     // List the provisioned per-device nodes (with a live node-id refresh). Refresh by KEY:
     // several device-scoped nodes can share one asset id, so each is refreshed on its own key.

@@ -18,10 +18,11 @@ import {
 } from './seqln.js';
 import { lnDeriveNode, lnDeriveAll, lnDeriveAsset, LN_PATHS, LN_ASSET_BRANCH } from './seqln-keys.js';
 import {
-  connectProvisioned, provisionAndConnect, provisionedState,
+  connectProvisioned, provisionAndConnect, provisionedState, nodeGetinfo, waitNodeReady,
 } from './seqln.js';
 
 let seen = [];
+let readyPolls = 0;
 // A fake channel-open job that transitions pending_deposit -> active over a few polls,
 // so the fundChannel poll loop is exercised end-to-end (Part 3).
 const chanJobs = new Map();
@@ -47,6 +48,15 @@ const srv = http.createServer((req, res) => {
         status: 'booting', node_id: null, host_pubkey: 'ee'.repeat(33),
         public_ws_path: isBtc ? '/lsp-ws-node/BTC-9' : '/lsp-ws-node/X-0',
         ws_port: 18800, network: isBtc ? 'testnet4' : 'sequentia-testnet' }));
+    }
+    if (u.pathname === '/node/getinfo') {
+      // Not ready for the first 2 polls (fresh node still booting), then ready — exercises
+      // waitNodeReady's poll-until-ready loop.
+      const key = u.searchParams.get('node') || '';
+      readyPolls++;
+      const ready = readyPolls >= 3;
+      return res.end(JSON.stringify({ ok: true, ready, node_id: ready ? 'ff'.repeat(33) : null,
+        blockheight: ready ? 100 : null, synced: ready }));
     }
     if (u.pathname === '/node/list') {
       return res.end(JSON.stringify({ ok: true, nodes: [
@@ -373,6 +383,24 @@ await fundChannel({ chain: 'seq', asset: 'GOLD', amount: 3000, sendOnchain: asyn
 const openNoNode = seen.slice(beforeNoNode).filter((s) => s.method === 'POST' && s.path === '/channel/open').at(-1);
 assert.ok(!('node' in JSON.parse(openNoNode.body)), 'no node key -> open body omits node (no accidental demo-node key)');
 console.log('ok: fundChannel only sends a node key when the wallet supplies one (no accidental targeting)');
+
+// ===========================================================================
+// Part 6 — node readiness wait (fresh node boots + rescans before its rpc answers)
+// ===========================================================================
+initSeqln({ lspUrl: `http://127.0.0.1:${port}`, token: 'T0KEN' });
+readyPolls = 0;
+const progress6 = [];
+const ready = await waitNodeReady({ nodeKey: 'seq:' + 'aa'.repeat(32) + ':' + '02'.repeat(33),
+  onProgress: (e) => progress6.push(e.phase), pollMs: 5 });
+assert.ok(ready.ready === true && /^[0-9a-f]{66}$/.test(ready.node_id), 'waitNodeReady resolves once the node getinfo answers');
+assert.ok(progress6.length >= 2 && progress6.every((p) => p === 'preparing'),
+  'waitNodeReady emits "preparing" progress while the node is still booting (no dead end)');
+assert.ok(readyPolls >= 3, 'it polled /node/getinfo until ready (did not give up early)');
+// nodeGetinfo surfaces the raw readiness for the wallet.
+readyPolls = 10;   // force ready
+const gi = await nodeGetinfo('seq:' + 'aa'.repeat(32) + ':' + '02'.repeat(33));
+assert.equal(gi.ready, true, 'nodeGetinfo returns the node readiness');
+console.log('ok: waitNodeReady polls /node/getinfo until the fresh node is ready (honest progress)');
 
 srv.close();
 console.log('\nALL PASS');
