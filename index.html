@@ -1678,7 +1678,16 @@ async function lnSendDeposit({ chain, asset, amount, address }){
   const assetId = new AssetId(asset);
   let b = network.txBuilder();
   b = a.isBlinded() ? b.addRecipient(a, BigInt(amount), assetId) : b.addExplicitRecipient(a, BigInt(amount), assetId);
-  const pset = b.feeRate(DEFAULT_FEERATE).finish(wollet);
+  b = b.feeRate(DEFAULT_FEERATE);
+  // Pay the funding transaction's fee STRICTLY IN THE ASSET BEING MOVED — moving an asset into a
+  // single-asset Lightning channel must never require a DIFFERENT asset (least of all tSEQ: a fresh
+  // wallet holding only this asset has none, which is exactly the "missing N units of tSEQ" failure).
+  // Open fee market, no privileged coin (first-principle #3/#4). Movability is gated on this asset
+  // being fee-priced, so feeRateFor() resolves; there is deliberately NO fallback to another asset.
+  if(asset!==POLICY_HEX){
+    b = b.feeAsset(assetId, feeRateFor(asset));
+  }
+  const pset = b.finish(wollet);
   const signed = signer.sign(pset);
   const finalized = wollet.finalize(signed);
   const txid = await client.broadcast(finalized);
