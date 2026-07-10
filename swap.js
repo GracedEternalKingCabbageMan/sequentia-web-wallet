@@ -623,15 +623,31 @@ function renderRailNote(ra){
   const b = C.$('swRailMove');
   if (b) b.onclick = () => { if (C.gotoLightning) C.gotoLightning(); else try { C.toast('Open a Lightning channel from the Balance tab.'); } catch {} };
 }
+// Assets with a deployed SUB-ASSET maker (asset over Lightning + BTC ON-CHAIN HTLC),
+// so a BUY may offer the pay=chain/recv=ln rail for them. GATED, not blanket-enabled:
+// the LSP fails closed (HTTP 422) for any pair without a maker, and this list keeps
+// unsupported pairs unselectable in the UI. Extend as more sub-asset makers deploy (or
+// wire it from an LSP capability probe).
+const SUBASSET_ASSETS = new Set([
+  '3a0f9192219db59f8d7f87d93ac6311095dfe1255d149727b87baaa7d2cc71a1', // GOLD (live sub-asset maker)
+]);
+function subassetCapable(seqAssetHex){ return !!seqAssetHex && SUBASSET_ASSETS.has(seqAssetHex); }
+
 // Is (payRail, recvRail) a rail combination with a backend for the current pair? Both
-// legs the same (pure-LN or fully on-chain) always work. The only mixed shape deployed
-// is asset-on-chain <-> BTC-Lightning; its mirror (asset over LN + BTC on-chain) has no
-// maker and fails closed (HTTP 422), so it must never be selectable.
+// legs the same (pure-LN or fully on-chain) always work. Two mixed shapes exist:
+//   - asset-on-chain <-> BTC-Lightning (the submarine) — always available; and
+//   - asset-over-Lightning + BTC-on-chain (the sub-asset MIRROR) — a BUY only, and only
+//     for a pair that actually has a sub-asset maker (subassetCapable), else it fails
+//     closed at the LSP, so it must not be selectable.
 function railSupported(p, r){
   if (p === r) return true;                       // both-LN or both-on-chain
   const payIsBtc = (S.payAsset === 'BTC');        // buy asset (pay BTC) vs sell asset (pay the asset)
-  return payIsBtc ? (p === 'ln' && r === 'chain')     // buy: BTC over LN + asset on-chain
-                  : (p === 'chain' && r === 'ln');    // sell: asset on-chain + BTC over LN
+  if (payIsBtc){
+    if (p === 'ln' && r === 'chain') return true;                       // buy: BTC over LN + asset on-chain
+    if (p === 'chain' && r === 'ln') return subassetCapable(S.receiveAsset); // buy: BTC on-chain + asset over LN (sub-asset)
+    return false;
+  }
+  return (p === 'chain' && r === 'ln');           // sell: asset on-chain + BTC over LN
 }
 function wireRailSeg(id, leg){
   const seg = C.$(id); if (!seg || seg._wired) return; seg._wired = true;
@@ -2000,20 +2016,33 @@ async function reviewMixed(q){
   if (!L || !L.swap){ $('swErr').textContent = 'The mixed (Lightning + on-chain) route needs the Lightning service, which is unavailable in this build.'; return; }
   const am = C.assetMeta(q.seqAsset);
   const side = q.payIsBtc ? 'buy' : 'sell';            // buy the asset (pay BTC) / sell it (pay the asset)
-  // Which leg is the ASSET, which is BTC — the deployed submarine needs asset-on-chain + BTC-LN.
+  // Which leg is the ASSET, which is BTC.
   const assetLeg = q.payIsBtc ? q.recvRail : q.payRail;
   const btcLeg   = q.payIsBtc ? q.payRail : q.recvRail;
-  if (!(assetLeg === 'chain' && btcLeg === 'ln')){
-    $('swErr').textContent = `This mixed combination (${am.ticker} over Lightning + BTC on-chain) needs a BTC on-chain HTLC submarine, which is not deployed yet. `
+  // Two mixed shapes settle: the submarine (asset on-chain + BTC-LN), and its MIRROR the
+  // sub-asset (asset over LN + BTC on-chain) — a BUY only, gated to pairs with a maker.
+  const isSubAsset = (side === 'buy' && assetLeg === 'ln' && btcLeg === 'chain');
+  const isSubmarine = (assetLeg === 'chain' && btcLeg === 'ln');
+  if (!(isSubmarine || (isSubAsset && subassetCapable(q.seqAsset)))){
+    $('swErr').textContent = `This mixed combination (${am.ticker} over Lightning + BTC on-chain) has no maker for this pair yet. `
       + `For now: put ${am.ticker} on-chain and BTC on Lightning, or set both legs the same way.`;
-    try { C.toast('That mixed direction is not deployed yet — put the asset on-chain and BTC on Lightning.'); } catch {}
+    try { C.toast('That mixed direction has no maker for this pair yet — put the asset on-chain and BTC on Lightning.'); } catch {}
     return;
   }
   const amount = parseFloat((($('swPayAmt').value || '') + '').trim()) || null;
-  const dir = side === 'buy'
-    ? `Buy ${am.ticker} with Bitcoin over Lightning · receive ${am.ticker} on-chain`
-    : `Sell ${am.ticker} on-chain · receive Bitcoin over Lightning`;
-  const kv = [
+  const dir = isSubAsset
+    ? `Buy ${am.ticker} with Bitcoin on-chain · receive ${am.ticker} over Lightning`
+    : (side === 'buy'
+      ? `Buy ${am.ticker} with Bitcoin over Lightning · receive ${am.ticker} on-chain`
+      : `Sell ${am.ticker} on-chain · receive Bitcoin over Lightning`);
+  const kv = isSubAsset ? [
+    ['Route', 'Mixed rails · you pay Bitcoin in an on-chain HTLC and receive the asset over Lightning, bound by one preimage'],
+    ['Direction', dir],
+    ['Pricing', 'Best resting sub-asset offer · whole-swap lift (the LP\'s fixed terms)'],
+    ['Timing', 'The asset arrives over Lightning the moment the maker is paid; your BTC is claimed from its on-chain HTLC with the revealed preimage.'],
+    ['Finality', 'The BTC leg is a Bitcoin on-chain HTLC (final to Bitcoin); the asset leg settles over Lightning.'],
+    ['If it stalls', 'Nothing is lost · you reclaim the BTC HTLC after its on-chain timeout if the asset never arrives.'],
+  ] : [
     ['Route', 'Mixed rails · one leg on Lightning, one anchored on-chain (a submarine swap, bound by one preimage)'],
     ['Direction', dir],
     ['Pricing', 'Best resting submarine offer · whole-HTLC lift (the LP\'s fixed terms)'],

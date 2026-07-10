@@ -126,6 +126,17 @@ const CFG = {
   // it (or when the amount is unknown) /swap returns a pollable 'confirming' job so the
   // browser never hangs through the multi-block anchor gate. 0 = always anchor-gated.
   mixedMax0conf: Number(process.env.MIXED_MAX_0CONF || 0),
+  // --- Sub-asset rail: the MIRROR submarine (asset over Lightning + BTC ON-CHAIN HTLC). ---
+  // A buy where the taker pays BTC on-chain and receives the asset over Lightning
+  // (seqob-cli xsubas). It needs a bitcoind (funds + refunds the BTC HTLC), an asset LN
+  // socket (receives the asset), and a relay carrying a sub-asset (ln_direction=4) maker.
+  // Unset SUBAS_BTC_RPC/SUBAS_ASSET_LN => the rail is disabled (POST /swap fails closed).
+  subasRelay: process.env.SUBAS_RELAY || process.env.RELAY || 'http://127.0.0.1:9955',
+  subasBtcRpc: process.env.SUBAS_BTC_RPC || '',            // bitcoind RPC http://user:pass@host:port
+  subasBtcWallet: process.env.SUBAS_BTC_WALLET || '',      // bitcoind wallet funding the BTC HTLC
+  subasBtcChain: process.env.SUBAS_BTC_CHAIN || 'testnet4',
+  subasAssetLn: process.env.SUBAS_ASSET_LN || process.env.HOSTED_ASSET_RPC || hostedRpcFallback,
+  subasMinBtcConf: Number(process.env.SUBAS_MIN_BTC_CONF || 0), // 0 = LP fronts the reorg risk (instant)
   // --- "Move to Lightning" channel funding (GET /channel/deposit, POST /channel/open) ---
   // The routing peer each hosted node opens its channel TO (id@host:port). The channel
   // is funded from the hosted node's OWN on-chain wallet, whose only signer is the user's
@@ -624,36 +635,54 @@ function runMixed({ side, asset, amount, payRail, recvRail }) {
     if (!CFG.seqRpc || !CFG.seqWallet) {
       return resolve({ ok: false, error: 'the mixed (submarine) rail is not configured on this LSP (set SEQ_RPC + SEQ_WALLET)' });
     }
-    // Map (side, payRail, recvRail) -> the submarine CLI. The ASSET leg must be
-    // on-chain and the BTC leg on Lightning.
-    let cmd, extra;
-    if (side === 'buy' && payRail === 'ln' && recvRail === 'chain') {
-      cmd = 'xsubbuy';                                         // BTC-LN in, asset on-chain out
-      extra = ['-ln-socket', CFG.mixedBtcRpc, '-min-anchor-depth', String(CFG.minAnchorDepth)];
-      // 0-conf cap: the taker skips the anchor-bury wait when the asset leg is <= it
-      // (instant). 0 means "use the maker offer's advertised cap".
-      if (CFG.mixedMax0conf > 0) extra.push('-max-0conf', String(CFG.mixedMax0conf));
-    } else if (side === 'sell' && payRail === 'chain' && recvRail === 'ln') {
-      cmd = 'xsublift';                                        // asset on-chain in, BTC-LN out
-      extra = ['-ln-socket', CFG.mixedBtcRpc];
-    } else {
-      return resolve({ ok: false, finality: 'unsupported',
-        error: `mixed pay=${payRail}/recv=${recvRail} for a ${side} is not a deployed submarine `
-             + '(only asset-on-chain <-> BTC-Lightning). Use both-Lightning, both-on-chain, or flip the mixed legs.' });
-    }
+    // Map (side, payRail, recvRail) -> the submarine CLI. The three deployed shapes:
+    //   asset-on-chain <-> BTC-LN (xsubbuy/xsublift, via -seq-rpc/-seq-wallet), and
+    //   the MIRROR asset-over-LN + BTC-on-chain (xsubas, via -btc-rpc/-asset-ln-socket).
     const stateFile = path.join(os.tmpdir(), `lsp-mixed-${Date.now()}-${Math.random().toString(36).slice(2)}.json`);
-    const args = [cmd, '-asset', assetId, '-relay', CFG.relay,
-      '-seq-rpc', CFG.seqRpc, '-seq-wallet', CFG.seqWallet, '-state-file', stateFile, ...extra];
+    let args;
+    if (side === 'buy' && payRail === 'chain' && recvRail === 'ln') {
+      // SUB-ASSET: pay BTC ON-CHAIN, receive the asset OVER LIGHTNING. The taker (this
+      // hosted LSP) funds the BTC HTLC from its bitcoind wallet and receives the asset
+      // on its asset LN node; a sub-asset (ln_direction=4) maker on SUBAS_RELAY pays it.
+      if (!CFG.subasBtcRpc || !CFG.subasAssetLn) {
+        return resolve({ ok: false, finality: 'unsupported',
+          error: 'the sub-asset rail (pay BTC on-chain, receive the asset over Lightning) is not configured on this LSP '
+               + '(set SUBAS_BTC_RPC + SUBAS_ASSET_LN + a sub-asset maker on SUBAS_RELAY).' });
+      }
+      args = ['xsubas', '-asset', assetId, '-relay', CFG.subasRelay,
+        '-btc-rpc', CFG.subasBtcRpc, '-btc-wallet', CFG.subasBtcWallet, '-btc-chain', CFG.subasBtcChain,
+        '-asset-ln-socket', CFG.subasAssetLn, '-min-btc-conf', String(CFG.subasMinBtcConf),
+        '-asset-invoice', 'plain', '-state-file', stateFile];
+    } else {
+      let cmd, extra;
+      if (side === 'buy' && payRail === 'ln' && recvRail === 'chain') {
+        cmd = 'xsubbuy';                                       // BTC-LN in, asset on-chain out
+        extra = ['-ln-socket', CFG.mixedBtcRpc, '-min-anchor-depth', String(CFG.minAnchorDepth)];
+        if (CFG.mixedMax0conf > 0) extra.push('-max-0conf', String(CFG.mixedMax0conf));
+      } else if (side === 'sell' && payRail === 'chain' && recvRail === 'ln') {
+        cmd = 'xsublift';                                      // asset on-chain in, BTC-LN out
+        extra = ['-ln-socket', CFG.mixedBtcRpc];
+      } else {
+        return resolve({ ok: false, finality: 'unsupported',
+          error: `mixed pay=${payRail}/recv=${recvRail} for a ${side} is not a deployed submarine. `
+               + 'Use both-Lightning, both-on-chain, or a supported mixed shape.' });
+      }
+      args = [cmd, '-asset', assetId, '-relay', CFG.relay,
+        '-seq-rpc', CFG.seqRpc, '-seq-wallet', CFG.seqWallet, '-state-file', stateFile, ...extra];
+    }
     const t0 = Date.now();
     execFile(CFG.seqobCli, args, { timeout: CFG.mixedTimeoutMs, maxBuffer: 8 << 20 }, (err, stdout, stderr) => {
       const out = (stdout || '') + (stderr || '');
-      const settled = /SUBMARINE SWAP SETTLED/i.test(out);
-      // The preimage + funded/claim outpoints are persisted to the session file.
+      // xsubbuy/xsublift log "SUBMARINE SWAP SETTLED"; xsubas logs "SUB-ASSET SWAP SETTLED".
+      const settled = /SUB(?:MARINE|-ASSET) SWAP SETTLED/i.test(out);
+      // The preimage + on-chain outpoint are persisted to the session file. The on-chain
+      // leg is the ASSET (seq_leg_txid) for xsubbuy/xsublift, or the BTC HTLC (btc_leg_txid)
+      // for xsubas.
       let preimage = null, htlcTxid = null;
       try {
         const st = JSON.parse(fs.readFileSync(stateFile, 'utf8'));
-        preimage = st.preimage_hex || st.secret_hex || null;   // xsubbuy: preimage learned; xsublift: our secret
-        htlcTxid = st.seq_leg_txid || null;
+        preimage = st.preimage_hex || st.secret_hex || st.seq_preimage_hex || null;
+        htlcTxid = st.seq_leg_txid || st.btc_leg_txid || null;
       } catch { /* file may be absent on early failure */ }
       const cm = out.match(/claimed the asset in ([0-9a-f]{64})/i);
       try { fs.unlinkSync(stateFile); } catch { /* best-effort */ }
