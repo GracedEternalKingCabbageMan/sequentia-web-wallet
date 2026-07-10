@@ -441,14 +441,16 @@ async function runChannelOpen(job) {
   job.status = 'opening';
   try { await lnrpc('connect', [peerAddr ? `${peerId}@${peerAddr}` : peerId], rpc); }
   catch (e) { job.connect_note = e.message; /* often already connected */ }
-  const fcArgs = ['fundchannel', `id=${peerId}`, `amount=${need}`, 'announce=true'];
-  // Pin the exact deposit outputs so an asset channel funds from the right asset UTXOs
-  // (the seqln fork picks the channel asset from the funding UTXOs) and BTC never
-  // sweeps unrelated coins.
-  if (job.deposit_outpoints && job.deposit_outpoints.length) {
-    fcArgs.push(`utxos=${JSON.stringify(job.deposit_outpoints)}`);
-  }
-  const fc = await lnrpc(fcArgs[0], fcArgs.slice(1), rpc);
+  // Plain fundchannel with amount=all and NO utxos pin. The provisioned node is
+  // SINGLE-ASSET (it holds only the deposited asset), so fundchannel's own coin-selection
+  // funds the channel with that asset and pays the on-chain fee IN THAT ASSET (it is
+  // fee-rated) — one all-asset funding tx (asset channel + asset fee), byte-shape matching
+  // the working demo GOLD channel. Pinning `utxos` forced fundchannel to denominate the fee
+  // output in the POLICY asset (tSEQ), which a single-asset node holds none of, so the tx
+  // could not balance -> `bad-txns-in-ne-out`. `amount=all` moves the whole deposit into the
+  // channel minus the (tiny, in-asset) fee, so the wallet never needs to over-deposit a fee
+  // buffer. The node being single-asset is what guarantees the channel asset (no pin needed).
+  const fc = await lnrpc('fundchannel', [`id=${peerId}`, 'amount=all', 'announce=true'], rpc);
   job.funding_txid = fc.txid || (fc.txids && fc.txids[0]) || null;
   job.channel_id = fc.channel_id || null;
 
