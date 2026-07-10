@@ -1267,11 +1267,11 @@ async function requoteCross(route, amtStr){
     if (seqAtoms <= 0n) throw new Error('enter an amount greater than zero');
     if (route.payIsBtc){
       const xq = await X.quote(seqAsset, seqAtoms);          // { seq_amount, btc_amount, fee_btc, ... }
-      LAST_QUOTE = { kind:'cross', reverse:false, route, xq, seqAsset };
+      LAST_QUOTE = { kind:'cross', reverse:false, route, xq, seqAsset, requestedSeqAtoms: seqAtoms };
     } else {
       if (!X.reverseQuote) throw new Error('selling an asset for BTC is unavailable in this build');
       const rq = await X.reverseQuote(seqAsset, seqAtoms);   // same shape; btc_amount is what you receive (net of fee)
-      LAST_QUOTE = { kind:'cross', reverse:true, route, xq: rq, seqAsset };
+      LAST_QUOTE = { kind:'cross', reverse:true, route, xq: rq, seqAsset, requestedSeqAtoms: seqAtoms };
     }
     status.textContent = '';
     paintQuoteCross();
@@ -1389,7 +1389,18 @@ function paintQuoteCross(){
   paintRefHints();
   const seqUnits = Number(q.xq.seq_amount) / Math.pow(10, sm.precision || 0);
   const btcUnits = Number(q.xq.btc_amount) / 1e8;
-  if (btcUnits > 0) $('swRate').textContent = `1 BTC = ${trim(seqUnits / btcUnits)} ${sm.ticker} · cross-chain HTLC`;
+  // Honest cap: the cross-chain daemon quotes at most what the best maker can fill. If the user
+  // asked for MORE than that, the quote (and the fields above) was capped down to the fillable
+  // amount — say so plainly instead of silently shrinking their typed amount, which reads as a
+  // mismatched autofill. (>1% short = a real cap, not a rounding difference.)
+  const capped = q.requestedSeqAtoms && q.xq.seq_amount != null
+    && BigInt(q.xq.seq_amount) < (BigInt(q.requestedSeqAtoms) * 99n) / 100n;
+  if (btcUnits > 0){
+    const rateLine = `1 BTC = ${trim(seqUnits / btcUnits)} ${sm.ticker} · cross-chain HTLC`;
+    $('swRate').textContent = capped
+      ? `Capped to ${C.fmtAtoms(q.xq.seq_amount, sm.precision)} ${sm.ticker} (${trim(btcUnits)} BTC) — the most the best maker offers. You asked for more; reduce the amount or wait for a larger offer.`
+      : rateLine;
+  }
   // Cross-chain "fee" is the maker fee in BTC (no open fee-asset market on the BTC leg).
   paintFee('BTC', q.xq.fee_btc, 'Maker fee, paid in BTC on the parent chain.');
   setFinality('cross');
