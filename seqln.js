@@ -231,11 +231,15 @@ function provWsUrl(publicWsPath) {
 }
 
 // Connect the on-device signer to a PROVISIONED node's responder (arbitrary asset).
-export async function connectProvisioned({ assetId, deviceSigningSeed, deviceTransportPrivkey,
+export async function connectProvisioned({ assetId, key, deviceSigningSeed, deviceTransportPrivkey,
   wsUrl, hostStaticPubkey, policy = 'permissive' } = {}) {
-  if (!/^[0-9a-fA-F]{64}$/.test(String(assetId || ''))) throw new Error('connectProvisioned: assetId must be a 32-byte hex id');
-  const key = String(assetId).toLowerCase();
-  const s = provNodes[key] || (provNodes[key] = { signer: null, connected: false, nodeId: null, phase: 'idle', detail: '' });
+  // The provNodes map key: an explicit LSP registry key (e.g. `btc:<devicepub>` for a
+  // per-user BTC node), else a 32-byte-hex asset id (a Sequentia asset node is keyed by
+  // its asset id). One of the two is required so the signer state is addressable.
+  const mapKey = key ? String(key).toLowerCase()
+    : (/^[0-9a-fA-F]{64}$/.test(String(assetId || '')) ? String(assetId).toLowerCase() : null);
+  if (!mapKey) throw new Error('connectProvisioned: a node key or a 32-byte-hex assetId is required');
+  const s = provNodes[mapKey] || (provNodes[mapKey] = { signer: null, connected: false, nodeId: null, phase: 'idle', detail: '' });
   if (!wsUrl || !hostStaticPubkey) { s.phase = 'unconfigured'; s.detail = 'no wss endpoint / host key'; return null; }
   if (!deviceSigningSeed || !deviceTransportPrivkey) { s.phase = 'unconfigured'; s.detail = 'no device identity'; return null; }
   if (s.signer) return s.nodeId;
@@ -267,17 +271,28 @@ export async function connectProvisioned({ assetId, deviceSigningSeed, deviceTra
 // derive this asset's device identity, provision its hosted node keyed to that device,
 // and bring the signer online. Returns { node, nodeId } (the wallet then funds a channel).
 //   deriveIdentity(assetId) -> { transportPrivkey, signingSeed }  (seqln-keys.lnDeriveAsset)
-export async function provisionAndConnect({ assetId, deriveIdentity, policy = 'permissive', label } = {}) {
+// `chain` selects the hosted node kind: 'seq' (a Sequentia asset node, keyed by `assetId`)
+// or 'btc' (a per-user testnet4 node, device-keyed — no assetId). `deriveIdentity` returns
+// { transportPrivkey, signingSeed }: for seq it takes the assetId (lnDeriveAsset); for btc
+// it ignores the arg (the btc device identity, lnDeriveNode(phrase,'btc')). Returns
+// { node, nodeId, connected, key } — `key` is the LSP registry key the wallet then hands to
+// fundChannel so the deposit + device-co-signed funding target THIS node, not a demo node.
+export async function provisionAndConnect({ chain = 'seq', assetId, deriveIdentity, policy = 'permissive', label } = {}) {
   if (typeof deriveIdentity !== 'function') throw new Error('provisionAndConnect: deriveIdentity(assetId) is required');
   const id = deriveIdentity(assetId);
   const devicePubkey = await deviceTransportPubkey(id.transportPrivkey);
-  const node = await provisionNode({ asset: assetId, deviceTransportPubkey: devicePubkey, label });
+  const node = await provisionNode({ chain, asset: assetId, deviceTransportPubkey: devicePubkey, label });
+  // The registry key the LSP routes /channel/deposit + /channel/open by. Prefer the key the
+  // LSP returned; fall back to the asset id (seq) or the device-keyed form (btc) so a stub
+  // /node/provision (the Node test) that omits `key` still resolves the same key the LSP uses.
+  const nodeKey = node.key
+    || (chain === 'btc' ? `btc:${String(devicePubkey).toLowerCase()}` : String(assetId).toLowerCase());
   const wsUrl = provWsUrl(node.public_ws_path);
   const nodeId = await connectProvisioned({
-    assetId, deviceSigningSeed: id.signingSeed, deviceTransportPrivkey: id.transportPrivkey,
+    key: nodeKey, deviceSigningSeed: id.signingSeed, deviceTransportPrivkey: id.transportPrivkey,
     wsUrl, hostStaticPubkey: node.host_pubkey, policy,
   });
-  return { node, nodeId, connected: !!nodeId };
+  return { node, nodeId, connected: !!nodeId, key: nodeKey };
 }
 
 // Snapshot of the provisioned-node signers (for the dynamic N/M leg display).
@@ -348,8 +363,14 @@ export async function seqlnNodes() {
 // `deviceTransportPubkey` is the device's per-node Noise static pubkey (seqln-keys.js);
 // the node pins it so only this device can sign. Returns the node wiring the wallet then
 // attaches its signer to (host_pubkey, public_ws_path) before funding a channel.
-export function provisionNode({ asset, deviceTransportPubkey, label }) {
-  const body = { asset, device_transport_pubkey: deviceTransportPubkey };
+export function provisionNode({ asset, chain, deviceTransportPubkey, label }) {
+  const body = { device_transport_pubkey: deviceTransportPubkey };
+  // A per-USER BTC (testnet4) node is device-keyed (chain:'btc', NO asset id — the LSP
+  // keys it by the device pubkey so a real wallet gets its OWN non-custodial BTC node).
+  // A Sequentia asset node is asset-keyed. Only serialize `chain` for BTC so the seq
+  // provision call is byte-identical to before.
+  if (chain === 'btc') body.chain = 'btc';
+  else body.asset = asset;
   if (label) body.label = label;
   return lspFetch('/node/provision', { method: 'POST', body: JSON.stringify(body) });
 }
@@ -370,15 +391,23 @@ export function provisionNode({ asset, deviceTransportPubkey, label }) {
 //   onProgress   (evt) => void — { phase, ... }: 'deposit-address' | 'sending' | 'sent' |
 //                'pending_deposit' | 'opening' | 'awaiting_lockin' | 'active' | 'failed'
 // Resolves with the final active job ({ short_channel_id, spendable_msat, ... }).
-export async function fundChannel({ chain, asset, amount, sendOnchain, onProgress,
+// `node` is the LSP registry key of the user's OWN provisioned node (from
+// provisionAndConnect). When present it is threaded into BOTH /channel/deposit and
+// /channel/open so the deposit address AND the device-co-signed fundchannel target THAT
+// node — NOT the shared demo node. Omitting it falls back to the LSP default (demo) node,
+// so the wallet MUST pass it for a non-custodial per-user channel.
+export async function fundChannel({ chain, asset, amount, node, sendOnchain, onProgress,
   pollMs = 5000, timeoutMs = 3_600_000 } = {}) {
   if (chain !== 'btc' && chain !== 'seq') throw new Error("fundChannel: chain must be 'btc' or 'seq'");
   if (typeof sendOnchain !== 'function') throw new Error('fundChannel: a sendOnchain hook is required (the wallet signs the deposit)');
   const emit = (phase, extra) => { try { onProgress && onProgress({ phase, ...extra }); } catch {} };
 
-  // 1. The hosted node's on-chain deposit address for this chain.
+  // 1. The hosted node's on-chain deposit address for this chain (of the user's own node).
   emit('deposit-address');
-  const dep = await lspFetch(`/channel/deposit?chain=${encodeURIComponent(chain)}`);
+  const depQ = `/channel/deposit?chain=${encodeURIComponent(chain)}`
+    + (asset ? `&asset=${encodeURIComponent(asset)}` : '')
+    + (node ? `&node=${encodeURIComponent(node)}` : '');
+  const dep = await lspFetch(depQ);
   if (!dep.address) throw new Error('LSP returned no deposit address');
 
   // 2. The WALLET sends the deposit on-chain (it signs it — the LSP never holds the key).
@@ -390,6 +419,7 @@ export async function fundChannel({ chain, asset, amount, sendOnchain, onProgres
   emit('opening-request');
   const body = { chain, amount };
   if (asset) body.asset = asset;
+  if (node) body.node = node;               // route the fundchannel to the user's OWN node
   const started = await lspFetch('/channel/open', { method: 'POST', body: JSON.stringify(body) });
   const jobUrl = started.poll || `/channel/open/${started.job_id}`;
 

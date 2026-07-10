@@ -38,9 +38,15 @@ const srv = http.createServer((req, res) => {
       preimage: 'cd'.repeat(32), finality: 'final', settled_ms: 2100 }));
     if (u.pathname === '/node/provision' && req.method === 'POST') {
       const body = JSON.parse(b || '{}');
-      return res.end(JSON.stringify({ ok: true, asset_id: body.asset, label: body.label || 'X',
+      // Mirror the real LSP registry keying: a btc node is device-keyed (`btc:<pub>`),
+      // a seq node is asset-keyed. The wallet threads this `key` into fundChannel.
+      const isBtc = body.chain === 'btc';
+      const key = isBtc ? `btc:${String(body.device_transport_pubkey).toLowerCase()}` : body.asset;
+      return res.end(JSON.stringify({ ok: true, chain: isBtc ? 'btc' : 'seq', key,
+        asset_id: isBtc ? 'btc' : body.asset, label: body.label || 'X',
         status: 'booting', node_id: null, host_pubkey: 'ee'.repeat(33),
-        public_ws_path: '/lsp-ws-node/X-0', ws_port: 18800, network: 'sequentia-testnet' }));
+        public_ws_path: isBtc ? '/lsp-ws-node/BTC-9' : '/lsp-ws-node/X-0',
+        ws_port: 18800, network: isBtc ? 'testnet4' : 'sequentia-testnet' }));
     }
     if (u.pathname === '/node/list') {
       return res.end(JSON.stringify({ ok: true, nodes: [
@@ -301,6 +307,72 @@ assert.equal(JSON.parse(provPost.body).asset, ASSET_A, 'provisionAndConnect prov
 const conn = globalThis.__seqlnMockConnects.at(-1);
 assert.ok(conn.wsUrl.endsWith('/lsp-ws-node/X-0'), 'signer connected to the provisioned node public_ws_path');
 console.log('ok: provisionAndConnect provisions a per-asset node keyed to the device + brings its signer online');
+
+// ===========================================================================
+// Part 5 — provision-then-fund ordering + the per-user node selector (the fix)
+// ===========================================================================
+// The Move-to-Lightning bug fix: the wallet FIRST provisions the user's OWN node, THEN
+// funds a channel routed to THAT node (never the shared demo node). These assert the two
+// seams that make it non-custodial-per-user: (a) provisionAndConnect returns the LSP
+// registry `key`, and (b) fundChannel threads that key into BOTH /channel/deposit and
+// /channel/open so the deposit + device-co-signed funding target the user's node.
+initSeqln({ lspUrl: `http://127.0.0.1:${port}`, token: 'T0KEN', sdkPath: MOCK });
+
+// (a) A SEQ provision returns the asset id as its routing key; provision resolves BEFORE
+//     we fund (the caller awaits it), and the signer is connected at that point.
+globalThis.__seqlnMockConnects = [];
+const seqProv = await provisionAndConnect({
+  chain: 'seq', assetId: 'de'.repeat(32), deriveIdentity: (id) => lnDeriveAsset(PHRASE, id), label: 'USDX',
+});
+assert.equal(seqProv.key, 'de'.repeat(32), 'seq provisionAndConnect returns the asset id as the routing key');
+assert.ok(seqProv.connected, 'the user node is CONNECTED before any funding is attempted (ordering)');
+console.log('ok: provisionAndConnect connects the user node and returns its routing key BEFORE funding');
+
+// (b) fundChannel threads prov.key into the deposit query AND the open body -> the LSP
+//     routes to the USER'S node (targetFor uses the node key), not the demo node.
+const beforeIdx = seen.length;
+await fundChannel({
+  chain: 'seq', asset: 'de'.repeat(32), amount: 7000, node: seqProv.key,
+  sendOnchain: async () => ({ txid: 'ba'.repeat(32) }), pollMs: 5,
+});
+const depSel = seen.slice(beforeIdx).find((s) => s.path.startsWith('/channel/deposit'));
+assert.ok(depSel.path.includes(`node=${encodeURIComponent(seqProv.key)}`), 'deposit query carries the user node key');
+assert.ok(depSel.path.includes('asset=' + 'de'.repeat(32)), 'deposit query carries the asset (right node address)');
+const openSel = seen.slice(beforeIdx).filter((s) => s.method === 'POST' && s.path === '/channel/open').at(-1);
+assert.deepEqual(JSON.parse(openSel.body), { chain: 'seq', amount: 7000, asset: 'de'.repeat(32), node: seqProv.key },
+  'open body routes the fundchannel to the user node key (NOT the demo node)');
+console.log('ok: fundChannel targets the user node via the node key in BOTH deposit + open (not the demo node)');
+
+// (c) The BTC leg provisions the per-USER testnet4 node the same way: device-keyed
+//     (chain:btc, no asset id), and funds routed to that `btc:<pub>` key.
+globalThis.__seqlnMockConnects = [];
+const btcProv = await provisionAndConnect({
+  chain: 'btc', label: 'BTC',
+  deriveIdentity: () => { const k = lnDeriveNode(PHRASE, 'btc'); return { transportPrivkey: k.transportPrivkey, signingSeed: k.signingSeed }; },
+});
+assert.ok(/^btc:[0-9a-f]{2,}/.test(btcProv.key), 'btc provisionAndConnect returns a device-keyed btc:<pub> routing key');
+assert.ok(btcProv.connected, 'btc user node signer connected');
+const btcProvPost = seen.filter((s) => s.method === 'POST' && s.path === '/node/provision').at(-1);
+const btcBody = JSON.parse(btcProvPost.body);
+assert.equal(btcBody.chain, 'btc', 'btc provision sends chain:btc');
+assert.ok(!('asset' in btcBody), 'btc provision sends NO asset (device-keyed, not asset-keyed)');
+const beforeBtc = seen.length;
+await fundChannel({
+  chain: 'btc', amount: 40000, node: btcProv.key,
+  sendOnchain: async () => ({ txid: 'ca'.repeat(32) }), pollMs: 5,
+});
+const openBtc = seen.slice(beforeBtc).filter((s) => s.method === 'POST' && s.path === '/channel/open').at(-1);
+assert.deepEqual(JSON.parse(openBtc.body), { chain: 'btc', amount: 40000, node: btcProv.key },
+  'btc open body routes to the per-user btc node key');
+console.log('ok: the BTC leg provisions the per-USER testnet4 node (device-keyed) + funds routed to it');
+
+// (d) Without a node key, fundChannel omits it (back-compat: the demo-node path is only
+//     ever hit when the wallet does NOT pass a key — which the fixed UI now always does).
+const beforeNoNode = seen.length;
+await fundChannel({ chain: 'seq', asset: 'GOLD', amount: 3000, sendOnchain: async () => ({ txid: 'ab'.repeat(32) }), pollMs: 5 });
+const openNoNode = seen.slice(beforeNoNode).filter((s) => s.method === 'POST' && s.path === '/channel/open').at(-1);
+assert.ok(!('node' in JSON.parse(openNoNode.body)), 'no node key -> open body omits node (no accidental demo-node key)');
+console.log('ok: fundChannel only sends a node key when the wallet supplies one (no accidental targeting)');
 
 srv.close();
 console.log('\nALL PASS');

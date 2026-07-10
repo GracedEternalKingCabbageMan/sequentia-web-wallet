@@ -736,8 +736,8 @@ import { initXrswap, fetchRQuote, openReverseFromComposer, hasInFlight as hasRev
 import { initXmaker, startForwardMaker, startReverseMaker, liveMakerOffers, resumeMakerSwaps } from './xmaker.js';
 import { initSeqln, connectDevice as lnConnectDevice, disconnectDevice as lnDisconnect,
   onSeqlnStatus, seqlnState, seqlnAvailable, seqlnGetStatus, seqlnSwap, lnFinalityCopy,
-  seqlnChannels, seqlnFunding, fundChannel, provisionedState } from './seqln.js';
-import { lnDeriveNode } from './seqln-keys.js';
+  seqlnChannels, seqlnFunding, fundChannel, provisionAndConnect, provisionedState } from './seqln.js';
+import { lnDeriveNode, lnDeriveAsset } from './seqln-keys.js';
 
 const ESPLORA = location.origin + '/api';
 const OPENAMP = location.origin + '/openamp';   // OpenAMP restricted-asset enclave (same-origin proxy)
@@ -1550,6 +1550,7 @@ async function openWallet(phrase){
 //   SEQ_LSP_DEV_SEED_ASSET / _BTC  (signing seed string)
 // and the legacy single-node overrides (SEQ_LSP_DEV_KEY / _DEV_MNEMONIC) still
 // pin the ASSET slot so an existing one-node harness keeps working.
+function lnPolicy(){ return ((typeof window!=='undefined') && window.SEQ_LSP_POLICY) || 'permissive'; }
 function lnHexOverride(v){ return (typeof v==='string' && /^[0-9a-fA-F]{64}$/.test(v)) ? v.toLowerCase() : null; }
 function lnNodeIdentity(phrase, node){
   const W = (typeof window!=='undefined') ? window : {};
@@ -1694,22 +1695,19 @@ async function renderLightningBalance(){
     const onchainStr=el('div','sub','On-chain: '+fmtAtoms(BigInt(leg.onchain||0n), leg.precision)+' '+leg.ticker);
     const btn=el('button','ghost', sp.channels?'Add funds':'Move to Lightning');
     btn.style.cssText='padding:4px 12px;font-size:12px;margin-top:4px';
-    btn.disabled = !(BigInt(leg.onchain||0n) > 0n) || !seqlnStateLegReady(leg.chain);
-    if(btn.disabled && !(BigInt(leg.onchain||0n) > 0n)) btn.title='No on-chain '+leg.ticker+' to move';
-    else if(btn.disabled) btn.title='The Lightning device signer for this leg is still connecting';
+    // Enabled purely by on-chain balance: the click provisions the user's OWN hosted node
+    // and connects the device signer ON DEMAND (no chicken-and-egg wait for a pre-connected
+    // signer). Never a permanent "still connecting" dead end.
+    btn.disabled = !(BigInt(leg.onchain||0n) > 0n);
+    btn.title = btn.disabled
+      ? ('No on-chain '+leg.ticker+' to move')
+      : ('Provision your own '+leg.ticker+' Lightning node and open a channel');
     btn.onclick=()=>moveToLightningDialog(leg);
     act.appendChild(onchainStr); act.appendChild(btn); r.appendChild(act);
     list.appendChild(r);
   }
   lnStatusPill();
 }
-// Is the device signer for a given leg ('btc' -> btc node, 'seq' -> asset node) serving?
-// Funding needs it, because the funding tx is co-signed by that node's device.
-function seqlnStateLegReady(chain){
-  const st=seqlnState(); const node = chain==='btc' ? 'btc' : 'asset';
-  const n=st.nodes[node]; return !!(n && n.enabled && n.connected);
-}
-
 // Modal: choose an amount, then run the non-custodial Move-to-Lightning flow.
 function moveToLightningDialog(leg){
   const avail = BigInt(leg.onchain||0n);
@@ -1737,9 +1735,27 @@ function moveToLightningDialog(leg){
       'sent':'Deposit sent; waiting for confirmation…', 'pending_deposit':'Waiting for the deposit to confirm on-chain…',
       'opening':'Opening the Lightning channel (your device is co-signing the funding)…', 'awaiting_lockin':'Channel funding broadcast; waiting for it to confirm…' };
     try{
-      say('Starting…');
+      const phrase=(localStorage.getItem(KEY)||'').trim();
+      if(!phrase) throw new Error('Your wallet is locked; unlock it and try again.');
+      // 1. Provision the USER'S OWN keyless hosted node for this leg and bring its on-device
+      //    signer online over the /lsp-ws-node router. The node is keyed to THIS wallet's
+      //    device (per-asset identity via lnDeriveAsset; the btc node via the btc device
+      //    identity), and the device is its SOLE signer — so the channel we then fund is the
+      //    user's own, non-custodial, NOT the shared demo node.
+      say(leg.chain==='btc' ? 'Provisioning your Lightning BTC node…' : 'Provisioning your '+leg.ticker+' Lightning node…');
+      const prov = leg.chain==='btc'
+        ? await provisionAndConnect({ chain:'btc', label:'BTC', policy:lnPolicy(),
+            deriveIdentity: ()=>{ const k=lnNodeIdentity(phrase,'btc'); return { transportPrivkey:k.deviceTransportPrivkey, signingSeed:k.deviceSigningSeed }; } })
+        : await provisionAndConnect({ chain:'seq', assetId: leg.asset, label: leg.ticker, policy:lnPolicy(),
+            deriveIdentity: (id)=>lnDeriveAsset(phrase, id) });
+      if(!(prov && prov.connected)) throw new Error('Could not bring your device signer online for your hosted node. Check your connection and try again.');
+      renderLightningBalance();
+      // 2. Fund a channel ON THAT node: the deposit address + the device-co-signed
+      //    fundchannel are both routed to prov.key (the user's provisioned node), never the
+      //    shared demo node. The wallet signs the on-chain deposit itself (lnSendDeposit).
+      say('Your Lightning node is ready. Preparing the on-chain deposit…');
       const res = await fundChannel({
-        chain: leg.chain, asset: leg.asset || undefined, amount: Number(atoms),
+        chain: leg.chain, asset: leg.asset || undefined, amount: Number(atoms), node: prov.key,
         sendOnchain: lnSendDeposit,
         onProgress: (e)=>{ if(phaseCopy[e.phase]) say(phaseCopy[e.phase]); },
       });
