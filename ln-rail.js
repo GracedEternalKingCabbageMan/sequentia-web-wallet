@@ -51,6 +51,11 @@ export function channelActive(c) {
 export function legLiquidity(channels, target) {
   let active = false, spendable = 0n, receivable = 0n, count = 0;
   for (const c of channels || []) {
+    // Only the wallet's OWN device-provisioned channels (carry a node_key) count for rail
+    // liquidity — never shared/demo-topology channels the LSP's /status also returns. Keeps the
+    // Swap tab consistent with the Balance tab: a wallet can only pay/receive over Lightning
+    // with channels it actually controls (a fresh wallet has none until it moves funds in).
+    if (!c.node_key) continue;
     if (!channelMatches(c, target) || !channelActive(c)) continue;
     active = true; count++;
     spendable += big(c.spendable_units ?? c.spendable ?? 0);

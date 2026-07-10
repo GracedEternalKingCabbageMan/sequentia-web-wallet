@@ -394,9 +394,9 @@
       </div>
       <div class="card">
         <label class="lbl">Testnet faucet</label>
-        <p class="sub" style="margin:0 0 12px">Get free testnet assets to try out the wallet, sent straight to this wallet (tSEQ for fees + staking; the others for asset sends and paying fees in an asset).</p>
+        <p class="sub" style="margin:0 0 12px">Get free testnet assets to try out the wallet, sent straight to your wallet. Network fees are payable in any asset you hold, all on equal footing; tSEQ is additionally what you stake to help produce blocks.</p>
         <div class="row" id="faucetBtns">
-          <button class="primary" data-faucet="">tSEQ</button>
+          <button data-faucet="">tSEQ</button>
           <button data-faucet="USDX">USDX</button>
           <button data-faucet="EURX">EURX</button>
           <button data-faucet="GOLD">GOLD</button>
@@ -1693,6 +1693,11 @@ function lnSpendableFor(kind /* 'BTC' | assetHex */){
   const chs = (lnLastStatus && lnLastStatus.channels) || [];
   let units = 0, n = 0;
   for(const c of chs){
+    if(!c.node_key) continue;   // ONLY the wallet's OWN device-provisioned channels count as its
+                                // Lightning balance — never shared/demo-topology channels the LSP's
+                                // /status also returns (those aren't this wallet's funds, and a fresh
+                                // wallet must show nothing in Lightning). This is what guarantees the
+                                // "balance in a channel this wallet didn't open" case can never arise.
     const isBtc = (c.asset_label==='BTC' || c.leg==='btc');
     const match = kind==='BTC' ? isBtc : (!isBtc && (c.asset===kind || c.asset_label===assetMeta(kind).ticker));
     if(match && String(c.state||'').startsWith('CHANNELD')){ units += Number(c.spendable_units||0); n++; }
@@ -2081,11 +2086,15 @@ function renderBalance(){
   // clearly-labelled Lightning metacard beneath it (the split + move/close actions). movable
   // = the asset can be moved to Lightning (a producer prices it for fees, uniform across assets
   // — first-principle #3); leg drives the move/close modals.
-  const rowFull = ({ticker, refKey, precision, onchainAtoms, kind, nameNode, movable, leg, known})=>{
+  const rowFull = ({ticker, refKey, precision, onchainAtoms, kind, nameNode, movable, leg, known, alwaysShow})=>{
     const lnAtoms = lnOn ? lnAtomsFor(kind) : 0n;
     const chans   = lnOn ? lnChansFor(kind) : 0;
     const own     = lnOn ? ownChansFor(kind) : [];
     const totalAtoms = (onchainAtoms||0n) + lnAtoms;
+    // Equal standing: a Sequentia asset with ZERO total (on-chain AND own-Lightning) is not shown —
+    // no asset gets a privileged always-visible 0 row, tSEQ included. Only BTC (the parent chain) is
+    // always shown (dual-chain), via alwaysShow. A fresh wallet therefore shows ONLY a 0 BTC row.
+    if(!alwaysShow && totalAtoms <= 0n) return;
     const r=el('div','asset-row arow2');
     // Header line: ticker · name/id · combined total (on-chain + Lightning) + ref value.
     const head=el('div','arow-head');
@@ -2099,8 +2108,9 @@ function renderBalance(){
     if(ref) a.appendChild(el('div','sub', ref));
     head.appendChild(a);
     r.appendChild(head);
-    // Lightning metacard (only when an LSP is live and this asset can use Lightning).
-    if(lnOn && leg && (movable || chans>0 || own.length)){
+    // Lightning metacard: only when there is an own Lightning balance, or on-chain funds that could
+    // be moved in — never an empty "Not in Lightning yet" card on a zero row (e.g. a fresh BTC).
+    if(lnOn && leg && (chans>0 || own.length || (movable && (onchainAtoms||0n) > 0n))){
       const meta=el('div','ln-meta');
       const mh=el('div','ln-meta-head'); mh.appendChild(el('span','z','⚡')); mh.appendChild(document.createTextNode(' Lightning')); meta.appendChild(mh);
       const split=el('div','ln-meta-split');
@@ -2123,11 +2133,6 @@ function renderBalance(){
         acts.appendChild(cb);
       }
       if(acts.children.length) meta.appendChild(acts);
-      // Honest reason a Lightning balance may have no "Move to chain": it sits in a channel this
-      // wallet didn't open (a shared/demo channel with no device node_key), so it isn't closable here.
-      if(chans>0 && !own.length){
-        meta.appendChild(el('div','ln-meta-hint','This balance is in a channel this wallet didn’t open, so it can’t be moved back on-chain from here.'));
-      }
       r.appendChild(meta);
     }
     list.appendChild(r);
@@ -2139,7 +2144,9 @@ function renderBalance(){
   if(lnLastStatus && lnLastStatus.channels){
     for(const c of lnLastStatus.channels){
       const isBtc=(c.asset_label==='BTC'||c.leg==='btc');
-      if(!isBtc && c.asset && String(c.state||'').startsWith('CHANNELD')) seqKeys.add(c.asset);
+      // Only the wallet's OWN channels (node_key) — a shared/demo channel must not conjure an asset
+      // row on a wallet that doesn't actually hold it.
+      if(!isBtc && c.node_key && c.asset && String(c.state||'').startsWith('CHANNELD')) seqKeys.add(c.asset);
     }
   }
 
@@ -2158,7 +2165,7 @@ function renderBalance(){
 
   // BTC (parent chain) leads only because it is the other chain, not a privileged unit.
   rowFull({ ticker:'BTC', refKey:'BTC', precision:8, onchainAtoms:btcBalance, kind:'BTC',
-    nameNode: el('span','sub','Bitcoin testnet4'), movable: btcFunding,
+    nameNode: el('span','sub','Bitcoin testnet4'), movable: btcFunding, alwaysShow:true,
     leg:{ kind:'BTC', ticker:'BTC', precision:8, onchain:btcBalance, chain:'btc', asset:null }, known:true });
 
   // Uniform order (by ticker); tSEQ is one row among equals, not pinned.
