@@ -182,6 +182,22 @@
   .swtiming.wait .swtiming-ic{color:var(--amber2)}
   .swfix{color:var(--amber2);font-weight:650;cursor:pointer;text-decoration:underline;text-underline-offset:2px}
   .swfix:hover{filter:brightness(1.15)}
+  /* One cohesive composer panel: divided sections of a single card (not scattered sub-cards). */
+  .swpanel{padding:0;overflow:visible}
+  .swsec{padding:15px 20px;border-top:1px solid var(--line)}
+  .swsec-head{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-bottom:9px;min-height:26px}
+  .swsec-lab{font-size:11px;color:var(--dim);text-transform:uppercase;letter-spacing:.05em;font-weight:650;display:block}
+  .swsec .swmode-seg{max-width:180px;margin:0}
+  .swsec .swmeta-row{margin:0}
+  .swsec .swmode-hint{display:block;margin-top:7px}
+  .swsec .swrails{margin-top:2px}
+  .swsec .swtiming{margin-top:11px}
+  /* the fee section: plain divided section (drop the old bordered sub-card look inside the panel) */
+  .swpanel .swfee{border:0;border-radius:0;background:transparent}
+  .swpanel .swfee .swfee-head{margin-bottom:0}
+  .swpanel .swfee .swfee-body{margin-top:10px}
+  .swsec-place{padding-top:16px}
+  .swsec-place .swreview{margin-top:0}
   .swreview{width:100%;padding:13px;font-size:15px}
   .swback{font-size:13px;padding:6px 11px}
   /* SeqOB order book (resting offers + your orders) */
@@ -443,126 +459,116 @@
                  your price, and the order rests until it's crossed). Every order is still just
                  "Place order" — this only chooses how the price is set. Shown for same-chain +
                  cross pairs (LN/mixed are market-only); paintModeSeg toggles .hide. -->
-            <div class="swmode hide" id="swModeWrap">
-              <div class="swseg swmode-seg" id="swModeSeg" role="group" aria-label="Order price">
-                <button type="button" data-m="take">Market</button>
-                <button type="button" data-m="post">Limit</button>
+            <!-- The composer is ONE cohesive panel: amounts -> price -> how it settles -> fee -> place.
+                 Each block is a divided section of the same card (no more scattered sub-cards). Every
+                 id/class the JS drives is preserved; only the layout is reorganised. -->
+            <div class="card swpanel">
+
+              <!-- AMOUNTS -->
+              <div class="swpane" id="swPayPane">
+                <div class="swpane-top">
+                  <label class="lbl" style="margin:0">You pay</label>
+                  <button type="button" class="swmax" id="swMax" title="Use your full balance">Max</button>
+                </div>
+                <div class="swrow">
+                  <div class="swamt-wrap">
+                    <input id="swPayAmt" class="swamt mono" inputmode="decimal" placeholder="0.0" aria-label="Amount you pay" autocomplete="off">
+                  </div>
+                  <button type="button" class="swpick" id="swPayPick" aria-haspopup="listbox" aria-expanded="false">
+                    <span class="swpick-tk" id="swPayTk">Select</span><span class="swpick-caret">&#9662;</span>
+                  </button>
+                </div>
+                <div class="swpane-foot"><span class="sub swbal" id="swPayBal"></span></div>
               </div>
-              <span class="sub swmode-hint" id="swModeHint">Type an amount; the other fills at the best price. Switch to Limit to set your own.</span>
-            </div>
 
-        <div class="card swcard">
-          <!-- PAY pane -->
-          <div class="swpane" id="swPayPane">
-            <div class="swpane-top">
-              <label class="lbl" style="margin:0">You pay</label>
-              <button type="button" class="swmax" id="swMax" title="Use your full balance">Max</button>
-            </div>
-            <div class="swrow">
-              <div class="swamt-wrap">
-                <input id="swPayAmt" class="swamt mono" inputmode="decimal" placeholder="0.0"
-                       aria-label="Amount you pay" autocomplete="off">
-                <!-- attachRefHint drops the "≈ <ref>" line here, under the amount -->
+              <div class="swflip-wrap">
+                <button type="button" class="swflip" id="swFlip" aria-label="Flip pay and receive" title="Flip pay and receive">
+                  <svg viewBox="0 0 24 24" width="20" height="20" aria-hidden="true" focusable="false"><path d="M7 4v13M7 4L4 7M7 4l3 3M17 20V7M17 20l3-3M17 20l-3-3" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>
+                </button>
               </div>
-              <button type="button" class="swpick" id="swPayPick" aria-haspopup="listbox" aria-expanded="false">
-                <span class="swpick-tk" id="swPayTk">Select</span><span class="swpick-caret">▾</span>
-              </button>
-            </div>
-            <div class="swpane-foot">
-              <span class="sub swbal" id="swPayBal"></span>
-            </div>
-          </div>
 
-          <!-- the flip control (the one place we spend boldness) -->
-          <div class="swflip-wrap">
-            <button type="button" class="swflip" id="swFlip" aria-label="Flip pay and receive" title="Flip pay and receive">
-              <svg viewBox="0 0 24 24" width="20" height="20" aria-hidden="true" focusable="false">
-                <path d="M7 4v13M7 4L4 7M7 4l3 3M17 20V7M17 20l3-3M17 20l-3-3"
-                      fill="none" stroke="currentColor" stroke-width="2"
-                      stroke-linecap="round" stroke-linejoin="round"/>
-              </svg>
-            </button>
-          </div>
-
-          <!-- RECEIVE pane -->
-          <div class="swpane" id="swRecvPane">
-            <div class="swpane-top">
-              <label class="lbl" style="margin:0">You receive</label>
-            </div>
-            <div class="swrow">
-              <div class="swamt-wrap">
-                <input id="swRecvAmt" class="swamt mono" inputmode="decimal" placeholder="0.0"
-                       aria-label="Amount you receive" autocomplete="off">
-                <!-- attachRefHint drops the "≈ <ref>" line here, under the amount -->
+              <div class="swpane" id="swRecvPane">
+                <div class="swpane-top"><label class="lbl" style="margin:0">You receive</label></div>
+                <div class="swrow">
+                  <div class="swamt-wrap">
+                    <input id="swRecvAmt" class="swamt mono" inputmode="decimal" placeholder="0.0" aria-label="Amount you receive" autocomplete="off">
+                  </div>
+                  <button type="button" class="swpick" id="swRecvPick" aria-haspopup="listbox" aria-expanded="false">
+                    <span class="swpick-tk" id="swRecvTk">Select</span><span class="swpick-caret">&#9662;</span>
+                  </button>
+                </div>
+                <div class="swpane-foot"><span class="sub swbal" id="swRecvBal"></span></div>
               </div>
-              <button type="button" class="swpick" id="swRecvPick" aria-haspopup="listbox" aria-expanded="false">
-                <span class="swpick-tk" id="swRecvTk">Select</span><span class="swpick-caret">▾</span>
-              </button>
-            </div>
-            <div class="swpane-foot">
-              <span class="sub swbal" id="swRecvBal"></span>
-            </div>
-          </div>
-        </div>
 
-        <!-- rate + fee market + finality + action -->
-        <div class="card swmeta">
-          <div class="swmeta-row" id="swRateRow">
-            <span class="sub" id="swRate">Pick two assets to see a rate.</span>
-            <span class="sub" id="swRoute"></span>
-          </div>
-
-          <!-- BTC<->asset: choose EACH leg's settlement rail INDEPENDENTLY. Pay from
-               Lightning (instant) or on-chain; receive to Lightning (instant & final)
-               or on-chain. Shown only when a BTC<->asset pair is selected and the
-               on-device signer is live; otherwise hidden and both legs are on-chain,
-               so an LN-unconfigured wallet behaves exactly as before. -->
-          <div class="swrails hide" id="swRailPicks">
-            <div class="swrailpick">
-              <span class="swrail-lab">Pay from</span>
-              <div class="swseg" id="swPayRailSeg">
-                <button type="button" data-r="ln"><span class="z">⚡</span> Lightning</button>
-                <button type="button" data-r="chain">On-chain</button>
+              <!-- PRICE: the rate + the Market/Limit toggle. Market (default) fills the other amount at
+                   the best executable price; Limit lets you set your own (fields independent). -->
+              <div class="swsec">
+                <div class="swsec-head">
+                  <span class="swsec-lab">Price</span>
+                  <div class="swmode hide" id="swModeWrap">
+                    <div class="swseg swmode-seg" id="swModeSeg" role="group" aria-label="Order price">
+                      <button type="button" data-m="take">Market</button>
+                      <button type="button" data-m="post">Limit</button>
+                    </div>
+                  </div>
+                </div>
+                <div class="swmeta-row" id="swRateRow">
+                  <span class="sub" id="swRate">Pick two assets to see a rate.</span>
+                  <span class="sub" id="swRoute"></span>
+                </div>
+                <span class="sub swmode-hint" id="swModeHint">Type an amount; the other fills at the best price. Switch to Limit to set your own.</span>
               </div>
-            </div>
-            <div class="swrailpick">
-              <span class="swrail-lab">Receive to</span>
-              <div class="swseg" id="swRecvRailSeg">
-                <button type="button" data-r="ln"><span class="z">⚡</span> Lightning</button>
-                <button type="button" data-r="chain">On-chain</button>
+
+              <!-- HOW IT SETTLES: per-leg rail (BTC<->asset pairs, when the signer is live) + the
+                   honest timing banner. Both rails hidden by JS for non-BTC pairs (renders just the banner). -->
+              <div class="swsec" id="swSettleSec">
+                <span class="swsec-lab">How it settles</span>
+                <div class="swrails hide" id="swRailPicks">
+                  <div class="swrailpick">
+                    <span class="swrail-lab">Pay from</span>
+                    <div class="swseg" id="swPayRailSeg">
+                      <button type="button" data-r="ln"><span class="z">&#9889;</span> Lightning</button>
+                      <button type="button" data-r="chain">On-chain</button>
+                    </div>
+                  </div>
+                  <div class="swrailpick">
+                    <span class="swrail-lab">Receive to</span>
+                    <div class="swseg" id="swRecvRailSeg">
+                      <button type="button" data-r="ln"><span class="z">&#9889;</span> Lightning</button>
+                      <button type="button" data-r="chain">On-chain</button>
+                    </div>
+                  </div>
+                  <div class="sub swrail-note hide" id="swRailNote" style="grid-column:1/-1;margin-top:2px"></div>
+                </div>
+                <div class="swtiming ok" id="swTiming">
+                  <span class="swtiming-ic" id="swTimingIcon" aria-hidden="true">&#8226;</span>
+                  <span class="swtiming-tx" id="swTimingText">Pick two assets to see how settlement works.</span>
+                </div>
               </div>
-            </div>
-            <!-- HONEST gating: when a leg has no usable Lightning channel, its LN button
-                 is disabled and this note says why + routes to Move-to-Lightning. -->
-            <div class="sub swrail-note hide" id="swRailNote" style="grid-column:1/-1;margin-top:2px"></div>
-          </div>
 
-          <!-- open fee market: pay the network fee in any asset the node prices -->
-          <div class="swfee" id="swFeeRow">
-            <div class="swfee-head">
-              <label class="lbl" style="margin:0">Fee</label>
-              <span class="sub" id="swFeeNote">Pay the fee in any asset the network prices.</span>
-            </div>
-            <div class="swfee-body">
-              <button type="button" class="swpick swpick-sm" id="swFeePick" aria-haspopup="listbox" aria-expanded="false">
-                <span class="swpick-tk" id="swFeeTk">—</span><span class="swpick-caret">▾</span>
-              </button>
-              <span class="swfee-amt mono" id="swFeeAmt">—</span>
-              <span class="sub" id="swFeeRef"></span>
-            </div>
-          </div>
+              <!-- FEE: pay the network fee in any asset a producer prices (open fee market). -->
+              <div class="swsec swfee" id="swFeeRow">
+                <div class="swfee-head">
+                  <span class="swsec-lab">Fee</span>
+                  <span class="sub" id="swFeeNote">Pay the fee in any asset the network prices.</span>
+                </div>
+                <div class="swfee-body">
+                  <button type="button" class="swpick swpick-sm" id="swFeePick" aria-haspopup="listbox" aria-expanded="false">
+                    <span class="swpick-tk" id="swFeeTk">&#8212;</span><span class="swpick-caret">&#9662;</span>
+                  </button>
+                  <span class="swfee-amt mono" id="swFeeAmt">&#8212;</span>
+                  <span class="sub" id="swFeeRef"></span>
+                </div>
+              </div>
 
-          <!-- honest, actionable timing banner (keyed off the RECEIVE leg; the CAP
-               fronts on-chain PAY, never an on-chain RECEIPT). Rendered by
-               swap.js/renderTiming; the inline "fix" links flip a leg to Lightning. -->
-          <div class="swtiming ok" id="swTiming">
-            <span class="swtiming-ic" id="swTimingIcon" aria-hidden="true">•</span>
-            <span class="swtiming-tx" id="swTimingText">Pick two assets to see how settlement works.</span>
-          </div>
+              <!-- PLACE -->
+              <div class="swsec swsec-place">
+                <button class="primary swreview" id="swReview" disabled>Place order</button>
+                <div class="status" id="swStatus"></div>
+                <div class="status err" id="swErr"></div>
+              </div>
 
-          <button class="primary swreview" id="swReview" disabled>Place order</button>
-          <div class="status" id="swStatus"></div>
-          <div class="status err" id="swErr"></div>
+            </div><!-- /.swpanel -->
         </div>
 
           </div><!-- /.swdesk-compose -->
