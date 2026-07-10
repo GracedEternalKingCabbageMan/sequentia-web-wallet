@@ -88,7 +88,8 @@ export function deriveOtherField({ edited, editedVal, otherUserTyped, price }){
 //   recvAddress    the maker's same-chain receive address (informational)
 //   nowUnix/ttl    created/expires timestamps
 export function buildCovenantOffer({ assetA, assetB, sellAtoms, recvAtoms, covenant,
-                                     makerPubkey, recvAddress, offerId, nowUnix, ttlSecs }){
+                                     makerPubkey, recvAddress, offerId, nowUnix, ttlSecs,
+                                     allowPartial, minLot }){
   const now = Number(nowUnix != null ? nowUnix : Math.floor(Date.now() / 1000));
   const ttl = Number(ttlSecs || 3600);
   return {
@@ -99,7 +100,11 @@ export function buildCovenantOffer({ assetA, assetB, sellAtoms, recvAtoms, coven
     base_amount: String(BigInt(sellAtoms)),
     offer_amount: String(BigInt(sellAtoms)), offer_asset: assetA,
     want_amount: String(BigInt(recvAtoms)),  want_asset: assetB,
-    allow_partial: false,                           // v1 UI: all-or-nothing (min_lot == locked)
+    // allow_partial + min_lot let the matcher cross what's available now and leave the covenant's
+    // self-replicating remainder resting (a market order bigger than the book fills the book, rests
+    // the rest). Defaults keep the old all-or-nothing behaviour for any caller that omits them.
+    allow_partial: !!allowPartial,
+    ...(minLot != null ? { min_lot: String(BigInt(minLot)) } : {}),
     created_at_unix: String(now),
     expires_at_unix: String(now + ttl),
     maker_pubkey: makerPubkey,

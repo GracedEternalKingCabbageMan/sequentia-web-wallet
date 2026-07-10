@@ -83,6 +83,19 @@ check('user_limit_not_overwritten',
   check('offer_covenant_present', !!offer.covenant, true);
   const signed = seqob.__test__.signOffer({ ...offer }, priv);
   ok('offer_verifies', seqob.__test__.verifyOffer(signed), 'covenant offer must verify');
+
+  // Partial-fill order: allow_partial + min_lot let the matcher cross what's available now and leave
+  // the covenant's self-replicating remainder resting (a market order bigger than the book fills the
+  // book, rests the rest). Omitting them keeps the old all-or-nothing behaviour (offer_partial_false).
+  const minLot = (90n * 100000000n) / 1000n;
+  const pOffer = buildCovenantOffer({
+    assetA, assetB, sellAtoms: 90n * 100000000n, recvAtoms: plan.requiredBForFull,
+    covenant: ct, makerPubkey: pub, recvAddress: 'tex1qexample', offerId: 'cov-3',
+    nowUnix: 1000, ttlSecs: 3600, allowPartial: true, minLot,
+  });
+  check('offer_partial_true', pOffer.allow_partial, true);
+  check('offer_min_lot', pOffer.min_lot, String(minLot));
+  ok('offer_partial_verifies', seqob.__test__.verifyOffer(seqob.__test__.signOffer({ ...pOffer }, priv)), 'partial covenant offer must verify');
 }
 
 // --- end-to-end place -> matched -> FILL, mocking the relay + wasm -----------

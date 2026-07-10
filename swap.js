@@ -889,7 +889,12 @@ function paintPlaceRate(pay, receive, best, bookLen){
   } else {
     // MARKET: fill at the best executable offer.
     if (yourPrice > 0 && best){
-      $('swRate').textContent = `Market · 1 ${pm.ticker} = ${trim(yourPrice)} ${rm.ticker} (best offer)`;
+      // If the order is bigger than the resting depth at this price, it fills what's there now and
+      // rests the remainder as a limit — surface that split.
+      const split = marketFillSplit(safeAtoms($('swPayAmt').value, pm.precision||0), safeAtoms($('swRecvAmt').value, rm.precision||0));
+      let s = `Market · 1 ${pm.ticker} = ${trim(yourPrice)} ${rm.ticker} (best offer)`;
+      if (split) s += ` · fills ~${trim(Number(split.fill)/Math.pow(10, pm.precision||0))} ${pm.ticker} now, ~${trim(Number(split.rest)/Math.pow(10, pm.precision||0))} rests`;
+      $('swRate').textContent = s;
     } else if (best){
       $('swRate').textContent = `Market · fills at 1 ${pm.ticker} = ${trim(best)} ${rm.ticker} — set an amount.`;
     } else {
@@ -913,6 +918,34 @@ function bestReceivePerPay(offers, pay, receive){
   return best || null;
 }
 function safeAtoms(str, prec){ try { return C.parseAtoms((str||'').trim(), prec); } catch { return 0n; } }
+
+// PAY-atoms of resting book depth that meets the order's price right now — the amount a Market
+// order can fill immediately (asks giving >= the order's receive-per-pay). Anything above this
+// depth is the remainder that rests. `offers` are the crossable asks (BOOK.offers), each offering
+// `offer_amount` of RECEIVE for `want_amount` of PAY. A best-effort preview; the matcher does the
+// actual crossing at fill time.
+function crossableDepthAtoms(offers, orderPayAtoms, orderRecvAtoms){
+  const op = Number(orderPayAtoms), or = Number(orderRecvAtoms);
+  const orderPrice = op > 0 ? or / op : 0;               // receive per pay the order is willing to accept
+  let d = 0n;
+  for (const o of (offers || [])){
+    const recvU = Number(big(o.offer_amount || o.offerAmount || 0));
+    const payU  = Number(big(o.want_amount  || o.wantAmount  || 0));
+    if (payU <= 0) continue;
+    if (recvU / payU + 1e-9 >= orderPrice) d += big(o.want_amount || o.wantAmount || 0);   // ask meets the price
+  }
+  return d;
+}
+// The Market fill/rest preview for an order of `payAtoms` against the current book: how much fills
+// now vs rests as a limit. null when nothing rests (full fill) or nothing crosses (whole thing rests).
+function marketFillSplit(payAtoms, recvAtoms){
+  const depth = crossableDepthAtoms((BOOK && BOOK.offers) || [], payAtoms, recvAtoms);
+  const pay = BigInt(payAtoms);
+  const fill = depth > pay ? pay : depth;                // can't fill more than the order
+  const rest = pay - fill;
+  if (fill <= 0n || rest <= 0n) return null;             // full fill or no crossable liquidity -> no split to show
+  return { fill, rest };
+}
 
 // POST mode (same-chain): the two amount fields are the user's OWN limit — their ratio
 // IS the price. We do NOT touch either field (no book-derived fill) and route Review to
@@ -1724,15 +1757,22 @@ async function resolveVout(txid, spkHex){
 
 // place: derive the covenant, get the maker payout (register the companion wollet
 // so the credit is watchable), fund it on-chain, then sign + post the resting offer.
+// The partial-fill dust floor for a placed order: the smallest lot a taker may fill AND the
+// smallest remainder that may re-rest (planFill rejects a fill leaving a smaller remainder as
+// dust-griefing). ~0.1% of the order (min 1 atom) — fine-grained enough that a market order fills
+// almost all of the available book, coarse enough that no dust remainder is ever left.
+function covenantMinLot(sellAtoms){ const s = BigInt(sellAtoms); const f = s / 1000n; return f > 0n ? f : 1n; }
+
 async function placeCovenant(pay, receive, payAtoms, recvAtoms, onStatus){
   const tip = C.wollet.tip().height();
   const { rateNum, rateDen } = computeRate(payAtoms, recvAtoms);
   const idx = nextMakerIndex();
   const payout = makerPayout(C.signer, C.network, idx);   // { program, spkHex, address, internalKey, descriptor }
   ensureCompanion();                                      // so this wallet SEES the credit it is paid
+  const minLot = covenantMinLot(payAtoms);                // PARTIAL-fillable (was all-or-nothing minLot==sell)
   const params = {
     assetA: pay, assetB: receive, sellAtoms: BigInt(payAtoms),
-    rateNum, rateDen, minLot: BigInt(payAtoms),           // all-or-nothing (no remainder dust)
+    rateNum, rateDen, minLot,                             // a taker may fill any lot >= minLot; the covenant re-rests the remainder
     expiryLocktime: orderExpiry(tip),
     makerProg: payout.program,                            // the taproot payout the FILL credits
     makerX: payout.internalKey,                           // wallet-derived x-only REFUND authoriser
@@ -1745,6 +1785,7 @@ async function placeCovenant(pay, receive, payAtoms, recvAtoms, onStatus){
   const offer = buildCovenantOffer({
     assetA: pay, assetB: receive, sellAtoms: BigInt(payAtoms), recvAtoms: BigInt(recvAtoms),
     covenant, makerPubkey: makerPubHex(), recvAddress: payout.address, offerId: seqob.randHex(16),
+    allowPartial: true, minLot,                           // fill what crosses now; the covenant's remainder rests on
   });
   onStatus && onStatus('Posting your resting order…');
   await seqob.postCovenantOffer(offer, makerPriv());
@@ -1866,15 +1907,22 @@ async function placeCovenantReview(q){
   const pay = q.pay, receive = q.receive, payAtoms = q.payAtoms, recvAtoms = q.recvAtoms;
   const pm = C.assetMeta(pay), rm = C.assetMeta(receive);
   const payU = Number(payAtoms)/Math.pow(10, pm.precision||0), recvU = Number(recvAtoms)/Math.pow(10, rm.precision||0);
+  const isMarket = S.mode !== 'post';
   const kv = [
     ['You pay', amtRow(pay, payAtoms) + refSuffix(pay, payAtoms)],
     ['You receive', amtRow(receive, recvAtoms) + refSuffix(receive, recvAtoms)],
-    ['Price', payU>0 ? `1 ${pm.ticker} = ${trim(recvU/payU)} ${rm.ticker}` : '-'],
-    ['How it fills', `Your order becomes a funded, self-enforcing covenant on-chain. It fills whenever someone crosses it at your price or better — even while this wallet is closed. Consensus rejects any underpay or redirect.`],
+    ['Price', payU>0 ? `${isMarket ? 'Market · ' : 'Limit · '}1 ${pm.ticker} = ${trim(recvU/payU)} ${rm.ticker}` : '-'],
+    ['How it fills', isMarket
+      ? `Fills against the order book now at your price or better. If your order is larger than what's resting, the filled part settles on-chain and the unfilled remainder keeps resting at the same price until it's crossed — even while this wallet is closed. Consensus rejects any underpay or redirect.`
+      : `Rests on-chain at your price and fills — fully or partially — whenever someone crosses it, even while this wallet is closed. A partial fill settles that part and leaves the rest resting. Consensus rejects any underpay or redirect.`],
     ['You can close the wallet', `The order rests on-chain; when it fills you are credited to a payout address only this wallet controls. Reopen any time to see it.`],
     ['If it does not fill', `Cancel any time to delist it. After the order expires the locked ${pm.ticker} is reclaimable on-chain.`],
     ['Finality', 'Settles in ~1 block · anchor-bound to Bitcoin (reverts only if Bitcoin reverts).'],
   ];
+  // Market order bigger than the resting book at this price: show the fill-now / rest split honestly.
+  const split = isMarket ? marketFillSplit(payAtoms, recvAtoms) : null;
+  if (split) kv.splice(3, 0, ['Now / resting',
+    `About ${C.fmtAtoms(split.fill, pm.precision)} ${pm.ticker} fills now against the book; the remaining ${C.fmtAtoms(split.rest, pm.precision)} ${pm.ticker} rests at your price until it's crossed.`]);
   const { m: modal, ok, st } = C.modalRows({ title: 'Place order', kv });
   if (ok) ok.textContent = 'Place order';
   ok.onclick = async () => {
