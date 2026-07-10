@@ -137,6 +137,15 @@ const CFG = {
   subasBtcChain: process.env.SUBAS_BTC_CHAIN || 'testnet4',
   subasAssetLn: process.env.SUBAS_ASSET_LN || process.env.HOSTED_ASSET_RPC || hostedRpcFallback,
   subasMinBtcConf: Number(process.env.SUBAS_MIN_BTC_CONF || 0), // 0 = LP fronts the reorg risk (instant)
+  // Sub-asset INBOUND provisioning (JIT / pay-to-open). For a PER-USER receive the
+  // user's own hosted asset node must have INBOUND liquidity (Move-to-Lightning only
+  // gives outbound). SUBAS_LP_RPC is the lightning-rpc of the LP that opens an inbound
+  // asset channel TOWARD the user (e.g. ln-asset = the sub-asset maker's own node, so
+  // the maker can then pay over it). Unset => POST /channel/inbound + the per-user
+  // sub-asset receive fail closed. The LP peer id/addr is CHANNEL_PEER_ASSET.
+  subasLpRpc: process.env.SUBAS_LP_RPC || '',
+  subasInboundReserve: Number(process.env.SUBAS_INBOUND_RESERVE || 5000), // extra asset sat funded above the receive amount (channel reserve room)
+  subasInboundFeeBps: Number(process.env.SUBAS_INBOUND_FEE_BPS || 0),     // JIT-inbound fee, basis points of the amount (recorded)
   // --- "Move to Lightning" channel funding (GET /channel/deposit, POST /channel/open) ---
   // The routing peer each hosted node opens its channel TO (id@host:port). The channel
   // is funded from the hosted node's OWN on-chain wallet, whose only signer is the user's
@@ -627,8 +636,54 @@ function runSwap({ side, asset, amount }) {
 // long — so the POST /swap handler runs runMixed in the BACKGROUND as a job and returns
 // immediately; this function is the same either way. Honest finality: 'confirming'
 // (anchor-bound), NOT the pure-LN instant-'final'.
-function runMixed({ side, asset, amount, payRail, recvRail }) {
-  return new Promise((resolve) => {
+// provisionInbound gives the user's OWN hosted asset node INBOUND liquidity so it
+// can RECEIVE the asset (Move-to-Lightning only funds outbound). The LP (SUBAS_LP_RPC,
+// e.g. ln-asset) connects to the user node and opens a 0-conf asset channel TOWARD it,
+// funded from the LP's on-chain asset — the exact JIT/pay-to-open step proven at the
+// CLI. Idempotent: a no-op (already_had_inbound) if the user already has >= amount
+// receivable from the LP. Fails closed (throws) if unconfigured, the node is not
+// provisioned, or the LP lacks asset liquidity. amount is in ASSET SATS.
+async function provisionInbound({ nodeKey, assetId, amount }) {
+  if (!CFG.subasLpRpc) throw new Error('inbound provisioning is not configured on this LSP (set SUBAS_LP_RPC)');
+  const lpId = (CFG.channelPeerAsset || '').split('@')[0];
+  if (!lpId) throw new Error('inbound: no LP peer configured (CHANNEL_PEER_ASSET)');
+  if (!(amount > 0)) throw new Error('inbound: amount (asset sats) must be > 0');
+  const { rpc: userRpc, rec } = targetFor('seq', assetId, nodeKey);
+  if (!userRpc || !rec) throw new Error('user node not provisioned for this asset (POST /node/provision first)');
+  const need = amount * 1000; // msat
+  // Idempotent: reuse an existing NORMAL channel from the LP with enough receivable.
+  const pc = await lnrpc('listpeerchannels', [], userRpc).catch(() => ({ channels: [] }));
+  const already = (pc.channels || []).find(c => c.peer_id === lpId && c.state === 'CHANNELD_NORMAL' && Number(c.receivable_msat || 0) >= need);
+  if (already) return { ok: true, already_had_inbound: true, channel_id: already.channel_id || null, receivable_msat: already.receivable_msat ?? null, fee_msat: 0 };
+  // The user node's listen address, so the LP can dial it.
+  const uinfo = await lnrpc('getinfo', [], userRpc);
+  const userId = uinfo.id;
+  const bind = (uinfo.binding || []).find(b => b.port) || {};
+  if (!bind.port) throw new Error('user node has no listen binding for the LP to connect to');
+  const host = bind.address || '127.0.0.1';
+  await lnrpc('connect', [`id=${userId}`, `host=${host}`, `port=${bind.port}`], CFG.subasLpRpc)
+    .catch(e => { throw new Error(`LP could not connect to the user node: ${e.message}`); });
+  // LP funds a 0-conf asset channel TOWARD the user (all liquidity on the LP side =
+  // the user's inbound). Fails closed if the LP lacks the asset on-chain.
+  const fundAmt = amount + CFG.subasInboundReserve;
+  const fc = await lnrpc('fundchannel', [`id=${userId}`, `amount=${fundAmt}sat`, `asset=${assetId}`, 'mindepth=0', 'announce=false'], CFG.subasLpRpc);
+  // Wait for CHANNELD_NORMAL on the user side (0-conf -> seconds).
+  const deadline = Date.now() + 90000;
+  let chan;
+  for (;;) {
+    const pc2 = await lnrpc('listpeerchannels', [], userRpc).catch(() => ({ channels: [] }));
+    chan = (pc2.channels || []).find(c => c.peer_id === lpId && (c.funding_txid === fc.txid || c.channel_id === fc.channel_id));
+    if (chan && chan.state === 'CHANNELD_NORMAL') break;
+    if (Date.now() > deadline) throw new Error('inbound channel did not reach CHANNELD_NORMAL in time');
+    await sleep(3000);
+  }
+  const feeMsat = Math.floor(need * CFG.subasInboundFeeBps / 10000);
+  return { ok: true, already_had_inbound: false, channel_id: fc.channel_id || null, funding_txid: fc.txid || null,
+    receivable_msat: chan.receivable_msat ?? null, fee_msat: feeMsat };
+}
+
+function runMixed({ side, asset, amount, payRail, recvRail, node_key, asset_bolt11, payment_hash, asset_amount }) {
+  return new Promise(async (resolve) => {
     const assetId = resolveAsset(asset);
     if (side !== 'buy' && side !== 'sell') return resolve({ ok: false, error: "side must be 'buy' or 'sell'" });
     if (!assetId || assetId === CFG.btcx) return resolve({ ok: false, error: 'mixed swap needs a Sequentia asset id (not BTC)' });
@@ -639,19 +694,49 @@ function runMixed({ side, asset, amount, payRail, recvRail }) {
     // branches; the sub-asset branch has no on-chain asset leg, so it is checked there.
     const stateFile = path.join(os.tmpdir(), `lsp-mixed-${Date.now()}-${Math.random().toString(36).slice(2)}.json`);
     let args;
+    let inbound = null;          // set for a per-user sub-asset receive (JIT inbound record)
+    const perUser = !!(node_key && asset_bolt11 && payment_hash);
     if (side === 'buy' && payRail === 'chain' && recvRail === 'ln') {
-      // SUB-ASSET: pay BTC ON-CHAIN, receive the asset OVER LIGHTNING. The taker (this
-      // hosted LSP) funds the BTC HTLC from its bitcoind wallet and receives the asset
-      // on its asset LN node; a sub-asset (ln_direction=4) maker on SUBAS_RELAY pays it.
-      if (!CFG.subasBtcRpc || !CFG.subasAssetLn) {
+      // SUB-ASSET: pay BTC ON-CHAIN, receive the asset OVER LIGHTNING. The LSP funds the
+      // BTC HTLC from its bitcoind wallet; a sub-asset (ln_direction=4) maker on
+      // SUBAS_RELAY pays the asset invoice. Two receive targets:
+      //   PER-USER (node_key + asset_bolt11 + payment_hash): the invoice was made by the
+      //     DEVICE on its OWN hosted node with the device's OWN preimage (non-custodial).
+      //     The LSP JIT-provisions inbound to that node, then drives xsubas in
+      //     external-invoice mode (never minting/settling P). This is the real feature.
+      //   SHARED (no node_key): the legacy path — invoice minted on CFG.subasAssetLn (the
+      //     LSP's own node). Kept for smoke tests; NOT a per-user receive.
+      if (!CFG.subasBtcRpc) {
         return resolve({ ok: false, finality: 'unsupported',
-          error: 'the sub-asset rail (pay BTC on-chain, receive the asset over Lightning) is not configured on this LSP '
-               + '(set SUBAS_BTC_RPC + SUBAS_ASSET_LN + a sub-asset maker on SUBAS_RELAY).' });
+          error: 'the sub-asset rail is not configured on this LSP (set SUBAS_BTC_RPC + a sub-asset maker on SUBAS_RELAY).' });
+      }
+      let assetLnSock, extraArgs;
+      if (perUser) {
+        const { rpc: userRpc, rec } = targetFor('seq', assetId, node_key);
+        if (!userRpc || !rec) {
+          return resolve({ ok: false, error: 'user node not provisioned for this asset (POST /node/provision first)' });
+        }
+        // (a) ensure the user's node has inbound for the asset (idempotent).
+        try {
+          inbound = await provisionInbound({ nodeKey: node_key, assetId, amount: Number(asset_amount) || 0 });
+        } catch (e) {
+          return resolve({ ok: false, error: `inbound provisioning failed: ${e.message}` });
+        }
+        // (b) the invoice lives on the USER's node; the device holds P.
+        assetLnSock = userRpc;
+        extraArgs = ['-asset-bolt11', asset_bolt11, '-payment-hash', payment_hash];
+      } else {
+        if (!CFG.subasAssetLn) {
+          return resolve({ ok: false, finality: 'unsupported',
+            error: 'the shared sub-asset rail is not configured (set SUBAS_ASSET_LN), or pass node_key + asset_bolt11 + payment_hash for a per-user receive.' });
+        }
+        assetLnSock = CFG.subasAssetLn;
+        extraArgs = ['-asset-invoice', 'plain'];
       }
       args = ['xsubas', '-asset', assetId, '-relay', CFG.subasRelay,
         '-btc-rpc', CFG.subasBtcRpc, '-btc-wallet', CFG.subasBtcWallet, '-btc-chain', CFG.subasBtcChain,
-        '-asset-ln-socket', CFG.subasAssetLn, '-min-btc-conf', String(CFG.subasMinBtcConf),
-        '-asset-invoice', 'plain', '-state-file', stateFile];
+        '-asset-ln-socket', assetLnSock, '-min-btc-conf', String(CFG.subasMinBtcConf),
+        ...extraArgs, '-state-file', stateFile];
     } else {
       if (!CFG.seqRpc || !CFG.seqWallet) {
         return resolve({ ok: false, error: 'the mixed (submarine) rail is not configured on this LSP (set SEQ_RPC + SEQ_WALLET)' });
@@ -689,14 +774,21 @@ function runMixed({ side, asset, amount, payRail, recvRail }) {
       const cm = out.match(/claimed the asset in ([0-9a-f]{64})/i);
       try { fs.unlinkSync(stateFile); } catch { /* best-effort */ }
       const dt = Date.now() - t0;
+      // PER-USER (device-preimage): the preimage is DEVICE-HELD and NEVER returned;
+      // the settlement signal is `settled:true` (the device's node auto-settled its
+      // invoice = the asset was received). The wallet observes the receive on its own
+      // node. SHARED (smoke-test) path may surface the LSP-minted preimage.
       if (settled) return resolve({
         ok: true, side, asset: assetId, asset_label: assetLabel(assetId),
         rail: 'mixed', pay_rail: payRail, recv_rail: recvRail,
-        preimage, htlc_txid: htlcTxid, claim_txid: cm ? cm[1] : null,
-        // HONEST: the asset leg is an anchored on-chain HTLC — final only to its
-        // Bitcoin-anchor depth, not the instant-final of pure Lightning.
+        settled: true,
+        ...(perUser ? { per_user: true, node_key, inbound } : { preimage }),
+        htlc_txid: htlcTxid, claim_txid: cm ? cm[1] : null,
+        // HONEST: the BTC leg is an on-chain HTLC — final to its Bitcoin depth.
         finality: 'confirming', anchor_bound: true, eta_seconds: Math.round(dt / 1000),
-        note: 'Mixed submarine swap: one leg on Lightning, one anchored on-chain. Anchor-bound to Bitcoin.',
+        note: perUser
+          ? 'Sub-asset receive on your own hosted node (preimage device-held, not returned).'
+          : 'Mixed submarine swap: one leg on Lightning, one anchored on-chain. Anchor-bound to Bitcoin.',
         settled_ms: dt, requested_amount: amount ?? null,
       });
       resolve({ ok: false, error: err ? `mixed swap failed: ${err.message}` : 'mixed swap did not settle',
@@ -809,6 +901,23 @@ const server = http.createServer(async (req, res) => {
       const r = startChannelOpen(body);
       return send(res, r.ok ? 202 : 400, r);
     }
+    // JIT INBOUND: give the user's OWN hosted asset node inbound liquidity so it can
+    // RECEIVE (the missing half of Move-to-Lightning). The LP (SUBAS_LP_RPC) opens a
+    // 0-conf asset channel TOWARD the user's node. Idempotent, fail-closed. Call this
+    // BEFORE creating the device invoice + POST /swap for a per-user sub-asset receive.
+    //   POST /channel/inbound {node_key, asset, amount}  (amount in ASSET SATS)
+    if (req.method === 'POST' && url.pathname === '/channel/inbound') {
+      const body = await readBody(req);
+      if (!body) return send(res, 400, { ok: false, error: 'bad json body' });
+      const assetId = resolveAsset(body.asset);
+      if (!assetId || assetId === CFG.btcx) return send(res, 400, { ok: false, error: 'asset must be a Sequentia asset id' });
+      const amount = Number(body.amount || 0);
+      if (!(amount > 0)) return send(res, 400, { ok: false, error: 'amount (asset sats to be receivable) is required' });
+      try {
+        const r = await provisionInbound({ nodeKey: body.node_key, assetId, amount });
+        return send(res, 200, r);
+      } catch (e) { return send(res, 502, { ok: false, error: String((e && e.message) || e) }); }
+    }
     // "Move back to chain": cooperatively close a channel on the user's own hosted node, sending
     // the reclaimed funds straight to the wallet's on-chain address. Device-signed (see closeChannel).
     if (req.method === 'POST' && url.pathname === '/channel/close') {
@@ -844,7 +953,11 @@ const server = http.createServer(async (req, res) => {
       // asset-over-LN + BTC-on-chain (xsubas) for a BUY when this LSP is configured with
       // a sub-asset backend (SUBAS_BTC_RPC + SUBAS_ASSET_LN + a maker on SUBAS_RELAY).
       const side = body.side;
-      const subasReady = !!(CFG.subasBtcRpc && CFG.subasAssetLn);
+      // Sub-asset is reachable when the BTC leg is configured AND either a shared asset
+      // node (SUBAS_ASSET_LN, smoke test) or the per-user path (an LP for JIT inbound +
+      // the request naming a provisioned node_key) is available.
+      const perUserReq = !!(body.node_key && body.asset_bolt11 && body.payment_hash);
+      const subasReady = !!(CFG.subasBtcRpc && (CFG.subasAssetLn || (perUserReq && CFG.subasLpRpc)));
       const supported = (side === 'buy' && payRail === 'ln' && recvRail === 'chain') ||
                         (side === 'sell' && payRail === 'chain' && recvRail === 'ln') ||
                         (side === 'buy' && payRail === 'chain' && recvRail === 'ln' && subasReady);
