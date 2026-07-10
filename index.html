@@ -81,11 +81,17 @@
   .asset-row{display:flex;align-items:baseline;gap:10px;padding:10px 0;border-top:1px solid var(--line)}
   .asset-row:first-child{border-top:none}
   .tk{font-weight:700} .aid{font:12px ui-monospace,monospace;color:var(--dim);word-break:break-all}
-  /* Consolidated balance row: the on-chain + Lightning split and the inline move/close actions
-     (the Lightning card was folded into each asset row). The bolt marks the Lightning portion. */
-  .split-ln{margin-top:2px}
-  .split-ln .z{color:var(--amber2)}
-  .bal-acts{display:flex;gap:6px;margin-top:7px;flex-wrap:wrap}
+  /* Consolidated balance row: a header line (ticker · name · total) with a nested Lightning
+     "metacard" beneath it — the on-chain/Lightning split and the move/close actions, clearly
+     labelled so the buttons read as Lightning actions. All still inside the one Assets card. */
+  .arow2{flex-direction:column;align-items:stretch;gap:0}
+  .arow-head{display:flex;align-items:baseline;gap:10px}
+  .ln-meta{margin-top:9px;padding:9px 11px;border:1px solid var(--line);border-radius:10px;background:rgba(255,198,41,.045)}
+  .ln-meta-head{display:flex;align-items:center;gap:5px;font-size:10px;text-transform:uppercase;letter-spacing:.06em;color:var(--amber2);font-weight:700;margin-bottom:5px}
+  .ln-meta-head .z{color:var(--amber2)}
+  .ln-meta-split{font-size:12px;color:var(--fg)}
+  .ln-meta-hint{font-size:11px;color:var(--dim);margin-top:6px}
+  .bal-acts{display:flex;gap:6px;margin-top:8px;flex-wrap:wrap}
   .bal-acts button{padding:3px 11px;font-size:12px}
   .ln-note{margin-top:12px}
   .ln-note summary{cursor:pointer;font-size:12px;color:var(--dim)}
@@ -2071,29 +2077,40 @@ function renderBalance(){
   const lnChansFor = (kind)=>{ try { return lnSpendableFor(kind).channels||0; } catch { return 0; } };
   const ownChansFor = (kind)=>{ try { return lnOwnChannelsFor(kind)||[]; } catch { return []; } };
 
-  // One consolidated row. movable = the asset can be moved to Lightning (producer prices it for
-  // fees, uniform across assets — first-principle #3); leg drives the move/close modals.
+  // One consolidated row: a header line (ticker · name · combined total) with a nested,
+  // clearly-labelled Lightning metacard beneath it (the split + move/close actions). movable
+  // = the asset can be moved to Lightning (a producer prices it for fees, uniform across assets
+  // — first-principle #3); leg drives the move/close modals.
   const rowFull = ({ticker, refKey, precision, onchainAtoms, kind, nameNode, movable, leg, known})=>{
     const lnAtoms = lnOn ? lnAtomsFor(kind) : 0n;
     const chans   = lnOn ? lnChansFor(kind) : 0;
     const own     = lnOn ? ownChansFor(kind) : [];
     const totalAtoms = (onchainAtoms||0n) + lnAtoms;
-    const r=el('div','asset-row');
-    r.appendChild(el('span','tk', ticker));
+    const r=el('div','asset-row arow2');
+    // Header line: ticker · name/id · combined total (on-chain + Lightning) + ref value.
+    const head=el('div','arow-head');
+    head.appendChild(el('span','tk', ticker));
     const mid=el('div','grow');
     if(nameNode){ const nd=el('div'); nd.appendChild(nameNode); mid.appendChild(nd); }
-    // Split line only when Lightning actually holds some of this asset.
-    if(lnOn && chans>0){
-      const sp=el('div','sub split-ln');
-      sp.appendChild(el('span','z','⚡'));
-      sp.appendChild(document.createTextNode(' '+fmtAtoms(lnAtoms, precision)+' in Lightning · '+fmtAtoms(onchainAtoms||0n, precision)+' on-chain'));
-      mid.appendChild(sp);
-    }
-    // Inline Lightning actions (only when an LSP is live and this asset can use Lightning).
+    head.appendChild(mid);
+    const a=el('span','amt');
+    a.appendChild(el('div',null, known ? fmtAtoms(totalAtoms, precision) : (BigInt(totalAtoms).toString()+' atoms')));
+    const ref = (known && refKey) ? refValueStr(refKey, totalAtoms) : '';
+    if(ref) a.appendChild(el('div','sub', ref));
+    head.appendChild(a);
+    r.appendChild(head);
+    // Lightning metacard (only when an LSP is live and this asset can use Lightning).
     if(lnOn && leg && (movable || chans>0 || own.length)){
+      const meta=el('div','ln-meta');
+      const mh=el('div','ln-meta-head'); mh.appendChild(el('span','z','⚡')); mh.appendChild(document.createTextNode(' Lightning')); meta.appendChild(mh);
+      const split=el('div','ln-meta-split');
+      split.textContent = chans>0
+        ? (fmtAtoms(lnAtoms, precision)+' '+ticker+' in Lightning · '+fmtAtoms(onchainAtoms||0n, precision)+' on-chain')
+        : ('Not in Lightning yet · '+fmtAtoms(onchainAtoms||0n, precision)+' '+ticker+' on-chain');
+      meta.appendChild(split);
       const acts=el('div','bal-acts');
       if(movable || chans>0){
-        const btn=el('button','ghost', chans>0?'Add funds':'Move to Lightning');
+        const btn=el('button','ghost', chans>0?'Add to Lightning':'Move to Lightning');
         btn.disabled = !((onchainAtoms||0n) > 0n);   // provisions the user's OWN hosted node on click
         btn.title = btn.disabled ? ('No on-chain '+ticker+' to move') : ('Provision your own '+ticker+' Lightning node and open a channel');
         btn.onclick=()=>moveToLightningDialog(leg);
@@ -2105,14 +2122,15 @@ function renderBalance(){
         cb.onclick=()=>closeToChainDialog(leg, own);
         acts.appendChild(cb);
       }
-      if(acts.children.length) mid.appendChild(acts);
+      if(acts.children.length) meta.appendChild(acts);
+      // Honest reason a Lightning balance may have no "Move to chain": it sits in a channel this
+      // wallet didn't open (a shared/demo channel with no device node_key), so it isn't closable here.
+      if(chans>0 && !own.length){
+        meta.appendChild(el('div','ln-meta-hint','This balance is in a channel this wallet didn’t open, so it can’t be moved back on-chain from here.'));
+      }
+      r.appendChild(meta);
     }
-    r.appendChild(mid);
-    const a=el('span','amt');
-    a.appendChild(el('div',null, known ? fmtAtoms(totalAtoms, precision) : (BigInt(totalAtoms).toString()+' atoms')));
-    const ref = (known && refKey) ? refValueStr(refKey, totalAtoms) : '';
-    if(ref) a.appendChild(el('div','sub', ref));
-    r.appendChild(a); list.appendChild(r);
+    list.appendChild(r);
   };
 
   // The Sequentia assets to show: everything held on-chain PLUS anything that still has a live
