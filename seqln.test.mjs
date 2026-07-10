@@ -30,10 +30,19 @@ const srv = http.createServer((req, res) => {
   let b = ''; req.on('data', (c) => b += c); req.on('end', () => {
     const u = new URL(req.url, 'http://x');
     seen.push({ method: req.method, path: req.url, auth: req.headers['authorization'], body: b });
-    if (u.pathname === '/status') return res.end(JSON.stringify({ ok: true, node_id: 'ab'.repeat(33), channels: [
-      { peer_id: 'ln3', asset_label: 'GOLD', spendable_units: 0, receivable_units: 2000000, state: 'CHANNELD_NORMAL' },
-      { peer_id: 'ln2', asset_label: 'BTC', spendable_units: 1000000, receivable_units: 1000000, state: 'CHANNELD_NORMAL' },
-    ], funding: { btc: true, assets: [{ id: 'aa'.repeat(32), label: 'GOLD' }] } }));
+    if (u.pathname === '/status') {
+      const base = [
+        { peer_id: 'ln3', asset_label: 'GOLD', spendable_units: 0, receivable_units: 2000000, state: 'CHANNELD_NORMAL' },
+        { peer_id: 'ln2', asset_label: 'BTC', spendable_units: 1000000, receivable_units: 1000000, state: 'CHANNELD_NORMAL' },
+      ];
+      // The device's OWN provisioned-node channels, reported only for the keys it named via ?nodes=.
+      const keys = (u.searchParams.get('nodes') || '').split(',').filter(Boolean);
+      const prov = keys.map((k) => ({ peer_id: 'lnP', asset: k.startsWith('seq:') ? k.split(':')[1] : k,
+        node_key: k, leg: 'prov', spendable_units: 4242, receivable_units: 0, state: 'CHANNELD_NORMAL' }));
+      return res.end(JSON.stringify({ ok: true, node_id: 'ab'.repeat(33), channels: [...base, ...prov],
+        provisioned_nodes: keys.map((k) => ({ key: k })),
+        funding: { btc: true, assets: [{ id: 'aa'.repeat(32), label: 'GOLD' }] } }));
+    }
     if (u.pathname === '/swap') return res.end(JSON.stringify({ ok: true, side: 'buy', direction: 'bought',
       asset_label: 'GOLD', base_amount: 100000, quote_amount: 200000,
       preimage: 'cd'.repeat(32), finality: 'final', settled_ms: 2100 }));
@@ -401,6 +410,26 @@ readyPolls = 10;   // force ready
 const gi = await nodeGetinfo('seq:' + 'aa'.repeat(32) + ':' + '02'.repeat(33));
 assert.equal(gi.ready, true, 'nodeGetinfo returns the node readiness');
 console.log('ok: waitNodeReady polls /node/getinfo until the fresh node is ready (honest progress)');
+
+// ===========================================================================
+// Part 7 — /status reports the DEVICE's OWN provisioned-node channels (2c)
+// ===========================================================================
+// After a Move-to-Lightning, seqlnGetStatus threads the device's provisioned-node keys via
+// ?nodes= so /status also returns THAT device's channels — so the Balance card reflects a
+// channel the user just created on their own node (not only the shared demo nodes).
+initSeqln({ lspUrl: `http://127.0.0.1:${port}`, token: 'T0KEN', sdkPath: MOCK });
+globalThis.__seqlnMockConnects = [];
+const OWN = 'ce'.repeat(32);
+const ownProv = await provisionAndConnect({ chain: 'seq', assetId: OWN, deriveIdentity: (id) => lnDeriveAsset(PHRASE, id), label: 'OWN' });
+const before7 = seen.length;
+const st7 = await seqlnGetStatus();
+const statusReq = seen.slice(before7).find((s) => s.path.startsWith('/status'));
+assert.ok(statusReq.path.includes('nodes=') && statusReq.path.includes(encodeURIComponent(ownProv.key)),
+  'seqlnGetStatus threads the device provision key via ?nodes=');
+const ownChan = (st7.channels || []).find((c) => c.node_key === ownProv.key);
+assert.ok(ownChan && ownChan.state === 'CHANNELD_NORMAL', '/status merges the device\'s OWN provisioned-node channel');
+assert.ok((st7.provisioned_nodes || []).some((n) => n.key === ownProv.key), '/status lists the device\'s provisioned node');
+console.log('ok: seqlnGetStatus reports the device\'s own provisioned-node channels (Balance card readback)');
 
 srv.close();
 console.log('\nALL PASS');

@@ -266,18 +266,36 @@ async function nodeStatus(rpc, leg) {
     blockheight: info.blockheight, channels };
 }
 
-async function status() {
+async function status(deviceKeys = []) {
   // Aggregate BOTH hosted nodes: the asset (GOLD) node and the BTC node.
   // In one-node fallback mode both sockets are identical and return the same data.
   const [assetNode, btcNode] = await Promise.all([
     nodeStatus(CFG.hostedAssetRpc, 'asset'),
     nodeStatus(CFG.hostedBtcRpc, 'btc'),
   ]);
+  // Include the REQUESTING DEVICE's OWN provisioned-node channels, so the wallet reads back its
+  // LN balance right after a "Move to Lightning" (else a just-created channel on the user's own
+  // per-asset node is invisible and the balance card shows "No Lightning channel yet"). Gated by
+  // the device's PROVISION KEYS: `deviceKeys` are the `seq:<assetId>:<devicepub>` / `btc:<pub>`
+  // registry keys the wallet derived from ITS OWN mnemonic — only that device can name them, so
+  // this discloses a node's channels solely to the device that owns it. Channels are leg-tagged
+  // with the node key + the node's asset id (the wallet matches by asset id).
+  const provChannels = [];
+  const provNodes = [];
+  if (PROV) for (const key of deviceKeys) {
+    const rec = PROV.getByKey(key);
+    if (!rec) continue;
+    const ns = await nodeStatus(rec.rpc, rec.chain === 'btc' ? 'btc' : 'prov').catch(() => null);
+    if (!ns) continue;
+    provNodes.push({ key: rec.key, asset_id: rec.asset_id, node_id: ns.id, channels: ns.channels.length });
+    for (const c of ns.channels) provChannels.push({ ...c, node_key: rec.key });
+  }
   return {
     ok: true,
     asset_node: assetNode,
     btc_node: btcNode,
-    channels: [...assetNode.channels, ...btcNode.channels], // merged, leg-tagged
+    provisioned_nodes: provNodes,                                       // the device's own nodes it named
+    channels: [...assetNode.channels, ...btcNode.channels, ...provChannels], // merged, leg-tagged (incl. the device's own)
     // Which chains/assets "Move to Lightning" can fund on THIS LSP. SeqLN nodes are
     // single-asset, so each Sequentia asset needs its OWN hosted node; `assets` lists
     // the demo GOLD node PLUS every asset the provisioner has booted a node for, and
@@ -452,6 +470,12 @@ async function runChannelOpen(job) {
   // explicit amount = the confirmed deposit minus a small reserve for that fee; the leftover
   // stays on the node's wallet (recoverable). A BTC node is policy-denominated (BTC IS the
   // testnet4 policy asset), so it passes no `asset` and funds plainly.
+  //
+  // The fork sizes the asset fee from the node's OWN fee rate table (its Elements backend's
+  // getfeeexchangerates), so the LSP can only fund an asset its backend whitelists — acceptable by
+  // design (today that is every live asset: GOLD, USDX, EURX, SILVR, OILX). The wallet gates the
+  // Move-to-Lightning list on /feerates, which IS that acceptance set, so it only ever asks for
+  // assets the node can fund — consistent by construction.
   const FEE_RESERVE = 20000; // asset atoms held back for the in-asset on-chain fee (~1 atom)
   const fundAmount = Math.max(1, (job.confirmed_units || need) - FEE_RESERVE);
   const fcArgs = [`id=${peerId}`, `amount=${fundAmount}`, 'announce=true'];
@@ -484,12 +508,14 @@ function startChannelOpen(body) {
   if (!chain) return { ok: false, error: "chain must be 'btc' or 'seq'" };
   const amount = Number(body.amount);
   if (!Number.isFinite(amount) || amount <= 0) return { ok: false, error: 'amount must be a positive number (base units: BTC sats / asset atoms)' };
-  // Resolve the asset so the deposit watch counts only that asset + we route to the
-  // correct single-asset node. seq with no asset defaults to the GOLD node.
+  // Resolve the asset so the deposit watch counts only that asset + we route to the correct
+  // single-asset node. NO privileged default asset: a seq channel REQUIRES an explicit asset id
+  // (there is no "the GOLD node" fallback). The LSP funds whatever asset the wallet asks — it does
+  // not whitelist; producers decide movability by mining or not.
   let assetId = null;
   if (chain === 'seq') {
-    assetId = body.asset ? resolveAsset(body.asset) : CFG.gold;
-    if (!assetId) return { ok: false, error: 'unknown asset (want GOLD or a 32-byte hex id)' };
+    assetId = body.asset ? resolveAsset(body.asset) : null;
+    if (!assetId) return { ok: false, error: 'a Sequentia asset id is required for a seq channel (no default asset)' };
     if (assetId === CFG.btcx) return { ok: false, error: 'that id is the BTC leg; use chain=btc' };
   }
   // A provisioned-node key (e.g. `btc:<devicepub>`) routes to the user's OWN node.
@@ -630,7 +656,13 @@ const server = http.createServer(async (req, res) => {
   if (req.method === 'GET' && url.pathname === '/health') return send(res, 200, { ok: true, service: 'seqln-lsp' });
   if (!authed(req)) return send(res, 401, { ok: false, error: 'unauthorized (Bearer token required)' });
   try {
-    if (req.method === 'GET' && url.pathname === '/status') return send(res, 200, await status());
+    if (req.method === 'GET' && url.pathname === '/status') {
+      // `?nodes=<key1>,<key2>` = the requesting device's own provision keys, so /status also
+      // reports that device's provisioned-node channels (see status()). Only the device that
+      // derived a key knows it, so this is self-scoped.
+      const deviceKeys = (url.searchParams.get('nodes') || '').split(',').map((s) => s.trim()).filter(Boolean);
+      return send(res, 200, await status(deviceKeys));
+    }
     // Per-asset hosted-node provisioning: spin up (or re-attach) a SeqLN node for an
     // asset, keyed to the connecting device. Non-custodial (keyless node + device pin).
     if (req.method === 'POST' && url.pathname === '/node/provision') {

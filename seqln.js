@@ -317,8 +317,14 @@ async function lspFetch(path, opts = {}) {
   if (!r.ok || j.ok === false) throw new Error(j.error || ('HTTP ' + r.status));
   return j;
 }
-// Both hosted nodes' ids + per-asset channel balances (spendable=send, recv=recv).
-export function seqlnGetStatus() { return lspFetch('/status'); }
+// Both hosted nodes' ids + per-asset channel balances (spendable=send, recv=recv). Passes THIS
+// device's provisioned-node keys (`?nodes=`) so /status also reports the device's OWN per-asset
+// channels — so the Balance card reflects a channel the user just created on their own node
+// (not only the shared demo nodes). Only keys this device derived are sent, so it stays self-scoped.
+export function seqlnGetStatus() {
+  const keys = Object.keys(provNodes);
+  return lspFetch('/status' + (keys.length ? ('?nodes=' + encodeURIComponent(keys.join(','))) : ''));
+}
 // Take a cross-chain offer through the LSP: {side:'buy'|'sell', asset, amount,
 // payRail?, recvRail?}. payRail/recvRail each 'ln' | 'chain':
 //   • omitted / ln+ln -> pure-LN (both legs Lightning); the LSP drives BOTH legs and

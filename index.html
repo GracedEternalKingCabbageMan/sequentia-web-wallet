@@ -889,20 +889,27 @@ async function oampRefreshBalances(){
 // so a fee built with the same rate is exactly what the node requires.
 const EXCHANGE_RATE_SCALE = 100000000;
 let feeRates = {};                        // assetHex -> { rate, source }  (non-stale, positive)
-let feeRefRate = EXCHANGE_RATE_SCALE;     // the tSEQ reference rate, read from the feed
+let feeRefRate = null;                     // the tSEQ reference rate, READ from the feed (never fabricated; null until the feed provides it)
 async function fetchFeeRates(){
   try{
     // /feerates = getfeeexchangerates: the node's effective acceptance set {("bitcoin"|hex): rate},
     // i.e. static + non-stale dynamic. tSEQ (policy) is keyed "bitcoin" and is the reference unit.
     const d = await fetch('/feerates').then(r=>r.json());
-    const ref = d.bitcoin;                            // policy/tSEQ reference rate (a number)
-    feeRefRate = (ref>0) ? ref : EXCHANGE_RATE_SCALE;
-    console.log(`[feerates] tSEQ reference rate = ${feeRefRate}` +
-      (feeRefRate===EXCHANGE_RATE_SCALE ? ' (1:1 — node normalized to tSEQ)'
-                                        : ' (non-1:1 — valuing other assets relative to it)'));
+    const ref = d.bitcoin;                            // policy/tSEQ reference rate (a number) — or ABSENT
     const map={};
+    // tSEQ (policy) is NOT privileged. It enters feeRates from the feed's reference value, keyed
+    // by POLICY_HEX, EXACTLY like every other asset — so feeRateEntry(POLICY_HEX) resolves from
+    // the FEED. If this node's acceptance set omits the reference (e.g. it prices fees in USD and
+    // refuses SEQ), tSEQ is ABSENT here -> gated out of the fee selectors -> unusable for fees.
+    // That is correct: being the Elements tx format's native unit (always tx-buildable) does NOT
+    // mean a producer accepts it. We never FABRICATE a reference rate.
+    if(ref>0 && POLICY_HEX) map[POLICY_HEX] = { rate: ref, source: 'reference' };
+    feeRefRate = (ref>0) ? ref : null;                // read the reference; do NOT fabricate one
+    console.log(`[feerates] tSEQ reference rate = ` +
+      (feeRefRate==null ? 'ABSENT — SEQ not in this node\'s acceptance set; gated out like any unpriced asset'
+                        : feeRefRate));
     for(const [k,v] of Object.entries(d)){
-      if(k==='bitcoin' || !(v>0)) continue;          // skip the reference + invalid (node already drops stale)
+      if(k==='bitcoin' || !(v>0)) continue;          // reference handled above; skip invalid (node already drops stale)
       map[k] = { rate: v };
     }
     feeRates = map;
@@ -1096,15 +1103,15 @@ function populateFeeAssets(){
   const prev=sel.value;
   sel.innerHTML='';
   const add=(val,label)=>{ const o=el('option'); o.value=val; o.textContent=label; sel.appendChild(o); };
-  add(POLICY_HEX, 'tSEQ');
-  // Only offer owned assets this node actually prices: building a fee in an unpriced asset has no
-  // valid rate (feeRateFor would throw), so listing it would just produce a broken send. tSEQ above
-  // is always available — it's the protocol's default-accepted asset.
+  // NO privileged policy asset: tSEQ goes through the SAME gate as every asset — offered iff the
+  // wallet holds it AND this node's published feed prices it (feeRateEntry resolves). A producer
+  // may price fees in USD and refuse SEQ; then the feed omits SEQ and tSEQ is NOT offered here.
+  // Only offer owned assets the node prices (building a fee in an unpriced asset has no valid rate,
+  // so feeRateFor would throw and the send would break).
   const b=balObj();
   for(const h of Object.keys(b)){
-    if(h===POLICY_HEX) continue;
-    if(!(feeRateEntry(h) && feeRateEntry(h).rate>0)) continue;   // unpriced: gate it out of the selector
-    add(h, assetMeta(h).ticker);
+    if(!(feeRateEntry(h) && feeRateEntry(h).rate>0)) continue;   // unpriced (incl. tSEQ): gate it out
+    add(h, h===POLICY_HEX ? 'tSEQ' : assetMeta(h).ticker);
   }
   if(prev && [...sel.options].some(o=>o.value===prev)) sel.value=prev;
   updateFeeAssetHint();
@@ -2166,9 +2173,13 @@ function sentAssetHex(){ const box=$('recipients'); const sel=box && box.querySe
 function defaultFeeAssetToSent(){
   const sel=$('feeAsset'); if(!sel || feeAssetManual) return;
   const sent=sentAssetHex();
-  const priced = sent && sent!==POLICY_HEX && feeRateEntry(sent) && feeRateEntry(sent).rate>0
-    && [...sel.options].some(o=>o.value===sent);
-  sel.value = priced ? sent : POLICY_HEX;   // tSEQ only as the always-accepted fallback
+  const has=(v)=>v && [...sel.options].some(o=>o.value===v);
+  // Default to the asset being sent when it's an offered fee asset; else tSEQ ONLY if it too is
+  // offered (feed-priced); else the first offered asset. No privileged tSEQ fallback — if the feed
+  // doesn't price SEQ, tSEQ isn't in the list and isn't chosen.
+  if(has(sent)) sel.value=sent;
+  else if(has(POLICY_HEX)) sel.value=POLICY_HEX;
+  else if(sel.options.length) sel.value=sel.options[0].value;
   updateFeeAssetHint();
 }
 function updateFeeForSendType(){
