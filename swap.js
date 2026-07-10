@@ -527,8 +527,11 @@ function postSupported(route){ return !!route && (route.kind === 'same' || route
 // nothing resting to lift (start the market), Take when there is. Once the user picks a
 // mode (modeTouched) we stop overriding it. Unsupported routes are forced to Take.
 function applyAutoMode(bookLen, route){
+  // Default MARKET (S.mode='take') always: type one amount, the other auto-fills at the best
+  // executable price. The user can switch to LIMIT (S.mode='post') to set their own price
+  // (independent fields). Unsupported routes are forced to take. (bookLen kept for callers.)
   if (!postSupported(route)) S.mode = 'take';
-  else if (!S.modeTouched) S.mode = bookLen > 0 ? 'take' : 'post';
+  else if (!S.modeTouched) S.mode = 'take';
   paintModeSeg();
 }
 function wireModeSeg(){
@@ -543,9 +546,14 @@ function wireModeSeg(){
 // paintPanes. paintModeSeg is now just the internal auto-mode reconciler.
 function paintModeSeg(){
   if (!C) return;
-  const wrap = C.$('swModeWrap'); if (wrap) wrap.classList.add('hide');   // never shown
+  const wrap = C.$('swModeWrap'), seg = C.$('swModeSeg');
   const route = findRoute(S.payAsset, S.receiveAsset);
   if (!postSupported(route)) S.mode = 'take';
+  // Market/Limit is only meaningful where a limit order can rest (same-chain + cross); LN/mixed are
+  // market-only, so the toggle hides there. Shows once a limit-capable pair is chosen.
+  const show = !!(S.payAsset && S.receiveAsset && postSupported(route));
+  if (wrap) wrap.classList.toggle('hide', !show);
+  if (seg) seg.querySelectorAll('button[data-m]').forEach(b => b.classList.toggle('on', b.dataset.m === S.mode));
 }
 // Switch mode by hand (marks it touched so the auto-default stops). Take re-links the
 // fields (requote re-derives the opposite); Post leaves both fields independent.
@@ -574,13 +582,14 @@ function updateRails(){
     // explanation. This kills the old "LSP configured => flash the LN rail" bug.
     const ra = railAvail(pay, receive);
     if (!S.railsTouched){
+      // Auto-default: Lightning when a usable channel already exists, else on-chain (never auto-pick
+      // a rail that would need provisioning — the user opts into that by choosing Lightning).
       S.payRail  = ra.payLn.ok  ? 'ln' : 'chain';
       S.recvRail = ra.recvLn.ok ? 'ln' : 'chain';
-    } else {
-      // The user chose rails; still force any 'ln' leg that lost/lacks a channel to chain.
-      if (S.payRail  === 'ln' && !ra.payLn.ok)  S.payRail  = 'chain';
-      if (S.recvRail === 'ln' && !ra.recvLn.ok) S.recvRail = 'chain';
     }
+    // If the user chose Lightning for a leg with no channel yet, KEEP it — the channel is opened
+    // inline on Place-order (reviewLn). We no longer force it back to on-chain. (The unsupported
+    // mixed shape is still corrected below via railSupported.)
     // Never sit on the undeployed mixed shape (asset over LN + BTC on-chain): if the
     // channel-reconciled combo is unsupported, fall all the way back to the proven
     // on-chain cross route (both legs on-chain), which is always available.
@@ -599,13 +608,20 @@ function updateRails(){
 function renderRailNote(ra){
   const note = C.$('swRailNote'); if (!note) return;
   if (!ra || (ra.payLn.ok && ra.recvLn.ok)){ note.innerHTML = ''; note.classList.add('hide'); return; }
-  const bad = !ra.payLn.ok ? ra.payLn : ra.recvLn;   // surface the first blocked leg
-  const canMove = bad.cta === 'move' || bad.cta === 'add';
+  const bad = !ra.payLn.ok ? ra.payLn : ra.recvLn;   // surface the first leg that isn't LN-ready
   note.classList.remove('hide');
-  note.innerHTML = `<span>${esc(bad.reason)} ${esc(bad.hint || '')}</span>`
-    + (canMove ? ` <button type="button" class="swfix" id="swRailMove">${esc(bad.ctaLabel || 'Move to Lightning')}</button>` : '');
+  if (bad.cta === 'move'){
+    // No channel yet is NOT a blocker any more — a channel is opened for you INLINE when you place
+    // the order. Say so honestly; offer an optional "set it up now" shortcut to the Balance tab.
+    note.innerHTML = `<span>No Lightning channel for this leg yet — one is opened for you when you place the order (this can take a couple of minutes).</span>`
+      + ` <button type="button" class="swfix" id="swRailMove">Set it up now</button>`;
+  } else {
+    // Channel exists but this side lacks liquidity (cta 'add') — the honest add-liquidity note stays.
+    note.innerHTML = `<span>${esc(bad.reason)} ${esc(bad.hint || '')}</span>`
+      + ` <button type="button" class="swfix" id="swRailMove">${esc(bad.ctaLabel || 'Add liquidity')}</button>`;
+  }
   const b = C.$('swRailMove');
-  if (b) b.onclick = () => { if (C.gotoLightning) C.gotoLightning(); else try { C.toast('Move funds to Lightning from the Balance tab.'); } catch {} };
+  if (b) b.onclick = () => { if (C.gotoLightning) C.gotoLightning(); else try { C.toast('Open a Lightning channel from the Balance tab.'); } catch {} };
 }
 // Is (payRail, recvRail) a rail combination with a backend for the current pair? Both
 // legs the same (pure-LN or fully on-chain) always work. The only mixed shape deployed
@@ -632,19 +648,19 @@ function paintRailSegs(ra){
     seg.querySelectorAll('button[data-r]').forEach(b => {
       const r = b.dataset.r;
       b.classList.toggle('on', r === cur);
-      // The Lightning button is offerable ONLY with a real usable channel for this leg;
-      // otherwise disable it and say why (no channel -> Move to Lightning; empty side ->
-      // add liquidity). On-chain is always available.
+      // The Lightning button is now SELECTABLE even without a channel: if the leg has no channel yet,
+      // one is opened for you INLINE on Place-order (see reviewLn / renderRailNote). Only the
+      // undeployed mixed shape (asset over LN + BTC on-chain) stays disabled. A no-channel LN pick
+      // gets an informative title (not disabled). On-chain is always available.
       let bad = false, tip = '';
-      if (r === 'ln' && !legLn.ok){ bad = true; tip = legLn.reason + (legLn.hint ? ' ' + legLn.hint : ''); }
-      else {
-        // Also never let a pick form the undeployed mixed shape (asset over LN + BTC on-chain).
-        const p2 = leg === 'pay' ? r : S.payRail;
-        const r2 = leg === 'pay' ? S.recvRail : r;
-        if (!railSupported(p2, r2)){ bad = true; tip = badTip; }
-      }
+      const p2 = leg === 'pay' ? r : S.payRail;
+      const r2 = leg === 'pay' ? S.recvRail : r;
+      if (r !== 'chain' && !railSupported(p2, r2)){ bad = true; tip = badTip; }
+      else if (r === 'ln' && !legLn.ok){ tip = legLn.cta === 'add'
+        ? (legLn.reason + (legLn.hint ? ' ' + legLn.hint : ''))
+        : 'No channel yet — one is opened for you when you place the order.'; }
       b.disabled = bad;
-      if (bad) b.title = tip; else b.removeAttribute('title');
+      if (tip) b.title = tip; else b.removeAttribute('title');   // informative title even when selectable
     }); };
   paint('swPayRailSeg', 'pay');
   paint('swRecvRailSeg', 'recv');
@@ -827,10 +843,11 @@ async function requoteSame(route, amtStr){
     }
     status.textContent = '';
 
-    // Anti-clobber compose derivation: fill the empty side from the book's best price
-    // WITHOUT wiping user input (empty-market first order leaves both fields as typed).
+    // MARKET (default): fill the empty side from the book's best EXECUTABLE price, WITHOUT wiping
+    // user input. LIMIT (S.mode==='post'): the two fields are independent — the user sets their own
+    // price, so we never auto-derive. (Empty market: best is null -> no derivation either way.)
     const best = bestReceivePerPay(liftable, pay, receive);
-    applyComposeDerivation(pay, receive, best);
+    if (S.mode === 'take') applyComposeDerivation(pay, receive, best);
     paintPlaceRate(pay, receive, best, liftable.length);
     paintFee(S.feeAsset, null);
     setFinality('same');
@@ -859,14 +876,27 @@ function paintPlaceRate(pay, receive, best, bookLen){
   const { $ } = C;
   const pm = C.assetMeta(pay), rm = C.assetMeta(receive);
   const payV = numVal($('swPayAmt')), recvV = numVal($('swRecvAmt'));
-  if (payV > 0 && recvV > 0){
-    $('swRate').textContent = `Your price · 1 ${pm.ticker} = ${trim(recvV/payV)} ${rm.ticker}`;
-  } else if (best){
-    $('swRate').textContent = `Best resting price · 1 ${pm.ticker} = ${trim(best)} ${rm.ticker} — set an amount.`;
+  const yourPrice = (payV > 0 && recvV > 0) ? recvV / payV : 0;
+  if (S.mode === 'post'){
+    // LIMIT: the user's own price. Compare to the book so they know if/when it crosses.
+    if (yourPrice > 0){
+      let s = `Limit · 1 ${pm.ticker} = ${trim(yourPrice)} ${rm.ticker}`;
+      if (best) s += yourPrice <= best ? ` — crosses now (best offer ${trim(best)})` : ` — rests until crossed (best offer ${trim(best)})`;
+      $('swRate').textContent = s;
+    } else {
+      $('swRate').textContent = 'Limit — set both amounts; their ratio is your price.';
+    }
   } else {
-    $('swRate').textContent = bookLen
-      ? `${bookLen} resting order${bookLen>1?'s':''} — set both amounts (their ratio is your price).`
-      : `No resting orders yet — set both amounts to place the first order (their ratio is your price).`;
+    // MARKET: fill at the best executable offer.
+    if (yourPrice > 0 && best){
+      $('swRate').textContent = `Market · 1 ${pm.ticker} = ${trim(yourPrice)} ${rm.ticker} (best offer)`;
+    } else if (best){
+      $('swRate').textContent = `Market · fills at 1 ${pm.ticker} = ${trim(best)} ${rm.ticker} — set an amount.`;
+    } else {
+      $('swRate').textContent = bookLen
+        ? 'No crossable offers yet — set both amounts to rest an order (their ratio is your price).'
+        : 'No resting orders yet — set both amounts to place the first order.';
+    }
   }
   $('swRoute').textContent = bookLen ? 'Order book · place a resting order' : 'Order book · be the first';
 }
@@ -2282,12 +2312,33 @@ async function reviewLn(q){
   // Defense-in-depth: never proceed on a pure-LN swap without a real usable channel on
   // BOTH legs (findRoute already gates this; this catches a stale quote). Fail CLOSED
   // with a clear message + a route to Move-to-Lightning — never a silent flash.
-  const ra = railAvail(S.payAsset, S.receiveAsset);
+  let ra = railAvail(S.payAsset, S.receiveAsset);
   if (!ra.pureLnOk){
-    const bad = !ra.payLn.ok ? ra.payLn : ra.recvLn;
-    $('swErr').textContent = bad.reason + ' ' + (bad.hint || 'Move funds to Lightning from the Balance tab first.');
-    try { C.toast(bad.reason + ' Move to Lightning first.'); } catch {}
-    return;
+    // No usable channel on one/both legs. Instead of BLOCKING and sending the user to the Balance
+    // tab, OPEN the missing channel(s) INLINE now (the same non-custodial provision+fund flow), then
+    // continue the swap. Honest, bounded progress; a clear failure — never a silent hang.
+    if (!L.provisionChannel){ $('swErr').textContent = 'Opening a channel is unavailable in this build — open one from the Balance tab first.'; return; }
+    const provLeg = async (hexOrBtc, amtEl) => {
+      const chain = hexOrBtc === 'BTC' ? 'btc' : 'seq';
+      const m = metaOf(hexOrBtc);
+      const atoms = safeAtoms(C.$(amtEl).value, m.precision || 0);
+      if (atoms <= 0n) throw new Error('Enter an amount so the Lightning channel can be sized.');
+      await L.provisionChannel({ chain, asset: chain === 'seq' ? hexOrBtc : undefined, ticker: m.ticker,
+        amount: Number(atoms), onProgress: (t) => { $('swStatus').className = 'status'; $('swStatus').innerHTML = '<span class="spin"></span>' + t; } });
+    };
+    try {
+      $('swErr').textContent = '';
+      if (!ra.payLn.ok)  await provLeg(S.payAsset,     'swPayAmt');
+      if (!ra.recvLn.ok) await provLeg(S.receiveAsset, 'swRecvAmt');
+      LNSTATUS = await L.status();   // refresh so railAvail sees the freshly-opened channel(s)
+      $('swStatus').textContent = '';
+    } catch (e){
+      $('swStatus').textContent = '';
+      $('swErr').textContent = 'Could not open your Lightning channel: ' + (e && e.message || e);
+      return;
+    }
+    ra = railAvail(S.payAsset, S.receiveAsset);
+    if (!ra.pureLnOk){ $('swErr').textContent = 'Your Lightning channel opened but is not ready to trade yet — please try again in a moment.'; return; }
   }
   const am = C.assetMeta(q.seqAsset);
   const dir = q.side === 'buy' ? `Buy ${am.ticker} with BTC` : `Sell ${am.ticker} for BTC`;

@@ -110,11 +110,9 @@
   .swdesk-compose>.card{margin-top:0}
   /* Take (lift the book at its price) vs Post (rest a limit order at your own price). */
   .swmode{display:flex;align-items:center;gap:12px;flex-wrap:wrap}
-  /* Unified DEX: no visible Take/Post, ever — every order is just "Place order". #swModeWrap
-     is retained only as an internal auto-mode hook (read by JS), never shown. The generic
-     .swmode{display:flex} above was overriding the .hide class and leaking the buttons into
-     view, so force it hidden unconditionally. */
-  #swModeWrap{display:none!important}
+  /* The Market/Limit toggle is a real, visible control now. paintModeSeg shows it only for
+     limit-capable pairs (same-chain + cross) via the .hide class; LN/mixed are market-only. */
+  .swmode.hide{display:none}
   .swmode-seg{max-width:200px}
   .swmode-hint{font-size:12px;color:var(--dim)}
   .swpane{padding:18px 20px}
@@ -440,17 +438,17 @@
           <!-- RIGHT: the composer (the signature). -->
           <div class="swdesk-compose">
 
-            <!-- No Take vs Post, no maker vs taker: every order is just "Place order".
-                 The two amount fields are the user's own limit (their ratio is the
-                 price); placing rests a self-enforcing covenant that fills whenever it
-                 is crossed, even offline. The hidden #swModeWrap is retained only as an
-                 internal auto-mode hook for the cross-chain route (never shown). -->
-            <div class="swmode hide" id="swModeWrap" aria-hidden="true">
-              <div class="swseg swmode-seg" id="swModeSeg">
-                <button type="button" data-m="take">Take</button>
-                <button type="button" data-m="post">Post</button>
+            <!-- Pricing: MARKET (default) fills the other amount at the best executable price;
+                 LIMIT lets you set your own price (the two amounts are independent, their ratio is
+                 your price, and the order rests until it's crossed). Every order is still just
+                 "Place order" — this only chooses how the price is set. Shown for same-chain +
+                 cross pairs (LN/mixed are market-only); paintModeSeg toggles .hide. -->
+            <div class="swmode hide" id="swModeWrap">
+              <div class="swseg swmode-seg" id="swModeSeg" role="group" aria-label="Order price">
+                <button type="button" data-m="take">Market</button>
+                <button type="button" data-m="post">Limit</button>
               </div>
-              <span class="sub swmode-hint" id="swModeHint"></span>
+              <span class="sub swmode-hint" id="swModeHint">Type an amount; the other fills at the best price. Switch to Limit to set your own.</span>
             </div>
 
         <div class="card swcard">
@@ -2019,6 +2017,30 @@ function initSwapTab(){
       provisioned: () => provisionedState(),
       swap: (p) => seqlnSwap(p),
       finalityCopy: () => lnFinalityCopy(),
+      // Open a Lightning channel for a leg INLINE — the SAME non-custodial provision+fund flow as
+      // the Balance-tab Move-to-Lightning (moveToLightningDialog), exposed so the Swap composer can
+      // create a channel on Place-order instead of blocking the Lightning rail. { chain:'btc'|'seq',
+      // asset?, ticker?, amount(atoms), onProgress(text) } -> the funded-channel result; throws with
+      // a clear message on failure (never a silent hang).
+      provisionChannel: async ({ chain, asset, ticker, amount, onProgress }) => {
+        const say = (t) => { try { onProgress && onProgress(t); } catch {} };
+        const phrase = (localStorage.getItem(KEY) || '').trim();
+        if (!phrase) throw new Error('Your wallet is locked; unlock it and try again.');
+        say(chain === 'btc' ? 'Provisioning your Lightning BTC node…' : 'Provisioning your ' + (ticker || 'asset') + ' Lightning node…');
+        const prov = chain === 'btc'
+          ? await provisionAndConnect({ chain: 'btc', label: 'BTC', policy: lnPolicy(),
+              deriveIdentity: () => { const k = lnNodeIdentity(phrase, 'btc'); return { transportPrivkey: k.deviceTransportPrivkey, signingSeed: k.deviceSigningSeed }; } })
+          : await provisionAndConnect({ chain: 'seq', assetId: asset, label: ticker, policy: lnPolicy(),
+              deriveIdentity: (id) => lnDeriveAsset(phrase, id) });
+        if (!(prov && prov.connected)) throw new Error('Could not bring your device signer online for your Lightning node.');
+        say('Preparing your Lightning node (booting and syncing)…');
+        await waitNodeReady({ nodeKey: prov.key, onProgress: () => say('Preparing your Lightning node (booting and syncing)…') });
+        const phaseCopy = { 'deposit-address': 'Getting your hosted node deposit address…', 'sending': 'Signing and sending the on-chain deposit…', 'sent': 'Deposit sent; waiting for confirmation…', 'pending_deposit': 'Waiting for the deposit to confirm on-chain…', 'opening': 'Opening the Lightning channel (your device is co-signing)…', 'awaiting_lockin': 'Channel funding broadcast; waiting for it to confirm…' };
+        say('Your Lightning node is ready. Preparing the on-chain deposit…');
+        const res = await fundChannel({ chain, asset: asset || undefined, amount: Number(amount), node: prov.key, sendOnchain: lnSendDeposit, onProgress: (e) => { if (phaseCopy[e.phase]) say(phaseCopy[e.phase]); } });
+        try { renderLightningBalance(); } catch {}
+        return res;
+      },
     },
     // Route the user to Move-to-Lightning (the Balance tab's Lightning card) when a leg
     // has no usable channel — the honest fix for an unavailable LN rail.
