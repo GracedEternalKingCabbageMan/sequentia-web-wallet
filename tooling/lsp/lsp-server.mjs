@@ -837,15 +837,20 @@ const server = http.createServer(async (req, res) => {
         return send(res, 200, { ok: false, handled_by: 'wallet_onchain', finality: 'anchor-bound',
           error: 'on-chain <-> on-chain is settled by the wallet\'s own on-chain rail (the SeqOB order book), not the LSP' });
       }
-      // MIXED (one leg 'ln', one 'chain') -> a submarine swap. Only asset-on-chain <->
-      // BTC-Lightning maps to a deployed binary; reject the mirror combos synchronously.
+      // MIXED (one leg 'ln', one 'chain') -> a submarine swap. Two shapes settle:
+      // asset-on-chain <-> BTC-Lightning (xsubbuy/xsublift, always), and the MIRROR
+      // asset-over-LN + BTC-on-chain (xsubas) for a BUY when this LSP is configured with
+      // a sub-asset backend (SUBAS_BTC_RPC + SUBAS_ASSET_LN + a maker on SUBAS_RELAY).
       const side = body.side;
+      const subasReady = !!(CFG.subasBtcRpc && CFG.subasAssetLn);
       const supported = (side === 'buy' && payRail === 'ln' && recvRail === 'chain') ||
-                        (side === 'sell' && payRail === 'chain' && recvRail === 'ln');
+                        (side === 'sell' && payRail === 'chain' && recvRail === 'ln') ||
+                        (side === 'buy' && payRail === 'chain' && recvRail === 'ln' && subasReady);
       if (!supported) {
         return send(res, 422, { ok: false, finality: 'unsupported',
-          error: `mixed pay=${payRail}/recv=${recvRail} for a ${side} is not a deployed submarine `
-               + '(only asset-on-chain <-> BTC-Lightning). Use both-Lightning, both-on-chain, or flip the mixed legs.' });
+          error: `mixed pay=${payRail}/recv=${recvRail} for a ${side} has no maker/backend on this LSP `
+               + '(asset-on-chain <-> BTC-Lightning always; asset-over-LN + BTC-on-chain needs a sub-asset backend). '
+               + 'Use both-Lightning, both-on-chain, or a supported mixed shape.' });
       }
       reapJobs();
       // Under the 0-conf cap -> the submarine skips the anchor-bury wait, so the swap
