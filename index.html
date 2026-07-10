@@ -737,7 +737,7 @@ import { initXmaker, startForwardMaker, startReverseMaker, liveMakerOffers, resu
 import { initSeqln, connectDevice as lnConnectDevice, disconnectDevice as lnDisconnect,
   onSeqlnStatus, seqlnState, seqlnAvailable, seqlnGetStatus, seqlnSwap, lnFinalityCopy,
   seqlnChannels, seqlnFunding, fundChannel, provisionAndConnect, waitNodeReady, provisionedState,
-  deviceTransportPubkey, registerOwnStatusKeys } from './seqln.js';
+  deviceTransportPubkey, registerOwnStatusKeys, closeChannelLsp } from './seqln.js';
 import { lnDeriveNode, lnDeriveAsset } from './seqln-keys.js';
 
 const ESPLORA = location.origin + '/api';
@@ -1666,6 +1666,19 @@ function lnSpendableFor(kind /* 'BTC' | assetHex */){
   }
   return { units, channels: n };
 }
+// The active channel(s) on the user's OWN provisioned node for a leg — carries the scid + node_key
+// that "Move back to chain" needs to name the exact channel to close. Returns [{scid, node_key, spendable_units}].
+function lnOwnChannelsFor(kind /* 'BTC' | assetHex */){
+  const chs = (lnLastStatus && lnLastStatus.channels) || [];
+  const out = [];
+  for(const c of chs){
+    if(!c.node_key) continue;                                   // only the device's OWN provisioned nodes are closable here
+    const isBtc = (c.asset_label==='BTC' || c.leg==='btc');
+    const match = kind==='BTC' ? isBtc : (!isBtc && (c.asset===kind || c.asset_label===assetMeta(kind).ticker));
+    if(match && String(c.state||'').startsWith('CHANNELD')) out.push({ scid:c.short_channel_id, node_key:c.node_key, spendable_units:Number(c.spendable_units||0) });
+  }
+  return out;
+}
 
 // Render the Balance-tab "Lightning" card: for BTC and every asset the LSP can fund
 // (dynamic — one row per hosted node, NOT hardcoded), show the in-channel balance and
@@ -1756,10 +1769,66 @@ async function renderLightningBalance(){
       ? ('No on-chain '+leg.ticker+' to move')
       : ('Provision your own '+leg.ticker+' Lightning node and open a channel');
     btn.onclick=()=>moveToLightningDialog(leg);
-    act.appendChild(onchainStr); act.appendChild(btn); r.appendChild(act);
+    act.appendChild(onchainStr); act.appendChild(btn);
+    // "Move back to chain": only for the user's OWN provisioned channels (a channel carrying a
+    // node_key). Demo/shared channels have no node_key and can't be closed from here. This is the
+    // inverse of Move-to-Lightning — closes the channel and returns the funds to the wallet on-chain.
+    const own=lnOwnChannelsFor(leg.kind);
+    if(own.length){
+      const cb=el('button','ghost','Move to chain');
+      cb.style.cssText='padding:4px 12px;font-size:12px;margin-top:4px;margin-left:6px';
+      cb.title='Close your '+leg.ticker+' Lightning channel and move the funds back on-chain to your wallet';
+      cb.onclick=()=>closeToChainDialog(leg, own);
+      act.appendChild(cb);
+    }
+    r.appendChild(act);
     list.appendChild(r);
   }
   lnStatusPill();
+}
+// Modal: "Move back to chain" — the inverse of Move-to-Lightning. Reconnects the device signer to
+// the user's own hosted node, then cooperatively closes the channel, sending the reclaimed funds
+// straight to a fresh wallet address. Device-signed + non-custodial: the LSP drives the close but the
+// closing tx is signed by the device, so it can only pay the user's own address.
+function closeToChainDialog(leg, own){
+  const chan = own[0];   // one channel per own node in practice; scid names it exactly
+  const m=el('div','modal'); const c=el('div','card');
+  c.appendChild(el('label','lbl','Move '+leg.ticker+' back on-chain'));
+  c.appendChild(el('div','sub','This closes your '+leg.ticker+' Lightning channel and returns the funds to your wallet on-chain. Your device co-signs the closing transaction, so only you can move these funds. A cooperative close is near-instant; if the routing peer is offline it falls back to a slower unilateral close.'));
+  const inLn=el('div','sub'); inLn.style.marginTop='8px';
+  inLn.textContent='In Lightning: '+fmtAtoms(BigInt(Math.round(chan.spendable_units||0)), leg.precision)+' '+leg.ticker+' (channel '+(chan.scid||'')+')';
+  c.appendChild(inLn);
+  const st=el('div','sub'); st.style.marginTop='8px';
+  const row=el('div','row'); row.style.marginTop='10px';
+  const go=el('button','primary','Move to chain'); const cancel=el('button','ghost','Cancel');
+  cancel.onclick=()=>m.remove();
+  go.onclick=async()=>{
+    go.disabled=true; cancel.disabled=true;
+    const say=(t)=>{ st.textContent=t; };
+    try{
+      const phrase=(localStorage.getItem(KEY)||'').trim();
+      if(!phrase) throw new Error('Your wallet is locked; unlock it and try again.');
+      // 1. Reconnect the device signer to this hosted node (the close is device-signed).
+      say('Connecting your device signer…');
+      const prov = leg.chain==='btc'
+        ? await provisionAndConnect({ chain:'btc', label:'BTC', policy:lnPolicy(),
+            deriveIdentity: ()=>{ const k=lnNodeIdentity(phrase,'btc'); return { transportPrivkey:k.deviceTransportPrivkey, signingSeed:k.deviceSigningSeed }; } })
+        : await provisionAndConnect({ chain:'seq', assetId: leg.asset, label: leg.ticker, policy:lnPolicy(),
+            deriveIdentity: (id)=>lnDeriveAsset(phrase, id) });
+      if(!(prov && prov.connected)) throw new Error('Could not bring your device signer online. Check your connection and try again.');
+      // 2. A fresh on-chain address of ours = where the reclaimed funds land.
+      const dest = wollet.address(addrIndex==null?undefined:addrIndex).address().toUnconfidential().toString();
+      // 3. Ask the LSP to cooperatively close, paying our address.
+      say('Closing the channel (your device is co-signing)…');
+      const res = await closeChannelLsp({ chain: leg.chain, asset: leg.asset||undefined, node: prov.key||chan.node_key, scid: chan.scid, destination: dest });
+      say('Done. Closing transaction '+(res.closing_txid? res.closing_txid.slice(0,16)+'…':'broadcast')+'. Your '+leg.ticker+' will return on-chain once it confirms.');
+      go.textContent='Close'; go.disabled=false; go.onclick=()=>m.remove(); cancel.style.display='none';
+      setTimeout(async()=>{ try{ await sync(); renderBalance(); renderLightningBalance(); }catch{} }, 1500);
+    }catch(e){ say('Failed: '+prettyErr(e)); go.disabled=false; cancel.disabled=false; }
+  };
+  row.appendChild(go); row.appendChild(cancel);
+  c.appendChild(st); c.appendChild(row);
+  m.appendChild(c); document.body.appendChild(m);
 }
 // Modal: choose an amount, then run the non-custodial Move-to-Lightning flow.
 function moveToLightningDialog(leg){

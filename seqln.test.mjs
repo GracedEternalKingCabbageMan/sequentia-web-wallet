@@ -18,7 +18,7 @@ import {
 } from './seqln.js';
 import { lnDeriveNode, lnDeriveAll, lnDeriveAsset, LN_PATHS, LN_ASSET_BRANCH } from './seqln-keys.js';
 import {
-  connectProvisioned, provisionAndConnect, provisionedState, nodeGetinfo, waitNodeReady,
+  connectProvisioned, provisionAndConnect, provisionedState, nodeGetinfo, waitNodeReady, closeChannelLsp,
 } from './seqln.js';
 
 let seen = [];
@@ -46,6 +46,12 @@ const srv = http.createServer((req, res) => {
     if (u.pathname === '/swap') return res.end(JSON.stringify({ ok: true, side: 'buy', direction: 'bought',
       asset_label: 'GOLD', base_amount: 100000, quote_amount: 200000,
       preimage: 'cd'.repeat(32), finality: 'final', settled_ms: 2100 }));
+    if (u.pathname === '/channel/close' && req.method === 'POST') {
+      const body = JSON.parse(b || '{}');
+      // Echo back what the wallet asked to close, plus a closing txid — mirrors the LSP.
+      return res.end(JSON.stringify({ ok: true, closing_txid: 'fc'.repeat(32), type: 'mutual',
+        scid: body.scid, destination: body.destination, asset_label: 'GOLD' }));
+    }
     if (u.pathname === '/node/provision' && req.method === 'POST') {
       const body = JSON.parse(b || '{}');
       // Mirror the real LSP registry keying: a btc node is device-keyed (`btc:<pub>`),
@@ -430,6 +436,23 @@ const ownChan = (st7.channels || []).find((c) => c.node_key === ownProv.key);
 assert.ok(ownChan && ownChan.state === 'CHANNELD_NORMAL', '/status merges the device\'s OWN provisioned-node channel');
 assert.ok((st7.provisioned_nodes || []).some((n) => n.key === ownProv.key), '/status lists the device\'s provisioned node');
 console.log('ok: seqlnGetStatus reports the device\'s own provisioned-node channels (Balance card readback)');
+
+// ===========================================================================
+// Part 8 — "Move back to chain": closeChannelLsp posts the close request (2c inverse)
+// ===========================================================================
+// The wallet closes a channel on its own hosted node and names the destination address, so the
+// reclaimed funds return on-chain. Verify the POST body carries chain/asset/node/scid/destination
+// and the closing txid comes back.
+const before8 = seen.length;
+const close8 = await closeChannelLsp({ chain: 'seq', asset: 'aa'.repeat(32), node: 'seq:' + 'aa'.repeat(32) + ':' + '02'.repeat(33), scid: '111x2x0', destination: 'tb1qexampledest' });
+const closeReq = seen.slice(before8).find((s) => s.path === '/channel/close' && s.method === 'POST');
+assert.ok(closeReq, 'closeChannelLsp POSTs to /channel/close');
+const cbody = JSON.parse(closeReq.body || '{}');
+assert.equal(cbody.scid, '111x2x0', 'close request carries the channel scid');
+assert.equal(cbody.destination, 'tb1qexampledest', 'close request carries the wallet destination address');
+assert.ok(cbody.node && cbody.node.startsWith('seq:'), 'close request names the device node key');
+assert.equal(close8.closing_txid, 'fc'.repeat(32), 'closeChannelLsp returns the closing txid');
+console.log('ok: closeChannelLsp drives a device-signed channel close back to the wallet address (Move back to chain)');
 
 srv.close();
 console.log('\nALL PASS');

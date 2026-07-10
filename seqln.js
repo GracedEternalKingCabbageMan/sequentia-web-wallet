@@ -335,6 +335,17 @@ export function seqlnGetStatus() {
   const keys = [...new Set([...Object.keys(provNodes), ...ownStatusKeys])];
   return lspFetch('/status' + (keys.length ? ('?nodes=' + encodeURIComponent(keys.join(','))) : ''));
 }
+
+// "Move back to chain": cooperatively close a channel on the user's own hosted node and send the
+// reclaimed funds to `destination` (the wallet's own on-chain address). The INVERSE of fundChannel.
+// The device signer MUST be connected first (the keyless node's closing tx is device-signed), so the
+// caller provisions/connects the node before calling this. Returns { closing_txid, type, destination }.
+export function closeChannelLsp({ chain = 'seq', asset, node, scid, destination, unilateraltimeout } = {}) {
+  return lspFetch('/channel/close', {
+    method: 'POST',
+    body: JSON.stringify({ chain, asset, node, scid, destination, unilateraltimeout }),
+  });
+}
 // Take a cross-chain offer through the LSP: {side:'buy'|'sell', asset, amount,
 // payRail?, recvRail?}. payRail/recvRail each 'ln' | 'chain':
 //   • omitted / ln+ln -> pure-LN (both legs Lightning); the LSP drives BOTH legs and

@@ -221,14 +221,15 @@ function assetLabel(id) {
   return id.slice(0, 8) + '…';
 }
 
-function lnrpc(method, args = [], rpc) {
+function lnrpc(method, args = [], rpc, timeoutMs = 0) {
   return new Promise((resolve, reject) => {
     // Fail LOUD on a missing rpc path: never silently default to the demo node (that would
     // target the wrong node) or to a bare `lightning-rpc` in cwd. A falsy rpc here is a
     // programming/registry bug, so surface it clearly instead of hitting the wrong socket.
     if (!rpc) return reject(new Error(`internal: no rpc path for lnrpc '${method}' (node record is missing its rpc)`));
     execFile(CFG.lncli, [`--rpc-file=${rpc}`, method, ...args],
-      { maxBuffer: 8 << 20 }, (err, stdout, stderr) => {
+      { maxBuffer: 8 << 20, timeout: timeoutMs || undefined }, (err, stdout, stderr) => {
+        if (err && err.killed) return reject(new Error(`${method}: timed out after ${Math.round(timeoutMs/1000)}s (is the device signer connected?)`));
         // lightning-cli prints the JSON-RPC error (with a human "message") to stdout
         // even on a non-zero exit, so surface that instead of the bare "Command failed".
         if (err) {
@@ -539,6 +540,41 @@ function startChannelOpen(body) {
   return { ...job, poll: `/channel/open/${jobId}` };
 }
 
+// POST /channel/close {chain, asset?, node?, scid?, destination}. The INVERSE of Move-to-Lightning:
+// cooperatively close a channel on the user's OWN hosted node and send the reclaimed funds straight
+// to `destination` (the wallet's own on-chain address), so nothing is left parked on the hosted node
+// and no separate asset-sweep is needed. Device-signed and fail-closed: the keyless node's closing tx
+// SIGN is served by the DEVICE (like the funding SIGN_WITHDRAWAL), so the LSP can command the close
+// but cannot redirect the funds — and if no device signer is connected, the close simply times out
+// rather than moving anything. `unilateraltimeout` gives the cooperative path a window before falling
+// back to a (still device-signed) unilateral force-close.
+async function closeChannel(body) {
+  const chain = CHAINS[String(body.chain || '').toLowerCase()];
+  if (!chain) return { ok: false, error: "chain must be 'btc' or 'seq'" };
+  let assetId = null;
+  if (chain === 'seq') {
+    assetId = body.asset ? resolveAsset(body.asset) : null;
+    if (!assetId) return { ok: false, error: 'a Sequentia asset id is required for a seq channel' };
+  }
+  const nodeKey = body.node || null;
+  const { rpc } = targetFor(chain, assetId, nodeKey);
+  if (!rpc) return { ok: false, error: `no hosted Lightning node for ${chain === 'btc' ? 'BTC' : assetLabel(assetId)}` };
+  const dest = String(body.destination || '').trim();
+  if (!dest) return { ok: false, error: 'destination (your on-chain address) is required so the reclaimed funds return to your wallet' };
+  // Pick the channel to close: the named scid, else the node's single open channel.
+  const pc = await lnrpc('listpeerchannels', [], rpc).catch(() => ({ channels: [] }));
+  const open = (pc.channels || []).filter((c) => String(c.state || '').startsWith('CHANNELD'));
+  const ch = body.scid ? open.find((c) => c.short_channel_id === body.scid) : (open.length === 1 ? open[0] : null);
+  if (!ch) return { ok: false, error: open.length ? 'multiple channels on this node — specify scid' : 'no open channel to close on this node' };
+  const id = ch.short_channel_id || ch.channel_id;
+  // close <id> <unilateraltimeout> <destination>: cooperative first (funds -> destination), then a
+  // device-signed unilateral fallback. Bounded by an execFile timeout so a missing device fails fast.
+  const uni = Number.isFinite(Number(body.unilateraltimeout)) ? Math.max(1, Number(body.unilateraltimeout)) : 60;
+  const r = await lnrpc('close', [id, String(uni), dest], rpc, (uni + 30) * 1000);
+  return { ok: true, closing_txid: r.txid || (r.txids && r.txids[0]) || null, type: r.type || null,
+    scid: ch.short_channel_id || null, destination: dest, asset_label: assetId ? assetLabel(assetId) : 'BTC' };
+}
+
 function runSwap({ side, asset, amount }) {
   return new Promise((resolve) => {
     const assetId = resolveAsset(asset);
@@ -741,6 +777,14 @@ const server = http.createServer(async (req, res) => {
       if (!body) return send(res, 400, { ok: false, error: 'bad json body' });
       const r = startChannelOpen(body);
       return send(res, r.ok ? 202 : 400, r);
+    }
+    // "Move back to chain": cooperatively close a channel on the user's own hosted node, sending
+    // the reclaimed funds straight to the wallet's on-chain address. Device-signed (see closeChannel).
+    if (req.method === 'POST' && url.pathname === '/channel/close') {
+      const body = await readBody(req);
+      if (!body) return send(res, 400, { ok: false, error: 'bad json body' });
+      const r = await closeChannel(body);
+      return send(res, r.ok ? 200 : 400, r);
     }
     // Poll an over-cap (anchor-gated) mixed swap started asynchronously by POST /swap.
     if (req.method === 'GET' && url.pathname.startsWith('/swap/')) {
