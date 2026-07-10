@@ -4,7 +4,7 @@
 // that mocks the relay + wasm hooks (proving the taker settlement path without a
 // live relay). Run: node covenant-flow.test.mjs
 
-import { gcdBig, computeRate, orderExpiry, deriveOtherField, buildCovenantOffer, DEFAULT_ORDER_BLOCKS } from './covenant-flow.js';
+import { gcdBig, computeRate, orderExpiry, deriveOtherField, buildCovenantOffer, fillRestSplit, DEFAULT_ORDER_BLOCKS } from './covenant-flow.js';
 import { ceilPrice, bytesToHex } from './covenant.js';
 import { planPlaceOrder, buildCovenantTerms, place, settleFill } from './covenant-order.js';
 import * as seqob from './seqob.js';
@@ -150,6 +150,29 @@ check('user_limit_not_overwritten',
     await settleFill(matched, { ...fillHooks, fetchUtxoSpk: async () => placed.plan.spkHex.slice(0,-2) + '00' });
   } catch { rejected = true; }
   ok('settle_rejects_tampered_spk', rejected, 'a lying relay spk must be refused');
+}
+
+// --- market fill/rest split (shared by same-chain + cross-chain routes) -----
+{
+  const G = (n) => BigInt(Math.round(n * 1e8));                 // GOLD atoms (prec 8)
+  // requested > fillable -> fill the available now, rest the remainder
+  const s1 = fillRestSplit(G(2.72), G(0.02));
+  ok('split_has_remainder', !!s1, 's1 null');
+  check('split_fill', s1 && s1.fill, G(0.02));
+  check('split_rest', s1 && s1.rest, G(2.72) - G(0.02));
+  ok('split_sum_equals_request', s1 && (s1.fill + s1.rest === G(2.72)), 'fill+rest must equal the request (exact atoms)');
+  // requested <= fillable -> full fill, no remainder (null)
+  ok('split_full_fill_null', fillRestSplit(G(1), G(5)) === null, 'a fully-fillable order has no remainder');
+  // fillable exactly equal -> full fill
+  ok('split_exact_null', fillRestSplit(G(3), G(3)) === null, 'exact fill has no remainder');
+  // a <0.5% sliver of remainder is rounding, not a real remainder
+  ok('split_dust_null', fillRestSplit(G(100), G(99.8)) === null, 'a <0.5% short is treated as a full fill');
+  ok('split_dust_boundary', !!fillRestSplit(G(100), G(99)), 'a 1% short is a real remainder');
+  // zero/empty
+  ok('split_zero_null', fillRestSplit(0n, G(1)) === null, 'nothing requested -> no split');
+  // nothing crosses -> whole thing "rests" is handled by the caller (empty book), but fillable 0 -> all rest
+  const s2 = fillRestSplit(G(5), 0n);
+  ok('split_empty_all_rests', s2 && s2.fill === 0n && s2.rest === G(5), 'no fillable -> whole order rests');
 }
 
 console.log(fails ? `\n${fails} FAILED` : '\nALL PASS');

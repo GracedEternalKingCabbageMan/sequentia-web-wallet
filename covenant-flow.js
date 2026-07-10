@@ -74,6 +74,25 @@ export function deriveOtherField({ edited, editedVal, otherUserTyped, price }){
   return { side: otherSide, value };
 }
 
+// --- market fill / rest split -----------------------------------------------
+
+// fillRestSplit: for a MARKET order of `requestedAtoms` when only `fillableAtoms` can fill NOW
+// (the book/maker depth at the price), return the { fill, rest } split — fill = what settles
+// immediately, rest = the remainder that rests as a limit order at the same price. Both BigInt
+// atoms. A sub-`1/dustDen` sliver of remainder (default <0.5%) is treated as rounding = a full
+// fill (returns null, so callers show no split and rest nothing). null also when nothing is
+// requested. Used identically by the same-chain (covenant) and cross-chain (HTLC) routes so the
+// "fills ~X now, ~Y rests" behaviour + copy read the same on both.
+export function fillRestSplit(requestedAtoms, fillableAtoms, dustDen = 200n){
+  const req = BigInt(requestedAtoms);
+  if (req <= 0n) return null;
+  let fillable = BigInt(fillableAtoms); if (fillable < 0n) fillable = 0n;
+  const fill = fillable > req ? req : fillable;    // can't fill more than the order
+  const rest = req - fill;
+  if (rest <= req / dustDen) return null;          // <0.5% sliver -> full fill, no remainder
+  return { fill, rest };
+}
+
 // --- seqob.v1.Offer skeleton for a covenant resting order -------------------
 
 // buildCovenantOffer assembles the seqob Offer a covenant maker posts: a SELL of
@@ -114,4 +133,4 @@ export function buildCovenantOffer({ assetA, assetB, sellAtoms, recvAtoms, coven
   };
 }
 
-export const __test__ = { gcdBig, computeRate, orderExpiry, deriveOtherField, buildCovenantOffer };
+export const __test__ = { gcdBig, computeRate, orderExpiry, deriveOtherField, buildCovenantOffer, fillRestSplit };

@@ -36,7 +36,7 @@ import { secp256k1 } from './btc.js';
 // match as the taker. Everything routes through these; no crypto is hand-rolled here.
 import { planPlaceOrder, buildCovenantTerms, settleFill as covSettleFill, planRefund as covPlanRefund, cancel as covCancel } from './covenant-order.js';
 import { makeCovenantHooks, makerPayout } from './covenant-fill-host.js';
-import { computeRate, orderExpiry, deriveOtherField, buildCovenantOffer } from './covenant-flow.js';
+import { computeRate, orderExpiry, deriveOtherField, buildCovenantOffer, fillRestSplit } from './covenant-flow.js';
 // HONEST per-asset Lightning-rail gating (offer LN only with a real usable channel).
 import { railAvailability } from './ln-rail.js';
 // The mixed-rail (submarine) swap state machine + localStorage resume (fund-safety:
@@ -1252,27 +1252,36 @@ async function requoteCross(route, amtStr){
       return;
     }
 
-    // seq_amount to quote (the daemon prices in the asset amount): use the typed
-    // asset amount, or convert a typed BTC amount via the best resting offer.
+    // The user's FULL requested amount, priced at the best resting offer. We quote the full amount;
+    // the cross daemon returns what the best maker can fill NOW (its liquidity) — the immediate-fill
+    // portion. The unfilled remainder rests as a limit order at the same price (posted on Review).
+    const { asset: bestAsset, btc: bestBtc } = xOfferAmts(offers[0], route.payIsBtc);
+    if (!(bestAsset > 0n && bestBtc > 0n)) throw new Error('no cross-chain price yet');
     const editedIsSeq = (S.edited === 'pay' ? S.payAsset : S.receiveAsset) === seqAsset;
-    let seqAtoms;
+    let reqSeqAtoms, reqBtcAtoms;
     if (editedIsSeq){
-      seqAtoms = C.parseAtoms(amtStr, seqPrec);
+      reqSeqAtoms = C.parseAtoms(amtStr, seqPrec);
+      reqBtcAtoms = (reqSeqAtoms * bestBtc) / bestAsset;      // BTC at the best price
     } else {
-      const btcAtoms = C.parseAtoms(amtStr, 8);
-      const { asset, btc } = xOfferAmts(offers[0], route.payIsBtc);
-      if (!(asset > 0n && btc > 0n)) throw new Error('no cross-chain price yet');
-      seqAtoms = (btcAtoms * asset) / btc;   // asset-atoms per btc-atom, from the best offer
+      reqBtcAtoms = C.parseAtoms(amtStr, 8);
+      reqSeqAtoms = (reqBtcAtoms * bestAsset) / bestBtc;
     }
-    if (seqAtoms <= 0n) throw new Error('enter an amount greater than zero');
-    if (route.payIsBtc){
-      const xq = await X.quote(seqAsset, seqAtoms);          // { seq_amount, btc_amount, fee_btc, ... }
-      LAST_QUOTE = { kind:'cross', reverse:false, route, xq, seqAsset, requestedSeqAtoms: seqAtoms };
-    } else {
-      if (!X.reverseQuote) throw new Error('selling an asset for BTC is unavailable in this build');
-      const rq = await X.reverseQuote(seqAsset, seqAtoms);   // same shape; btc_amount is what you receive (net of fee)
-      LAST_QUOTE = { kind:'cross', reverse:true, route, xq: rq, seqAsset, requestedSeqAtoms: seqAtoms };
-    }
+    if (reqSeqAtoms <= 0n) throw new Error('enter an amount greater than zero');
+    const rawXq = route.payIsBtc
+      ? await X.quote(seqAsset, reqSeqAtoms)                  // { seq_amount, btc_amount, fee_btc } — capped to the maker's fillable
+      : (X.reverseQuote ? await X.reverseQuote(seqAsset, reqSeqAtoms)
+                        : (() => { throw new Error('selling an asset for BTC is unavailable in this build'); })());
+    // fill-now = what the maker can fill (the quote); remainder = requested − fill, rested at the
+    // same price. A <0.5% sliver is treated as rounding (full fill, no remainder).
+    const fillSeq = big(rawXq.seq_amount);
+    const canRest = route.payIsBtc ? !!(X && X.makerStartReverse) : !!(X && X.makerStart);
+    const split = canRest ? fillRestSplit(reqSeqAtoms, fillSeq) : null;   // { fill, rest } or null (full fill)
+    const remSeq = split ? split.rest : 0n;
+    const hasRemainder = remSeq > 0n;
+    const remBtc = hasRemainder ? (remSeq * bestBtc) / bestAsset : 0n;
+    LAST_QUOTE = { kind:'cross', reverse: !route.payIsBtc, route, xq: rawXq, seqAsset,
+      requestedSeqAtoms: reqSeqAtoms, requestedBtcAtoms: reqBtcAtoms, fillSeqAtoms: fillSeq,
+      remainderSeqAtoms: hasRemainder ? remSeq : 0n, remainderBtcAtoms: remBtc };
     status.textContent = '';
     paintQuoteCross();
     setReviewEnabled(true);
@@ -1375,8 +1384,11 @@ function renderLadder(host, o){
 function paintQuoteCross(){
   const { $ } = C; const q = LAST_QUOTE; if (!q || q.kind !== 'cross') return;
   const sm = C.assetMeta(q.seqAsset);
-  const seqStr = C.fmtAtoms(q.xq.seq_amount, sm.precision);
-  const btcStr = C.fmtAtoms(q.xq.btc_amount, 8);
+  // Show the user's FULL requested amount (never the fillable sliver): the order they typed.
+  const reqSeq = q.requestedSeqAtoms != null ? BigInt(q.requestedSeqAtoms) : big(q.xq.seq_amount);
+  const reqBtc = q.requestedBtcAtoms != null ? BigInt(q.requestedBtcAtoms) : big(q.xq.btc_amount);
+  const seqStr = C.fmtAtoms(reqSeq, sm.precision);
+  const btcStr = C.fmtAtoms(reqBtc, 8);
   // Map BTC<->asset onto pay/receive panes (whichever the user has on each side).
   const btcIsPay = (S.payAsset === 'BTC');
   if (btcIsPay){
@@ -1387,20 +1399,18 @@ function paintQuoteCross(){
     if (document.activeElement !== $('swRecvAmt')) $('swRecvAmt').value = btcStr;
   }
   paintRefHints();
-  const seqUnits = Number(q.xq.seq_amount) / Math.pow(10, sm.precision || 0);
-  const btcUnits = Number(q.xq.btc_amount) / 1e8;
-  // Honest cap: the cross-chain daemon quotes at most what the best maker can fill. If the user
-  // asked for MORE than that, the quote (and the fields above) was capped down to the fillable
-  // amount — say so plainly instead of silently shrinking their typed amount, which reads as a
-  // mismatched autofill. (>1% short = a real cap, not a rounding difference.)
-  const capped = q.requestedSeqAtoms && q.xq.seq_amount != null
-    && BigInt(q.xq.seq_amount) < (BigInt(q.requestedSeqAtoms) * 99n) / 100n;
-  if (btcUnits > 0){
-    const rateLine = `1 BTC = ${trim(seqUnits / btcUnits)} ${sm.ticker} · cross-chain HTLC`;
-    $('swRate').textContent = capped
-      ? `Capped to ${C.fmtAtoms(q.xq.seq_amount, sm.precision)} ${sm.ticker} (${trim(btcUnits)} BTC) — the most the best maker offers. You asked for more; reduce the amount or wait for a larger offer.`
-      : rateLine;
+  const seqUnits = Number(reqSeq) / Math.pow(10, sm.precision || 0);
+  const btcUnits = Number(reqBtc) / 1e8;
+  let line = btcUnits > 0 ? `1 BTC = ${trim(seqUnits / btcUnits)} ${sm.ticker} · cross-chain HTLC` : `cross-chain HTLC`;
+  // Market order bigger than the maker's depth: say how much fills now and how much rests — the
+  // same "fills ~X now, ~Y rests" language the same-chain route uses. No more "Capped — reduce it".
+  const rem = q.remainderSeqAtoms != null ? BigInt(q.remainderSeqAtoms) : 0n;
+  if (rem > 0n){
+    const fillU = Number(BigInt(q.fillSeqAtoms)) / Math.pow(10, sm.precision || 0);
+    const restU = Number(rem) / Math.pow(10, sm.precision || 0);
+    line += ` · fills ~${trim(fillU)} ${sm.ticker} now, ~${trim(restU)} rests`;
   }
+  $('swRate').textContent = line;
   // Cross-chain "fee" is the maker fee in BTC (no open fee-asset market on the BTC leg).
   paintFee('BTC', q.xq.fee_btc, 'Maker fee, paid in BTC on the parent chain.');
   setFinality('cross');
@@ -2350,18 +2360,39 @@ async function reviewSame(q){
 async function reviewCross(q){
   const { $ } = C;
   if (!X){ $('swErr').textContent = 'Cross-chain route unavailable in this build.'; return; }
+  // Market order bigger than the best maker's depth: fill what's available now (the HTLC wizard,
+  // below) AND rest the remainder as a limit order at the same price. Post the remainder FIRST —
+  // it's quick and non-interactive, so it rests even if the user closes the fill wizard — then open
+  // the fill. If the remainder post fails, the fill still proceeds and we say so.
+  const rem = q.remainderSeqAtoms != null ? BigInt(q.remainderSeqAtoms) : 0n;
+  if (rem > 0n){
+    const payIsBtc = !!(q.route && q.route.payIsBtc);
+    const start = payIsBtc ? (X.makerStartReverse) : (X.makerStart);   // buy -> post a bid; sell -> post an ask
+    const sm = C.assetMeta(q.seqAsset);
+    if (start){
+      try {
+        C.toast(`Filling ~${C.fmtAtoms(BigInt(q.fillSeqAtoms), sm.precision)} ${sm.ticker} now; resting ~${C.fmtAtoms(rem, sm.precision)} ${sm.ticker} as a limit order…`);
+        const recvAddr = C.wollet.address(C.addrIndex == null ? undefined : C.addrIndex).address();
+        const handle = await start({ assetHex: q.seqAsset, assetAtoms: rem, btcSats: BigInt(q.remainderBtcAtoms), expirySecs: 3600, recvAddr }, onCrossMakeState);
+        XMAKE = { handle, assetHex: q.seqAsset, assetAtoms: rem, btcSats: BigInt(q.remainderBtcAtoms), reverse: !payIsBtc, offerId: handle.offer.offer_id, state: 'resting' };
+        renderXMake();
+      } catch (e){
+        $('swErr').textContent = 'The available part will fill, but the remainder could not be rested: ' + C.prettyErr(e);
+      }
+    }
+  }
   if (q.reverse){
     // Reverse (sell asset for BTC): the xrswap.js wizard takes over (its own review
     // modals, leg verification, fund/claim/poll, and localStorage resume).
     if (!X.openReverseFromComposer){ $('swErr').textContent = 'Selling an asset for BTC is unavailable in this build.'; return; }
     showReverse(true);
-    X.openReverseFromComposer(q.xq);
+    X.openReverseFromComposer(q.xq);   // the FILLABLE portion
     return;
   }
   // Forward (pay BTC, receive asset): the xswap.js wizard takes over.
   if (!X.openFromComposer){ $('swErr').textContent = 'Cross-chain route unavailable in this build.'; return; }
   showCross(true);
-  X.openFromComposer(q.xq);   // seeds LAST_XQUOTE in xswap.js + renders the lock step
+  X.openFromComposer(q.xq);   // seeds LAST_XQUOTE in xswap.js + renders the lock step (the FILLABLE portion)
 }
 
 // --- Instant Lightning (pure-LN) rail -------------------------------------
