@@ -102,7 +102,12 @@
   .swcard{position:relative;padding:0;overflow:visible}
   /* Two-column trading desk: order book on the LEFT, composer on the RIGHT.
      Stacks to a single column on narrow/mobile widths (see the media query below). */
-  .swdesk{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1.02fr);gap:20px;align-items:start}
+  /* The Swap tab is a two-column order-book + composer layout — it needs far more room than the
+     600px single-column .wrap. Break it out to a wider, viewport-centred width (collapses cleanly
+     on small screens via the min()). This is what stops the composer being a cramped, overflowing,
+     scroll-forever 275px strip. */
+  section[data-panel="swap"]{--sww:min(1080px,calc(100vw - 40px));width:var(--sww);margin-inline:calc((100% - var(--sww)) / 2)}
+  .swdesk{display:grid;grid-template-columns:minmax(0,1fr) 452px;gap:26px;align-items:start}
   .swdesk-book{min-width:0;display:flex;flex-direction:column}
   /* zero the first ladder/book's top margin so its head aligns with the compose column */
   .swdesk-book #swBook .swladder,.swdesk-book #swBook .swbook{margin-top:0}
