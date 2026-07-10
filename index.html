@@ -130,15 +130,20 @@
   .swamt-wrap .sub{margin-top:3px!important}
   /* The amount is the hero content: large, mono, borderless — it reads as a number, not a form field. */
   .swamt{width:100%;background:transparent;border:none;border-radius:0;padding:2px 0;
-         font:600 30px/1.1 ui-monospace,Menlo,Consolas,monospace;color:var(--txt);min-width:0}
+         font:600 38px/1.05 ui-monospace,Menlo,Consolas,monospace;color:var(--txt);min-width:0;letter-spacing:-.01em}
   .swamt:focus{outline:none}
-  .swamt::placeholder{color:#3a434e}
+  .swamt::placeholder{color:#333c46}
   .swamt:focus-visible{outline:none}
   .swrow:focus-within{box-shadow:none}
-  /* Both pickers are byte-identical — that visual equality IS the no-base/quote principle. */
-  .swpick{display:inline-flex;align-items:center;gap:7px;flex:0 0 auto;background:#1d242d;border:1px solid var(--line);
-          color:var(--txt);border-radius:999px;padding:8px 13px;font-weight:700;font-size:15px;white-space:nowrap}
-  .swpick:hover{filter:brightness(1.13)}
+  /* Both pickers are byte-identical — that visual equality IS the no-base/quote principle. A tactile
+     raised chip (not a dull flat pill): gradient surface, defined ring, amber-lit on hover/focus. */
+  .swpick{display:inline-flex;align-items:center;gap:8px;flex:0 0 auto;
+          background:linear-gradient(180deg,#242e39,#1a212a);border:1px solid #35414f;
+          color:var(--txt);border-radius:14px;padding:11px 16px;font-weight:750;font-size:16px;white-space:nowrap;
+          box-shadow:0 1px 0 #ffffff0a inset,0 2px 7px #0004;transition:border-color .14s,box-shadow .14s,transform .1s}
+  .swpick:hover{border-color:#6a5016;box-shadow:0 0 0 1px #6a501655,0 3px 9px #0005}
+  .swpick:active{transform:translateY(1px)}
+  .swpick:focus-visible{outline:none;border-color:var(--amber2);box-shadow:0 0 0 2px #d9a12655}
   .swpick-sm{padding:6px 11px;font-size:13px}
   .swpick-tk{letter-spacing:.01em}
   .swpick-caret{color:var(--dim);font-size:11px;margin-top:1px}
