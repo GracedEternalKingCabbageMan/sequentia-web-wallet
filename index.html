@@ -106,8 +106,10 @@
      600px single-column .wrap. Break it out to a wider, viewport-centred width (collapses cleanly
      on small screens via the min()). This is what stops the composer being a cramped, overflowing,
      scroll-forever 275px strip. */
-  section[data-panel="swap"]{--sww:min(1080px,calc(100vw - 40px));width:var(--sww);margin-inline:calc((100% - var(--sww)) / 2)}
-  .swdesk{display:grid;grid-template-columns:minmax(0,1fr) 452px;gap:26px;align-items:start}
+  section[data-panel="swap"]{--sww:min(560px,calc(100vw - 32px));width:var(--sww);margin-inline:calc((100% - var(--sww)) / 2)}
+  /* Stacked: the order book on top, the composer as a card directly below it (not a cramped
+     side-by-side split). One comfortable centred column. */
+  .swdesk{display:flex;flex-direction:column;gap:18px}
   .swdesk-book{min-width:0;display:flex;flex-direction:column}
   /* zero the first ladder/book's top margin so its head aligns with the compose column */
   .swdesk-book #swBook .swladder,.swdesk-book #swBook .swbook{margin-top:0}
@@ -237,6 +239,12 @@
   .swopt-bal .b{font:13px ui-monospace,monospace}
   .swopt-bal .r{font-size:11px;color:var(--dim)}
   .swopt-empty{padding:14px 12px;color:var(--dim);font-size:13px}
+  /* Grouped dropdown: "Your assets" (held) first, then "All assets", scalable to a big registry. */
+  .swopt-grp{padding:9px 12px 4px;font-size:10.5px;color:var(--dim);text-transform:uppercase;letter-spacing:.06em;font-weight:700}
+  .swopt-grp:first-child{padding-top:3px}
+  .swopt-split{font-size:11px;color:var(--dim);margin-top:1px;white-space:nowrap}
+  .swopt-split .z{color:var(--amber2)}
+  .swopt-more{padding:9px 12px;color:var(--dim);font-size:11.5px;text-align:center;border-top:1px solid var(--line);margin-top:2px}
   /* balance chips: per-asset instant (Lightning) vs on-chain split */
   .swchips{display:flex;gap:9px;flex-wrap:wrap;margin-bottom:14px}
   .swchip{display:flex;align-items:center;gap:10px;background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:9px 12px;text-align:left;font-weight:500}
@@ -444,9 +452,8 @@
       <!-- ===== the composer (the signature) ===== -->
       <div id="swComposer">
 
-        <!-- balance chips: per-asset Lightning vs on-chain split; BTC is
-             first-class (dual-chain). Rendered by swap.js/renderChips. -->
-        <div class="swchips" id="swChips"></div>
+        <!-- (the per-asset balance cards used to live here; their info now lives inside the
+             asset dropdown's "Your assets" group, so the Swap view stays uncluttered.) -->
         <!-- pair bar: the selected market + last price (derived from the book). -->
         <div class="swpairbar hide" id="swPairBar"></div>
 

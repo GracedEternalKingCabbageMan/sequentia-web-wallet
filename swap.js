@@ -1599,11 +1599,16 @@ function openPicker(side){
   // Candidate set: assets that trade against the OTHER side (or all tradable if the
   // other side is unset). This is what enforces "only offer a counter-asset that trades".
   const candidates = counterpartsOf(other);
-  // If choosing the FIRST side (other unset), also let any tradable asset be picked.
+  const cur = side === 'pay' ? S.payAsset : S.receiveAsset;
+  // Your HELD assets first (carrying the on-chain/Lightning split that used to be on the top
+  // cards), then every other tradable asset — so a registry of thousands stays navigable via the
+  // search box + a capped "All assets" tail. This dropdown is what replaces the removed cards.
   const list = candidates.map(hex => ({
     hex, ticker: C.assetMeta(hex).ticker, name: pickerName(hex), bal: balLine(hex),
-    enabled: hex !== (side === 'pay' ? S.payAsset : S.receiveAsset),
+    held: balAtoms(hex) > 0n, split: balAtoms(hex) > 0n ? heldSplitStr(hex) : '',
+    enabled: hex !== cur,
   }));
+  list.sort((a, b) => (b.held ? 1 : 0) - (a.held ? 1 : 0) || a.ticker.localeCompare(b.ticker));
   const anchor = side === 'pay' ? C.$('swPayPick') : C.$('swRecvPick');
   popover(anchor, list, (hex) => {
     if (side === 'pay') S.payAsset = hex; else S.receiveAsset = hex;
@@ -1621,6 +1626,12 @@ function openPicker(side){
   });
 }
 function pickerName(hex){ if (hex === 'BTC') return 'Bitcoin testnet4'; return C.assetMeta(hex).name || 'Asset'; }
+// The on-chain/Lightning split for a held asset — the info that used to be on the top cards,
+// now shown inline under a held asset's name in the dropdown. HTML (the ⚡ part gets the amber .z).
+function heldSplitStr(hex){
+  const m = metaOf(hex), instant = instantAtomsFor(hex), onchain = balAtoms(hex);
+  return `<span class="z">${C.fmtAtoms(instant, m.precision)} Lightning</span> · ${C.fmtAtoms(onchain, m.precision)} on-chain`;
+}
 
 // A lightweight searchable popover anchored under `anchorEl`. `items` are
 // { hex, ticker, name, bal:{b,r}, enabled }. onPick(hex) is called on selection.
@@ -1639,32 +1650,46 @@ function popover(anchorEl, items, onPick){
   pop.style.top = Math.min(r.bottom + 6, window.innerHeight - 40) + 'px';
   pop.style.left = Math.max(8, Math.min(r.left, window.innerWidth - pop.offsetWidth - 8)) + 'px';
 
-  let kbdIdx = -1, shown = [];
+  const ALL_CAP = 40;   // don't render a whole (potentially huge) registry eagerly — search finds the rest
+  let kbdIdx = -1, shown = [], optEls = [];
+  const rowFor = (it) => {
+    const b = el('button','swopt'); b.type = 'button'; b.setAttribute('role','option');
+    if (!it.enabled){ b.disabled = true; }
+    const t = el('span','swopt-tk', it.ticker);
+    const mid = el('div','swopt-mid'); mid.appendChild(el('div','swopt-name', it.name || ''));
+    if (it.split){ const sp = el('div','swopt-split'); sp.innerHTML = it.split; mid.appendChild(sp); }
+    const bal = el('div','swopt-bal');
+    if (it.bal && it.bal.b) bal.appendChild(el('div','b', it.bal.b));
+    if (it.bal && it.bal.r) bal.appendChild(el('div','r', it.bal.r));
+    b.appendChild(t); b.appendChild(mid); b.appendChild(bal);
+    b.onclick = () => { if (it.enabled){ onPick(it.hex); closePopover(); } };
+    return b;
+  };
   const draw = (q) => {
-    listEl.innerHTML = ''; kbdIdx = -1;
-    shown = items.filter(it => {
-      if (!q) return true;
-      const s = (it.ticker + ' ' + (it.name||'') + ' ' + it.hex).toLowerCase();
-      return s.includes(q.toLowerCase());
-    });
-    if (!shown.length){ listEl.appendChild(el('div','swopt-empty','No matching assets.')); return; }
-    shown.forEach((it, i) => {
-      const b = el('button','swopt'); b.type = 'button'; b.setAttribute('role','option');
-      if (!it.enabled){ b.disabled = true; }
-      const t = el('span','swopt-tk', it.ticker);
-      const mid = el('div','swopt-mid'); mid.appendChild(el('div','swopt-name', it.name || ''));
-      const bal = el('div','swopt-bal');
-      if (it.bal && it.bal.b) bal.appendChild(el('div','b', it.bal.b));
-      if (it.bal && it.bal.r) bal.appendChild(el('div','r', it.bal.r));
-      b.appendChild(t); b.appendChild(mid); b.appendChild(bal);
-      b.onclick = () => { if (it.enabled){ onPick(it.hex); closePopover(); } };
-      b.onmouseenter = () => { kbdIdx = i; markKbd(); };
-      listEl.appendChild(b);
-    });
+    listEl.innerHTML = ''; kbdIdx = -1; shown = []; optEls = [];
+    const ql = (q || '').toLowerCase();
+    const match = items.filter(it => !q || (it.ticker + ' ' + (it.name||'') + ' ' + it.hex).toLowerCase().includes(ql));
+    if (!match.length){ listEl.appendChild(el('div','swopt-empty','No matching assets.')); return; }
+    // Your held assets FIRST, then everything else. The "All assets" tail is capped until you
+    // search, so a registry of thousands never renders thousands of rows.
+    const held = match.filter(it => it.held), all = match.filter(it => !it.held);
+    const capped = !q && all.length > ALL_CAP;
+    const groups = [];
+    if (held.length) groups.push(['Your assets', held]);
+    if (all.length) groups.push([held.length ? 'All assets' : 'Assets', capped ? all.slice(0, ALL_CAP) : all]);
+    for (const [label, arr] of groups){
+      listEl.appendChild(el('div','swopt-grp', label));
+      for (const it of arr){
+        const b = rowFor(it); const idx = shown.length;
+        b.onmouseenter = () => { kbdIdx = idx; markKbd(); };
+        listEl.appendChild(b); shown.push(it); optEls.push(b);
+      }
+    }
+    if (capped) listEl.appendChild(el('div','swopt-more', `+${all.length - ALL_CAP} more — keep typing to find them.`));
   };
   const markKbd = () => {
-    [...listEl.children].forEach((c,i)=>c.classList && c.classList.toggle('kbd', i===kbdIdx));
-    const cur = listEl.children[kbdIdx]; if (cur && cur.scrollIntoView) cur.scrollIntoView({ block:'nearest' });
+    optEls.forEach((c,i)=>c.classList.toggle('kbd', i===kbdIdx));
+    const cur = optEls[kbdIdx]; if (cur && cur.scrollIntoView) cur.scrollIntoView({ block:'nearest' });
   };
   inp.addEventListener('input', () => draw(inp.value.trim()));
   inp.addEventListener('keydown', (e) => {
