@@ -81,6 +81,15 @@
   .asset-row{display:flex;align-items:baseline;gap:10px;padding:10px 0;border-top:1px solid var(--line)}
   .asset-row:first-child{border-top:none}
   .tk{font-weight:700} .aid{font:12px ui-monospace,monospace;color:var(--dim);word-break:break-all}
+  /* Consolidated balance row: the on-chain + Lightning split and the inline move/close actions
+     (the Lightning card was folded into each asset row). The bolt marks the Lightning portion. */
+  .split-ln{margin-top:2px}
+  .split-ln .z{color:var(--amber2)}
+  .bal-acts{display:flex;gap:6px;margin-top:7px;flex-wrap:wrap}
+  .bal-acts button{padding:3px 11px;font-size:12px}
+  .ln-note{margin-top:12px}
+  .ln-note summary{cursor:pointer;font-size:12px;color:var(--dim)}
+  .ln-note p{margin:8px 0 0}
   .qr{image-rendering:pixelated;width:200px;height:200px;border:10px solid #fff;border-radius:8px;background:#fff;display:block;margin:4px auto 0}
   .rec{border:1px solid var(--line);border-radius:12px;padding:12px;margin-top:10px;position:relative}
   .rec .x{position:absolute;top:8px;right:8px;background:transparent;border:none;color:var(--dim);padding:2px 7px}
@@ -368,17 +377,14 @@
         </div>
         <div class="status" id="syncStatus"></div>
         <div class="list" id="assetList"><div class="muted">No assets yet.</div></div>
-      </div>
-      <!-- Lightning: move on-chain funds into a Lightning channel (non-custodial).
-           Rendered by renderLightningBalance(); hidden until an LSP is configured. -->
-      <div class="card hide" id="lnBalanceCard">
-        <div class="row" style="justify-content:space-between;align-items:center;margin-bottom:2px">
-          <label class="lbl" style="margin:0">Lightning</label>
-          <span class="sub" id="lnBalSummary"></span>
-        </div>
-        <p class="sub" id="lnBalIntro" style="margin:0 0 12px">Move BTC or a Sequentia asset into a Lightning channel on your hosted node. Your wallet signs the on-chain deposit and your device co-signs the channel funding, so no one else can move your funds. An asset is movable to Lightning when the on-chain funding transaction can pay an accepted fee (in that asset or another asset you hold); a brand-new asset that no block producer accepts for fees yet cannot be moved until one does.</p>
-        <div class="list" id="lnBalList"></div>
         <div class="status" id="lnBalStatus" style="margin-top:10px"></div>
+        <!-- Lightning is folded INTO each asset row now (on-chain + Lightning split + the
+             move/close actions). This note just explains the non-custodial mechanism; shown
+             only when an LSP is configured. -->
+        <details class="ln-note hide" id="lnHelpNote">
+          <summary>About your Lightning balances</summary>
+          <p class="sub">Each asset shows its on-chain and Lightning balance together. Moving to Lightning sends the amount on-chain to your hosted node, then your device co-signs opening a channel with it, so only you can move the funds. An asset is movable when the funding transaction can pay an accepted fee in that asset or another you hold; a brand-new asset no block producer accepts for fees yet cannot be moved until one does.</p>
+        </details>
       </div>
       <div class="card">
         <label class="lbl">Testnet faucet</label>
@@ -1727,86 +1733,24 @@ async function refreshOwnLnNodeKeys(){
   registerOwnStatusKeys(keys);
   _ownLnKeysSig=sig;
 }
-async function renderLightningBalance(){
-  const card=$('lnBalanceCard'); const list=$('lnBalList'); const summ=$('lnBalSummary');
-  if(!card||!list) return;
-  if(!seqlnState().deployed){ card.classList.add('hide'); return; }
-  card.classList.remove('hide');
+// Refresh the hosted-node Lightning status into the cache, then re-render the (now
+// consolidated) balance rows. The old standalone Lightning card is gone: each asset's
+// on-chain + Lightning split and its move/close actions live INLINE in its balance row
+// (see renderBalance). This function only owns the async /status fetch + the header pill;
+// renderBalance renders synchronously from the cache, so there is no render loop.
+async function refreshLnStatus(){
+  const note=$('lnHelpNote');
+  if(!seqlnState().deployed){ if(note) note.classList.add('hide'); try{ renderBalance(); }catch{} try{ lnStatusPill(); }catch{} return; }
+  if(note) note.classList.remove('hide');
   try{ await refreshOwnLnNodeKeys(); }catch{}   // so /status includes this device's own nodes across reloads
-  let funding, chans;
-  try{ lnLastStatus = await seqlnGetStatus(); funding = lnLastStatus.funding || { btc:false, assets:[] }; chans = lnLastStatus.channels||[]; }
-  catch(e){ list.innerHTML=''; summ.textContent=''; $('lnBalStatus').className='status err'; $('lnBalStatus').textContent='Lightning status unavailable: '+prettyErr(e); lnStatusPill(); return; }
-  $('lnBalStatus').textContent='';
-  const active = chans.filter(c=>String(c.state||'').startsWith('CHANNELD')).length;
-  summ.textContent = active ? (active+' channel'+(active>1?'s':'')) : 'no channels yet';
-  list.innerHTML='';
-  const legs=[];
-  if(funding.btc) legs.push({ kind:'BTC', ticker:'BTC', precision:8, onchain:btcBalance, chain:'btc', asset:null });
-  // One movable row per Sequentia asset the user can ACTUALLY move to Lightning: any asset HELD
-  // on-chain that some block producer accepts for fees (so the funding tx — whose fee is paid IN
-  // that asset — will be mined), plus any asset already backing a live channel (so existing
-  // channels stay visible at 0 on-chain). This is what lets a freshly issued/received asset be
-  // moved to Lightning on demand — the LSP provisions the device's OWN node for it on the click.
-  // The ONLY gate is producer acceptance, read from the published fee feed: NO asset is
-  // privileged — tSEQ is judged by the exact same feed as every issued asset (first-principle #3;
-  // a node whose fee reference is USD and ignores SEQ would make tSEQ unmovable here, correctly).
-  // Legs are deliberately NOT taken from the LSP's funding.assets list: that only knows GOLD +
-  // previously-provisioned assets, so it both hid freshly-held assets and surfaced stale
-  // pre-re-genesis phantoms (wrong asset ids).
-  {
-    const bals=balObj();
-    const ids=new Set();
-    for(const h of Object.keys(bals)){
-      if(!(BigInt(bals[h]||0n)>0n)) continue;                        // must actually hold some
-      if(feeRateEntry(h) && feeRateEntry(h).rate>0) ids.add(h);      // ...that a producer prices for fees — uniform, no policy-asset exception
-    }
-    for(const a of (funding.assets||[])){                            // keep assets already backing a live channel
-      if(a && a.id && lnSpendableFor(a.id).channels>0) ids.add(a.id);
-    }
-    for(const h of ids){
-      const meta=assetMeta(h);
-      legs.push({ kind:h, ticker:meta.ticker||(h.slice(0,8)+'…'), precision:meta.precision, onchain:bals[h]||0n, chain:'seq', asset:h });
-    }
-  }
-  if(!legs.length){ list.appendChild(el('div','muted','Lightning funding is not available on this network yet.')); lnStatusPill(); return; }
-  for(const leg of legs){
-    const sp=lnSpendableFor(leg.kind);
-    const r=el('div','asset-row');
-    r.appendChild(el('span','tk', leg.ticker));
-    const mid=el('div','grow'); const sub=el('div','sub');
-    sub.textContent = sp.channels
-      ? ('In Lightning: '+fmtAtoms(BigInt(Math.round(sp.units)), leg.precision)+' '+leg.ticker+' spendable · '+sp.channels+' channel'+(sp.channels>1?'s':''))
-      : 'No Lightning channel yet';
-    mid.appendChild(sub); r.appendChild(mid);
-    const act=el('span','amt');
-    const onchainStr=el('div','sub','On-chain: '+fmtAtoms(BigInt(leg.onchain||0n), leg.precision)+' '+leg.ticker);
-    const btn=el('button','ghost', sp.channels?'Add funds':'Move to Lightning');
-    btn.style.cssText='padding:4px 12px;font-size:12px;margin-top:4px';
-    // Enabled purely by on-chain balance: the click provisions the user's OWN hosted node
-    // and connects the device signer ON DEMAND (no chicken-and-egg wait for a pre-connected
-    // signer). Never a permanent "still connecting" dead end.
-    btn.disabled = !(BigInt(leg.onchain||0n) > 0n);
-    btn.title = btn.disabled
-      ? ('No on-chain '+leg.ticker+' to move')
-      : ('Provision your own '+leg.ticker+' Lightning node and open a channel');
-    btn.onclick=()=>moveToLightningDialog(leg);
-    act.appendChild(onchainStr); act.appendChild(btn);
-    // "Move back to chain": only for the user's OWN provisioned channels (a channel carrying a
-    // node_key). Demo/shared channels have no node_key and can't be closed from here. This is the
-    // inverse of Move-to-Lightning — closes the channel and returns the funds to the wallet on-chain.
-    const own=lnOwnChannelsFor(leg.kind);
-    if(own.length){
-      const cb=el('button','ghost','Move to chain');
-      cb.style.cssText='padding:4px 12px;font-size:12px;margin-top:4px;margin-left:6px';
-      cb.title='Close your '+leg.ticker+' Lightning channel and move the funds back on-chain to your wallet';
-      cb.onclick=()=>closeToChainDialog(leg, own);
-      act.appendChild(cb);
-    }
-    r.appendChild(act);
-    list.appendChild(r);
-  }
-  lnStatusPill();
+  try{ lnLastStatus = await seqlnGetStatus(); $('lnBalStatus').textContent=''; }
+  catch(e){ $('lnBalStatus').className='status err'; $('lnBalStatus').textContent='Lightning status unavailable: '+prettyErr(e); }
+  try{ renderBalance(); }catch{}   // fold the fresh LN spendable into the asset rows
+  try{ lnStatusPill(); }catch{}
 }
+// Back-compat: callers that changed LN state want "refresh + re-render". Kept as a hoisted
+// function (not a const alias) so it is callable from anywhere regardless of load order.
+function renderLightningBalance(){ return refreshLnStatus(); }
 // Modal: "Move back to chain" — the inverse of Move-to-Lightning. Reconnects the device signer to
 // the user's own hosted node, then cooperatively closes the channel, sending the reclaimed funds
 // straight to a fresh wallet address. Device-signed + non-custodial: the LSP drives the close but the
@@ -2067,7 +2011,7 @@ function initSwapTab(){
     },
     // Route the user to Move-to-Lightning (the Balance tab's Lightning card) when a leg
     // has no usable channel — the honest fix for an unavailable LN rail.
-    gotoLightning: () => { tab('balance'); const c=$('lnBalanceCard'); if(c && c.scrollIntoView) try{ c.scrollIntoView({behavior:'smooth', block:'center'}); }catch{} },
+    gotoLightning: () => { tab('balance'); const c=$('assetList'); if(c && c.scrollIntoView) try{ c.scrollIntoView({behavior:'smooth', block:'center'}); }catch{} },
   });
 }
 function renderActiveSwap(){ renderSwap(); }
@@ -2114,22 +2058,78 @@ function refreshAllAvail(){ const box=document.getElementById('recipients'); if(
 function renderBalance(){
   const b = balObj();
   const list=$('assetList'); list.innerHTML='';
-  // Equal-standing + dual-chain: a headline portfolio total across BTC (parent chain)
-  // and every Sequentia asset in the chosen reference currency, then per-asset rows
-  // in a uniform order with NOTHING pinned. No asset is privileged; the staking note
-  // lives only in the Stake tab. Each amount carries its own reference value if priced.
-  // sub is a DOM node (not an HTML string): el() sets textContent, so passing
-  // markup as a string would render it literally. Build nodes instead.
-  const row=(ticker, sub, amt, ref)=>{ const r=el('div','asset-row');
+  // Equal-standing + dual-chain: a headline portfolio total across BTC (parent chain) and
+  // every Sequentia asset in the chosen reference currency, then per-asset rows in a uniform
+  // order with NOTHING pinned. No asset is privileged; the staking note lives only in the
+  // Stake tab. CONSOLIDATED: each row folds on-chain + Lightning together — the split, the
+  // TOTAL (+ ref value), and the inline Move-to-Lightning / Add funds / Move-to-chain actions
+  // (there is no separate Lightning card any more). sub/action nodes are DOM nodes (el() sets
+  // textContent), so build nodes, never HTML strings.
+  const lnOn = (()=>{ try { return seqlnState().deployed; } catch { return false; } })();
+  const btcFunding = !!(lnLastStatus && lnLastStatus.funding && lnLastStatus.funding.btc);
+  const lnAtomsFor = (kind)=>{ try { return BigInt(Math.round(lnSpendableFor(kind).units||0)); } catch { return 0n; } };
+  const lnChansFor = (kind)=>{ try { return lnSpendableFor(kind).channels||0; } catch { return 0; } };
+  const ownChansFor = (kind)=>{ try { return lnOwnChannelsFor(kind)||[]; } catch { return []; } };
+
+  // One consolidated row. movable = the asset can be moved to Lightning (producer prices it for
+  // fees, uniform across assets — first-principle #3); leg drives the move/close modals.
+  const rowFull = ({ticker, refKey, precision, onchainAtoms, kind, nameNode, movable, leg, known})=>{
+    const lnAtoms = lnOn ? lnAtomsFor(kind) : 0n;
+    const chans   = lnOn ? lnChansFor(kind) : 0;
+    const own     = lnOn ? ownChansFor(kind) : [];
+    const totalAtoms = (onchainAtoms||0n) + lnAtoms;
+    const r=el('div','asset-row');
     r.appendChild(el('span','tk', ticker));
-    const m=el('div','grow'); const sd=el('div'); if(sub) sd.appendChild(sub); m.appendChild(sd); r.appendChild(m);
-    const a=el('span','amt'); a.appendChild(el('div',null,amt));
+    const mid=el('div','grow');
+    if(nameNode){ const nd=el('div'); nd.appendChild(nameNode); mid.appendChild(nd); }
+    // Split line only when Lightning actually holds some of this asset.
+    if(lnOn && chans>0){
+      const sp=el('div','sub split-ln');
+      sp.appendChild(el('span','z','⚡'));
+      sp.appendChild(document.createTextNode(' '+fmtAtoms(lnAtoms, precision)+' in Lightning · '+fmtAtoms(onchainAtoms||0n, precision)+' on-chain'));
+      mid.appendChild(sp);
+    }
+    // Inline Lightning actions (only when an LSP is live and this asset can use Lightning).
+    if(lnOn && leg && (movable || chans>0 || own.length)){
+      const acts=el('div','bal-acts');
+      if(movable || chans>0){
+        const btn=el('button','ghost', chans>0?'Add funds':'Move to Lightning');
+        btn.disabled = !((onchainAtoms||0n) > 0n);   // provisions the user's OWN hosted node on click
+        btn.title = btn.disabled ? ('No on-chain '+ticker+' to move') : ('Provision your own '+ticker+' Lightning node and open a channel');
+        btn.onclick=()=>moveToLightningDialog(leg);
+        acts.appendChild(btn);
+      }
+      if(own.length){   // Move-to-chain only for the user's OWN provisioned channels (carry a node_key)
+        const cb=el('button','ghost','Move to chain');
+        cb.title='Close your '+ticker+' Lightning channel and move the funds back on-chain to your wallet';
+        cb.onclick=()=>closeToChainDialog(leg, own);
+        acts.appendChild(cb);
+      }
+      if(acts.children.length) mid.appendChild(acts);
+    }
+    r.appendChild(mid);
+    const a=el('span','amt');
+    a.appendChild(el('div',null, known ? fmtAtoms(totalAtoms, precision) : (BigInt(totalAtoms).toString()+' atoms')));
+    const ref = (known && refKey) ? refValueStr(refKey, totalAtoms) : '';
     if(ref) a.appendChild(el('div','sub', ref));
-    r.appendChild(a); list.appendChild(r); };
-  // Headline total: sum every priced holding into one reference-currency figure.
+    r.appendChild(a); list.appendChild(r);
+  };
+
+  // The Sequentia assets to show: everything held on-chain PLUS anything that still has a live
+  // Lightning channel even at 0 on-chain (so a fully-moved asset stays visible).
+  const seqKeys = new Set(Object.keys(b));
+  if(lnLastStatus && lnLastStatus.channels){
+    for(const c of lnLastStatus.channels){
+      const isBtc=(c.asset_label==='BTC'||c.leg==='btc');
+      if(!isBtc && c.asset && String(c.state||'').startsWith('CHANNELD')) seqKeys.add(c.asset);
+    }
+  }
+
+  // Headline total across BTC + every asset (on-chain + Lightning), in the reference currency.
   let total=0, totalRef=null, anyPriced=false, allPriced=true;
-  const holdings=[['BTC', btcBalance], ...Object.keys(b).map(h=>[h, b[h]])];
-  for(const [h,amt] of holdings){ const rv=refValue(h, amt); if(rv){ total+=rv.v; totalRef=rv.ref; anyPriced=true; } else if((amt||0)>0) allPriced=false; }
+  const addToTotal=(refKey, atoms)=>{ const rv=refValue(refKey, atoms); if(rv){ total+=rv.v; totalRef=rv.ref; anyPriced=true; } else if((atoms||0n)>0n) allPriced=false; };
+  addToTotal('BTC', btcBalance + (lnOn?lnAtomsFor('BTC'):0n));
+  for(const h of seqKeys) addToTotal(h, BigInt(b[h]||0n) + (lnOn?lnAtomsFor(h):0n));
   const card=$('balTotal');
   if(card){ card.innerHTML='';
     card.appendChild(el('div','bal-total-label','Total balance'));
@@ -2137,10 +2137,14 @@ function renderBalance(){
     if(anyPriced && !allPriced) card.appendChild(el('div','bal-total-note','priced assets only'));
     else if(refUnpriced()) card.appendChild(el('div','bal-total-note', REF+' has no live price; shown in USD'));
   }
+
   // BTC (parent chain) leads only because it is the other chain, not a privileged unit.
-  row('BTC', el('span','sub','Bitcoin testnet4'), fmtAtoms(btcBalance, 8), refValueStr('BTC', btcBalance));
+  rowFull({ ticker:'BTC', refKey:'BTC', precision:8, onchainAtoms:btcBalance, kind:'BTC',
+    nameNode: el('span','sub','Bitcoin testnet4'), movable: btcFunding,
+    leg:{ kind:'BTC', ticker:'BTC', precision:8, onchain:btcBalance, chain:'btc', asset:null }, known:true });
+
   // Uniform order (by ticker); tSEQ is one row among equals, not pinned.
-  const keys = Object.keys(b).sort((x,y)=> assetMeta(x).ticker.localeCompare(assetMeta(y).ticker));
+  const keys = [...seqKeys].sort((x,y)=> assetMeta(x).ticker.localeCompare(assetMeta(y).ticker));
   const lmap=labels();
   for(const h of keys){
     const meta=assetMeta(h);
@@ -2157,22 +2161,22 @@ function renderBalance(){
     } else if(lmap[h] && lmap[h].local){
       const m2=el('button','ghost','local label'); m2.title='A wallet-local label (not in the registry). Click to edit.'; m2.style.cssText='padding:2px 9px;font-size:11px;margin-left:8px;opacity:.75'; m2.onclick=()=>labelAssetDialog(h); sub.appendChild(m2);
     }
-    // Unknown-precision assets have no authoritative precision, so show raw atoms honestly (rather
-    // than silently mis-scaling at precision 0); labeling then renders the real amount + ref value.
-    const amtStr = known ? fmtAtoms(b[h], meta.precision) : (BigInt(b[h]).toString()+' atoms');
-    row(meta.ticker, sub, amtStr, known ? refValueStr(h, b[h]) : '');
+    // Unknown-precision assets: show raw atoms honestly (labeling then renders the real amount).
+    const movable = known && !!(feeRateEntry(h) && feeRateEntry(h).rate>0);
+    rowFull({ ticker:meta.ticker, refKey: known?h:null, precision:meta.precision, onchainAtoms:BigInt(b[h]||0n), kind:h,
+      nameNode:sub, movable,
+      leg:{ kind:h, ticker:meta.ticker||(h.slice(0,8)+'…'), precision:meta.precision, onchain:BigInt(b[h]||0n), chain:'seq', asset:h }, known });
   }
-  // Restricted (OpenAMP) assets: enclave-custodied balances rendered with the SAME row() helper and
-  // NO privileged styling — one row among equals. Only assets the AID actually holds are shown.
+  // Restricted (OpenAMP) assets: enclave-custodied, one row among equals, no Lightning affordance.
   const oids = Object.keys(oampBalances).filter(id=>(oampBalances[id]?.atoms||0n)>0n)
     .sort((x,y)=> (oampAssets[x]?.ticker||x).localeCompare(oampAssets[y]?.ticker||y));
   for(const id of oids){
     const a=oampAssets[id]||{}; const sub=el('div');
     sub.appendChild(el('span','sub', id.slice(0,10)+'…'+id.slice(-6)));
-    row(a.ticker||id.slice(0,8)+'…', sub, fmtAtoms(oampBalances[id].atoms, a.precision||0), '');
+    rowFull({ ticker:a.ticker||id.slice(0,8)+'…', refKey:null, precision:a.precision||0, onchainAtoms:BigInt(oampBalances[id].atoms||0n),
+      kind:'__oamp_'+id, nameNode:sub, movable:false, leg:null, known:true });
   }
   refreshAllAvail();   // keep the Send tab's "Available:" lines in sync with balances
-  try{ renderLightningBalance(); }catch{}   // refresh the Move-to-Lightning card (on-chain balances changed)
 }
 // Wallet-local "label this asset" affordance (T9 / W2): give a received-but-unknown asset a ticker,
 // name, and PRECISION so it can be read and SENT. Stored in localStorage (LBL) marked local:true and
