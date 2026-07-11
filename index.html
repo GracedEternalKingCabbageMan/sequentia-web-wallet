@@ -1715,6 +1715,18 @@ async function reconnectOwnNodes(){
     }catch(e){ _lnReconnectedLegs.delete(key); console.warn('[ln] own-node reconnect failed', key, e?.message??e); }
   }
 }
+// TEMP DEBUG (remove after diagnosing the own-node reconnect): expose the LN internals so a live
+// wallet can be inspected from the console — what /status returns, which legs have own channels,
+// what the reconnect finds/errors. Read-only accessors + explicit trigger; no behavior change.
+if(typeof window!=='undefined') window.__ln = {
+  cached: ()=>lnLastStatus,
+  ownChannels: (h)=>lnOwnChannelsFor(h),
+  heldAssets: ()=>Object.keys(balObj()),
+  feeRated: ()=>Object.keys(balObj()).filter(h=>feeRateEntry(h)&&feeRateEntry(h).rate>0).map(h=>({hex:h.slice(0,10),ticker:assetMeta(h).ticker,rate:(feeRateEntry(h)||{}).rate})),
+  reconnectedLegs: ()=>[..._lnReconnectedLegs],
+  liveStatus: async ()=>{ await refreshOwnLnNodeKeys(); const s=await seqlnGetStatus(); return { own: (s.channels||[]).filter(c=>c.node_key).map(c=>({asset:(c.asset||'').slice(0,10),label:c.asset_label,nk:(c.node_key||'').slice(0,28),spend:c.spendable_units,state:c.state})), prov: s.provisioned_nodes }; },
+  doReconnect: async ()=>{ _lnReconnectedLegs.clear(); await reconnectOwnNodes(); return [..._lnReconnectedLegs]; },
+};
 
 // ---------- Move to Lightning (non-custodial channel funding) ----------
 // The on-chain DEPOSIT send hook handed to seqln.js's fundChannel. The WALLET signs
