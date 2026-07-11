@@ -421,7 +421,19 @@ async function refreshInstant(){
     for (const c of chans){
       if (!c.node_key) continue;   // ONLY the wallet's own channels count as its Lightning balance
                                    // (never shared/demo) — consistent with the Balance tab + railAvail
-      const t = c.asset_label || c.asset || c.ticker; if (!t) continue;
+      // Key by the RESOLVED ticker (what instantAtomsFor looks up), not the raw channel label: the
+      // LSP labels a channel with a TRUNCATED hex when it can't resolve the asset's ticker (e.g.
+      // "2a515539…" for USDX), so keying by asset_label put the balance under a key nothing reads,
+      // and the composer showed "0 Lightning" for a funded channel. Resolve the full asset hex →
+      // metaOf().ticker to match, exactly like the Balance card matches on c.asset.
+      const isBtc = (c.leg === 'btc' || c.asset_label === 'BTC');
+      let t;
+      if (isBtc) t = 'BTC';
+      else {
+        const hex = (typeof c.asset === 'string' && /^[0-9a-f]{64}$/i.test(c.asset)) ? c.asset.toLowerCase() : null;
+        t = hex ? metaOf(hex).ticker : (c.asset_label || c.asset || c.ticker);
+      }
+      if (!t) continue;
       INSTANT[t] = {
         spendable: (c.spendable_units ?? c.spendable ?? 0),
         receivable: (c.receivable_units ?? c.receivable ?? 0),
