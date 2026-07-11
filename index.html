@@ -1681,36 +1681,39 @@ function initLightning(phrase){
   }
   // The loop above brings up only the SHARED hub nodes (lnEnabledNodes). A per-user node the wallet
   // opened via Move-to-Lightning is NOT among them, so after a refresh its channels read back (from
-  // /status) but its device signer is offline — the funds show yet can't be spent. Once /status has
-  // loaded (it lists the own channels), reconnect the signer for every leg the user actually holds
-  // an own channel on.
-  refreshLnStatus().then(()=> reconnectOwnNodes(phrase)).catch(e=> console.warn('[ln] own-node reconnect:', e?.message??e));
+  // /status) but its device signer is offline — the funds show yet can't be spent. reconnectOwnNodes
+  // (driven from refreshLnStatus, below) re-attaches those signers as the channels appear.
+  renderLightningBalance();
 }
 
-// Reconnect the device signers for THIS wallet's OWN provisioned nodes after a load/refresh.
-// provisionAndConnect is idempotent for an already-provisioned node (re-attaches the signer, never
-// re-funds), and we ONLY touch legs that have a real own channel (node_key present in /status), so
-// no phantom node is ever created for an asset the user merely holds on-chain. This is what makes a
-// refreshed wallet's own Lightning channels usable again (pay / sell) rather than visible-but-frozen.
-async function reconnectOwnNodes(phrase){
+// Reconnect the device signers for THIS wallet's OWN provisioned nodes after a load/refresh. Called
+// from refreshLnStatus on every /status poll (not once, up front) so it fires on whichever poll first
+// reports an own channel — sidestepping the load-order race where /status hasn't synced yet. Which
+// legs have own channels is resolved with lnOwnChannelsFor — the SAME node_key + asset/label matching
+// the balance card uses — NOT the raw channel.asset (the LSP reports 'policy' when the fork doesn't
+// echo channel_asset, which silently lost the asset identity). provisionAndConnect is idempotent for
+// an already-provisioned node (re-attaches the signer, never re-funds), and we only touch legs with a
+// real own channel, so no phantom node is created for an asset merely held on-chain. Per-leg guard so
+// each connects once; a failed attempt clears the guard to retry on the next poll.
+const _lnReconnectedLegs = new Set();
+async function reconnectOwnNodes(){
+  const phrase=(localStorage.getItem(KEY)||'').trim();
   if(!phrase) return;
-  const chs=(lnLastStatus && lnLastStatus.channels)||[];
-  const seen=new Set();
-  for(const c of chs){
-    if(!c.node_key) continue;                                 // only the wallet's OWN provisioned nodes
-    const isBtc=(c.asset_label==='BTC' || c.leg==='btc');
-    const key=isBtc ? 'btc' : (c.asset||'');
-    if(!key || seen.has(key)) continue; seen.add(key);
+  const targets=[];
+  if(!_lnReconnectedLegs.has('btc') && lnOwnChannelsFor('BTC').length) targets.push('btc');
+  for(const h of Object.keys(balObj())){ if(!_lnReconnectedLegs.has(h) && lnOwnChannelsFor(h).length) targets.push(h); }
+  for(const key of targets){
+    _lnReconnectedLegs.add(key);                              // mark before await so a concurrent poll doesn't double-connect
     try{
-      const prov=isBtc
+      const prov=key==='btc'
         ? await provisionAndConnect({ chain:'btc', label:'BTC', policy:lnPolicy(),
             deriveIdentity: ()=>{ const k=lnNodeIdentity(phrase,'btc'); return { transportPrivkey:k.deviceTransportPrivkey, signingSeed:k.deviceSigningSeed }; } })
         : await provisionAndConnect({ chain:'seq', assetId: key, label: assetMeta(key).ticker, policy:lnPolicy(),
             deriveIdentity: (id)=>lnDeriveAsset(phrase, id) });
-      if(prov && prov.connected) console.log('[ln] reconnected own node', isBtc?'btc':assetMeta(key).ticker);
-    }catch(e){ console.warn('[ln] own-node reconnect failed', key, e?.message??e); }
+      if(prov && prov.connected){ console.log('[ln] reconnected own node', key==='btc'?'BTC':assetMeta(key).ticker); try{ lnStatusPill(); }catch{} }
+      else _lnReconnectedLegs.delete(key);                    // not connected — let the next poll retry
+    }catch(e){ _lnReconnectedLegs.delete(key); console.warn('[ln] own-node reconnect failed', key, e?.message??e); }
   }
-  try{ renderLightningBalance(); lnStatusPill(); }catch{}
 }
 
 // ---------- Move to Lightning (non-custodial channel funding) ----------
@@ -1822,6 +1825,7 @@ async function refreshLnStatus(){
   catch(e){ $('lnBalStatus').className='status err'; $('lnBalStatus').textContent='Lightning status unavailable: '+prettyErr(e); }
   try{ renderBalance(); }catch{}   // fold the fresh LN spendable into the asset rows
   try{ lnStatusPill(); }catch{}
+  try{ reconnectOwnNodes(); }catch(e){ console.warn('[ln] own-node reconnect:', e?.message??e); }  // re-attach OWN per-user node signers as their channels appear
 }
 // Back-compat: callers that changed LN state want "refresh + re-render". Kept as a hoisted
 // function (not a const alias) so it is callable from anywhere regardless of load order.
