@@ -947,6 +947,9 @@ const server = http.createServer(async (req, res) => {
             buy.push({ offer_id: o.offer_id, maker_pubkey: o.maker_pubkey, ln_direction: 4,
               asset_amount, btc_sats, price_sats_per_atom: asset_amount ? btc_sats / asset_amount : null,
               maker_ln_node: o.maker_ln_node_pubkey || null, ln_connect_hints: o.ln_connect_hints || null,
+              // the maker identity pubkey the wallet locks its BTC HTLC's CLAIM branch to, and the
+              // maker's suggested on-chain CLTV delta (the wallet sets T_btc = btc_tip + this-or-more).
+              maker_claim_pub: lt.maker_claim_pub || null, onchain_cltv: Number(lt.onchain_cltv || 0),
               expires_at: Number(o.expires_at_unix || 0), interactive: true });
           }
         }
