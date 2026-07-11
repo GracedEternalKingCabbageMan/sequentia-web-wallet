@@ -170,6 +170,9 @@ export function makeProvisioner(opts) {
       'log-level=debug',
       `log-file=${path.join(dir, 'lightningd.log')}`,
       `subdaemon=hsmd:${CFG.hsmdProxy}`,
+      // holdinvoice-seq: HODL invoices on a hash H so the DEVICE holds the preimage P and
+      // settles it out-of-band (non-custodial external-BTC BUY). Asset (seq) nodes only.
+      ...(chain === 'seq' ? ['plugin=/root/sequentia/seqln/contrib/holdinvoice-seq/holdinvoice.py'] : []),
       ...(chainCfg.extra || []),
     ].join('\n') + '\n';
     fs.writeFileSync(path.join(dir, 'config'), config);
