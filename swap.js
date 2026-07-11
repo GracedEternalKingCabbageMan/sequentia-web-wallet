@@ -1469,8 +1469,8 @@ function renderLadder(host, o){
   const rowHtml = (cls, r, i) => {
     const clk = typeof r.onClick === 'function';
     const w = Math.max(2, Math.min(100, Math.round((r.frac || 0) * 100)));
-    return `<button type="button" class="swlrow ${cls}${clk ? '' : ' noclick'}" data-side="${cls}" data-i="${i}"${clk ? '' : ' tabindex="-1"'}>
-      <span>${esc(trim(r.price))}</span><span>${esc(trim(r.size))}</span><span>${esc(trim(r.cum != null ? r.cum : r.size))}</span>
+    return `<button type="button" class="swlrow ${cls}${clk ? '' : ' noclick'}${r.mine ? ' mine' : ''}" data-side="${cls}" data-i="${i}"${r.mine ? ' title="Your resting order"' : ''}${clk ? '' : ' tabindex="-1"'}>
+      <span>${r.mine ? '<i class="swlyou">you</i>' : ''}${esc(trim(r.price))}</span><span>${esc(trim(r.size))}</span><span>${esc(trim(r.cum != null ? r.cum : r.size))}</span>
       <i class="swldepth" style="width:${w}%"></i></button>`;
   };
   const asks = o.asks || [], bids = o.bids || [];
@@ -2851,16 +2851,18 @@ function renderBook(pay, receive){
   const host = C.$('swBook'); if (!host) return;
   const pm = C.assetMeta(pay), rm = C.assetMeta(receive);
   const toU = (a, p) => Number(big(a)) / Math.pow(10, p || 0);
+  const MY = (typeof makerPubHex === 'function') ? makerPubHex() : null;   // this wallet's own maker id
+  const isMine = (o) => !!(MY && (o.maker_pubkey || o.makerPubkey) === MY);
   let asks = (BOOK.offers || []).map(o => {
     const recvSize = toU(o.offer_amount || o.offerAmount, rm.precision);   // offer asset = receive
     const payWanted = toU(o.want_amount || o.wantAmount, pm.precision);    // want asset  = pay
     return { price: recvSize > 0 ? payWanted / recvSize : 0, size: recvSize,
-             id: o.offer_id || o.offerId, maker: o.maker_pubkey || o.makerPubkey };
+             id: o.offer_id || o.offerId, maker: o.maker_pubkey || o.makerPubkey, mine: isMine(o) };
   }).filter(r => r.price > 0 && r.size > 0);
   let bids = (BOOK.otherOffers || []).map(o => {
     const payGiven = toU(o.offer_amount || o.offerAmount, pm.precision);   // offer asset = pay
     const recvWanted = toU(o.want_amount || o.wantAmount, rm.precision);   // want asset  = receive
-    return { price: recvWanted > 0 ? payGiven / recvWanted : 0, size: recvWanted };
+    return { price: recvWanted > 0 ? payGiven / recvWanted : 0, size: recvWanted, mine: isMine(o) };
   }).filter(r => r.price > 0 && r.size > 0);
   const bestAsk = asks.length ? Math.min(...asks.map(a => a.price)) : null;
   const bestBid = bids.length ? Math.max(...bids.map(b => b.price)) : null;

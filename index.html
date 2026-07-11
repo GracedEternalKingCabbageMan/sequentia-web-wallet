@@ -291,6 +291,10 @@
   .swlrow.bid span:first-child{color:var(--green)} .swlrow.bid .swldepth{background:rgba(39,174,96,.13)}
   .swlrow:hover{background:#1d242d;filter:none;transform:none} .swlrow.picked{outline:1.5px solid var(--amber2);outline-offset:-1.5px}
   .swlrow.noclick{cursor:default} .swlrow.noclick:hover{background:transparent}
+  /* Your own resting orders, marked inline in the book (a subtle amber left-rail + a "you" tag). */
+  .swlrow.mine{background:rgba(240,185,66,.09)} .swlrow.mine:hover{background:rgba(240,185,66,.16)}
+  .swlrow.mine::before{content:"";position:absolute;left:0;top:3px;bottom:3px;width:2.5px;border-radius:2px;background:var(--amber2);z-index:2}
+  .swlyou{display:inline-block;font-style:normal;font-size:9px;font-weight:700;letter-spacing:.04em;text-transform:uppercase;color:var(--amber2);background:rgba(240,185,66,.16);border-radius:4px;padding:0 4px;margin-right:5px;vertical-align:1px}
   .swlmid{display:flex;align-items:center;justify-content:space-between;gap:8px;padding:6px 9px;margin:5px 4px;background:var(--panel);border:1px solid var(--line);border-radius:8px;font:12.5px ui-monospace,monospace}
   .swlmid b{font-size:14px;color:var(--txt)} .swlmid .sp{color:var(--dim);font-size:11px}
   .swladder-empty{color:var(--dim);font-size:12.5px;padding:8px 4px}
