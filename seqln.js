@@ -384,6 +384,16 @@ export function seqlnInvoiceStatus({ node_key, payment_hash }) {
 export function seqlnNodeSettle({ node_key, payment_hash, preimage }) {
   return lspFetch('/node/settle', { method: 'POST', body: JSON.stringify({ node_key, payment_hash, preimage }) });
 }
+// Generic Lightning RECEIVE: a plain (non-HODL) bolt11 to receive `amount` asset sats into the user's
+// own hosted node. The node signs the invoice (device online required). Returns { bolt11, payment_hash }.
+export function seqlnNodeReceive({ node_key, amount, description }) {
+  return lspFetch('/node/receive', { method: 'POST', body: JSON.stringify({ node_key, amount, description }) });
+}
+// Generic Lightning SEND: the user's own hosted node PAYS `bolt11` (device co-signs every HTLC).
+// Returns { paid, preimage, amount_msat, destination }.
+export function seqlnNodePay({ node_key, bolt11 }) {
+  return lspFetch('/node/pay', { method: 'POST', body: JSON.stringify({ node_key, bolt11 }) });
+}
 
 // "Move back to chain": cooperatively close a channel on the user's own hosted node and send the
 // reclaimed funds to `destination` (the wallet's own on-chain address). The INVERSE of fundChannel.

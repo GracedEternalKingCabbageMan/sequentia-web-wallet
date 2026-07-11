@@ -1218,6 +1218,45 @@ const server = http.createServer(async (req, res) => {
       }
     }
 
+    // POST /node/receive { node_key, amount (asset sats), description? } -> { bolt11, payment_hash }.
+    // A PLAIN (non-HODL) invoice to RECEIVE over Lightning into the user's own hosted node. The node
+    // signs the bolt11 with its node key (device-co-signed), so its signer must be online. Distinct
+    // from /node/invoice (which is the HODL buy path); this is the generic Receive-tab invoice.
+    if (req.method === 'POST' && url.pathname === '/node/receive') {
+      if (!PROV) return send(res, 501, { ok: false, error: 'per-asset node provisioning is not enabled on this LSP' });
+      const body = await readBody(req);
+      const nodeKey = ((body && body.node_key) || '').toLowerCase();
+      const amount = Number(body && body.amount);
+      if (!nodeKey || !(amount > 0)) return send(res, 400, { ok: false, error: 'body { node_key, amount (asset sats), description? } required' });
+      const rec = PROV.getByKey(nodeKey);
+      if (!rec || !rec.rpc) return send(res, 404, { ok: false, error: 'unknown node key (POST /node/provision first)' });
+      const amtMsat = String(Math.round(amount) * 1000);
+      const label = 'recv-' + crypto.randomUUID();
+      const desc = (body && body.description) ? String(body.description).slice(0, 128) : 'Lightning receive';
+      try {
+        const inv = await lnrpcKw('invoice', [`amount_msat=${amtMsat}`, `label=${label}`, `description=${desc}`], rec.rpc);
+        return send(res, 200, { ok: true, bolt11: inv.bolt11, payment_hash: inv.payment_hash, amount_msat: Number(amtMsat) });
+      } catch (e) { return send(res, 502, { ok: false, error: `invoice: ${e.message}` }); }
+    }
+
+    // POST /node/pay { node_key, bolt11 } -> { paid, preimage, amount_msat, destination }. The user's
+    // hosted node PAYS a Lightning invoice (device co-signs every HTLC). Non-custodial: the LSP commands
+    // `pay` but cannot sign it. retry_for bounds the routing attempt so a dead route can't hang forever.
+    if (req.method === 'POST' && url.pathname === '/node/pay') {
+      if (!PROV) return send(res, 501, { ok: false, error: 'per-asset node provisioning is not enabled on this LSP' });
+      const body = await readBody(req);
+      const nodeKey = ((body && body.node_key) || '').toLowerCase();
+      const bolt11 = String((body && body.bolt11) || '').trim();
+      if (!nodeKey || !bolt11) return send(res, 400, { ok: false, error: 'body { node_key, bolt11 } required' });
+      const rec = PROV.getByKey(nodeKey);
+      if (!rec || !rec.rpc) return send(res, 404, { ok: false, error: 'unknown node key' });
+      try {
+        const r = await lnrpcKw('pay', [`bolt11=${bolt11}`, 'retry_for=45'], rec.rpc);
+        return send(res, 200, { ok: true, paid: r.status === 'complete', preimage: r.payment_preimage || null,
+          amount_msat: r.amount_msat != null ? Number(r.amount_msat) : null, destination: r.destination || null });
+      } catch (e) { return send(res, 502, { ok: false, error: `pay: ${e.message}` }); }
+    }
+
     if (req.method === 'GET' && url.pathname === '/node/getinfo') {
       if (!PROV) return send(res, 501, { ok: false, error: 'per-asset node provisioning is not enabled on this LSP' });
       const nodeKey = url.searchParams.get('node') || '';

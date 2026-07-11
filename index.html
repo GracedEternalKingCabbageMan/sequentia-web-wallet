@@ -440,6 +440,14 @@
         </div>
         <div class="status err" id="sendErr"></div>
       </div>
+      <div class="card hide" id="lnSendCard">
+        <label class="lbl">⚡ Pay a Lightning invoice</label>
+        <p class="sub" style="margin:0 0 10px">Your hosted node pays the invoice and your device co-signs. Pick the asset to pay from.</p>
+        <select id="lnSendAsset" style="width:100%"></select>
+        <textarea id="lnSendBolt11" class="mono" placeholder="lnbc… — paste a BOLT11 invoice" style="width:100%;margin-top:8px;min-height:64px;resize:vertical"></textarea>
+        <button class="primary" id="lnSendBtn" style="margin-top:10px">Pay invoice</button>
+        <div class="status" id="lnSendStatus" style="margin-top:8px"></div>
+      </div>
     </section>
 
     <!-- receive -->
@@ -454,6 +462,18 @@
           <button id="btnNewAddr">New address</button>
           <button class="ghost" id="btnConf">Show confidential</button>
         </div>
+      </div>
+      <div class="card hide" id="lnRecvCard">
+        <label class="lbl">⚡ Receive over Lightning</label>
+        <p class="sub" style="margin:0 0 10px">Generate a Lightning invoice paid into your hosted node. Your device must be online to sign it.</p>
+        <div class="row">
+          <select id="lnRecvAsset" style="flex:1"></select>
+          <input id="lnRecvAmt" class="mono" placeholder="amount" style="width:130px">
+        </div>
+        <button class="primary" id="lnRecvBtn" style="margin-top:10px">Create invoice</button>
+        <div class="status" id="lnRecvStatus" style="margin-top:8px"></div>
+        <div class="mono" id="lnRecvBolt11" style="margin-top:8px;word-break:break-all;font-size:11px"></div>
+        <button class="ghost hide" id="lnRecvCopy" style="margin-top:8px">Copy invoice</button>
       </div>
       <div class="card hide" id="recvOampCard">
         <label class="lbl">Receive a restricted asset (OpenAMP)</label>
@@ -779,7 +799,7 @@ import { initXrswap, fetchRQuote, openReverseFromComposer, hasInFlight as hasRev
 import { initXmaker, startForwardMaker, startReverseMaker, liveMakerOffers, resumeMakerSwaps } from './xmaker.js';
 import { initSeqln, connectDevice as lnConnectDevice, disconnectDevice as lnDisconnect,
   onSeqlnStatus, seqlnState, seqlnAvailable, seqlnGetStatus, seqlnListNodes, seqlnNodeOnchain, seqlnSwap, seqlnBook, seqlnPostOffer, lnFinalityCopy,
-  seqlnChannelInbound, seqlnNodeInvoice, seqlnInvoiceStatus, seqlnNodeSettle,
+  seqlnChannelInbound, seqlnNodeInvoice, seqlnInvoiceStatus, seqlnNodeSettle, seqlnNodeReceive, seqlnNodePay,
   seqlnChannels, seqlnFunding, fundChannel, resumeFundChannel, provisionAndConnect, waitNodeReady, provisionedState,
   disconnectProvisioned, deviceTransportPubkey, registerOwnStatusKeys, closeChannelLsp } from './seqln.js';
 import { lnDeriveNode, lnDeriveAsset } from './seqln-keys.js';
@@ -1556,11 +1576,11 @@ function views(active){ for(const v of ['welcome','createView','importView','app
 function tab(name){
   document.querySelectorAll('#tabs button').forEach(b=>b.classList.toggle('active', b.dataset.tab===name));
   document.querySelectorAll('[data-panel]').forEach(p=>p.classList.toggle('hide', p.dataset.panel!==name));
-  if(name==='receive') renderReceive();
+  if(name==='receive'){ renderReceive(); try{ initLnSendReceive(); refreshLnSendReceive(); }catch{} }
   if(name==='history') renderHistory();
   if(name==='stake') refreshStakes();
   if(name==='swap') renderActiveSwap();
-  if(name==='send'){ feeAssetManual=false; refreshRecipientAssets(); populateFeeAssets(); defaultFeeAssetToSent(); updateFeeForSendType(); }
+  if(name==='send'){ feeAssetManual=false; refreshRecipientAssets(); populateFeeAssets(); defaultFeeAssetToSent(); updateFeeForSendType(); try{ initLnSendReceive(); refreshLnSendReceive(); }catch{} }
 }
 
 // ---------- boot ----------
@@ -1944,6 +1964,7 @@ async function refreshOwnLnNodeKeys(){
 // renderBalance renders synchronously from the cache, so there is no render loop.
 async function refreshLnStatus(){
   const note=$('lnHelpNote');
+  try{ initLnSendReceive(); refreshLnSendReceive(); }catch{}   // wire + refresh the LN send/receive cards
   if(!seqlnState().deployed){ if(note) note.classList.add('hide'); try{ renderBalance(); }catch{} try{ lnStatusPill(); }catch{} return; }
   if(note) note.classList.remove('hide');
   try{ await refreshOwnLnNodeKeys(); }catch{}   // so /status includes this device's own nodes across reloads
@@ -1956,6 +1977,69 @@ async function refreshLnStatus(){
 // Back-compat: callers that changed LN state want "refresh + re-render". Kept as a hoisted
 // function (not a const alias) so it is callable from anywhere regardless of load order.
 function renderLightningBalance(){ return refreshLnStatus(); }
+
+// ---------- Lightning in the Send / Receive tabs ----------
+// Held, fee-rated assets can run (or already have) a hosted LN node, so they can send/receive over LN.
+function lnCapableAssets(){
+  return Object.keys(balObj()).filter(h => feeRateEntry(h) && feeRateEntry(h).rate > 0)
+    .map(h => ({ hex: h, ticker: assetMeta(h).ticker }));
+}
+function fillLnAssetSelect(sel){
+  if (!sel) return;
+  const cur = sel.value, opts = lnCapableAssets();
+  sel.innerHTML = opts.map(o => `<option value="${o.hex}">${esc(o.ticker)}</option>`).join('');
+  if (cur && opts.some(o => o.hex === cur)) sel.value = cur;
+}
+// Show the LN send/receive cards only when LN is deployed AND the wallet holds a fee-rated asset.
+function refreshLnSendReceive(){
+  const on = !!(typeof seqlnState === 'function' && seqlnState().deployed) && lnCapableAssets().length > 0;
+  const sc = $('lnSendCard'), rc = $('lnRecvCard');
+  if (sc) sc.classList.toggle('hide', !on);
+  if (rc) rc.classList.toggle('hide', !on);
+  if (on){ fillLnAssetSelect($('lnRecvAsset')); fillLnAssetSelect($('lnSendAsset')); }
+}
+let _lnSRWired = false;
+function initLnSendReceive(){
+  if (_lnSRWired) return; _lnSRWired = true;
+  const recvBtn = $('lnRecvBtn'), sendBtn = $('lnSendBtn'), copyBtn = $('lnRecvCopy');
+  if (recvBtn) recvBtn.onclick = async () => {
+    const asset = $('lnRecvAsset').value, meta = assetMeta(asset);
+    const amt = Math.round(Number($('lnRecvAmt').value) * Math.pow(10, meta.precision || 0));
+    const st = $('lnRecvStatus'), out = $('lnRecvBolt11');
+    out.textContent = ''; $('lnRecvCopy').classList.add('hide');
+    if (!(amt > 0)){ st.className = 'status err'; st.textContent = 'Enter an amount.'; return; }
+    recvBtn.disabled = true; st.className = 'status'; st.innerHTML = '<span class="spin"></span>Bringing your ' + esc(meta.ticker) + ' node online…';
+    try {
+      await L.connectNode(asset);
+      const node_key = await L.assetNodeKey(asset);
+      st.innerHTML = '<span class="spin"></span>Ensuring inbound liquidity…';
+      try { await L.channelInbound({ node_key, asset, amount: amt }); } catch(e){ /* best-effort JIT; a funded channel may already have inbound */ }
+      st.innerHTML = '<span class="spin"></span>Creating the invoice…';
+      const inv = await L.nodeReceive({ node_key, amount: amt, description: 'Receive ' + meta.ticker });
+      if (!inv || !inv.bolt11) throw new Error((inv && inv.error) || 'no invoice returned');
+      out.textContent = inv.bolt11; $('lnRecvCopy').classList.remove('hide');
+      st.className = 'status'; st.textContent = 'Invoice ready — share it to receive ' + esc($('lnRecvAmt').value) + ' ' + esc(meta.ticker) + '.';
+    } catch(e){ st.className = 'status err'; st.textContent = 'Could not create the invoice: ' + prettyErr(e); }
+    finally { recvBtn.disabled = false; }
+  };
+  if (copyBtn) copyBtn.onclick = () => { try { navigator.clipboard.writeText($('lnRecvBolt11').textContent || ''); toast('Invoice copied.'); } catch {} };
+  if (sendBtn) sendBtn.onclick = async () => {
+    const asset = $('lnSendAsset').value, meta = assetMeta(asset);
+    const bolt11 = ($('lnSendBolt11').value || '').trim();
+    const st = $('lnSendStatus');
+    if (!bolt11){ st.className = 'status err'; st.textContent = 'Paste an invoice.'; return; }
+    sendBtn.disabled = true; st.className = 'status'; st.innerHTML = '<span class="spin"></span>Bringing your ' + esc(meta.ticker) + ' node online…';
+    try {
+      await L.connectNode(asset);
+      const node_key = await L.assetNodeKey(asset);
+      st.innerHTML = '<span class="spin"></span>Paying over Lightning…';
+      const r = await L.nodePay({ node_key, bolt11 });
+      if (r && r.paid){ st.className = 'status'; st.textContent = 'Paid ✓' + (r.preimage ? ' · preimage ' + String(r.preimage).slice(0, 16) + '…' : ''); $('lnSendBolt11').value = ''; try { renderLightningBalance(); } catch {} }
+      else throw new Error((r && r.error) || 'payment did not complete');
+    } catch(e){ st.className = 'status err'; st.textContent = 'Payment failed: ' + prettyErr(e); }
+    finally { sendBtn.disabled = false; }
+  };
+}
 // Modal: "Move back to chain" — the inverse of Move-to-Lightning. Reconnects the device signer to
 // the user's own hosted node, then cooperatively closes the channel, sending the reclaimed funds
 // straight to a fresh wallet address. Device-signed + non-custodial: the LSP drives the close but the
@@ -2263,6 +2347,8 @@ function initSwapTab(){
       nodeInvoice: (p) => seqlnNodeInvoice(p),
       invoiceStatus: (p) => seqlnInvoiceStatus(p),
       nodeSettle: (p) => seqlnNodeSettle(p),
+      nodeReceive: (p) => seqlnNodeReceive(p),
+      nodePay: (p) => seqlnNodePay(p),
       // The registry node_key for the user's OWN hosted LN node for `assetHex`
       // (seq:<asset>:<deviceTransportPubkey>) — matches refreshOwnLnNodeKeys. Needed by the
       // sub-asset sell/buy /swap calls to name which hosted node pays over Lightning.
