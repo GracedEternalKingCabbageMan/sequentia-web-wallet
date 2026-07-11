@@ -528,16 +528,58 @@ export async function fundChannel({ chain, asset, amount, node, sendOnchain, onP
   const started = await lspFetch('/channel/open', { method: 'POST', body: JSON.stringify(body) });
   const jobUrl = started.poll || `/channel/open/${started.job_id}`;
 
-  // 4. Poll to completion, surfacing each phase for the UI.
+  // 4. Poll to completion, surfacing each phase for the UI. The channel-open runs SERVER-SIDE, so a
+  // transient network blip on the poll (the "failed to fetch" that used to kill the whole move) must
+  // NOT abandon it — retry a bounded number of times, and only then surface a RESUMABLE error (the
+  // job keeps running; reopening the wallet re-polls it). This is what makes a flaky connection
+  // survivable instead of stranding a deposit.
   const deadline = Date.now() + timeoutMs;
-  let job = started;
+  let job = started, pollErrors = 0;
+  const maxPollErrors = 24;   // 24 * pollMs (~2 min at 5s) of transient tolerance before giving up
   for (;;) {
     emit(job.status, { job, deposit_txid: sent && sent.txid });
     if (job.status === 'active') return job;
     if (job.status === 'failed') throw new Error(job.error || 'channel open failed');
     if (Date.now() > deadline) throw new Error('channel open timed out');
     await new Promise((r) => setTimeout(r, pollMs));
-    job = await lspFetch(jobUrl);
+    try {
+      job = await lspFetch(jobUrl);
+      pollErrors = 0;
+    } catch (e) {
+      if (++pollErrors > maxPollErrors) {
+        const err = new Error('Lost connection while opening the channel. It may still be completing on the server — reopen the wallet to resume.');
+        err.resumable = true; err.jobUrl = jobUrl; err.cause = e;
+        throw err;
+      }
+      emit('reconnecting', { attempt: pollErrors, of: maxPollErrors });
+      // keep `job` as-is (last known status) and loop; the next poll retries the same jobUrl.
+    }
+  }
+}
+
+// Resume a channel-open WITHOUT re-depositing: the deposit already landed on the node, so just
+// (re)start the LSP's fundchannel-from-existing-balance job and poll it to completion. Used to
+// recover a move that was interrupted after the deposit but before the channel opened (the
+// "stranded deposit" case) — the funds are on the user's own node, this finishes moving them.
+export async function resumeFundChannel({ chain, asset, amount, node, onProgress, pollMs = 5000, timeoutMs = 3_600_000 } = {}) {
+  const emit = (phase, extra) => { try { onProgress && onProgress({ phase, ...extra }); } catch {} };
+  emit('opening-request');
+  const body = { chain, amount };
+  if (asset) body.asset = asset;
+  if (node) body.node = node;
+  const started = await lspFetch('/channel/open', { method: 'POST', body: JSON.stringify(body) });
+  const jobUrl = started.poll || `/channel/open/${started.job_id}`;
+  const deadline = Date.now() + timeoutMs;
+  let job = started, pollErrors = 0;
+  const maxPollErrors = 24;
+  for (;;) {
+    emit(job.status, { job });
+    if (job.status === 'active') return job;
+    if (job.status === 'failed') throw new Error(job.error || 'channel open failed');
+    if (Date.now() > deadline) throw new Error('channel open timed out');
+    await new Promise((r) => setTimeout(r, pollMs));
+    try { job = await lspFetch(jobUrl); pollErrors = 0; }
+    catch (e) { if (++pollErrors > maxPollErrors) throw e; emit('reconnecting', { attempt: pollErrors, of: maxPollErrors }); }
   }
 }
 
