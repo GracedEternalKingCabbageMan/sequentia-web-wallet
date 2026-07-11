@@ -397,7 +397,11 @@ async function confirmedOnchain(rpc, chain, assetId) {
   const lf = await lnrpc('listfunds', [], rpc);
   let units = 0; const outpoints = [];
   for (const o of (lf.outputs || [])) {
-    if (o.status !== 'confirmed') continue;
+    // Count the user's own deposit as soon as the node SEES it, confirmed or not: it is the
+    // user funding their OWN single-asset channel, so there is no counterparty risk in funding
+    // at 0-conf (fundchannel uses minconf=0; the channel still won't lock in until the funding
+    // tx — and thus its parent deposit — confirms). This removes a full block of latency.
+    if (o.status !== 'confirmed' && o.status !== 'unconfirmed') continue;
     if (chain === 'seq' && assetId && (o.asset || '').toLowerCase() !== assetId.toLowerCase()) continue;
     const sats = Math.round(Number(o.amount_msat ?? 0) / 1000);
     if (!sats) continue;
@@ -472,7 +476,7 @@ async function runChannelOpen(job) {
     job.confirmed_units = units;
     if (units >= need) { job.deposit_outpoints = outpoints; break; }
     job.status = 'pending_deposit';
-    await sleep(15000);
+    await sleep(3000);   // poll briskly: the deposit is the user's own tx, seen within seconds
   }
 
   // 2. Connect to the routing peer + fundchannel. The funding tx SIGN_WITHDRAWAL is
@@ -499,7 +503,9 @@ async function runChannelOpen(job) {
   // assets the node can fund — consistent by construction.
   const FEE_RESERVE = 20000; // asset atoms held back for the in-asset on-chain fee (~1 atom)
   const fundAmount = Math.max(1, (job.confirmed_units || need) - FEE_RESERVE);
-  const fcArgs = [`id=${peerId}`, `amount=${fundAmount}`, 'announce=true'];
+  // minconf=0 so we can fund from the user's just-broadcast (0-conf) deposit immediately —
+  // it's their own money funding their own channel, so 0-conf carries no counterparty risk.
+  const fcArgs = [`id=${peerId}`, `amount=${fundAmount}`, 'announce=true', 'minconf=0'];
   if (job.chain === 'seq' && job.asset_id) fcArgs.push(`asset=${job.asset_id}`);
   const fc = await lnrpc('fundchannel', fcArgs, rpc);
   job.funding_txid = fc.txid || (fc.txids && fc.txids[0]) || null;
