@@ -2756,7 +2756,11 @@ function trim(n){ if (!isFinite(n)) return '-'; const s = (Math.round(n*1e8)/1e8
 // and couriers the SwapComplete receipt back.
 async function liftOffer(q, st){
   const { wasm } = C;
-  const receiveAddr = C.wollet.address(C.addrIndex == null ? undefined : C.addrIndex).address();
+  // Receive TRANSPARENTLY by default (principle #6: transparent-by-default). Only a confidential
+  // swap (q.confidential — the opt-in Confidential sub-tab) receives to the blinded blech32 address;
+  // everywhere else the received amount is explicit, like the Receive tab and the cross-chain wizards.
+  const _raw = C.wollet.address(C.addrIndex == null ? undefined : C.addrIndex).address();
+  const receiveAddr = q.confidential ? _raw : (_raw.toUnconfidential ? _raw.toUnconfidential() : _raw);
   const buildRequest = async () => {
     const sreq = C.wollet.seqdexSwapRequest(
       new wasm.AssetId(q.assetP), q.amountP,
