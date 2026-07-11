@@ -1750,15 +1750,6 @@ async function reconnectOwnNodes(){
     try{ renderBalance(); lnStatusPill(); }catch{}
   }
 }
-// TEMP DEBUG (remove after diagnosing auto-reconnect display): inspect the discovery + reconnect.
-if(typeof window!=='undefined') window.__ln = {
-  candidates: ()=>_ownLnCandidates.map(c=>({leg:c.leg==='btc'?'btc':assetMeta(c.leg).ticker, key:c.key.slice(0,30)})),
-  discoveryDone: ()=>_lnDiscoveryDone,
-  reconnected: ()=>[..._lnReconnectedLegs].map(l=>l==='btc'?'btc':assetMeta(l).ticker),
-  provisioned: ()=>provisionedState(),
-  testDiscovery: async ()=>{ try{ return await seqlnListNodes(_ownLnCandidates.map(c=>c.key)); }catch(e){ return {err:e.message}; } },
-  liveStatus: async ()=>{ try{ await refreshOwnLnNodeKeys(); const s=await seqlnGetStatus(); return { own:(s.channels||[]).filter(c=>c.node_key).map(c=>({label:c.asset_label,state:c.state,spend:c.spendable_units})), prov:(s.provisioned_nodes||[]).length }; }catch(e){ return {err:e.message}; } },
-};
 
 // ---------- Move to Lightning (non-custodial channel funding) ----------
 // The on-chain DEPOSIT send hook handed to seqln.js's fundChannel. The WALLET signs
