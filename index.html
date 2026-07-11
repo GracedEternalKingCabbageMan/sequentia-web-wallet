@@ -771,7 +771,7 @@ import { initSeqln, connectDevice as lnConnectDevice, disconnectDevice as lnDisc
   onSeqlnStatus, seqlnState, seqlnAvailable, seqlnGetStatus, seqlnListNodes, seqlnNodeOnchain, seqlnSwap, seqlnBook, seqlnPostOffer, lnFinalityCopy,
   seqlnChannelInbound, seqlnNodeInvoice, seqlnInvoiceStatus, seqlnNodeSettle,
   seqlnChannels, seqlnFunding, fundChannel, resumeFundChannel, provisionAndConnect, waitNodeReady, provisionedState,
-  deviceTransportPubkey, registerOwnStatusKeys, closeChannelLsp } from './seqln.js';
+  disconnectProvisioned, deviceTransportPubkey, registerOwnStatusKeys, closeChannelLsp } from './seqln.js';
 import { lnDeriveNode, lnDeriveAsset } from './seqln-keys.js';
 
 const ESPLORA = location.origin + '/api';
@@ -1707,8 +1707,13 @@ function ownLnLegs(){ try{ return JSON.parse(localStorage.getItem(_ownLnLegsKey)
 function rememberOwnLnLeg(leg){ if(!leg) return; const s=new Set(ownLnLegs()); if(s.has(leg)) return; s.add(leg); try{ localStorage.setItem(_ownLnLegsKey, JSON.stringify([...s])); }catch{} }
 const _lnReconnectedLegs = new Set();
 const _lnStrandRecovered = new Set();   // nodes whose stranded deposit we've already completed this session
+const _lnLegNodeKey = {};               // leg ('btc' | assethex) -> resolved LSP registry key, for liveness checks
 let _lnDiscoveryDone = false;   // the registry discovery pass runs once (per successful call) per session
+let _reconnectInFlight = false; // single-flight: the /status poll and the wake/interval driver can call concurrently
 async function reconnectOwnNodes(){
+  if(_reconnectInFlight) return;   // a concurrent poll/driver tick skips and retries on the next one
+  _reconnectInFlight = true;
+  try{
   const phrase=(localStorage.getItem(KEY)||'').trim();
   if(!phrase) return;
   const targets=[];
@@ -1741,7 +1746,7 @@ async function reconnectOwnNodes(){
             deriveIdentity: ()=>{ const k=lnNodeIdentity(phrase,'btc'); return { transportPrivkey:k.deviceTransportPrivkey, signingSeed:k.deviceSigningSeed }; } })
         : await provisionAndConnect({ chain:'seq', assetId: key, label: assetMeta(key).ticker, policy:lnPolicy(),
             deriveIdentity: (id)=>lnDeriveAsset(phrase, id) });
-      if(prov && prov.connected){ readyKeys.push(prov.key); console.log('[ln] reconnected own node', key==='btc'?'BTC':assetMeta(key).ticker); try{ lnStatusPill(); }catch{} }
+      if(prov && prov.connected){ readyKeys.push(prov.key); _lnLegNodeKey[key]=String(prov.key||'').toLowerCase(); console.log('[ln] reconnected own node', key==='btc'?'BTC':assetMeta(key).ticker); try{ lnStatusPill(); }catch{} }
       else _lnReconnectedLegs.delete(key);                    // not connected — let the next poll retry
     }catch(e){ _lnReconnectedLegs.delete(key); console.warn('[ln] own-node reconnect failed', key, e?.message??e); }
   }
@@ -1777,6 +1782,51 @@ async function reconnectOwnNodes(){
       }catch(e){ _lnStrandRecovered.delete(k); console.warn('[ln] strand recovery (will retry next open):', e?.message??e); }
     }
   }
+  } finally { _reconnectInFlight = false; }
+}
+
+// Liveness sweep for THIS wallet's own hosted-node signers. Two failure modes to survive:
+//  (1) a link the SDK KNOWS is closed (ws.onclose fired -> onStatus 'closed' -> seqln.js nulled the
+//      signer): provisionedState() reports connected=false, so we drop the leg's "already reconnected"
+//      guard and reconnectOwnNodes rebuilds it on the next pass.
+//  (2) a ZOMBIE ws (phone sleep / lost signal / relay change) where onclose never fires: the SDK has no
+//      app-level ping, so the browser still believes it is connected. We cannot detect this passively,
+//      so on the genuine wake signals (tab re-shown after a real gap, network back online) we FORCE a
+//      teardown+rebuild, which guarantees a live link after wake. A brief tab switch (< the gap) is left
+//      untouched so we do not thrash a healthy signer.
+function pruneDeadOwnLegs(force){
+  const st = (typeof provisionedState==='function') ? provisionedState() : {};
+  for(const leg of [..._lnReconnectedLegs]){
+    const nk = _lnLegNodeKey[leg];
+    const alive = !!(nk && st[nk] && st[nk].connected === true);
+    if(force && nk){ try{ disconnectProvisioned(nk); }catch{} }   // wake: tear the (maybe-zombie) link down
+    if(force || !alive){ _lnReconnectedLegs.delete(leg); }        // allow reconnectOwnNodes to rebuild it
+  }
+}
+let _reconnectSweepAt = 0;
+function lnReconnectSweep(force){
+  if(!seqlnState().deployed) return;
+  const now = Date.now();
+  if(!force && now - _reconnectSweepAt < 8000) return;   // rate-limit the idle tick; wake signals bypass
+  _reconnectSweepAt = now;
+  try{ pruneDeadOwnLegs(force); }catch(e){ console.warn('[ln] prune:', e?.message??e); }
+  reconnectOwnNodes().catch(e=>console.warn('[ln] sweep reconnect:', e?.message??e));
+}
+// Drive the sweep from the real reconnection triggers. A long background/sleep or a network flap is the
+// case that strands a zombie ws, so those force a rebuild; a quick tab switch only prunes+retries.
+let _lnHiddenSince = 0;
+if(typeof document!=='undefined'){
+  document.addEventListener('visibilitychange', ()=>{
+    if(document.visibilityState==='hidden'){ _lnHiddenSince = Date.now(); return; }
+    const away = _lnHiddenSince ? (Date.now()-_lnHiddenSince) : 0;
+    _lnHiddenSince = 0;
+    lnReconnectSweep(away > 15000);           // force only after a real gap (sleep/long background)
+  });
+}
+if(typeof window!=='undefined'){
+  window.addEventListener('online', ()=> lnReconnectSweep(true));   // network came back — links are stale
+  window.addEventListener('focus',  ()=> lnReconnectSweep(false));
+  setInterval(()=> lnReconnectSweep(false), 12000);                 // steady tick catches SDK-known closes
 }
 
 // ---------- Move to Lightning (non-custodial channel funding) ----------

@@ -184,7 +184,10 @@ export async function connectDevice({
   signer.onStatus = (st) => {
     if (st.state === 'node_id') { s.nodeId = st.nodeId; setPhase(node, 'node_id', st.nodeId.slice(0, 14) + '…'); }
     else setPhase(node, st.state, st.detail);
-    if (st.state === 'closed' || st.state === 'error') { s.connected = false; }
+    // Drop the dead signer object, not just the flag: a closed ws can't be reused (SDK builds a
+    // fresh SeqlnSigner per connect), and the `if (s.signer) return` guards below would otherwise
+    // block every reconnect after a link drop (the "won't reconnect after refresh/sleep" bug).
+    if (st.state === 'closed' || st.state === 'error') { s.connected = false; s.signer = null; }
   };
   try {
     await signer.connect({ wsUrl: ws, hostStaticPubkey: hostPub, deviceStaticPrivkey: deviceTransportPrivkey });
@@ -252,7 +255,9 @@ export async function connectProvisioned({ assetId, key, deviceSigningSeed, devi
   signer.onStatus = (st) => {
     if (st.state === 'node_id') { s.nodeId = st.nodeId; s.phase = 'node_id'; }
     else s.phase = st.state;
-    if (st.state === 'closed' || st.state === 'error') s.connected = false;
+    // Null the dead signer (not just the flag) so a later reconnect rebuilds — the `if (s.signer)`
+    // guard above would otherwise short-circuit every retry once the link has dropped once.
+    if (st.state === 'closed' || st.state === 'error') { s.connected = false; s.signer = null; }
     if (onChange) { try { onChange(seqlnState()); } catch {} }
   };
   try {
