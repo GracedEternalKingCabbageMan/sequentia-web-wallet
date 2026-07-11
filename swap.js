@@ -1237,6 +1237,30 @@ async function requoteMixed(route, amtStr){
     renderTiming(route);
     return;
   }
+  // Sub-asset SELL (pay the asset over Lightning, receive BTC on-chain): take a resting sell offer
+  // from the sub-asset book — a whole-offer lift at the maker's fixed terms. Attach the offer so
+  // startSell takes exactly THIS one (unambiguous amount), fill both amount fields, and show the
+  // BTC received. Distinct from the submarine path below (which reads the on-chain cross book).
+  if (route.payRail === 'ln' && route.recvRail === 'chain' && !route.payIsBtc){
+    const offer = subassetOffers(route.seqAsset, 'sell')[0] || null;
+    if (!offer){
+      $('swRate').textContent = `No resting ${am.ticker}→BTC sell offer right now — try again shortly.`;
+      $('swRoute').textContent = 'Mixed rails · sell over Lightning, receive BTC on-chain';
+      setReviewEnabled(false); renderTiming(route); return;
+    }
+    const assetU = Number(offer.asset_amount) / Math.pow(10, am.precision || 0);
+    const btcU = Number(offer.btc_sats) / 1e8;
+    $('swPayAmt').value = trim(assetU);
+    $('swRecvAmt').value = trim(btcU);
+    $('swRate').textContent = `${trim(assetU)} ${am.ticker} → ${trim(btcU)} BTC · best resting offer`;
+    $('swRoute').textContent = 'Mixed rails · sell over Lightning, receive BTC on-chain';
+    paintFee('BTC', null, 'You pay the ' + am.ticker + ' over Lightning; your device claims the BTC from its on-chain HTLC.');
+    LAST_QUOTE = { kind: 'mixed', route, seqAsset: route.seqAsset, payIsBtc: false,
+      payRail: 'ln', recvRail: 'chain', sellOffer: offer };
+    renderTiming(route);
+    setReviewEnabled(true);
+    return;
+  }
   await loadBtcBook(route);
   deriveXOpposite(route);
   const o = (XBOOK.offers || [])[0];
