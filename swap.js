@@ -2249,6 +2249,9 @@ async function startSell(params){
     // never claims (no claim key) and we claim on-chain ourselves.
     say('Paying ' + am.ticker + ' over Lightning…');
     const resp = await L.swap({ side: 'sell', asset, node_key, btc_claim_pub, amount: params.amount,
+      // State the rails EXPLICITLY (asset over Lightning, BTC on-chain) so the LSP routes this to
+      // the sub-asset sell (xsubas-sell) rather than defaulting omitted rails to pure-LN (xpln).
+      payRail: 'ln', recvRail: 'chain',
       offer_id: offer && offer.offer_id, maker_pubkey: offer && offer.maker_pubkey });
     if (!(resp && resp.settled && resp.preimage && resp.btc_htlc)) throw new Error(resp && resp.error ? resp.error : 'The sell did not settle over Lightning.');
     const H = resp.btc_htlc;
