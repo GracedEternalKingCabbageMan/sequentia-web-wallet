@@ -1695,6 +1695,12 @@ function initLightning(phrase){
 // an already-provisioned node (re-attaches the signer, never re-funds), and we only touch legs with a
 // real own channel, so no phantom node is created for an asset merely held on-chain. Per-leg guard so
 // each connects once; a failed attempt clears the guard to retry on the next poll.
+// This device's remembered OWN Lightning legs (asset hex, or 'btc') — every leg it has opened a
+// channel on. Persisted so the on-load reconnect can rediscover a node that is momentarily blocked
+// waiting for its signer (a just-revived node), which /status cannot see until the signer attaches.
+const _ownLnLegsKey = 'swk.ln.ownLegs.v1';
+function ownLnLegs(){ try{ return JSON.parse(localStorage.getItem(_ownLnLegsKey)||'[]')||[]; }catch{ return []; } }
+function rememberOwnLnLeg(leg){ if(!leg) return; const s=new Set(ownLnLegs()); if(s.has(leg)) return; s.add(leg); try{ localStorage.setItem(_ownLnLegsKey, JSON.stringify([...s])); }catch{} }
 const _lnReconnectedLegs = new Set();
 async function reconnectOwnNodes(){
   const phrase=(localStorage.getItem(KEY)||'').trim();
@@ -1702,6 +1708,11 @@ async function reconnectOwnNodes(){
   const targets=[];
   if(!_lnReconnectedLegs.has('btc') && lnOwnChannelsFor('BTC').length) targets.push('btc');
   for(const h of Object.keys(balObj())){ if(!_lnReconnectedLegs.has(h) && lnOwnChannelsFor(h).length) targets.push(h); }
+  // Also reconnect legs we REMEMBER opening a channel on but that /status can't see yet — a node
+  // blocked waiting for its signer (e.g. just revived) is invisible to /status, so without this its
+  // signer could never be reattached (chicken-and-egg). provisionAndConnect only ever names a node
+  // THIS device opened, so it reattaches rather than creating a phantom node.
+  for(const leg of ownLnLegs()){ const k=(leg==='btc')?'btc':String(leg).toLowerCase(); if(!_lnReconnectedLegs.has(k) && !targets.includes(k)) targets.push(k); }
   for(const key of targets){
     _lnReconnectedLegs.add(key);                              // mark before await so a concurrent poll doesn't double-connect
     try{
@@ -1948,6 +1959,10 @@ function moveToLightningDialog(leg){
       st.textContent = 'Done. Lightning channel '+(res.short_channel_id||'')+' is active'
         + (res.spendable_msat!=null ? (' with '+fmtAtoms(BigInt(Math.round(res.spendable_msat/1000)), leg.precision)+' '+leg.ticker+' spendable.') : '.');
       toast('Moved '+leg.ticker+' to Lightning');
+      // Remember we opened a channel on this leg, so the on-load reconnect can bring its signer
+      // back even when the node is momentarily blocked waiting for that signer (and thus invisible
+      // to /status) — the reconnect deadlock a just-revived node would otherwise hit.
+      try{ rememberOwnLnLeg(leg.chain==='btc' ? 'btc' : (leg.asset||'').toLowerCase()); }catch{}
       // Turn the Cancel button into a working Close: the move succeeded so 'ok' stays disabled,
       // but the original handler only closes when ok is ENABLED — override it to close outright.
       no.disabled=false; no.textContent='Close'; no.onclick=()=>m.remove();
