@@ -413,7 +413,11 @@ async function refreshInstant(){
   INSTANT = {};
   LNSTATUS = { channels: [], funding: null };
   LNPROV = (L && L.provisioned) ? (L.provisioned() || {}) : {};
-  if (!(L && L.available && L.available() && L.status)) return;
+  // Read /status whenever we CAN (L.status exists) — NOT gated on L.available(). available() means
+  // "the shared rail's BTC+asset hub nodes are both serving", but the wallet's OWN provisioned
+  // channels are real regardless; gating on it left INSTANT empty (composer "0 Lightning") whenever
+  // a shared leg wasn't up, which also broke the pay-from-Lightning amount check for own channels.
+  if (!(L && L.status)) return;
   try {
     const st = await L.status();
     const chans = (st && (st.channels || st.channel_balances)) || [];
