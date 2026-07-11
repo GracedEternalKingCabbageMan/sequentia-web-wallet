@@ -363,17 +363,6 @@ function lnAvailable(){ return !!(L && L.available && L.available()); }
 // LN is DEPLOYED (LSP + node config present) but the SHARED hub isn't necessarily connected. The
 // sub-asset rails use the user's OWN node, so they gate on this, not lnAvailable() (see the bridge).
 function lnDeployed(){ return !!(L && L.deployed ? L.deployed() : (L && L.available && L.available())); }
-// TEMP DEBUG (remove after diagnosing the sub-asset sell rail): expose the rail decision inputs.
-if(typeof window!=='undefined') window.__sw = {
-  state: ()=>({ payAsset:S.payAsset, receiveAsset:S.receiveAsset, payRail:S.payRail, receiveRail:S.receiveRail }),
-  sellCapable: ()=>sellCapable(S.payAsset),
-  subassetBook: ()=>SUBASSET_BOOK,
-  lnDeployed: ()=>lnDeployed(),
-  lnAvailable: ()=>lnAvailable(),
-  railAvail: ()=>{ try{ return railAvail(S.payAsset, S.receiveAsset); }catch(e){ return 'err:'+e.message; } },
-  railSupportedLnChain: ()=>{ try{ return railSupported('ln','chain'); }catch(e){ return 'err:'+e.message; } },
-  route: ()=>{ try{ return findRoute(S.payAsset, S.receiveAsset); }catch(e){ return 'err:'+e.message; } },
-};
 
 // The composer deliberately opens with NO pair preselected — both sides sit on
 // "Select asset" so no asset (least of all SEQ) is implied as a default. Here we
