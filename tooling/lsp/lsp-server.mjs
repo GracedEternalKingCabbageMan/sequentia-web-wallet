@@ -329,7 +329,9 @@ async function status(deviceKeys = []) {
     if (!rec) continue;
     const ns = await nodeStatus(rec.rpc, rec.chain === 'btc' ? 'btc' : 'prov').catch(() => null);
     if (!ns) continue;
-    provNodes.push({ key: rec.key, asset_id: rec.asset_id, node_id: ns.id, channels: ns.channels.length });
+    const on = await onchainForReport(rec.rpc, rec.chain === 'btc' ? 'btc' : 'seq', rec.chain === 'btc' ? null : rec.asset_id).catch(() => ({ onchain_msat: 0 }));
+    provNodes.push({ key: rec.key, asset_id: rec.asset_id, node_id: ns.id, channels: ns.channels.length,
+      onchain_msat: on.onchain_msat, stranded: on.onchain_msat > 0 && ns.channels.length === 0 });
     for (const c of ns.channels) provChannels.push({ ...c, node_key: rec.key });
   }
   return {
@@ -443,6 +445,51 @@ async function findChannel(rpc, peerId, fundingTxid) {
     || cands.find((c) => String(c.state).startsWith('CHANNELD')) || cands[0] || null;
 }
 
+// Reliably connect the hosted node to the routing peer BEFORE funding a channel. A peerless
+// fundchannel is exactly what stranded a user's deposit once (the node had 0 peers), so we retry
+// `connect` and VERIFY via listpeers that the link is actually up — and if it never comes up we
+// throw a CLEAR error instead of proceeding to a fundchannel that would hang/strand the deposit.
+// The connect crypto handshake (Noise ECDH) is DEVICE-SIGNED over the hsmd proxy, so a device that
+// isn't serving signing makes this fail loud ("keep your wallet open") rather than hang forever.
+async function ensurePeer(rpc, peerId, peerAddr, job) {
+  const CONNECT_TIMEOUT_MS = 25000;   // per attempt; bounds the device-signed ECDH so it can't hang
+  const ATTEMPTS = 4;
+  const alreadyUp = async () => {
+    const lp = await lnrpc('listpeers', [`id=${peerId}`], rpc).catch(() => ({ peers: [] }));
+    return (lp.peers || []).some((p) => (p.id || '').toLowerCase() === peerId.toLowerCase() && p.connected);
+  };
+  if (await alreadyUp()) { if (job) job.connect_note = 'already connected'; return; }
+  let lastErr = '';
+  for (let i = 0; i < ATTEMPTS; i++) {
+    try { await lnrpc('connect', [peerAddr ? `${peerId}@${peerAddr}` : peerId], rpc, CONNECT_TIMEOUT_MS); }
+    catch (e) { lastErr = e.message; if (job) job.connect_note = lastErr; }
+    if (await alreadyUp()) { if (job) job.connect_note = 'connected'; return; }
+    await sleep(2000);
+  }
+  throw new Error(`could not connect your Lightning node to the routing peer after ${ATTEMPTS} tries` +
+    (lastErr ? ` (${lastErr})` : '') +
+    ` — the device signer may not be serving the connection handshake; keep your wallet open and retry.` +
+    ` Your deposit is safe on-chain and no channel was opened.`);
+}
+
+// A hosted node's on-chain balance that is NOT yet in a channel (listfunds.outputs are, by
+// definition, wallet UTXOs not committed to any channel). Used by the stranded-deposit report so a
+// wallet can auto-detect "deposit landed on my node but no channel" and (re)call /channel/open.
+// msat convention matches CLN: for an asset output amount_msat = atoms * 1000 (5 USDX -> 500000000000).
+async function onchainForReport(rpc, chain, assetId) {
+  const lf = await lnrpc('listfunds', [], rpc).catch(() => ({ outputs: [] }));
+  let msat = 0; const outputs = [];
+  for (const o of (lf.outputs || [])) {
+    if (o.status !== 'confirmed' && o.status !== 'unconfirmed') continue;   // count 0-conf too
+    if (chain === 'seq' && assetId && (o.asset || '').toLowerCase() !== assetId.toLowerCase()) continue;
+    const m = Number(o.amount_msat ?? 0);
+    if (!m) continue;
+    msat += m;
+    outputs.push({ txid: o.txid, output: o.output, amount_msat: m, status: o.status, asset: o.asset || null });
+  }
+  return { onchain_msat: msat, outputs };
+}
+
 const channelJobs = new Map();
 function reapChannelJobs() {
   const now = Date.now();
@@ -502,9 +549,11 @@ async function runChannelOpen(job) {
 
   // 2. Connect to the routing peer + fundchannel. The funding tx SIGN_WITHDRAWAL is
   //    served by the DEVICE over the hsmd proxy; a missing device fails this closed.
+  job.status = 'connecting';
+  // Reliable connect w/ retry + verify. NEVER proceed to fundchannel peerless (that stranded a
+  // user's 5 USDX once): ensurePeer throws a clear error and the job fails cleanly, funds intact.
+  await ensurePeer(rpc, peerId, peerAddr, job);
   job.status = 'opening';
-  try { await lnrpc('connect', [peerAddr ? `${peerId}@${peerAddr}` : peerId], rpc); }
-  catch (e) { job.connect_note = e.message; /* often already connected */ }
   // fundchannel with the seqln fork's `asset` parameter, so the channel AND its on-chain
   // funding fee are denominated in the DEPOSITED asset — NOT the policy asset (tSEQ). This
   // is the crux: stock fundchannel funds in the policy asset, so on a single-asset node it
@@ -1131,6 +1180,27 @@ const server = http.createServer(async (req, res) => {
       return send(res, 200, { ok: true, ready: !!info, node_id: (info && info.id) || rec.node_id || null,
         blockheight: (info && info.blockheight) || null,
         synced: !!(info && info.warning_lightningd_sync == null && info.blockheight != null) });
+    }
+    // Stranded-deposit report for ONE provisioned node: the on-chain balance not yet in a channel.
+    // The wallet polls this after a "Move to Lightning" to auto-detect "deposit landed, no channel"
+    // (onchain_msat > 0 && channels === 0 -> stranded) and (re)call POST /channel/open.
+    if (req.method === 'GET' && url.pathname === '/node/onchain') {
+      if (!PROV) return send(res, 501, { ok: false, error: 'per-asset node provisioning is not enabled on this LSP' });
+      const nodeKey = url.searchParams.get('node') || '';
+      const rec = PROV.getByKey(nodeKey);
+      if (!rec) return send(res, 404, { ok: false, error: 'unknown node key' });
+      const chain = rec.chain === 'btc' ? 'btc' : 'seq';
+      // Probe reachability first: a keyless node blocked at HSM init (no device signer) can't
+      // answer RPC, so onchain would read 0 — which is "unknown", NOT "no deposit". node_up lets
+      // the wallet say "keep your wallet open so the signer connects" instead of "nothing here".
+      let channels = 0, node_up = false;
+      try { const ns = await nodeStatus(rec.rpc, 'prov'); channels = ns.channels.length; node_up = true; } catch { /* down/booting/awaiting-signer */ }
+      const on = node_up
+        ? await onchainForReport(rec.rpc, chain, chain === 'btc' ? null : rec.asset_id).catch(() => ({ onchain_msat: 0, outputs: [] }))
+        : { onchain_msat: 0, outputs: [] };
+      return send(res, 200, { ok: true, node_key: rec.key, node_id: rec.node_id, asset_id: rec.asset_id,
+        chain, node_up, onchain_msat: on.onchain_msat, outputs: on.outputs || [], channels,
+        stranded: node_up && on.onchain_msat > 0 && channels === 0 });
     }
     // List the provisioned per-device nodes (with a live node-id refresh). Refresh by KEY:
     // several device-scoped nodes can share one asset id, so each is refreshed on its own key.
