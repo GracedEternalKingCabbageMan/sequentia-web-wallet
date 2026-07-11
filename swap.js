@@ -327,10 +327,13 @@ function findRoute(pay, receive){
     const seqAsset = pay === 'BTC' ? receive : pay;
     const payIsBtc = pay === 'BTC';
     const xm = XMARKETS.find(m => m.seq_asset === seqAsset) || null;
-    // When the LSP isn't serving there is no rail choice: both legs are on-chain, so
-    // an LN-unconfigured wallet always takes the proven cross route (independent of
-    // any stale rail state). updateRails() also forces this in the UI.
-    const ln = lnAvailable();
+    // When LN isn't deployed there is no rail choice: both legs are on-chain, so an
+    // LN-unconfigured wallet always takes the proven cross route (independent of any
+    // stale rail state). Gate on lnDeployed() (own-node capable), NOT lnAvailable()
+    // (shared hub connected): the mixed/pure-LN legs below run on the user's OWN nodes,
+    // and the per-leg ra.payLn/recvLn.ok checks already require a real usable channel —
+    // so a disconnected shared hub must not force a funded own channel back to on-chain.
+    const ln = lnDeployed();
     // HONEST gating: a leg may sit on 'ln' ONLY when THAT asset (or BTC) has a real,
     // usable channel with the liquidity the leg's direction needs — never merely
     // "LSP configured". Any 'ln' leg without a channel is downgraded to 'chain' here,
