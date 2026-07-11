@@ -357,6 +357,9 @@ function findRoute(pay, receive){
   return { kind: 'same', pay, receive };
 }
 function lnAvailable(){ return !!(L && L.available && L.available()); }
+// LN is DEPLOYED (LSP + node config present) but the SHARED hub isn't necessarily connected. The
+// sub-asset rails use the user's OWN node, so they gate on this, not lnAvailable() (see the bridge).
+function lnDeployed(){ return !!(L && L.deployed ? L.deployed() : (L && L.available && L.available())); }
 
 // The composer deliberately opens with NO pair preselected — both sides sit on
 // "Select asset" so no asset (least of all SEQ) is implied as a default. Here we
@@ -659,7 +662,7 @@ function sellCapable(seqAssetHex){ const e = seqAssetHex && SUBASSET_BOOK[seqAss
 function subassetOffers(seqAssetHex, dir){ const e = seqAssetHex && SUBASSET_BOOK[seqAssetHex.toLowerCase()]; return (e && (dir === 'sell' ? e.sell_offers : e.buy_offers)) || []; }
 let _bookInflight = {};
 async function refreshSubassetBook(seqAssetHex){
-  if (!seqAssetHex || seqAssetHex === 'BTC' || !(L && L.book && lnAvailable())) return;
+  if (!seqAssetHex || seqAssetHex === 'BTC' || !(L && L.book && lnDeployed())) return;
   const k = seqAssetHex.toLowerCase();
   const prev = SUBASSET_BOOK[k];
   if (prev && (Date.now() - prev.ts) < 15000) return;   // ~15s cache
@@ -694,7 +697,7 @@ function railSupported(p, r){
       // never silently downgrades to the on-chain cross route (findRoute would otherwise
       // recompute recv=chain and fall through to kind:'cross').
       return subassetCapable(S.receiveAsset)
-        && lnAvailable() && railAvail(S.payAsset, S.receiveAsset).recvLn.ok;
+        && lnDeployed() && railAvail(S.payAsset, S.receiveAsset).recvLn.ok;
     return false;
   }
   // SELL (pay the asset, receive BTC).
@@ -703,7 +706,7 @@ function railSupported(p, r){
     // sell-maker for the asset AND the user actually holding it in a usable Lightning channel
     // (payLn.ok) so they can pay the asset over LN. This is the direction that spends a
     // Lightning asset balance for BTC.
-    return sellCapable(S.payAsset) && lnAvailable() && railAvail(S.payAsset, S.receiveAsset).payLn.ok;
+    return sellCapable(S.payAsset) && lnDeployed() && railAvail(S.payAsset, S.receiveAsset).payLn.ok;
   return (p === 'chain' && r === 'ln');           // sell: asset on-chain + BTC over LN (submarine)
 }
 function wireRailSeg(id, leg){

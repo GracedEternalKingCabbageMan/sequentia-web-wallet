@@ -2075,6 +2075,11 @@ function initSwapTab(){
     // device co-signs; the LSP commands the hosted node to take a pure-LN offer).
     ln: {
       available: () => seqlnAvailable(),
+      // LN is DEPLOYED for this wallet (LSP + node config present) — distinct from available(),
+      // which additionally requires the SHARED hub nodes to be connected. The sub-asset rails pay
+      // from / receive into the user's OWN provisioned node and never touch the shared hub, so they
+      // gate on deployed(), not available() (which is false whenever a shared leg isn't up).
+      deployed: () => { try { return seqlnState().deployed; } catch { return false; } },
       // Register THIS device's own provisioned-node keys before every /status read, so any caller
       // (the Balance card AND the swap composer's refreshInstant) sees the wallet's own channels —
       // not just whichever code path happened to register keys first. Idempotent (signature-cached),
