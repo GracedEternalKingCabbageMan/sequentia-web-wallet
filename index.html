@@ -2047,6 +2047,16 @@ function initSwapTab(){
         const pub = await deviceTransportPubkey(id.transportPrivkey);
         return 'seq:' + assetHex.toLowerCase() + ':' + String(pub).toLowerCase();
       },
+      // Bring the on-device signer for the user's OWN hosted asset node ONLINE (idempotent —
+      // re-attaches to the existing provisioned node without re-funding). A per-user node's signer
+      // is NOT auto-connected on load, so this is required before a sub-asset SELL: the LSP commands
+      // that node to pay the asset over Lightning, which needs the device signer serving it.
+      connectNode: async (assetHex) => {
+        const phrase = (localStorage.getItem(KEY) || '').trim();
+        if (!phrase) throw new Error('Your wallet is locked; unlock it and try again.');
+        return await provisionAndConnect({ chain:'seq', assetId: assetHex, label: assetMeta(assetHex).ticker, policy: lnPolicy(),
+          deriveIdentity: (id) => lnDeriveAsset(phrase, id) });
+      },
       finalityCopy: () => lnFinalityCopy(),
       // Open a Lightning channel for a leg INLINE — the SAME non-custodial provision+fund flow as
       // the Balance-tab Move-to-Lightning (moveToLightningDialog), exposed so the Swap composer can

@@ -2180,6 +2180,13 @@ async function startSell(params){
     const btc_claim_pub = C.btcLeg.claimKey().public_key;   // the device claim key; only we can claim
     const node_key = await L.assetNodeKey(asset);           // our own hosted asset node pays over LN
     const offer = params.offer || null;
+    // Bring our asset LN node's device signer ONLINE — a per-user node isn't auto-connected on
+    // load, and the LSP needs it serving to command the pay. Idempotent (re-attaches, no re-fund).
+    if (L.connectNode){
+      say('Bringing your ' + am.ticker + ' Lightning node online…');
+      const prov = await L.connectNode(asset);
+      if (!(prov && prov.connected)) throw new Error('Could not bring your ' + am.ticker + ' Lightning node online — reopen the wallet and try again.');
+    }
     // Pay the asset over Lightning (LSP drives the hold-invoice pay from our node; device co-signs).
     // On settle the maker reveals the preimage, returned here WITH the BTC HTLC terms — the LSP
     // never claims (no claim key) and we claim on-chain ourselves.
