@@ -1679,7 +1679,38 @@ function initLightning(phrase){
       .then((nid)=>{ if(nid){ console.log(`[ln] ${node} device signer serving hosted node`, nid); renderLightningBalance(); } })
       .catch((e)=> console.warn(`[ln] ${node} connect failed:`, e?.message??e));
   }
-  renderLightningBalance();
+  // The loop above brings up only the SHARED hub nodes (lnEnabledNodes). A per-user node the wallet
+  // opened via Move-to-Lightning is NOT among them, so after a refresh its channels read back (from
+  // /status) but its device signer is offline — the funds show yet can't be spent. Once /status has
+  // loaded (it lists the own channels), reconnect the signer for every leg the user actually holds
+  // an own channel on.
+  refreshLnStatus().then(()=> reconnectOwnNodes(phrase)).catch(e=> console.warn('[ln] own-node reconnect:', e?.message??e));
+}
+
+// Reconnect the device signers for THIS wallet's OWN provisioned nodes after a load/refresh.
+// provisionAndConnect is idempotent for an already-provisioned node (re-attaches the signer, never
+// re-funds), and we ONLY touch legs that have a real own channel (node_key present in /status), so
+// no phantom node is ever created for an asset the user merely holds on-chain. This is what makes a
+// refreshed wallet's own Lightning channels usable again (pay / sell) rather than visible-but-frozen.
+async function reconnectOwnNodes(phrase){
+  if(!phrase) return;
+  const chs=(lnLastStatus && lnLastStatus.channels)||[];
+  const seen=new Set();
+  for(const c of chs){
+    if(!c.node_key) continue;                                 // only the wallet's OWN provisioned nodes
+    const isBtc=(c.asset_label==='BTC' || c.leg==='btc');
+    const key=isBtc ? 'btc' : (c.asset||'');
+    if(!key || seen.has(key)) continue; seen.add(key);
+    try{
+      const prov=isBtc
+        ? await provisionAndConnect({ chain:'btc', label:'BTC', policy:lnPolicy(),
+            deriveIdentity: ()=>{ const k=lnNodeIdentity(phrase,'btc'); return { transportPrivkey:k.deviceTransportPrivkey, signingSeed:k.deviceSigningSeed }; } })
+        : await provisionAndConnect({ chain:'seq', assetId: key, label: assetMeta(key).ticker, policy:lnPolicy(),
+            deriveIdentity: (id)=>lnDeriveAsset(phrase, id) });
+      if(prov && prov.connected) console.log('[ln] reconnected own node', isBtc?'btc':assetMeta(key).ticker);
+    }catch(e){ console.warn('[ln] own-node reconnect failed', key, e?.message??e); }
+  }
+  try{ renderLightningBalance(); lnStatusPill(); }catch{}
 }
 
 // ---------- Move to Lightning (non-custodial channel funding) ----------
