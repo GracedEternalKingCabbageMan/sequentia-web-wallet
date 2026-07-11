@@ -349,6 +349,28 @@ export function seqlnListNodes(keys) {
   return lspFetch('/nodes/list', { method: 'POST', body: JSON.stringify({ keys: list }) });
 }
 
+// --- Sub-asset BUY (pay BTC on-chain, receive asset over Lightning) HODL primitives ------------
+// Ensure inbound asset liquidity to the user's OWN node so the maker can pay the asset over LN
+// (JIT 0-conf inbound channel). amount in ASSET SATS.
+export function seqlnChannelInbound({ node_key, asset, amount }) {
+  return lspFetch('/channel/inbound', { method: 'POST', body: JSON.stringify({ node_key, asset, amount }) });
+}
+// Register a HODL invoice by hash H on the user's OWN node (the DEVICE keeps P; the node/LSP never
+// learn it). Returns { payment_hash, bolt11:null, node_id, hodl:true } — the maker pays H BY HASH
+// to node_id (pay-by-hash, like the sell). amount in ASSET SATS.
+export function seqlnNodeInvoice({ node_key, asset, amount, payment_hash }) {
+  return lspFetch('/node/invoice', { method: 'POST', body: JSON.stringify({ node_key, asset, amount, payment_hash }) });
+}
+// Poll the HODL invoice state on the user's node: { state, held /* maker's payment accepted+held */, settled }.
+export function seqlnInvoiceStatus({ node_key, payment_hash }) {
+  return lspFetch('/node/invoice-status?node=' + encodeURIComponent(node_key) + '&payment_hash=' + encodeURIComponent(payment_hash));
+}
+// Device-settle a HELD HODL invoice with P: releases the held asset payment to the user AND reveals
+// P to the maker (via update_fulfill_htlc), atomically. Call ONLY after invoice-status shows held.
+export function seqlnNodeSettle({ node_key, payment_hash, preimage }) {
+  return lspFetch('/node/settle', { method: 'POST', body: JSON.stringify({ node_key, payment_hash, preimage }) });
+}
+
 // "Move back to chain": cooperatively close a channel on the user's own hosted node and send the
 // reclaimed funds to `destination` (the wallet's own on-chain address). The INVERSE of fundChannel.
 // The device signer MUST be connected first (the keyless node's closing tx is device-signed), so the

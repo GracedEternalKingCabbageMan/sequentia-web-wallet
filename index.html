@@ -769,6 +769,7 @@ import { initXrswap, fetchRQuote, openReverseFromComposer, hasInFlight as hasRev
 import { initXmaker, startForwardMaker, startReverseMaker, liveMakerOffers, resumeMakerSwaps } from './xmaker.js';
 import { initSeqln, connectDevice as lnConnectDevice, disconnectDevice as lnDisconnect,
   onSeqlnStatus, seqlnState, seqlnAvailable, seqlnGetStatus, seqlnListNodes, seqlnSwap, seqlnBook, seqlnPostOffer, lnFinalityCopy,
+  seqlnChannelInbound, seqlnNodeInvoice, seqlnInvoiceStatus, seqlnNodeSettle,
   seqlnChannels, seqlnFunding, fundChannel, provisionAndConnect, waitNodeReady, provisionedState,
   deviceTransportPubkey, registerOwnStatusKeys, closeChannelLsp } from './seqln.js';
 import { lnDeriveNode, lnDeriveAsset } from './seqln-keys.js';
@@ -2132,6 +2133,12 @@ function initSwapTab(){
       // for nodes blocked waiting for their signer). Used by the on-load reconnect to rediscover a
       // node that /status can't see yet. Throws if the endpoint isn't deployed; the caller falls back.
       listNodes: (keys) => seqlnListNodes(keys),
+      // Sub-asset BUY (pay BTC on-chain, receive asset over LN) — HODL primitives. The DEVICE holds
+      // P; the maker pays H by hash to the user's node; the device settles once held (see startBuy).
+      channelInbound: (p) => seqlnChannelInbound(p),
+      nodeInvoice: (p) => seqlnNodeInvoice(p),
+      invoiceStatus: (p) => seqlnInvoiceStatus(p),
+      nodeSettle: (p) => seqlnNodeSettle(p),
       // The registry node_key for the user's OWN hosted LN node for `assetHex`
       // (seq:<asset>:<deviceTransportPubkey>) — matches refreshOwnLnNodeKeys. Needed by the
       // sub-asset sell/buy /swap calls to name which hosted node pays over Lightning.
