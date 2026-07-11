@@ -419,6 +419,8 @@ async function refreshInstant(){
     const chans = (st && (st.channels || st.channel_balances)) || [];
     LNSTATUS = { channels: chans, funding: (st && st.funding) || null };   // ground truth for rail gating
     for (const c of chans){
+      if (!c.node_key) continue;   // ONLY the wallet's own channels count as its Lightning balance
+                                   // (never shared/demo) — consistent with the Balance tab + railAvail
       const t = c.asset_label || c.asset || c.ticker; if (!t) continue;
       INSTANT[t] = {
         spendable: (c.spendable_units ?? c.spendable ?? 0),
@@ -2264,8 +2266,16 @@ async function postCrossOfferReview(q){
     const haveBtc = balAtoms('BTC');
     if (btcSats > haveBtc){ $('swErr').textContent = `You only hold ${C.fmtAtoms(haveBtc, 8)} BTC.`; return; }
   } else {
-    const have = balAtoms(assetHex);
-    if (assetAtoms > have){ $('swErr').textContent = `You only hold ${C.fmtAtoms(have, am.precision)} ${am.ticker}.`; return; }
+    const onc = balAtoms(assetHex), lnHeld = instantAtomsFor(assetHex);
+    if (assetAtoms > onc){
+      // A resting CROSS offer locks the asset in an ON-CHAIN HTLC, so it needs on-chain funds. If the
+      // only reason for the shortfall is that the asset sits in Lightning, say that plainly rather than
+      // a bare "you only hold" that reads wrong when a Lightning balance is visible.
+      $('swErr').textContent = (lnHeld > 0n && (onc + lnHeld) >= assetAtoms)
+        ? `Posting a resting cross-chain offer locks ${am.ticker} in an on-chain HTLC, but ${C.fmtAtoms(lnHeld, am.precision)} ${am.ticker} of yours is in Lightning and only ${C.fmtAtoms(onc, am.precision)} is on-chain. Move some ${am.ticker} back on-chain to post this on-chain, or use a Lightning rail (coming soon for this direction).`
+        : `You only hold ${C.fmtAtoms(onc, am.precision)} ${am.ticker}.`;
+      return;
+    }
   }
   const assetU = Number(assetAtoms)/Math.pow(10, am.precision||0), btcU = Number(btcSats)/1e8;
   const kv = reverse ? [
