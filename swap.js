@@ -710,6 +710,7 @@ function setRail(leg, r){
   S.railsTouched = true; S.modeTouched = false;
   LAST_QUOTE = null; setReviewEnabled(false);
   paintRailSegs();
+  try { renderFeePicker(); } catch {}   // reflect the pay-from-Lightning fee freeze immediately
   requote().catch(()=>{});
 }
 function paintRefHints(){
@@ -1456,18 +1457,26 @@ function paintQuoteCross(){
 // ---------------------------------------------------------------------------
 function paintFee(feeAssetHex, feeAtoms, noteOverride){
   const { $ } = C;
+  // Paying FROM Lightning is a single-asset payment (you pay one asset over one route), so the fee
+  // is inherently in that same asset — freeze the fee asset to the pay asset and lock the picker.
+  const payFromLn = !!(S.payRail === 'ln' && S.payAsset);
+  if (payFromLn){ feeAssetHex = S.payAsset; if (S.payAsset !== 'BTC') S.feeAsset = S.payAsset; }
   const fm = C.assetMeta(feeAssetHex);
   $('swFeeTk').textContent = fm.ticker;
   $('swFeeAmt').textContent = (feeAtoms != null) ? (C.fmtAtoms(feeAtoms, fm.precision) + ' ' + fm.ticker) : '-';
   const ref = (feeAtoms != null) ? (C.refValueStr(feeAssetHex, feeAtoms) || '') : '';
   $('swFeeRef').textContent = ref;
-  $('swFeeNote').textContent = noteOverride || 'Pay the fee in any asset the network prices.';
-  // The fee picker is disabled for the cross-chain (BTC-only) leg, the LN leg, and
-  // the mixed rail (their cost is the LP spread / BTC-leg fee baked into the rate,
-  // not a taker-funded open-market network fee).
-  const noFee = LAST_QUOTE && (LAST_QUOTE.kind === 'cross' || LAST_QUOTE.kind === 'ln' || LAST_QUOTE.kind === 'mixed');
+  $('swFeeNote').textContent = noteOverride || (payFromLn
+    ? `In ${fm.ticker} — the asset you pay over Lightning.`
+    : 'Pay the fee in any asset the network prices.');
+  // The fee picker is disabled when paying from Lightning (fee frozen to the pay asset), and for
+  // the cross-chain (BTC-only) leg / LN leg / mixed rail (their cost is the LP spread / BTC-leg fee
+  // baked into the rate, not a taker-funded open-market network fee).
+  const noFee = payFromLn || (LAST_QUOTE && (LAST_QUOTE.kind === 'cross' || LAST_QUOTE.kind === 'ln' || LAST_QUOTE.kind === 'mixed'));
   $('swFeePick').disabled = !!noFee;
   $('swFeePick').style.opacity = noFee ? '.5' : '';
+  if (payFromLn) $('swFeePick').title = `Paying over Lightning — the fee is in ${fm.ticker}, the asset you pay.`;
+  else $('swFeePick').removeAttribute('title');
 }
 
 // An asset is acceptable for fees if the node publishes a rate for it. Native is
@@ -1506,8 +1515,12 @@ function feeAssetOptions(){
   return out;
 }
 function renderFeePicker(){
-  const fa = S.feeAsset || (S.payAsset ? defaultFeeAsset() : null);
+  // Paying from Lightning freezes the fee to the pay asset (see paintFee).
+  const payFromLn = (S.payRail === 'ln' && S.payAsset);
+  const fa = payFromLn ? S.payAsset : (S.feeAsset || (S.payAsset ? defaultFeeAsset() : null));
   C.$('swFeeTk').textContent = fa ? C.assetMeta(fa).ticker : '-';
+  const pick = C.$('swFeePick');
+  if (pick && payFromLn){ pick.disabled = true; pick.style.opacity = '.5'; }
 }
 function openFeePicker(){
   if (C.$('swFeePick').disabled) return;
