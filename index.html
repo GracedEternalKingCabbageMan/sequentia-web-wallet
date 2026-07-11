@@ -1875,7 +1875,9 @@ function moveToLightningDialog(leg){
       st.textContent = 'Done. Lightning channel '+(res.short_channel_id||'')+' is active'
         + (res.spendable_msat!=null ? (' with '+fmtAtoms(BigInt(Math.round(res.spendable_msat/1000)), leg.precision)+' '+leg.ticker+' spendable.') : '.');
       toast('Moved '+leg.ticker+' to Lightning');
-      no.disabled=false; no.textContent='Close';
+      // Turn the Cancel button into a working Close: the move succeeded so 'ok' stays disabled,
+      // but the original handler only closes when ok is ENABLED — override it to close outright.
+      no.disabled=false; no.textContent='Close'; no.onclick=()=>m.remove();
       await sync(); renderBalance(); renderLightningBalance();
     }catch(e){
       // Surface the open-fee-market outcome honestly: a funding tx that no producer will
