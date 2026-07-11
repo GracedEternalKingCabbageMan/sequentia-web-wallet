@@ -52,6 +52,11 @@ let LAST_QUOTE = null;   // the priced/oriented same-chain legs for the current 
 let BOOK = { offers: [], pair: null };   // the resting offers for the selected same-chain pair
 let XBOOK = { offers: [], seqAsset: null, payIsBtc: true };   // resting cross offers for the selected BTC<->asset pair
 let XMAKE = null;   // the wallet's OWN live resting cross offer (maker) + its settlement state, if any
+// Trades the user DISMISSED this session (kept live + resumable, just not force-shown). Gated in
+// renderSwap so a dismissed swap returns to the composer instead of bouncing straight back to its
+// stepper; the "Active trades" card (renderInFlightCard) reopens any of them. Session-only: a reload
+// clears it, so an in-flight trade force-shows again on load (fund-safety: never silently lost).
+const _dismissed = new Set();
 
 // The wallet's SeqOB MAKER identity: a stable per-browser key that signs resting
 // offers + doubles as the E2E session key. It is NOT a fund key (funds move via the
@@ -154,7 +159,7 @@ export function initSwap(ctx){
     wireRailSeg('swRecvRailSeg', 'recv');
     // Take / Post chooser (switching to Post unlinks the two amount fields).
     wireModeSeg();
-    if ($('swXBack')) $('swXBack').onclick = () => { showCross(false); renderSwap(); };
+    if ($('swXBack')) $('swXBack').onclick = () => { if (X && X.hasInFlight && X.hasInFlight()) _dismissed.add('cross'); showCross(false); renderSwap(); };
     // Live re-quote as the user types. The edited side is the "fixed" leg; the
     // other side is quoted. Debounced so we don't hammer the daemon per keystroke.
     wireAmount($('swPayAmt'), 'pay');
@@ -206,28 +211,34 @@ function applyComposeDerivation(pay, receive, price){
 // Re-render the whole composer for the current wallet/markets/state.
 export async function renderSwap(){
   if (!C.wollet) return;
+  // Prune stale dismissals: once a kind's trade has ended, its flag must not suppress a future one.
+  if (!hasMixedInFlight()) _dismissed.delete('mixed');
+  if (!(X && X.hasInFlight && X.hasInFlight())) _dismissed.delete('cross');
+  if (!(X && X.hasReverseInFlight && X.hasReverseInFlight())) _dismissed.delete('reverse');
   // A persisted mixed-rail (submarine) swap owns the tab until it is terminal or
   // dismissed: its on-chain HTLC leg is recoverable only via the Refund off-ramp, so
   // the trade-process view (not the composer) must show on entry — including after a reload.
-  if (hasMixedInFlight()){
+  if (hasMixedInFlight() && !_dismissed.has('mixed')){
     showMixed(true); renderMixedSwap();
     return;
   }
   // If a cross-chain swap is already in flight, jump straight to its stepper —
   // the composer's single entry point also resumes an interrupted BTC swap. Two
   // directions, two wizards: forward (pay BTC, get asset) and reverse (sell asset).
-  if (X && X.hasInFlight && X.hasInFlight()){
+  // Skipped if the user DISMISSED it this session — the Active-trades card reopens it.
+  if (X && X.hasInFlight && X.hasInFlight() && !_dismissed.has('cross')){
     showCross(true);
     X.renderXswap();
     return;
   }
-  if (X && X.hasReverseInFlight && X.hasReverseInFlight()){
+  if (X && X.hasReverseInFlight && X.hasReverseInFlight() && !_dismissed.has('reverse')){
     showReverse(true);
     X.renderReverse();
     return;
   }
   showCross(false); showReverse(false); showMixed(false);
   const _bh = C.$('swBook'); if (_bh) _bh.innerHTML = '';   // cleared; requote re-renders for the selected pair
+  renderInFlightCard();   // any dismissed / background in-flight trade, reopenable
   renderMyOrders();
   await loadMarkets();
   // Default the pay/receive assets to the first sensible tradable pair so the
@@ -246,11 +257,10 @@ function showCross(on){
   if (cw) cw.classList.toggle('hide', !on);
   if (on && rw) rw.classList.add('hide');     // forward + reverse hosts are mutually exclusive
   if (comp) comp.classList.toggle('hide', on);
-  // "Back to composer" only makes sense before BTC is locked. Once a cross-chain
-  // swap is in flight it must be resumed/abandoned/refunded from the stepper, not
-  // walked away from — so hide Back whenever a swap is persisted.
+  // "Back to composer" is now a DISMISS (the swap keeps running + the Active-trades card reopens
+  // it), so it's shown whenever the cross host is open — including with a swap in flight.
   const back = C.$('swXBack');
-  if (back) back.classList.toggle('hide', !on || (X && X.hasInFlight && X.hasInFlight()));
+  if (back) back.classList.toggle('hide', !on);
 }
 // Reverse (asset -> BTC) wizard host, symmetric with showCross.
 function showReverse(on){
@@ -2383,9 +2393,10 @@ function renderMixedSwap(){
   const done = terminal;
   const clr = C.el('button', 'ghost', done ? 'Clear' : 'Dismiss');
   clr.onclick = () => {
-    // Dismiss only HIDES a live swap (it keeps recovering + resumes next open); Clear
-    // drops a terminal one.
-    if (done) clearMixed(); else { /* keep persisted */ }
+    // Dismiss only HIDES a live swap (it keeps recovering + resumes; the Active-trades card
+    // reopens it); Clear drops a terminal one. The _dismissed flag stops renderSwap from
+    // bouncing straight back to this stepper.
+    if (done) clearMixed(); else _dismissed.add('mixed');
     showMixed(false); renderSwap();
   };
   btns.appendChild(clr);
@@ -2925,6 +2936,46 @@ function creditsHtml(){
   if (!rows) return '';
   return `<div class="swbook"><div class="swbook-head"><span class="lbl">Order credits received</span>
       <span class="sub">paid into a payout only this wallet controls</span></div>${rows}</div>`;
+}
+
+// The unified "Active trades" card: every in-flight swap (submarine, sub-asset sell, cross-chain),
+// so a DISMISSED one is never lost — each row reopens its process view (clearing the dismiss). A
+// trade that may need an on-chain action (refundable / claiming) is flagged so leaving it is a
+// deliberate, informed choice. Rendered in the composer (above your resting orders).
+function renderInFlightCard(){
+  const host = C.$('swInFlight'); if (!host) return;
+  const rows = [];
+  if (hasMixedInFlight()){
+    const am = metaOf(MIXED.asset);
+    const need = sub.isRefundable(MIXED, mixedTip());
+    rows.push({ view: 'mixed', need,
+      title: (MIXED.side === 'buy' ? 'Buy ' : 'Sell ') + esc(am.ticker) + ' · submarine',
+      status: need ? 'on-chain HTLC refundable now' : String(MIXED.state) });
+  }
+  if (hasSellInFlight()){
+    rows.push({ view: null, need: true, title: 'Sell ' + esc(SELL.ticker) + ' for BTC',
+      status: 'claiming your BTC on-chain (automatic)' });
+  }
+  if (X && X.hasInFlight && X.hasInFlight()){
+    rows.push({ view: 'cross', need: true, title: 'Buy asset with BTC · cross-chain', status: 'in progress' });
+  }
+  if (X && X.hasReverseInFlight && X.hasReverseInFlight()){
+    rows.push({ view: 'reverse', need: true, title: 'Sell asset for BTC · cross-chain', status: 'in progress' });
+  }
+  if (!rows.length){ host.innerHTML = ''; return; }
+  host.innerHTML = `<div class="swbook"><div class="swbook-head">
+      <span class="lbl">Active trades</span><span class="sub">running in the background · reopen anytime</span></div>`
+    + rows.map(r => `<div class="swbook-row${r.need ? ' needsact' : ''}">
+        <span class="mono">${r.title} · ${esc(r.status)}${r.need ? ' <b class="actneed">action may be needed</b>' : ''}</span>
+        ${r.view ? `<button type="button" class="ghost swviewtrade" data-view="${r.view}">View</button>` : '<span class="sub">automatic</span>'}
+      </div>`).join('')
+    + `</div>`;
+  host.querySelectorAll('.swviewtrade').forEach(b => b.onclick = () => {
+    const v = b.dataset.view; _dismissed.delete(v);
+    if (v === 'mixed'){ showMixed(true); renderMixedSwap(); }
+    else if (v === 'cross'){ showCross(true); if (X && X.renderXswap) X.renderXswap(); }
+    else if (v === 'reverse'){ showReverse(true); if (X && X.renderReverse) X.renderReverse(); }
+  });
 }
 
 async function renderMyOrders(){

@@ -236,6 +236,11 @@
   .swbook-row:hover{color:var(--amber2)}
   .swbook-row.myorder{cursor:default}
   .swbook-row.myorder:hover{color:inherit}
+  /* Active-trades card: a row that may need an on-chain action gets an amber rail + tag. */
+  .swbook-row.needsact{cursor:default;padding-left:9px;border-left:2.5px solid var(--amber2)}
+  .swbook-row.needsact:hover{color:inherit}
+  .actneed{color:var(--amber2);font-weight:700;font-size:11px;white-space:nowrap}
+  .swviewtrade{font-size:12px;padding:4px 10px}
   .swcancel{font-size:12px;padding:4px 10px}
   /* asset-picker popover (searchable; quiet, not a second accent) */
   .swpop{position:fixed;z-index:70;background:var(--panel);border:1px solid var(--line);border-radius:14px;
@@ -481,6 +486,7 @@
                same offers on every rail; no on-chain/LN distinction. Rendered by swap.js. -->
           <div class="swdesk-book">
             <div id="swBook"></div>
+            <div id="swInFlight"></div>
             <div id="swMyOrders"></div>
           </div>
 
