@@ -71,6 +71,18 @@ function logTrade(e){
     localStorage.setItem(HIST_KEY, JSON.stringify(h.slice(0, 15)));
   } catch {}
 }
+// Same-chain DEX swaps receive TRANSPARENTLY by default (principle #6: transparent-by-default);
+// the user can OPT IN to a confidential (blinded) receive. Persisted wallet-wide.
+let _confidentialReceive = false;
+try { _confidentialReceive = localStorage.getItem('swk.dex.confidentialReceive') === '1'; } catch {}
+export function setConfidentialReceive(on){ _confidentialReceive = !!on; try { localStorage.setItem('swk.dex.confidentialReceive', on ? '1' : '0'); } catch {} }
+export function confidentialReceive(){ return _confidentialReceive; }
+// This wallet's own receive address for a same-chain DEX credit/refund: transparent (toUnconfidential)
+// by DEFAULT, blinded only when the user opted in. Was previously blinded unconditionally (a #6 bug).
+function covReceiveAddr(){
+  const a = C.wollet.address(C.addrIndex == null ? undefined : C.addrIndex).address();
+  return (_confidentialReceive ? a : (a.toUnconfidential ? a.toUnconfidential() : a)).toString();
+}
 
 // The wallet's SeqOB MAKER identity: a stable per-browser key that signs resting
 // offers + doubles as the E2E session key. It is NOT a fund key (funds move via the
@@ -2005,7 +2017,7 @@ function fillHooksFor(matched){
   return makeCovenantHooks({
     wasm: C.wasm, wollet: C.wollet, network: C.network, mnemonic: C.mnemonic,
     esploraFetch: C.esploraFetch,
-    receiveAddress: () => C.wollet.address(C.addrIndex == null ? undefined : C.addrIndex).address().toString(),
+    receiveAddress: covReceiveAddr,   // transparent by default (#6); blinded only if the user opted in
     fee: { asset: feeAsset, atoms: covFeeAtoms(feeAsset) },
     onStatus: (m) => { try { C.toast && C.toast(m); } catch {} },
   });
@@ -2043,7 +2055,7 @@ function refundHooksFor(){
   return makeCovenantHooks({
     wasm: C.wasm, wollet: C.wollet, network: C.network, mnemonic: C.mnemonic,
     esploraFetch: C.esploraFetch,
-    receiveAddress: () => C.wollet.address(C.addrIndex == null ? undefined : C.addrIndex).address().toString(),
+    receiveAddress: covReceiveAddr,   // transparent by default (#6); blinded only if the user opted in
     fee: { asset: feeAsset, atoms: covFeeAtoms(feeAsset) },
     onStatus: (m) => { try { C.toast && C.toast(m); } catch {} },
   });
@@ -2790,7 +2802,7 @@ async function liftOffer(q, st){
   // swap (q.confidential — the opt-in Confidential sub-tab) receives to the blinded blech32 address;
   // everywhere else the received amount is explicit, like the Receive tab and the cross-chain wizards.
   const _raw = C.wollet.address(C.addrIndex == null ? undefined : C.addrIndex).address();
-  const receiveAddr = q.confidential ? _raw : (_raw.toUnconfidential ? _raw.toUnconfidential() : _raw);
+  const receiveAddr = (q.confidential || _confidentialReceive) ? _raw : (_raw.toUnconfidential ? _raw.toUnconfidential() : _raw);
   const buildRequest = async () => {
     const sreq = C.wollet.seqdexSwapRequest(
       new wasm.AssetId(q.assetP), q.amountP,
