@@ -768,7 +768,7 @@ import { initXswap, renderXswap, fetchXmarkets, fetchXquote, fetchXbook, openFro
 import { initXrswap, fetchRQuote, openReverseFromComposer, hasInFlight as hasReverseInFlight, renderReverse } from './xrswap.js';
 import { initXmaker, startForwardMaker, startReverseMaker, liveMakerOffers, resumeMakerSwaps } from './xmaker.js';
 import { initSeqln, connectDevice as lnConnectDevice, disconnectDevice as lnDisconnect,
-  onSeqlnStatus, seqlnState, seqlnAvailable, seqlnGetStatus, seqlnSwap, seqlnBook, seqlnPostOffer, lnFinalityCopy,
+  onSeqlnStatus, seqlnState, seqlnAvailable, seqlnGetStatus, seqlnListNodes, seqlnSwap, seqlnBook, seqlnPostOffer, lnFinalityCopy,
   seqlnChannels, seqlnFunding, fundChannel, provisionAndConnect, waitNodeReady, provisionedState,
   deviceTransportPubkey, registerOwnStatusKeys, closeChannelLsp } from './seqln.js';
 import { lnDeriveNode, lnDeriveAsset } from './seqln-keys.js';
@@ -1702,6 +1702,7 @@ const _ownLnLegsKey = 'swk.ln.ownLegs.v1';
 function ownLnLegs(){ try{ return JSON.parse(localStorage.getItem(_ownLnLegsKey)||'[]')||[]; }catch{ return []; } }
 function rememberOwnLnLeg(leg){ if(!leg) return; const s=new Set(ownLnLegs()); if(s.has(leg)) return; s.add(leg); try{ localStorage.setItem(_ownLnLegsKey, JSON.stringify([...s])); }catch{} }
 const _lnReconnectedLegs = new Set();
+let _lnDiscoveryDone = false;   // the registry discovery pass runs once (per successful call) per session
 async function reconnectOwnNodes(){
   const phrase=(localStorage.getItem(KEY)||'').trim();
   if(!phrase) return;
@@ -1713,6 +1714,19 @@ async function reconnectOwnNodes(){
   // signer could never be reattached (chicken-and-egg). provisionAndConnect only ever names a node
   // THIS device opened, so it reattaches rather than creating a phantom node.
   for(const leg of ownLnLegs()){ const k=(leg==='btc')?'btc':String(leg).toLowerCase(); if(!_lnReconnectedLegs.has(k) && !targets.includes(k)) targets.push(k); }
+  // Discovery pass (ONCE): ask the LSP which candidate nodes are actually provisioned, from its
+  // registry — so a node opened BEFORE the remembered-legs persistence existed (e.g. an older
+  // channel) and currently invisible to /status is still found and reconnected. Registry-resolved,
+  // so it works for a node blocked waiting for its signer. Graceful: if the endpoint isn't deployed
+  // it throws and we retry on a later poll (so it just starts working once the LSP ships it).
+  if(!_lnDiscoveryDone && _ownLnCandidates.length){
+    _lnDiscoveryDone = true;
+    try{
+      const resp = await seqlnListNodes(_ownLnCandidates.map(c=>c.key));
+      const prov = new Set(((resp && resp.provisioned)||[]).map(p=>String(p.key||'').toLowerCase()));
+      for(const c of _ownLnCandidates){ if(prov.has(c.key) && !_lnReconnectedLegs.has(c.leg) && !targets.includes(c.leg)) targets.push(c.leg); }
+    }catch{ _lnDiscoveryDone = false; }   // endpoint not ready — try again on the next /status poll
+  }
   for(const key of targets){
     _lnReconnectedLegs.add(key);                              // mark before await so a concurrent poll doesn't double-connect
     try{
@@ -1806,20 +1820,23 @@ function lnOwnChannelsFor(kind /* 'BTC' | assetHex */){
 // a never-opened candidate simply returns nothing. Recomputed only when the held-asset set changes
 // (device pubkey derivation is wasm — cheap, but not free).
 let _ownLnKeysSig='';
+let _ownLnCandidates=[];   // [{ key, leg }] derived from the mnemonic — the device's candidate node keys
+                           // (BTC + each held fee-rated asset), reused by the reconnect discovery pass.
 async function refreshOwnLnNodeKeys(){
   const phrase=(localStorage.getItem(KEY)||'').trim();   // module-scoped read (the mnemonic is not in scope here)
   if(!phrase) return;
   const held=Object.keys(balObj()).filter(h=>feeRateEntry(h)&&feeRateEntry(h).rate>0);
   const sig=held.slice().sort().join(',');
   if(sig===_ownLnKeysSig) return;
-  const keys=[];
+  const keys=[]; const cands=[];
   try{ const k=lnNodeIdentity(phrase,'btc'); const pub=await deviceTransportPubkey(k.deviceTransportPrivkey);
-    if(pub) keys.push('btc:'+String(pub).toLowerCase()); }catch{}
+    if(pub){ const key='btc:'+String(pub).toLowerCase(); keys.push(key); cands.push({key, leg:'btc'}); } }catch{}
   for(const a of held){
     try{ const id=lnDeriveAsset(phrase,a); const pub=await deviceTransportPubkey(id.transportPrivkey);
-      if(pub) keys.push('seq:'+a.toLowerCase()+':'+String(pub).toLowerCase()); }catch{}
+      if(pub){ const key='seq:'+a.toLowerCase()+':'+String(pub).toLowerCase(); keys.push(key); cands.push({key, leg:a.toLowerCase()}); } }catch{}
   }
   registerOwnStatusKeys(keys);
+  _ownLnCandidates=cands;
   _ownLnKeysSig=sig;
 }
 // Refresh the hosted-node Lightning status into the cache, then re-render the (now
@@ -2101,6 +2118,10 @@ function initSwapTab(){
       // offers, and posting the wallet's own signed resting offer (LSP never signs).
       book: (asset) => seqlnBook(asset),
       postOffer: (o) => seqlnPostOffer(o),
+      // Which of the device's candidate node keys are actually provisioned (registry-resolved, works
+      // for nodes blocked waiting for their signer). Used by the on-load reconnect to rediscover a
+      // node that /status can't see yet. Throws if the endpoint isn't deployed; the caller falls back.
+      listNodes: (keys) => seqlnListNodes(keys),
       // The registry node_key for the user's OWN hosted LN node for `assetHex`
       // (seq:<asset>:<deviceTransportPubkey>) — matches refreshOwnLnNodeKeys. Needed by the
       // sub-asset sell/buy /swap calls to name which hosted node pays over Lightning.

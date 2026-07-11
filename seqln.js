@@ -336,6 +336,19 @@ export function seqlnGetStatus() {
   return lspFetch('/status' + (keys.length ? ('?nodes=' + encodeURIComponent(keys.join(','))) : ''));
 }
 
+// Ask the LSP which of the device's CANDIDATE node keys are ACTUALLY provisioned (exist in the
+// registry) — resolved from the PROV registry, NOT the node RPC, so a node blocked waiting for its
+// signer (invisible to /status) is still discoverable. This breaks the reconnect deadlock: a just-
+// revived node can be found and have its signer reattached even though it can't answer /status yet.
+// Returns { provisioned: [{ key, asset_id, chain }] }. Self-scoped: only keys THIS device can derive
+// are sent, and the LSP confirms a key only if this device provisioned it. Callers should treat a
+// thrown error (e.g. endpoint not deployed) as "no discovery" and fall back to /status + remembered legs.
+export function seqlnListNodes(keys) {
+  const list = [...new Set((keys || []).filter(Boolean).map((k) => String(k).toLowerCase()))];
+  if (!list.length) return Promise.resolve({ provisioned: [] });
+  return lspFetch('/nodes/list', { method: 'POST', body: JSON.stringify({ keys: list }) });
+}
+
 // "Move back to chain": cooperatively close a channel on the user's own hosted node and send the
 // reclaimed funds to `destination` (the wallet's own on-chain address). The INVERSE of fundChannel.
 // The device signer MUST be connected first (the keyless node's closing tx is device-signed), so the
