@@ -1063,8 +1063,11 @@ const server = http.createServer(async (req, res) => {
       try {
         let inv;
         if (H) {
-          // HODL invoice on H (device holds P). holdinvoice-seq: payment_hash amount_msat label description.
+          // HODL: register H to be HELD (holdinvoice-seq creates NO bolt11 — the maker pays the
+          // hash directly via sendpay to this node id). The DEVICE holds P; settle via /node/settle.
           inv = await lnrpc('holdinvoice', [H, amtMsat, label, 'asset buy (HODL)'], rec.rpc);
+          const ni = await lnrpc('getinfo', [], rec.rpc).catch(() => ({}));
+          return send(res, 200, { ok: true, bolt11: null, payment_hash: H, hodl: true, node_id: ni.id || rec.node_id || null, amount_msat: Number(amtMsat) });
         } else {
           // NORMAL invoice. Use keyword args so the optional `preimage` can be set without
           // positional padding: lightning-cli -k invoice amount_msat=.. label=.. preimage=..
@@ -1076,6 +1079,23 @@ const server = http.createServer(async (req, res) => {
       } catch (e) {
         return send(res, 502, { ok: false, error: `invoice: ${e.message}` });
       }
+    }
+
+    // GET /node/invoice-status?node=<key>&payment_hash=<H> -> { state, held, settled }. Poll this
+    // after /swap {side:buy} so the wallet knows when the maker's payment is HELD (state 'accepted')
+    // and it is safe to /node/settle. Uses the holdinvoice plugin's holdinvoicelookup (registry-scoped).
+    if (req.method === 'GET' && url.pathname === '/node/invoice-status') {
+      if (!PROV) return send(res, 501, { ok: false, error: 'provisioning not enabled' });
+      const nodeKey = (url.searchParams.get('node') || '').toLowerCase();
+      const H = (url.searchParams.get('payment_hash') || '').toLowerCase();
+      if (!nodeKey || !H) return send(res, 400, { ok: false, error: '?node=<key>&payment_hash=<H> required' });
+      const rec = PROV.getByKey(nodeKey);
+      if (!rec || !rec.rpc) return send(res, 404, { ok: false, error: 'unknown node key' });
+      try {
+        const l = await lnrpc('holdinvoicelookup', [H], rec.rpc);
+        return send(res, 200, { ok: true, state: l.state,
+          held: l.state === 'accepted', settled: l.state === 'settled' });
+      } catch (e) { return send(res, 502, { ok: false, error: `lookup: ${e.message}` }); }
     }
 
     // POST /node/settle { node_key, payment_hash, preimage } -> { settled:true }.  Device-settle
@@ -1092,7 +1112,7 @@ const server = http.createServer(async (req, res) => {
       const rec = PROV.getByKey(nodeKey);
       if (!rec || !rec.rpc) return send(res, 404, { ok: false, error: 'unknown node key' });
       try {
-        await lnrpc('holdinvoice-settle', [H, P], rec.rpc);
+        await lnrpc('holdinvoicesettle', [H, P], rec.rpc);
         return send(res, 200, { ok: true, settled: true });
       } catch (e) {
         return send(res, 502, { ok: false, error: `settle: ${e.message}` });
