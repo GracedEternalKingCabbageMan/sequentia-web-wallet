@@ -605,7 +605,7 @@ function updateRails(){
   const pay = S.payAsset, receive = S.receiveAsset;
   const btcPair = pay && receive && pay !== receive
     && ((pay === 'BTC') !== (receive === 'BTC'));   // exactly one side is BTC
-  if (btcPair && lnAvailable()){
+  if (btcPair && lnDeployed()){
     box.classList.remove('hide');
     // Probe the sub-asset order book for this pair's asset (async, cached) so the sub-asset
     // BUY/SELL rails light from LIVE liquidity, not a hardcoded list. When it lands it may
