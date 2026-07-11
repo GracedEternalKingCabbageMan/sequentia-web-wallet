@@ -1726,6 +1726,8 @@ if(typeof window!=='undefined') window.__ln = {
   reconnectedLegs: ()=>[..._lnReconnectedLegs],
   liveStatus: async ()=>{ await refreshOwnLnNodeKeys(); const s=await seqlnGetStatus(); return { own: (s.channels||[]).filter(c=>c.node_key).map(c=>({asset:(c.asset||'').slice(0,10),label:c.asset_label,nk:(c.node_key||'').slice(0,28),spend:c.spendable_units,state:c.state})), prov: s.provisioned_nodes }; },
   doReconnect: async ()=>{ _lnReconnectedLegs.clear(); await reconnectOwnNodes(); return [..._lnReconnectedLegs]; },
+  provisioned: ()=>provisionedState(),
+  tryConnect: async (hex)=>{ const phrase=(localStorage.getItem(KEY)||'').trim(); try{ const r=await provisionAndConnect({ chain:'seq', assetId:hex, label:assetMeta(hex).ticker, policy:lnPolicy(), deriveIdentity:(id)=>lnDeriveAsset(phrase,id) }); return { connected:r.connected, nodeId:r.nodeId, key:(r.key||'').slice(0,30), node:r.node }; }catch(e){ return { err:e.message, stack:(e.stack||'').slice(0,240) }; } },
 };
 
 // ---------- Move to Lightning (non-custodial channel funding) ----------
