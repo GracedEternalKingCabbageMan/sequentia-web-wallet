@@ -57,6 +57,20 @@ let XMAKE = null;   // the wallet's OWN live resting cross offer (maker) + its s
 // stepper; the "Active trades" card (renderInFlightCard) reopens any of them. Session-only: a reload
 // clears it, so an in-flight trade force-shows again on load (fund-safety: never silently lost).
 const _dismissed = new Set();
+// A small persistent log of COMPLETED trades (submarine/sell/cross), so the orders card is a
+// history too, not just live status. Capped; deduped by a per-trade id so a terminal view that
+// re-renders logs once. Summaries only (no keys/secrets) — safe to persist.
+const HIST_KEY = 'swk.dex.history';
+function loadHist(){ try { return JSON.parse(localStorage.getItem(HIST_KEY) || '[]') || []; } catch { return []; } }
+function logTrade(e){
+  if (!e || !e.id) return;
+  try {
+    const h = loadHist();
+    if (h.some(x => x.id === e.id)) return;   // once per trade
+    h.unshift({ id: e.id, title: e.title || '', status: e.status || '', txid: e.txid || null, at: Date.now() });
+    localStorage.setItem(HIST_KEY, JSON.stringify(h.slice(0, 15)));
+  } catch {}
+}
 
 // The wallet's SeqOB MAKER identity: a stable per-browser key that signs resting
 // offers + doubles as the E2E session key. It is NOT a fund key (funds move via the
@@ -2278,6 +2292,7 @@ async function claimSell(){
     preimage: SELL.preimage, txid: H.txid, vout: H.vout, amount: H.amount });
   const claimTxid = await C.btcLeg.claim({ txid: H.txid, vout: H.vout, amount: H.amount, redeem_script: H.redeem_script, preimage: SELL.preimage });
   SELL.state = 'done'; SELL.claim_txid = (claimTxid && claimTxid.toString) ? claimTxid.toString() : String(claimTxid); saveSell();
+  logTrade({ id: 'sell:' + (SELL.hash_h || SELL.claim_txid || ''), title: 'Sold ' + SELL.ticker + ' for BTC', status: 'BTC claimed', txid: SELL.claim_txid });
 }
 // On wallet load: if a sell paid the asset but its BTC claim never confirmed, re-attempt the
 // claim (the preimage + HTLC terms are persisted). This is the fund-recovery path.
@@ -2361,6 +2376,8 @@ function renderMixedSwap(){
   const terminal = sub.isTerminal(MIXED);
   const tip = mixedTip();
   const refundable = sub.isRefundable(MIXED, tip);
+  if (terminal) logTrade({ id: 'mx:' + (MIXED.id || MIXED.ts || (MIXED.htlc && MIXED.htlc.refund_locktime) || ''),
+    title: (MIXED.side === 'buy' ? 'Bought ' : 'Sold ') + metaOf(MIXED.asset).ticker + ' · submarine', status: MIXED.state });
   const phase = {
     [sub.ST.SETTLING]:  'Settling — the on-chain HTLC leg is burying under Bitcoin (anchor-gated).',
     [sub.ST.REFUNDING]: 'Refunding the on-chain HTLC leg…',
@@ -2546,6 +2563,8 @@ function renderXMake(){
   };
   const label = phases[XMAKE.state] || XMAKE.state;
   const done = XMAKE.state === 'settled' || XMAKE.state === 'refunded';
+  if (done) logTrade({ id: 'xm:' + (XMAKE.offerId || ''),
+    title: (XMAKE.reverse ? 'Sold ' : 'Bought ') + (C.assetMeta(XMAKE.assetHex).ticker || 'asset') + ' · cross-chain', status: XMAKE.state });
   const headline = XMAKE.reverse
     ? `Your resting cross bid · buy ${esc(C.fmtAtoms(XMAKE.assetAtoms, am.precision))} ${esc(am.ticker)} for ${esc(C.fmtAtoms(XMAKE.btcSats,8))} BTC`
     : `Your resting cross offer · sell ${esc(C.fmtAtoms(XMAKE.assetAtoms, am.precision))} ${esc(am.ticker)} for ${esc(C.fmtAtoms(XMAKE.btcSats,8))} BTC`;
@@ -2962,14 +2981,27 @@ function renderInFlightCard(){
   if (X && X.hasReverseInFlight && X.hasReverseInFlight()){
     rows.push({ view: 'reverse', need: true, title: 'Sell asset for BTC · cross-chain', status: 'in progress' });
   }
-  if (!rows.length){ host.innerHTML = ''; return; }
-  host.innerHTML = `<div class="swbook"><div class="swbook-head">
-      <span class="lbl">Active trades</span><span class="sub">running in the background · reopen anytime</span></div>`
-    + rows.map(r => `<div class="swbook-row${r.need ? ' needsact' : ''}">
-        <span class="mono">${r.title} · ${esc(r.status)}${r.need ? ' <b class="actneed">action may be needed</b>' : ''}</span>
-        ${r.view ? `<button type="button" class="ghost swviewtrade" data-view="${r.view}">View</button>` : '<span class="sub">automatic</span>'}
-      </div>`).join('')
-    + `</div>`;
+  const hist = loadHist();
+  if (!rows.length && !hist.length){ host.innerHTML = ''; return; }
+  let html = '';
+  if (rows.length){
+    html += `<div class="swbook"><div class="swbook-head">
+        <span class="lbl">Active trades</span><span class="sub">running in the background · reopen anytime</span></div>`
+      + rows.map(r => `<div class="swbook-row${r.need ? ' needsact' : ''}">
+          <span class="mono">${r.title} · ${esc(r.status)}${r.need ? ' <b class="actneed">action may be needed</b>' : ''}</span>
+          ${r.view ? `<button type="button" class="ghost swviewtrade" data-view="${r.view}">View</button>` : '<span class="sub">automatic</span>'}
+        </div>`).join('')
+      + `</div>`;
+  }
+  if (hist.length){
+    html += `<div class="swbook"><div class="swbook-head">
+        <span class="lbl">Recent trades</span><span class="sub">last ${hist.length}</span></div>`
+      + hist.slice(0, 6).map(e => `<div class="swbook-row myorder">
+          <span class="mono">${esc(e.title)} · ${esc(e.status)}</span>
+          ${e.txid ? `<span class="sub mono">${esc(String(e.txid).slice(0, 12))}…</span>` : ''}</div>`).join('')
+      + `</div>`;
+  }
+  host.innerHTML = html;
   host.querySelectorAll('.swviewtrade').forEach(b => b.onclick = () => {
     const v = b.dataset.view; _dismissed.delete(v);
     if (v === 'mixed'){ showMixed(true); renderMixedSwap(); }
