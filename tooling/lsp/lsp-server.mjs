@@ -146,6 +146,11 @@ const CFG = {
   subasLpRpc: process.env.SUBAS_LP_RPC || '',
   subasInboundReserve: Number(process.env.SUBAS_INBOUND_RESERVE || 5000), // extra asset sat funded above the receive amount (channel reserve room)
   subasInboundFeeBps: Number(process.env.SUBAS_INBOUND_FEE_BPS || 0),     // JIT-inbound fee, basis points of the amount (recorded)
+  // SUB-ASSET SELL: pay the asset OVER LIGHTNING, receive BTC ON-CHAIN (mirror of the buy).
+  // A sub-asset-SELL maker (ln_direction=5) on SUBAS_SELL_RELAY locks BTC on-chain + holds
+  // an asset invoice on H; the LSP commands the USER's node to pay the held asset, learns P,
+  // and RETURNS P + the BTC HTLC terms for the WALLET to claim on-chain (LSP never claims).
+  subasSellRelay: process.env.SUBAS_SELL_RELAY || '',
   // --- "Move to Lightning" channel funding (GET /channel/deposit, POST /channel/open) ---
   // The routing peer each hosted node opens its channel TO (id@host:port). The channel
   // is funded from the hosted node's OWN on-chain wallet, whose only signer is the user's
@@ -688,7 +693,7 @@ async function provisionInbound({ nodeKey, assetId, amount }) {
     receivable_msat: chan.receivable_msat ?? null, fee_msat: feeMsat };
 }
 
-function runMixed({ side, asset, amount, payRail, recvRail, node_key, asset_bolt11, payment_hash, asset_amount }) {
+function runMixed({ side, asset, amount, payRail, recvRail, node_key, asset_bolt11, payment_hash, asset_amount, btc_claim_pub, offer_id, maker_pubkey }) {
   return new Promise(async (resolve) => {
     const assetId = resolveAsset(asset);
     if (side !== 'buy' && side !== 'sell') return resolve({ ok: false, error: "side must be 'buy' or 'sell'" });
@@ -702,6 +707,56 @@ function runMixed({ side, asset, amount, payRail, recvRail, node_key, asset_bolt
     let args;
     let inbound = null;          // set for a per-user sub-asset receive (JIT inbound record)
     const perUser = !!(node_key && asset_bolt11 && payment_hash);
+    // SUB-ASSET SELL: pay the asset OVER LIGHTNING, receive BTC ON-CHAIN (mirror of the buy).
+    // The maker (ln_direction=5) locks BTC on-chain + holds an asset invoice on H; the LSP
+    // commands the USER's hosted asset node (node_key) to pay the held asset by bare hash
+    // (device co-signs), learns P, and RETURNS P + the BTC HTLC terms for the WALLET to claim
+    // on-chain with its device key. The LSP never claims the BTC HTLC -> non-custodial.
+    if (side === 'sell' && payRail === 'ln' && recvRail === 'chain') {
+      if (!CFG.subasBtcRpc || !CFG.subasSellRelay) {
+        return resolve({ ok: false, finality: 'unsupported',
+          error: 'the sub-asset SELL rail is not configured on this LSP (set SUBAS_BTC_RPC + SUBAS_SELL_RELAY + a sub-asset-sell maker).' });
+      }
+      if (!node_key || !btc_claim_pub) {
+        return resolve({ ok: false, error: 'sub-asset sell requires node_key (the hosted asset node that pays over LN) + btc_claim_pub (the wallet device claim pubkey that claims the BTC on-chain)' });
+      }
+      const { rpc: userRpc, rec } = targetFor('seq', assetId, node_key);
+      if (!userRpc || !rec) {
+        return resolve({ ok: false, error: 'user node not provisioned for this asset (POST /node/provision first)' });
+      }
+      const sellArgs = ['xsubas-sell', '-asset', assetId, '-relay', CFG.subasSellRelay,
+        '-btc-rpc', CFG.subasBtcRpc, '-btc-chain', CFG.subasBtcChain,
+        '-asset-ln-socket', userRpc, '-btc-claim-pub', btc_claim_pub,
+        '-min-btc-conf', String(CFG.subasMinBtcConf), '-json'];
+      // Lift a SPECIFIC resting offer (order-book take) when the wallet names one.
+      if (offer_id) sellArgs.push('-offer-id', String(offer_id));
+      if (maker_pubkey) sellArgs.push('-maker-pubkey', String(maker_pubkey));
+      const t0s = Date.now();
+      return execFile(CFG.seqobCli, sellArgs, { timeout: CFG.mixedTimeoutMs, maxBuffer: 8 << 20 }, (err, stdout, stderr) => {
+        const out = (stdout || '') + (stderr || '');
+        let j = null;
+        for (const line of (stdout || '').trim().split('\n').reverse()) {
+          const s = line.trim();
+          if (s.startsWith('{') && s.endsWith('}')) { try { j = JSON.parse(s); break; } catch { /* keep scanning */ } }
+        }
+        const dt = Date.now() - t0s;
+        if (j && j.settled) {
+          return resolve({
+            ok: true, side: 'sell', asset: assetId, asset_label: assetLabel(assetId),
+            rail: 'mixed', pay_rail: 'ln', recv_rail: 'chain',
+            settled: true, per_user: true, node_key,
+            hash_h: j.hash_h, preimage: j.preimage,
+            maker_ln_node_id: j.maker_ln_node_id, btc_htlc: j.btc_htlc,
+            finality: 'confirming', anchor_bound: true, eta_seconds: Math.round(dt / 1000),
+            note: 'Sub-asset SELL: you paid the asset over Lightning. Claim the BTC on-chain with your device key using the returned preimage + btc_htlc (the LSP does not hold your claim key).',
+            settled_ms: dt, requested_amount: amount ?? null,
+          });
+        }
+        return resolve({ ok: false,
+          error: (j && j.error) ? `sub-asset sell failed: ${j.error}` : (err ? `sub-asset sell failed: ${err.message}` : 'sub-asset sell did not settle'),
+          detail: out.split('\n').filter(Boolean).slice(-6).join(' | '), settled_ms: dt });
+      });
+    }
     if (side === 'buy' && payRail === 'chain' && recvRail === 'ln') {
       // SUB-ASSET: pay BTC ON-CHAIN, receive the asset OVER LIGHTNING. The LSP funds the
       // BTC HTLC from its bitcoind wallet; a sub-asset (ln_direction=4) maker on
@@ -821,6 +876,93 @@ const server = http.createServer(async (req, res) => {
   if (req.method === 'GET' && url.pathname === '/health') return send(res, 200, { ok: true, service: 'seqln-lsp' });
   if (!authed(req)) return send(res, 401, { ok: false, error: 'unauthorized (Bearer token required)' });
   try {
+    // ----- ORDER BOOK (sub-asset rail): the wallet gates its BUY/SELL toggles on live
+    // resting liquidity, and users post their own resting offers (permissionless). Offers
+    // rest on the sub-asset relays (localhost, so the wallet reaches them via the LSP).
+    //   GET /book?asset=<id> -> { sell_available, buy_available, sell_offers[], buy_offers[] }
+    //   ln_direction 5 = resting BUY-asset-with-BTC (a party locks BTC on-chain) => user can SELL.
+    //   ln_direction 4 = resting SELL-asset-for-BTC (a party pays asset over LN, INTERACTIVE) => user can BUY.
+    if (req.method === 'GET' && url.pathname === '/book') {
+      const assetId = resolveAsset(url.searchParams.get('asset'));
+      if (!assetId || assetId === CFG.btcx) return send(res, 400, { ok: false, error: '?asset=<sequentia asset id> is required (not BTC)' });
+      const relays = [...new Set([CFG.subasSellRelay, CFG.subasRelay].filter(Boolean))];
+      const seen = new Set(), sell = [], buy = [];
+      for (const relay of relays) {
+        let offers = [];
+        try {
+          const rr = await fetch(`${relay}/v1/market/${assetId}/BTC/orderbook`, { signal: AbortSignal.timeout(5000) });
+          if (rr.ok) offers = (await rr.json()).offers || [];
+        } catch { /* a down relay just contributes no liquidity */ }
+        for (const o of offers) {
+          const lt = o.lightning || {}, dir = Number(lt.ln_direction);
+          if (dir !== 4 && dir !== 5) continue;
+          const key = (o.maker_pubkey || '') + ':' + (o.offer_id || '');
+          if (seen.has(key)) continue; seen.add(key);
+          if (dir === 5) {
+            const asset_amount = Number(o.want_amount || 0), btc_sats = Number(o.offer_amount || 0);
+            sell.push({ offer_id: o.offer_id, maker_pubkey: o.maker_pubkey, ln_direction: 5,
+              asset_amount, btc_sats, price_sats_per_atom: asset_amount ? btc_sats / asset_amount : null,
+              maker_ln_node: o.maker_ln_node_pubkey || null, onchain_cltv: Number(lt.onchain_cltv || 0),
+              expires_at: Number(o.expires_at_unix || 0), interactive: false });
+          } else {
+            const asset_amount = Number(o.offer_amount || 0), btc_sats = Number(o.want_amount || 0);
+            buy.push({ offer_id: o.offer_id, maker_pubkey: o.maker_pubkey, ln_direction: 4,
+              asset_amount, btc_sats, price_sats_per_atom: asset_amount ? btc_sats / asset_amount : null,
+              maker_ln_node: o.maker_ln_node_pubkey || null, ln_connect_hints: o.ln_connect_hints || null,
+              expires_at: Number(o.expires_at_unix || 0), interactive: true });
+          }
+        }
+      }
+      return send(res, 200, { ok: true, asset: assetId, asset_label: assetLabel(assetId),
+        sell_available: sell.length > 0, buy_available: buy.length > 0, sell_offers: sell, buy_offers: buy });
+    }
+
+    // POST /offer { offer: <signed Offer protojson> } -> forward to the sub-asset relay.
+    // The wallet builds + SIGNS the offer (non-custodial); the LSP only relays the bytes and
+    // routes by ln_direction (5 -> sell relay, 4 -> buy relay). Posting is permissionless.
+    if (req.method === 'POST' && url.pathname === '/offer') {
+      const body = await readBody(req);
+      const offer = body && body.offer;
+      const dir = Number(offer && offer.lightning && offer.lightning.ln_direction);
+      if (!offer || (dir !== 4 && dir !== 5)) return send(res, 400, { ok: false, error: 'body { offer: <signed Offer> } with lightning.ln_direction 4 (resting SELL) or 5 (resting BUY)' });
+      if (!offer.maker_sig || !offer.maker_pubkey) return send(res, 400, { ok: false, error: 'offer must be SIGNED (maker_sig + maker_pubkey); the LSP never signs on your behalf' });
+      const relay = dir === 5 ? CFG.subasSellRelay : CFG.subasRelay;
+      if (!relay) return send(res, 503, { ok: false, error: `no sub-asset relay configured for ln_direction=${dir}` });
+      try {
+        const rr = await fetch(`${relay}/v1/offers`, { method: 'POST', headers: { 'content-type': 'application/json' },
+          body: JSON.stringify(offer), signal: AbortSignal.timeout(8000) });
+        const txt = await rr.text();
+        if (!rr.ok) return send(res, 502, { ok: false, error: 'relay rejected the offer: ' + txt.slice(0, 240) });
+        let st = null; try { st = JSON.parse(txt); } catch { /* status is best-effort */ }
+        return send(res, 200, { ok: true, offer_id: (st && st.offer_id) || offer.offer_id,
+          status: (st && st.status) || 'OPEN', ln_direction: dir,
+          note: dir === 4 ? 'Resting SELL is INTERACTIVE: your LN node must be reachable at settlement to pay the asset when a taker locks BTC.' : 'Resting BUY: you lock BTC on-chain when taken.' });
+      } catch (e) { return send(res, 502, { ok: false, error: 'post to relay failed: ' + e.message }); }
+    }
+    // POST /nodes/list { keys:[...] } -> { provisioned:[{key,asset_id,chain}] }.
+    // Resolve candidate device node keys against the PROV REGISTRY ONLY (getByKey re-reads
+    // the registry file; it NEVER calls getinfo/listpeerchannels). This is deliberate: a node
+    // blocked at HSM init (waiting for its signer) can't answer its RPC, but must still be
+    // discoverable so the wallet can connect the signer and un-block it (the reconnect
+    // chicken-and-egg). Self-scoped: only keys that resolve to a node this device provisioned
+    // come back (a key the device couldn't derive simply isn't in the registry). Keys are
+    // lowercased (getByKey lowercases too).
+    if (req.method === 'POST' && url.pathname === '/nodes/list') {
+      const body = await readBody(req);
+      const keys = body && Array.isArray(body.keys) ? body.keys : null;
+      if (!keys) return send(res, 400, { ok: false, error: 'body { keys: ["seq:<assetHex>:<devicePub>" | "btc:<devicePub>", ...] } required' });
+      const provisioned = [], seen = new Set();
+      for (const raw of keys) {
+        if (typeof raw !== 'string') continue;
+        const key = raw.toLowerCase();
+        if (seen.has(key)) continue;
+        seen.add(key);
+        const rec = PROV && PROV.getByKey(key);
+        if (rec) provisioned.push({ key: rec.key || key, asset_id: rec.asset_id || null, chain: rec.chain || null });
+      }
+      return send(res, 200, { provisioned });
+    }
+
     if (req.method === 'GET' && url.pathname === '/status') {
       // `?nodes=<key1>,<key2>` = the requesting device's own provision keys, so /status also
       // reports that device's provisioned-node channels (see status()). Only the device that
@@ -943,7 +1085,14 @@ const server = http.createServer(async (req, res) => {
       const body = await readBody(req);
       if (!body) return send(res, 400, { ok: false, error: 'bad json body' });
       // Rails select the settlement path (default ln/ln = the unchanged pure-LN route).
-      const payRail = body.payRail || 'ln', recvRail = body.recvRail || 'ln';
+      // EXCEPTION: a SELL carrying a device btc_claim_pub is a SUB-ASSET sell (asset over
+      // Lightning -> BTC ON-CHAIN HTLC, ln_direction=5). The wallet omits rails, so default
+      // them to ln/chain here instead of letting it fall through to the pure-LN (xpln) path.
+      let payRail = body.payRail, recvRail = body.recvRail;
+      if (body.side === 'sell' && body.btc_claim_pub && !payRail && !recvRail) {
+        payRail = 'ln'; recvRail = 'chain';
+      }
+      payRail = payRail || 'ln'; recvRail = recvRail || 'ln';
       if (payRail === 'ln' && recvRail === 'ln') {
         const r = await runSwap(body);                          // UNCHANGED pure-LN
         return send(res, r.ok ? 200 : 502, r);
@@ -964,14 +1113,22 @@ const server = http.createServer(async (req, res) => {
       // the request naming a provisioned node_key) is available.
       const perUserReq = !!(body.node_key && body.asset_bolt11 && body.payment_hash);
       const subasReady = !!(CFG.subasBtcRpc && (CFG.subasAssetLn || (perUserReq && CFG.subasLpRpc)));
+      const subasSellReady = !!(CFG.subasBtcRpc && CFG.subasSellRelay);
       const supported = (side === 'buy' && payRail === 'ln' && recvRail === 'chain') ||
                         (side === 'sell' && payRail === 'chain' && recvRail === 'ln') ||
-                        (side === 'buy' && payRail === 'chain' && recvRail === 'ln' && subasReady);
+                        (side === 'buy' && payRail === 'chain' && recvRail === 'ln' && subasReady) ||
+                        (side === 'sell' && payRail === 'ln' && recvRail === 'chain' && subasSellReady);
       if (!supported) {
         return send(res, 422, { ok: false, finality: 'unsupported',
           error: `mixed pay=${payRail}/recv=${recvRail} for a ${side} has no maker/backend on this LSP `
                + '(asset-on-chain <-> BTC-Lightning always; asset-over-LN + BTC-on-chain needs a sub-asset backend). '
                + 'Use both-Lightning, both-on-chain, or a supported mixed shape.' });
+      }
+      // SUB-ASSET SELL always answers SYNCHRONOUSLY: the wallet needs P + the BTC HTLC
+      // terms in the response to claim on-chain with its device key.
+      if (side === 'sell' && payRail === 'ln' && recvRail === 'chain') {
+        const r = await runMixed({ ...body, payRail, recvRail });
+        return send(res, r.ok ? 200 : 502, r);
       }
       reapJobs();
       // Under the 0-conf cap -> the submarine skips the anchor-bury wait, so the swap
