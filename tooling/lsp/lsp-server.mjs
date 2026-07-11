@@ -515,6 +515,22 @@ async function waitGetinfo(rpc, timeoutMs = 45000) {
   }
 }
 
+// Wait until the node is FULLY SYNCED to the chain tip before we drive a channel open. A
+// keyless node boots + rescans for MINUTES; issuing `fundchannel` before it finishes syncing
+// parks the funding on "Waiting to sync with bitcoind" AND (worse) fires a funding-path signer
+// op mid-rescan, which is exactly what wedged a device signer once (proxy blocked on a device
+// read the browser never answered, freezing the whole node loop). So gate on getinfo reporting
+// no sync warnings. getinfo answering at all already means the loop is live (a wedged loop hangs
+// getinfo), so this also catches a soft-wedge as a timeout rather than a silent hang.
+async function waitSynced(rpc, deadline) {
+  for (;;) {
+    const info = await lnrpc('getinfo', [], rpc).catch(() => null);
+    if (info && info.warning_lightningd_sync == null && info.warning_bitcoind_sync == null) return info;
+    if (Date.now() > deadline) throw new Error('your Lightning node did not finish syncing to the chain tip in time (still rescanning) — its funds are safe on-chain; retry once it is caught up');
+    await sleep(3000);
+  }
+}
+
 async function channelDeposit(chain, assetId, nodeKey) {
   const { rpc } = targetFor(chain, chain === 'seq' ? (assetId || CFG.gold) : null, nodeKey);
   if (!rpc) throw new Error('no hosted node for that asset (provision it first)');
@@ -533,8 +549,12 @@ async function runChannelOpen(job) {
   const deadline = Date.now() + CFG.channelWatchMs;
   const need = Number(job.requested_amount);
 
-  // 0. Wait for the node's rpc to answer (a fresh node's socket may not exist yet).
+  // 0. Wait for the node's rpc to answer (a fresh node's socket may not exist yet), THEN wait
+  //    until it is fully synced to the chain tip. Funding an un-synced (still-rescanning) node
+  //    parks the funding tx and fires a signer op mid-rescan that can wedge the device signer.
   await waitGetinfo(rpc);
+  job.status = 'syncing';
+  await waitSynced(rpc, deadline);
 
   // 1. Wait for confirmed on-chain funds >= the requested channel amount. (Funds the
   //    user just deposited; if the node already holds enough, this passes at once.)
