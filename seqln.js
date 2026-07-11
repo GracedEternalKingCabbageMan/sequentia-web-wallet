@@ -349,6 +349,15 @@ export function seqlnListNodes(keys) {
   return lspFetch('/nodes/list', { method: 'POST', body: JSON.stringify({ keys: list }) });
 }
 
+// The on-chain (not-yet-in-a-channel) state of one of the device's OWN nodes. Used to DETECT a
+// stranded deposit — a Move-to-Lightning whose deposit landed but whose channel never opened — so
+// the wallet can finish it. Returns { node_up, onchain_msat, asset_id, channels, stranded }.
+// stranded = node_up && onchain_msat>0 && channels==0. node_up:false means the node is still
+// booting / awaiting its signer (unknown, not "no deposit").
+export function seqlnNodeOnchain(node_key) {
+  return lspFetch('/node/onchain?node=' + encodeURIComponent(node_key));
+}
+
 // --- Sub-asset BUY (pay BTC on-chain, receive asset over Lightning) HODL primitives ------------
 // Ensure inbound asset liquidity to the user's OWN node so the maker can pay the asset over LN
 // (JIT 0-conf inbound channel). amount in ASSET SATS.

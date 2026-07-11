@@ -768,7 +768,7 @@ import { initXswap, renderXswap, fetchXmarkets, fetchXquote, fetchXbook, openFro
 import { initXrswap, fetchRQuote, openReverseFromComposer, hasInFlight as hasReverseInFlight, renderReverse } from './xrswap.js';
 import { initXmaker, startForwardMaker, startReverseMaker, liveMakerOffers, resumeMakerSwaps } from './xmaker.js';
 import { initSeqln, connectDevice as lnConnectDevice, disconnectDevice as lnDisconnect,
-  onSeqlnStatus, seqlnState, seqlnAvailable, seqlnGetStatus, seqlnListNodes, seqlnSwap, seqlnBook, seqlnPostOffer, lnFinalityCopy,
+  onSeqlnStatus, seqlnState, seqlnAvailable, seqlnGetStatus, seqlnListNodes, seqlnNodeOnchain, seqlnSwap, seqlnBook, seqlnPostOffer, lnFinalityCopy,
   seqlnChannelInbound, seqlnNodeInvoice, seqlnInvoiceStatus, seqlnNodeSettle,
   seqlnChannels, seqlnFunding, fundChannel, resumeFundChannel, provisionAndConnect, waitNodeReady, provisionedState,
   deviceTransportPubkey, registerOwnStatusKeys, closeChannelLsp } from './seqln.js';
@@ -1706,6 +1706,7 @@ const _ownLnLegsKey = 'swk.ln.ownLegs.v1';
 function ownLnLegs(){ try{ return JSON.parse(localStorage.getItem(_ownLnLegsKey)||'[]')||[]; }catch{ return []; } }
 function rememberOwnLnLeg(leg){ if(!leg) return; const s=new Set(ownLnLegs()); if(s.has(leg)) return; s.add(leg); try{ localStorage.setItem(_ownLnLegsKey, JSON.stringify([...s])); }catch{} }
 const _lnReconnectedLegs = new Set();
+const _lnStrandRecovered = new Set();   // nodes whose stranded deposit we've already completed this session
 let _lnDiscoveryDone = false;   // the registry discovery pass runs once (per successful call) per session
 async function reconnectOwnNodes(){
   const phrase=(localStorage.getItem(KEY)||'').trim();
@@ -1752,6 +1753,29 @@ async function reconnectOwnNodes(){
     for(const k of readyKeys){ try{ await waitNodeReady({ nodeKey:k, onProgress:()=>{} }); }catch{} }
     try{ lnLastStatus = await seqlnGetStatus(); }catch{}
     try{ renderBalance(); lnStatusPill(); }catch{}
+    // Finish any STRANDED deposit: a node that booted with on-chain funds but no channel — a Move
+    // interrupted before the open (e.g. one from before the persistence existed, like a recovered
+    // node). Detect via /node/onchain (registry-safe, waits for the node to boot + rescan) and
+    // complete it from the landed deposit (no re-deposit). Guarded so it runs once per node.
+    for(const k of readyKeys){
+      if(k==='btc' || !/^seq:/i.test(k) || _lnStrandRecovered.has(k)) continue;
+      try{
+        let info=null;
+        for(let i=0;i<10;i++){ try{ info = await seqlnNodeOnchain(k); }catch{ info=null; } if(info && info.node_up) break; await new Promise(r=>setTimeout(r,3000)); }
+        if(info && info.node_up && info.stranded){
+          _lnStrandRecovered.add(k);
+          const assetHex = (k.split(':')[1]||'').toLowerCase();
+          const amount = Math.floor(Number(info.onchain_msat||0)/1000);
+          if(assetHex && amount>0){
+            console.log('[ln] completing a stranded deposit on', assetMeta(assetHex).ticker, amount);
+            await resumeFundChannel({ chain:'seq', asset: assetHex, amount, node: k, onProgress:()=>{} });
+            try{ rememberOwnLnLeg(assetHex); }catch{}
+            try{ toast('Finished moving '+assetMeta(assetHex).ticker+' to Lightning'); }catch{}
+            try{ lnLastStatus = await seqlnGetStatus(); renderBalance(); lnStatusPill(); }catch{}
+          }
+        }
+      }catch(e){ _lnStrandRecovered.delete(k); console.warn('[ln] strand recovery (will retry next open):', e?.message??e); }
+    }
   }
 }
 
