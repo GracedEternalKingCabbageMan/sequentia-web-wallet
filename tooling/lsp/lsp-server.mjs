@@ -246,6 +246,22 @@ function assetLabel(id) {
   return id.slice(0, 8) + '…';
 }
 
+// lnrpcKw: like lnrpc but passes keyword args (lightning-cli -k method k=v ...), for
+// commands (e.g. `invoice`) whose optional params are cleaner set by name than by position.
+function lnrpcKw(method, kv = [], rpc, timeoutMs = 0) {
+  return new Promise((resolve, reject) => {
+    if (!rpc) return reject(new Error(`internal: no rpc path for lnrpcKw '${method}'`));
+    execFile(CFG.lncli, [`--rpc-file=${rpc}`, '-k', method, ...kv],
+      { maxBuffer: 8 << 20, timeout: timeoutMs || undefined }, (err, stdout, stderr) => {
+        if (err) {
+          let detail = (stderr || '').trim();
+          try { const j = JSON.parse(stdout); if (j && j.message) detail = j.message; } catch { /* not json */ }
+          return reject(new Error(`${method}: ${detail || err.message}`));
+        }
+        try { resolve(JSON.parse(stdout)); } catch { reject(new Error(`${method}: bad json`)); }
+      });
+  });
+}
 function lnrpc(method, args = [], rpc, timeoutMs = 0) {
   return new Promise((resolve, reject) => {
     // Fail LOUD on a missing rpc path: never silently default to the demo node (that would
@@ -693,7 +709,7 @@ async function provisionInbound({ nodeKey, assetId, amount }) {
     receivable_msat: chan.receivable_msat ?? null, fee_msat: feeMsat };
 }
 
-function runMixed({ side, asset, amount, payRail, recvRail, node_key, asset_bolt11, payment_hash, asset_amount, btc_claim_pub, offer_id, maker_pubkey }) {
+function runMixed({ side, asset, amount, payRail, recvRail, node_key, asset_bolt11, payment_hash, asset_amount, btc_claim_pub, offer_id, maker_pubkey, btc_htlc }) {
   return new Promise(async (resolve) => {
     const assetId = resolveAsset(asset);
     if (side !== 'buy' && side !== 'sell') return resolve({ ok: false, error: "side must be 'buy' or 'sell'" });
@@ -794,10 +810,32 @@ function runMixed({ side, asset, amount, payRail, recvRail, node_key, asset_bolt
         assetLnSock = CFG.subasAssetLn;
         extraArgs = ['-asset-invoice', 'plain'];
       }
-      args = ['xsubas', '-asset', assetId, '-relay', CFG.subasRelay,
-        '-btc-rpc', CFG.subasBtcRpc, '-btc-wallet', CFG.subasBtcWallet, '-btc-chain', CFG.subasBtcChain,
-        '-asset-ln-socket', assetLnSock, '-min-btc-conf', String(CFG.subasMinBtcConf),
-        ...extraArgs, '-state-file', stateFile];
+      // EXTERNAL BTC (non-custodial): when the wallet supplies btc_htlc, the DEVICE
+      // funded+signed the BTC HTLC from the USER's own BTC. Drop -btc-wallet (the LSP
+      // fronts nothing) and RELAY the HTLC; the maker verifies it on-chain, pays the
+      // device's asset invoice (the device's node auto-settles, revealing P to the maker),
+      // then claims the HTLC with P. Requires the per-user path (device invoice on its own
+      // node). Absent btc_htlc = the legacy LSP-fronted path (-btc-wallet).
+      const bh = btc_htlc && btc_htlc.txid ? btc_htlc : null;
+      if (bh && !perUser) {
+        return resolve({ ok: false, error: 'external-BTC buy requires node_key + asset_bolt11 + payment_hash (the device invoice on its own node) alongside btc_htlc (the device-funded HTLC)' });
+      }
+      if (bh) {
+        args = ['xsubas', '-asset', assetId, '-relay', CFG.subasRelay,
+          '-btc-rpc', CFG.subasBtcRpc, '-btc-chain', CFG.subasBtcChain,      // no -btc-wallet: the DEVICE funded the HTLC
+          '-btc-htlc-txid', String(bh.txid), '-btc-htlc-vout', String(bh.vout),
+          '-btc-htlc-amount', String(bh.amount), '-btc-htlc-script', String(bh.redeem_script),
+          '-btc-locktime', String(bh.cltv), '-btc-refund-pub', String(bh.taker_refund_pub),
+          '-asset-ln-socket', assetLnSock, '-min-btc-conf', String(CFG.subasMinBtcConf),
+          ...extraArgs, '-state-file', stateFile];
+        if (offer_id) args.push('-offer-id', String(offer_id));
+        if (maker_pubkey) args.push('-maker-pubkey', String(maker_pubkey));
+      } else {
+        args = ['xsubas', '-asset', assetId, '-relay', CFG.subasRelay,
+          '-btc-rpc', CFG.subasBtcRpc, '-btc-wallet', CFG.subasBtcWallet, '-btc-chain', CFG.subasBtcChain,
+          '-asset-ln-socket', assetLnSock, '-min-btc-conf', String(CFG.subasMinBtcConf),
+          ...extraArgs, '-state-file', stateFile];
+      }
     } else {
       if (!CFG.seqRpc || !CFG.seqWallet) {
         return resolve({ ok: false, error: 'the mixed (submarine) rail is not configured on this LSP (set SEQ_RPC + SEQ_WALLET)' });
@@ -1001,6 +1039,66 @@ const server = http.createServer(async (req, res) => {
     // "preparing your node…" progress, before it asks for a deposit address). A fresh node
     // boots + rescans, so its rpc socket is absent for the first seconds; `ready` flips true
     // once getinfo answers. Fast + non-blocking (a single getinfo attempt with an 8s cap).
+    // POST /node/invoice { node_key, asset, amount /* asset sats */, preimage?, payment_hash? }
+    //   -> { bolt11, payment_hash }.  Mint an asset invoice on the node_key's OWN hosted node
+    //   (self-scoped). Two custody modes:
+    //     HODL (recommended, LSP stays blind to P): pass `payment_hash` (= H). The node holds
+    //       the payment by H and does NOT learn P; the DEVICE settles later via /node/settle
+    //       AFTER the maker's payment is held. Requires the holdinvoice plugin on the node.
+    //     NORMAL (weaker): pass `preimage` (= P). The node is created WITH P and auto-settles
+    //       on payment, so the node/LSP learns P at mint time (see the buy P-custody note).
+    if (req.method === 'POST' && url.pathname === '/node/invoice') {
+      if (!PROV) return send(res, 501, { ok: false, error: 'per-asset node provisioning is not enabled on this LSP' });
+      const body = await readBody(req);
+      const nodeKey = ((body && body.node_key) || '').toLowerCase();
+      const assetId = resolveAsset(body && body.asset);
+      const amount = Number(body && body.amount);
+      if (!nodeKey || !assetId || !(amount > 0)) return send(res, 400, { ok: false, error: 'body { node_key, asset, amount (asset sats), preimage? | payment_hash? } required' });
+      const rec = PROV.getByKey(nodeKey);
+      if (!rec || !rec.rpc) return send(res, 404, { ok: false, error: 'unknown node key (POST /node/provision first)' });
+      const amtMsat = String(Math.round(amount) * 1000);           // asset sats -> asset msat
+      const label = 'buy-' + crypto.randomUUID();
+      const H = body && body.payment_hash ? String(body.payment_hash).toLowerCase() : null;
+      const P = body && body.preimage ? String(body.preimage).toLowerCase() : null;
+      try {
+        let inv;
+        if (H) {
+          // HODL invoice on H (device holds P). holdinvoice-seq: payment_hash amount_msat label description.
+          inv = await lnrpc('holdinvoice', [H, amtMsat, label, 'asset buy (HODL)'], rec.rpc);
+        } else {
+          // NORMAL invoice. Use keyword args so the optional `preimage` can be set without
+          // positional padding: lightning-cli -k invoice amount_msat=.. label=.. preimage=..
+          const kv = [`amount_msat=${amtMsat}`, `label=${label}`, 'description=asset buy'];
+          if (P) kv.push(`preimage=${P}`);
+          inv = await lnrpcKw('invoice', kv, rec.rpc);
+        }
+        return send(res, 200, { ok: true, bolt11: inv.bolt11, payment_hash: inv.payment_hash, hodl: !!H });
+      } catch (e) {
+        return send(res, 502, { ok: false, error: `invoice: ${e.message}` });
+      }
+    }
+
+    // POST /node/settle { node_key, payment_hash, preimage } -> { settled:true }.  Device-settle
+    // a HODL invoice with P, releasing the maker's HELD payment to the taker and revealing P to
+    // the maker via the LN settle. Call ONLY after the maker's payment is held (so revealing P
+    // is safe). Self-scoped. Requires the holdinvoice plugin.
+    if (req.method === 'POST' && url.pathname === '/node/settle') {
+      if (!PROV) return send(res, 501, { ok: false, error: 'per-asset node provisioning is not enabled on this LSP' });
+      const body = await readBody(req);
+      const nodeKey = ((body && body.node_key) || '').toLowerCase();
+      const H = ((body && body.payment_hash) || '').toLowerCase();
+      const P = ((body && body.preimage) || '').toLowerCase();
+      if (!nodeKey || !H || !P) return send(res, 400, { ok: false, error: 'body { node_key, payment_hash, preimage } required' });
+      const rec = PROV.getByKey(nodeKey);
+      if (!rec || !rec.rpc) return send(res, 404, { ok: false, error: 'unknown node key' });
+      try {
+        await lnrpc('holdinvoice-settle', [H, P], rec.rpc);
+        return send(res, 200, { ok: true, settled: true });
+      } catch (e) {
+        return send(res, 502, { ok: false, error: `settle: ${e.message}` });
+      }
+    }
+
     if (req.method === 'GET' && url.pathname === '/node/getinfo') {
       if (!PROV) return send(res, 501, { ok: false, error: 'per-asset node provisioning is not enabled on this LSP' });
       const nodeKey = url.searchParams.get('node') || '';
