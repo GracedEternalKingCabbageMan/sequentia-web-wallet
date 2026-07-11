@@ -40,23 +40,26 @@ import { createHash, randomBytes } from 'node:crypto';
 
 // ---- args -----------------------------------------------------------------
 function parseArgs(argv) {
-  const a = { wsHost: '127.0.0.1', wsPort: 18081, tcp: null, tcpRetryMs: 20000, quiet: false };
+  const a = { wsHost: '127.0.0.1', wsPort: 18081, tcp: null, tcpRetryMs: 20000, quiet: false, pingMs: 15000, pongTimeoutMs: 0 };
   for (let i = 0; i < argv.length; i++) {
     const k = argv[i];
     if (k === '--ws-port') a.wsPort = Number(argv[++i]);
     else if (k === '--ws-host') a.wsHost = argv[++i];
     else if (k === '--tcp') a.tcp = argv[++i];
     else if (k === '--tcp-retry-ms') a.tcpRetryMs = Number(argv[++i]);
+    else if (k === '--ping-ms') a.pingMs = Number(argv[++i]);          // 0 disables keepalive
+    else if (k === '--pong-timeout-ms') a.pongTimeoutMs = Number(argv[++i]);
     else if (k === '--quiet') a.quiet = true;
     else if (k === '-h' || k === '--help') { usage(); process.exit(0); }
     else { console.error(`unknown arg: ${k}`); usage(); process.exit(2); }
   }
   if (!a.tcp || !a.tcp.includes(':')) { usage(); process.exit(2); }
+  if (!a.pongTimeoutMs) a.pongTimeoutMs = a.pingMs ? a.pingMs * 2 : 0;
   return a;
 }
 function usage() {
   console.error('usage: node seqln-ws-relay.mjs --ws-port <p> --tcp <host:port>'
-    + ' [--ws-host <h>] [--tcp-retry-ms <ms>] [--quiet]');
+    + ' [--ws-host <h>] [--tcp-retry-ms <ms>] [--ping-ms <ms>] [--pong-timeout-ms <ms>] [--quiet]');
 }
 const args = parseArgs(process.argv.slice(2));
 const [tcpHost, tcpPort] = (() => { const i = args.tcp.lastIndexOf(':'); return [args.tcp.slice(0, i), Number(args.tcp.slice(i + 1))]; })();
@@ -140,15 +143,32 @@ function bridge(wsSocket, req) {
   let pending = [];            // WS->proxy bytes buffered until the TCP dial lands
   let closed = false;
   let wsToTcp = 0, tcpToWs = 0;
+  let lastAlive = Date.now();
+  let keepalive = null;
 
   const wsSend = (opcode, payload) => { if (!wsSocket.destroyed) wsSocket.write(encodeFrame(opcode, payload)); };
   const shutdown = (why) => {
     if (closed) return; closed = true;
+    if (keepalive) { clearInterval(keepalive); keepalive = null; }
     log(`#${id} closing (${why}); relayed ws->proxy ${wsToTcp}B, proxy->ws ${tcpToWs}B`);
     try { wsSend(0x8, Buffer.alloc(0)); } catch {}
     try { wsSocket.destroy(); } catch {}
     try { tcp?.destroy(); } catch {}
   };
+  // Keepalive: detect a silently-dead ws (tab asleep / phone offline, no TCP RST)
+  // and CLOSE our TCP to the proxy so it sees a clean EOF instead of a half-dead
+  // ESTAB link that would wedge the hosted node. See ws-bridge.mjs for the why.
+  if (args.pingMs > 0) {
+    keepalive = setInterval(() => {
+      if (closed) return;
+      if (Date.now() - lastAlive > args.pongTimeoutMs) {
+        shutdown('ws keepalive timeout (device silent — likely tab asleep/offline)');
+        return;
+      }
+      try { wsSend(0x9, Buffer.alloc(0)); } catch {}   // ping
+    }, args.pingMs);
+    if (keepalive.unref) keepalive.unref();
+  }
 
   // Dial the proxy's Noise-responder TCP listener, retrying: lightningd may not
   // have exec'd the proxy (which binds at startup) by the time the device
@@ -178,11 +198,12 @@ function bridge(wsSocket, req) {
 
   wsSocket.setNoDelay(true);
   wsSocket.on('data', (chunk) => {
+    lastAlive = Date.now();   // ANY inbound ws frame proves the device is alive
     dec.push(chunk);
     for (const { opcode, payload } of dec.frames()) {
       if (opcode === 0x8) { shutdown('ws close'); return; }          // close
       if (opcode === 0x9) { wsSend(0xA, payload); continue; }        // ping->pong
-      if (opcode === 0xA) { continue; }                              // pong: ignore
+      if (opcode === 0xA) { continue; }                              // pong: refresh only
       // data (binary 0x2 / text 0x1 / continuation 0x0): forward bytes as-is.
       if (tcpReady) { tcp.write(payload); wsToTcp += payload.length; }
       else { pending.push(payload); }

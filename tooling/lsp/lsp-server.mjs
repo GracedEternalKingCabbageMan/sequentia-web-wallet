@@ -556,6 +556,32 @@ async function runChannelOpen(job) {
   job.status = 'syncing';
   await waitSynced(rpc, deadline);
 
+  // A10 IDEMPOTENCY GUARD (prevents a double-fund). Before waiting for the deposit
+  // or funding, check whether a channel to this peer ALREADY exists. The wallet's
+  // auto-reconnect / stranded-deposit recovery (section 4) — and any plain retry —
+  // can re-issue /channel/open after a prior fundchannel already broadcast; funding
+  // again would open a SECOND channel and fragment the user's deposit. Worse, the
+  // deposit-wait below would then spin to timeout ("Could not afford ...", the
+  // deposit already spent into the first channel). If an opening/locked channel is
+  // present, adopt it and skip straight to the lock-in watch. (listpeerchannels is
+  // registry/db-backed, so this needs no peer connection and never signs.)
+  let existingCh = null;
+  {
+    const pc = await lnrpc('listpeerchannels', [`id=${peerId}`], rpc)
+      .catch(() => ({ channels: [] }));
+    const OPEN_STATES = ['OPENINGD', 'DUALOPEND_OPEN_INIT', 'DUALOPEND_AWAITING_LOCKIN',
+                         'CHANNELD_AWAITING_LOCKIN', 'CHANNELD_NORMAL'];
+    existingCh = (pc.channels || []).find((c) => OPEN_STATES.includes(c.state)) || null;
+  }
+  if (existingCh) {
+    job.funding_txid = existingCh.funding_txid
+      || (existingCh.funding && existingCh.funding.txid) || null;
+    job.channel_id = existingCh.channel_id || null;
+    job.reused_existing = true;
+    job.status = 'awaiting_lockin';
+  }
+
+  if (!existingCh) {
   // 1. Wait for confirmed on-chain funds >= the requested channel amount. (Funds the
   //    user just deposited; if the node already holds enough, this passes at once.)
   for (;;) {
@@ -600,6 +626,7 @@ async function runChannelOpen(job) {
   const fc = await lnrpc('fundchannel', fcArgs, rpc);
   job.funding_txid = fc.txid || (fc.txids && fc.txids[0]) || null;
   job.channel_id = fc.channel_id || null;
+  } // end if(!existingCh): skip connect+fundchannel when a channel already exists (A10)
 
   // 3. Watch the channel to CHANNELD_NORMAL.
   job.status = 'awaiting_lockin';

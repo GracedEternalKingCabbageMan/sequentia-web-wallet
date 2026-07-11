@@ -88,22 +88,47 @@ export function acceptUpgrade(req, socket) {
 // `{ tcpHost, tcpPort }`, retrying the dial for up to `tcpRetryMs` (lightningd may
 // not have exec'd the proxy that binds the responder yet). `log` is optional.
 // Fail-closed: if the target never comes up, the WebSocket is closed.
-export function bridgeWsToTcp(wsSocket, req, { tcpHost, tcpPort, tcpRetryMs = 20000, log = () => {}, id = 0 }) {
+//
+// KEEPALIVE (funds-critical): a browser tab that sleeps or a phone that drops off
+// the network severs the device's WebSocket WITHOUT a TCP RST — the OS never
+// delivers a 'close'/'error', so this bridge would hold its proxy TCP ESTAB
+// forever. The hosted proxy, blocked reading that now-silent link, then wedges
+// the whole hosted node. To prevent that half-dead link we send a WebSocket PING
+// every `pingMs` and shut the bridge down (closing the proxy TCP -> the proxy
+// sees a clean EOF and awaits a reconnect) if no ws frame arrives within
+// `pongTimeoutMs`. Set `pingMs = 0` to disable (used only to isolate the
+// proxy-side recovery in tests).
+export function bridgeWsToTcp(wsSocket, req, { tcpHost, tcpPort, tcpRetryMs = 20000, log = () => {}, id = 0, pingMs = 15000, pongTimeoutMs = 0 }) {
   const peer = `${req.socket.remoteAddress}:${req.socket.remotePort}`;
   log(`#${id} WebSocket up from ${peer}; dialing ${tcpHost}:${tcpPort}`);
+  if (!pongTimeoutMs) pongTimeoutMs = pingMs ? pingMs * 2 : 0;
 
   const dec = new FrameDecoder();
   let tcp = null, tcpReady = false, closed = false, wsToTcp = 0, tcpToWs = 0;
   let pending = [];
+  let lastAlive = Date.now();
+  let keepalive = null;
 
   const wsSend = (opcode, payload) => { if (!wsSocket.destroyed) wsSocket.write(encodeFrame(opcode, payload)); };
   const shutdown = (why) => {
     if (closed) return; closed = true;
+    if (keepalive) { clearInterval(keepalive); keepalive = null; }
     log(`#${id} closing (${why}); relayed ws->tcp ${wsToTcp}B, tcp->ws ${tcpToWs}B`);
     try { wsSend(0x8, Buffer.alloc(0)); } catch {}
     try { wsSocket.destroy(); } catch {}
     try { tcp?.destroy(); } catch {}
   };
+  if (pingMs > 0) {
+    keepalive = setInterval(() => {
+      if (closed) return;
+      if (Date.now() - lastAlive > pongTimeoutMs) {
+        shutdown('ws keepalive timeout (device silent — likely tab asleep/offline)');
+        return;
+      }
+      try { wsSend(0x9, Buffer.alloc(0)); } catch {}   // ping
+    }, pingMs);
+    if (keepalive.unref) keepalive.unref();
+  }
 
   const deadline = Date.now() + tcpRetryMs;
   const dial = () => {
@@ -130,11 +155,12 @@ export function bridgeWsToTcp(wsSocket, req, { tcpHost, tcpPort, tcpRetryMs = 20
 
   wsSocket.setNoDelay(true);
   wsSocket.on('data', (chunk) => {
+    lastAlive = Date.now();   // ANY inbound ws frame proves the device is alive
     dec.push(chunk);
     for (const { opcode, payload } of dec.frames()) {
       if (opcode === 0x8) { shutdown('ws close'); return; }   // close
       if (opcode === 0x9) { wsSend(0xA, payload); continue; } // ping->pong
-      if (opcode === 0xA) { continue; }                       // pong: ignore
+      if (opcode === 0xA) { continue; }                       // pong: refresh only
       if (tcpReady) { tcp.write(payload); wsToTcp += payload.length; }
       else { pending.push(payload); }
     }

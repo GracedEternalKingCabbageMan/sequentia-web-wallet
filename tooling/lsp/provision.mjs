@@ -72,6 +72,15 @@ export function makeProvisioner(opts) {
   fs.mkdirSync(CFG.dir, { recursive: true });
   const REG = path.join(CFG.dir, 'registry.json');
 
+  // Boot debounce (idempotency): bootNode spawns a lightningd + a ws relay, so two
+  // near-simultaneous provision calls for the SAME down node (e.g. the wallet AND the
+  // LSP racing) would spawn DUPLICATE relays on one ws-port — the loser crashes with
+  // EADDRINUSE and leaves a half-booted mess. This per-key in-process lock coalesces
+  // those into ONE boot: a second boot for a key booted within BOOT_DEBOUNCE_MS is a
+  // no-op (the first boot is still coming up). Keyed per provisioner (LSP process).
+  const bootedAt = new Map();
+  const BOOT_DEBOUNCE_MS = 20000;
+
   const load = () => { try { return JSON.parse(fs.readFileSync(REG, 'utf8')); } catch { return { nodes: {}, seq: 0 }; } };
   const save = (r) => fs.writeFileSync(REG, JSON.stringify(r, null, 2));
 
@@ -180,7 +189,15 @@ export function makeProvisioner(opts) {
   }
 
   // Boot (or re-boot) lightningd + the ws relay for a node record, detached.
+  // IDEMPOTENT: coalesces a boot race for the same key (see bootedAt above) so we
+  // never spawn a duplicate relay/lightningd. Returns true if it actually booted.
   function bootNode(rec, deviceTransportPubkey) {
+    const prev = bootedAt.get(rec.key);
+    if (prev && (Date.now() - prev) < BOOT_DEBOUNCE_MS) {
+      // A boot for this node is already in flight; don't spawn a second relay.
+      return false;
+    }
+    bootedAt.set(rec.key, Date.now());
     const env = {
       ...process.env,
       SEQLN: path.dirname(path.dirname(CFG.lightningd)),
@@ -201,6 +218,7 @@ export function makeProvisioner(opts) {
       { detached: true, stdio: ['ignore', relayLog, relayLog] });
     rl.unref();
     rec.pids = { lightningd: ld.pid, relay: rl.pid };
+    return true;
   }
 
   // Guarantee a record always exposes a correct absolute rpc path. provision() sets it, but
