@@ -1727,6 +1727,7 @@ async function reconnectOwnNodes(){
       for(const c of _ownLnCandidates){ if(prov.has(c.key) && !_lnReconnectedLegs.has(c.leg) && !targets.includes(c.leg)) targets.push(c.leg); }
     }catch{ _lnDiscoveryDone = false; }   // endpoint not ready — try again on the next /status poll
   }
+  const readyKeys = [];
   for(const key of targets){
     _lnReconnectedLegs.add(key);                              // mark before await so a concurrent poll doesn't double-connect
     try{
@@ -1735,9 +1736,18 @@ async function reconnectOwnNodes(){
             deriveIdentity: ()=>{ const k=lnNodeIdentity(phrase,'btc'); return { transportPrivkey:k.deviceTransportPrivkey, signingSeed:k.deviceSigningSeed }; } })
         : await provisionAndConnect({ chain:'seq', assetId: key, label: assetMeta(key).ticker, policy:lnPolicy(),
             deriveIdentity: (id)=>lnDeriveAsset(phrase, id) });
-      if(prov && prov.connected){ console.log('[ln] reconnected own node', key==='btc'?'BTC':assetMeta(key).ticker); try{ lnStatusPill(); }catch{} }
+      if(prov && prov.connected){ readyKeys.push(prov.key); console.log('[ln] reconnected own node', key==='btc'?'BTC':assetMeta(key).ticker); try{ lnStatusPill(); }catch{} }
       else _lnReconnectedLegs.delete(key);                    // not connected — let the next poll retry
     }catch(e){ _lnReconnectedLegs.delete(key); console.warn('[ln] own-node reconnect failed', key, e?.message??e); }
+  }
+  // A just-reconnected node needs a moment to finish HSM init + boot before /status can read its
+  // channels. Wait for each, then re-poll ONCE so the reconnected channel folds into the balance
+  // immediately — otherwise the card keeps showing "Not in Lightning yet" until the next tab-switch.
+  // Re-poll directly (not via refreshLnStatus, which would re-enter this function).
+  if(readyKeys.length){
+    for(const k of readyKeys){ try{ await waitNodeReady({ nodeKey:k, onProgress:()=>{} }); }catch{} }
+    try{ lnLastStatus = await seqlnGetStatus(); }catch{}
+    try{ renderBalance(); lnStatusPill(); }catch{}
   }
 }
 // TEMP DEBUG (remove after diagnosing auto-reconnect display): inspect the discovery + reconnect.
