@@ -770,7 +770,7 @@ import { initXmaker, startForwardMaker, startReverseMaker, liveMakerOffers, resu
 import { initSeqln, connectDevice as lnConnectDevice, disconnectDevice as lnDisconnect,
   onSeqlnStatus, seqlnState, seqlnAvailable, seqlnGetStatus, seqlnListNodes, seqlnSwap, seqlnBook, seqlnPostOffer, lnFinalityCopy,
   seqlnChannelInbound, seqlnNodeInvoice, seqlnInvoiceStatus, seqlnNodeSettle,
-  seqlnChannels, seqlnFunding, fundChannel, provisionAndConnect, waitNodeReady, provisionedState,
+  seqlnChannels, seqlnFunding, fundChannel, resumeFundChannel, provisionAndConnect, waitNodeReady, provisionedState,
   deviceTransportPubkey, registerOwnStatusKeys, closeChannelLsp } from './seqln.js';
 import { lnDeriveNode, lnDeriveAsset } from './seqln-keys.js';
 
@@ -1593,6 +1593,9 @@ async function openWallet(phrase){
   // A sub-asset SELL that paid the asset over LN but whose on-chain BTC claim never confirmed:
   // re-attempt the claim from the persisted preimage + HTLC terms (the claim is the fund step).
   try{ resumeSell(); }catch(e){ console.warn('[resume] sub-asset sell resume failed:', e?.message??e); }
+  // Finish a Move-to-Lightning that was interrupted after its deposit landed (funds on the user's
+  // own node, never lost) — self-healing so a network blip / reload can't strand a deposit.
+  try{ resumeMove(); }catch(e){ console.warn('[resume] move resume failed:', e?.message??e); }
   // Lightning (LSP): bring the on-device signer online so the "Instant (Lightning)"
   // swap rail becomes available. Non-fatal + opt-in: if the wss endpoint / host key
   // aren't configured, LN stays off and the composer uses the on-chain rail.
@@ -1913,6 +1916,35 @@ function closeToChainDialog(leg, own){
   c.appendChild(st); c.appendChild(row);
   m.appendChild(c); document.body.appendChild(m);
 }
+// A Move-to-Lightning that got past the on-chain deposit but not the channel open leaves the funds
+// on the user's OWN node — recoverable, never lost. Persist just enough to FINISH it: on the next
+// wallet open, resumeMove reconnects the node's signer and funds the channel from the already-landed
+// deposit (no re-deposit). This is what makes the move self-healing instead of stranding funds.
+const MOVE_KEY = 'swk.ln.pendingMove.v1';
+function saveMoveState(rec){ try{ localStorage.setItem(MOVE_KEY, JSON.stringify(rec)); }catch{} }
+function loadMoveState(){ try{ return JSON.parse(localStorage.getItem(MOVE_KEY) || 'null'); }catch{ return null; } }
+function clearMoveState(){ try{ localStorage.removeItem(MOVE_KEY); }catch{} }
+async function resumeMove(){
+  const rec = loadMoveState();
+  if(!rec || !rec.node) return;
+  const phrase = (localStorage.getItem(KEY)||'').trim();
+  if(!phrase) return;
+  try{
+    // The node's device signer MUST be online to co-sign the fundchannel (it may have dropped since
+    // the interrupted attempt); reconnect it (idempotent), wait for the node, then finish the open.
+    const prov = rec.chain==='btc'
+      ? await provisionAndConnect({ chain:'btc', label:'BTC', policy:lnPolicy(), deriveIdentity: ()=>{ const k=lnNodeIdentity(phrase,'btc'); return { transportPrivkey:k.deviceTransportPrivkey, signingSeed:k.deviceSigningSeed }; } })
+      : await provisionAndConnect({ chain:'seq', assetId: rec.asset, label: rec.ticker, policy:lnPolicy(), deriveIdentity: (id)=>lnDeriveAsset(phrase, id) });
+    if(!(prov && prov.connected)) return;   // signer not up yet — a later open retries
+    try{ await waitNodeReady({ nodeKey: prov.key, onProgress:()=>{} }); }catch{}
+    await resumeFundChannel({ chain: rec.chain, asset: rec.asset || undefined, amount: rec.amount, node: prov.key, onProgress:()=>{} });
+    clearMoveState();
+    try{ rememberOwnLnLeg(rec.chain==='btc' ? 'btc' : String(rec.asset||'').toLowerCase()); }catch{}
+    try{ toast('Finished moving '+rec.ticker+' to Lightning'); }catch{}
+    try{ await sync(); }catch{}
+    try{ renderBalance(); renderLightningBalance(); }catch{}
+  }catch(e){ console.warn('[ln] resume move (will retry on next open):', e?.message??e); }
+}
 // Modal: choose an amount, then run the non-custodial Move-to-Lightning flow.
 function moveToLightningDialog(leg){
   const avail = BigInt(leg.onchain||0n);
@@ -1964,11 +1996,19 @@ function moveToLightningDialog(leg){
       //    fundchannel are both routed to prov.key (the user's provisioned node), never the
       //    shared demo node. The wallet signs the on-chain deposit itself (lnSendDeposit).
       say('Your Lightning node is ready. Preparing the on-chain deposit…');
+      // Record enough to FINISH this move if it is interrupted after the deposit lands (network
+      // blip / reload). Persisted the moment the deposit is sent; cleared once the channel opens.
+      const moveRec = { chain: leg.chain, asset: leg.asset || undefined, amount: Number(atoms), node: prov.key, ticker: leg.ticker, precision: leg.precision };
       const res = await fundChannel({
         chain: leg.chain, asset: leg.asset || undefined, amount: Number(atoms), node: prov.key,
         sendOnchain: lnSendDeposit,
-        onProgress: (e)=>{ if(phaseCopy[e.phase]) say(phaseCopy[e.phase]); },
+        onProgress: (e)=>{
+          if(e.phase==='sent'){ try{ saveMoveState(moveRec); }catch{} }   // deposit is now on the node — a reload can finish the open
+          if(e.phase==='reconnecting'){ say('Connection hiccup — reconnecting (your deposit is safe; this will finish)…'); return; }
+          if(phaseCopy[e.phase]) say(phaseCopy[e.phase]);
+        },
       });
+      try{ clearMoveState(); }catch{}   // channel opened — the move is complete
       st.className='status ok';
       st.textContent = 'Done. Lightning channel '+(res.short_channel_id||'')+' is active'
         + (res.spendable_msat!=null ? (' with '+fmtAtoms(BigInt(Math.round(res.spendable_msat/1000)), leg.precision)+' '+leg.ticker+' spendable.') : '.');
