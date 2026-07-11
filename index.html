@@ -2070,6 +2070,11 @@ function initSwapTab(){
       hasReverseInFlight: () => hasReverseInFlight(),
       renderReverse: () => renderReverse(),
     },
+    // The BTC-leg bridge (parent-chain testnet4): derive the taker's dedicated claim/refund keys
+    // and claim/refund a maker's on-chain HTLC. The sub-asset SELL claims the maker's BTC HTLC here
+    // with the Lightning-revealed preimage (device claim key — the LSP never sees it). Without this
+    // in the composer context C.btcLeg is undefined and startSell fails its claim-service guard.
+    btcLeg,
     // Instant Lightning (pure-LN) rail: the composer's "Instant (Lightning)"
     // route for a BTC<->asset pair. Non-custodial via the hosted-signer LSP (the
     // device co-signs; the LSP commands the hosted node to take a pure-LN offer).
