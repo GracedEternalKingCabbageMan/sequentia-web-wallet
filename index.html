@@ -763,12 +763,12 @@ import init, { Mnemonic, Network, Signer, Wollet, EsploraClient, Address, AssetI
   scriptToAddress, buildCovenantFillTx }
   from './pkg/lwk_wasm.js';
 import { HDKey, mnemonicToSeedSync, btc, schnorr } from './btc.js';
-import { initSwap, renderSwap, resumeCrossMakers, resumeCovenantOrders, resumeMixedSwap, scanCovenantCompanion } from './swap.js';
+import { initSwap, renderSwap, resumeCrossMakers, resumeCovenantOrders, resumeMixedSwap, resumeSell, scanCovenantCompanion } from './swap.js';
 import { initXswap, renderXswap, fetchXmarkets, fetchXquote, fetchXbook, openFromComposer, hasInFlight } from './xswap.js';
 import { initXrswap, fetchRQuote, openReverseFromComposer, hasInFlight as hasReverseInFlight, renderReverse } from './xrswap.js';
 import { initXmaker, startForwardMaker, startReverseMaker, liveMakerOffers, resumeMakerSwaps } from './xmaker.js';
 import { initSeqln, connectDevice as lnConnectDevice, disconnectDevice as lnDisconnect,
-  onSeqlnStatus, seqlnState, seqlnAvailable, seqlnGetStatus, seqlnSwap, lnFinalityCopy,
+  onSeqlnStatus, seqlnState, seqlnAvailable, seqlnGetStatus, seqlnSwap, seqlnBook, seqlnPostOffer, lnFinalityCopy,
   seqlnChannels, seqlnFunding, fundChannel, provisionAndConnect, waitNodeReady, provisionedState,
   deviceTransportPubkey, registerOwnStatusKeys, closeChannelLsp } from './seqln.js';
 import { lnDeriveNode, lnDeriveAsset } from './seqln-keys.js';
@@ -1394,6 +1394,27 @@ const btcLeg = {
   async claim({ txid, vout, amount, redeem_script, preimage }){
     return await btcHtlcSpend({ branch:'claim', txid, vout, amount, redeem_script, preimage, signNode: btcHtlcClaimNode() });
   },
+  // INDEPENDENTLY verify a maker's BTC HTLC binds OUR claim key + H before we trust it: rebuild
+  // the Design-A redeemScript from (H, ourClaimPub, makerRefundPub, T_btc) and byte-compare it to
+  // the reported redeem_script, confirm the on-chain P2SH matches, and confirm our preimage hashes
+  // to H. Throws on any mismatch — never trust the LSP's word about the on-chain leg.
+  async verifyClaimable({ redeem_script, hash_h, claim_pub, maker_refund_pub, t_btc, preimage, txid, vout, amount }){
+    const ours = this.claimKey().public_key.toLowerCase();
+    if ((claim_pub||'').toLowerCase() !== ours)
+      throw new Error('The BTC HTLC is not locked to this wallet’s claim key.');
+    const rebuilt = buildSeqHtlcRedeemScript(hash_h, claim_pub, maker_refund_pub, Number(t_btc)).toLowerCase();
+    if (rebuilt !== (redeem_script||'').toLowerCase())
+      throw new Error('The BTC HTLC redeem script does not match H + the claim/refund keys.');
+    if (preimage){
+      const h = hexOfBytes(new Uint8Array(await crypto.subtle.digest('SHA-256', bytesOfHex(preimage))));
+      if (h.toLowerCase() !== (hash_h||'').toLowerCase()) throw new Error('The revealed preimage does not hash to H.');
+    }
+    // Confirm the funding output actually exists on-chain with the expected P2SH + amount.
+    const f = await this.findFunding(txid, redeem_script).catch(() => null);
+    if (!f || f.vout !== vout) throw new Error('The BTC HTLC funding output was not found on-chain.');
+    if (amount != null && BigInt(f.value) !== BigInt(amount)) throw new Error('The BTC HTLC on-chain amount does not match the quote.');
+    return true;
+  },
   // Refund the BTC leg via the CLTV/ELSE branch after T_btc:
   // scriptSig <sig> OP_0 <redeemScript>, nLockTime=locktime, non-final sequence.
   async refund({ txid, vout, amount, redeem_script, locktime }){
@@ -1568,6 +1589,9 @@ async function openWallet(phrase){
   // its CLTV timeout, so a persisted in-flight swap MUST resume its trade-process view +
   // Refund off-ramp after a reload (fund-safety).
   try{ resumeMixedSwap(); }catch(e){ console.warn('[resume] submarine-swap resume failed:', e?.message??e); }
+  // A sub-asset SELL that paid the asset over LN but whose on-chain BTC claim never confirmed:
+  // re-attempt the claim from the persisted preimage + HTLC terms (the claim is the fund step).
+  try{ resumeSell(); }catch(e){ console.warn('[resume] sub-asset sell resume failed:', e?.message??e); }
   // Lightning (LSP): bring the on-device signer online so the "Instant (Lightning)"
   // swap rail becomes available. Non-fatal + opt-in: if the wss endpoint / host key
   // aren't configured, LN stays off and the composer uses the on-chain rail.
@@ -2009,6 +2033,20 @@ function initSwapTab(){
       // node informs the composer's "node ready, fund a channel" gating nuance.
       provisioned: () => provisionedState(),
       swap: (p) => seqlnSwap(p),
+      // Sub-asset order book: dynamic rail gating (sell_available/buy_available) + resting
+      // offers, and posting the wallet's own signed resting offer (LSP never signs).
+      book: (asset) => seqlnBook(asset),
+      postOffer: (o) => seqlnPostOffer(o),
+      // The registry node_key for the user's OWN hosted LN node for `assetHex`
+      // (seq:<asset>:<deviceTransportPubkey>) — matches refreshOwnLnNodeKeys. Needed by the
+      // sub-asset sell/buy /swap calls to name which hosted node pays over Lightning.
+      assetNodeKey: async (assetHex) => {
+        const phrase = (localStorage.getItem(KEY) || '').trim();
+        if (!phrase) throw new Error('Your wallet is locked; unlock it and try again.');
+        const id = lnDeriveAsset(phrase, assetHex);
+        const pub = await deviceTransportPubkey(id.transportPrivkey);
+        return 'seq:' + assetHex.toLowerCase() + ':' + String(pub).toLowerCase();
+      },
       finalityCopy: () => lnFinalityCopy(),
       // Open a Lightning channel for a leg INLINE — the SAME non-custodial provision+fund flow as
       // the Balance-tab Move-to-Lightning (moveToLightningDialog), exposed so the Swap composer can

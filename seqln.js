@@ -355,11 +355,29 @@ export function closeChannelLsp({ chain = 'seq', asset, node, scid, destination,
 //     over Lightning). Anchor-gated; returns finality:'confirming' (anchor-bound).
 // Rails are only serialized when present, so the pure-LN call is byte-identical to
 // before (the LSP treats a missing rail as ln/ln).
-export function seqlnSwap({ side, asset, amount, payRail, recvRail }) {
+export function seqlnSwap({ side, asset, amount, payRail, recvRail, node_key, btc_claim_pub }) {
   const body = { side, asset, amount };
   if (payRail) body.payRail = payRail;
   if (recvRail) body.recvRail = recvRail;
+  // Sub-asset SELL (pay asset over LN, receive BTC on-chain): the LSP drives the LN payment
+  // from the user's OWN hosted node (`node_key`) and returns P + the BTC HTLC terms WITHOUT
+  // claiming — the wallet then claims on-chain with the device key matching `btc_claim_pub`.
+  if (node_key) body.node_key = node_key;
+  if (btc_claim_pub) body.btc_claim_pub = btc_claim_pub;
   return lspFetch('/swap', { method: 'POST', body: JSON.stringify(body) });
+}
+
+// The sub-asset order book for an asset: { sell_available, buy_available, sell_offers[],
+// buy_offers[] }. Drives DYNAMIC rail gating (light the toggle only when real resting
+// counterparty liquidity exists — for ANY asset, no hardcoded maker list) and the book view.
+export function seqlnBook(asset) {
+  return lspFetch('/book?asset=' + encodeURIComponent(asset));
+}
+
+// Post a resting sub-asset offer the wallet signed itself (the LSP never signs). `offer` is
+// the signed Offer protojson. Returns { offer_id, status }.
+export function seqlnPostOffer(offer) {
+  return lspFetch('/offer', { method: 'POST', body: JSON.stringify({ offer }) });
 }
 
 // Just the channel list from /status (leg-tagged, per-asset spendable/receivable), for

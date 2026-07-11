@@ -577,6 +577,10 @@ function updateRails(){
     && ((pay === 'BTC') !== (receive === 'BTC'));   // exactly one side is BTC
   if (btcPair && lnAvailable()){
     box.classList.remove('hide');
+    // Probe the sub-asset order book for this pair's asset (async, cached) so the sub-asset
+    // BUY/SELL rails light from LIVE liquidity, not a hardcoded list. When it lands it may
+    // re-run updateRails to reflect a flipped availability.
+    try { refreshSubassetBook(pay === 'BTC' ? receive : pay); } catch {}
     // HONEST per-asset gating: a leg may sit on Lightning ONLY when THAT asset (or BTC)
     // has a real, usable channel with the liquidity the leg's direction needs. There is
     // no silent submarine-funding of a cold channel — a leg with no channel defaults to
@@ -625,15 +629,35 @@ function renderRailNote(ra){
   const b = C.$('swRailMove');
   if (b) b.onclick = () => { if (C.gotoLightning) C.gotoLightning(); else try { C.toast('Open a Lightning channel from the Balance tab.'); } catch {} };
 }
-// Assets with a deployed SUB-ASSET maker (asset over Lightning + BTC ON-CHAIN HTLC),
-// so a BUY may offer the pay=chain/recv=ln rail for them. GATED, not blanket-enabled:
-// the LSP fails closed (HTTP 422) for any pair without a maker, and this list keeps
-// unsupported pairs unselectable in the UI. Extend as more sub-asset makers deploy (or
-// wire it from an LSP capability probe).
-const SUBASSET_ASSETS = new Set([
-  '3a0f9192219db59f8d7f87d93ac6311095dfe1255d149727b87baaa7d2cc71a1', // GOLD (live sub-asset maker)
-]);
-function subassetCapable(seqAssetHex){ return !!seqAssetHex && SUBASSET_ASSETS.has(seqAssetHex); }
+// DYNAMIC sub-asset rail availability from the order book (L.book) — NO hardcoded maker
+// list. The sub-asset relays are a permissionless signed-intent book, so a rail is offered
+// only when REAL resting counterparty liquidity exists, for ANY asset (a deployed maker is
+// just seed liquidity, one offer among many). `buy_available` = someone rests an offer
+// paying the asset over LN (a BTC-on-chain BUYER can take it → the sub-asset BUY rail);
+// `sell_available` = someone rests an offer locking BTC on-chain (an asset-over-LN SELLER
+// can take it → the sub-asset SELL rail). Populated by refreshSubassetBook(); railSupported
+// reads it synchronously, so the toggle lights once the async probe lands.
+const SUBASSET_BOOK = {};   // assetHexLower -> { sell_available, buy_available, sell_offers, buy_offers, ts }
+function subassetCapable(seqAssetHex){ const e = seqAssetHex && SUBASSET_BOOK[seqAssetHex.toLowerCase()]; return !!(e && e.buy_available); }
+function sellCapable(seqAssetHex){ const e = seqAssetHex && SUBASSET_BOOK[seqAssetHex.toLowerCase()]; return !!(e && e.sell_available); }
+function subassetOffers(seqAssetHex, dir){ const e = seqAssetHex && SUBASSET_BOOK[seqAssetHex.toLowerCase()]; return (e && (dir === 'sell' ? e.sell_offers : e.buy_offers)) || []; }
+let _bookInflight = {};
+async function refreshSubassetBook(seqAssetHex){
+  if (!seqAssetHex || seqAssetHex === 'BTC' || !(L && L.book && lnAvailable())) return;
+  const k = seqAssetHex.toLowerCase();
+  const prev = SUBASSET_BOOK[k];
+  if (prev && (Date.now() - prev.ts) < 15000) return;   // ~15s cache
+  if (_bookInflight[k]) return; _bookInflight[k] = true;
+  try {
+    const b = await L.book(seqAssetHex);
+    const wasSell = !!(prev && prev.sell_available), wasBuy = !!(prev && prev.buy_available);
+    SUBASSET_BOOK[k] = { sell_available: !!b.sell_available, buy_available: !!b.buy_available,
+      sell_offers: b.sell_offers || [], buy_offers: b.buy_offers || [], ts: Date.now() };
+    // If availability flipped, re-gate + repaint the rails so the toggle tracks live liquidity.
+    if (wasSell !== !!b.sell_available || wasBuy !== !!b.buy_available){ try { updateRails(); } catch {} }
+  } catch { SUBASSET_BOOK[k] = { sell_available:false, buy_available:false, sell_offers:[], buy_offers:[], ts: Date.now() }; }
+  finally { _bookInflight[k] = false; }
+}
 
 // Is (payRail, recvRail) a rail combination with a backend for the current pair? Both
 // legs the same (pure-LN or fully on-chain) always work. Two mixed shapes exist:
@@ -657,7 +681,14 @@ function railSupported(p, r){
         && lnAvailable() && railAvail(S.payAsset, S.receiveAsset).recvLn.ok;
     return false;
   }
-  return (p === 'chain' && r === 'ln');           // sell: asset on-chain + BTC over LN
+  // SELL (pay the asset, receive BTC).
+  if (p === 'ln' && r === 'chain')
+    // Sub-asset SELL (pay asset over Lightning + receive BTC on-chain): gated on a deployed
+    // sell-maker for the asset AND the user actually holding it in a usable Lightning channel
+    // (payLn.ok) so they can pay the asset over LN. This is the direction that spends a
+    // Lightning asset balance for BTC.
+    return sellCapable(S.payAsset) && lnAvailable() && railAvail(S.payAsset, S.receiveAsset).payLn.ok;
+  return (p === 'chain' && r === 'ln');           // sell: asset on-chain + BTC over LN (submarine)
 }
 function wireRailSeg(id, leg){
   const seg = C.$(id); if (!seg || seg._wired) return; seg._wired = true;
@@ -2054,20 +2085,32 @@ async function reviewMixed(q){
   // Two mixed shapes settle: the submarine (asset on-chain + BTC-LN), and its MIRROR the
   // sub-asset (asset over LN + BTC on-chain) — a BUY only, gated to pairs with a maker.
   const isSubAsset = (side === 'buy' && assetLeg === 'ln' && btcLeg === 'chain');
+  // Sub-asset SELL: pay the asset over Lightning, receive BTC in an on-chain HTLC the wallet
+  // claims with the maker-revealed preimage. Gated on live sell-side book liquidity.
+  const isSubAssetSell = (side === 'sell' && assetLeg === 'ln' && btcLeg === 'chain');
   const isSubmarine = (assetLeg === 'chain' && btcLeg === 'ln');
-  if (!(isSubmarine || (isSubAsset && subassetCapable(q.seqAsset)))){
-    $('swErr').textContent = `This mixed combination (${am.ticker} over Lightning + BTC on-chain) has no maker for this pair yet. `
-      + `For now: put ${am.ticker} on-chain and BTC on Lightning, or set both legs the same way.`;
-    try { C.toast('That mixed direction has no maker for this pair yet — put the asset on-chain and BTC on Lightning.'); } catch {}
+  if (!(isSubmarine || (isSubAsset && subassetCapable(q.seqAsset)) || (isSubAssetSell && sellCapable(q.seqAsset)))){
+    $('swErr').textContent = `This mixed combination (${am.ticker} over Lightning + BTC on-chain) has no resting liquidity for this pair yet. `
+      + `Put ${am.ticker} on-chain and BTC on Lightning, or set both legs the same way.`;
+    try { C.toast('No resting liquidity for that mixed direction yet.'); } catch {}
     return;
   }
   const amount = parseFloat((($('swPayAmt').value || '') + '').trim()) || null;
   const dir = isSubAsset
     ? `Buy ${am.ticker} with Bitcoin on-chain · receive ${am.ticker} over Lightning`
+    : isSubAssetSell
+    ? `Sell ${am.ticker} over Lightning · receive Bitcoin on-chain`
     : (side === 'buy'
       ? `Buy ${am.ticker} with Bitcoin over Lightning · receive ${am.ticker} on-chain`
       : `Sell ${am.ticker} on-chain · receive Bitcoin over Lightning`);
-  const kv = isSubAsset ? [
+  const kv = isSubAssetSell ? [
+    ['Route', 'Mixed rails · you pay ' + am.ticker + ' over Lightning and receive Bitcoin in an on-chain HTLC your device claims, bound by one preimage'],
+    ['Direction', dir],
+    ['Pricing', 'Best resting offer · you take a party who locks BTC on-chain for your ' + am.ticker + ' (a maker or any posted offer)'],
+    ['Timing', 'You pay ' + am.ticker + ' over Lightning; the taker reveals the preimage on settle; your device claims the BTC on-chain with it.'],
+    ['Finality', 'The BTC arrives in a Bitcoin on-chain HTLC your device claims (final to Bitcoin); the ' + am.ticker + ' leg is over Lightning.'],
+    ['If it stalls', 'Nothing is lost · if the counterparty never settles, your Lightning payment auto-returns.'],
+  ] : isSubAsset ? [
     ['Route', 'Mixed rails · you pay Bitcoin in an on-chain HTLC and receive the asset over Lightning, bound by one preimage'],
     ['Direction', dir],
     ['Pricing', 'Best resting sub-asset offer · whole-swap lift (the LP\'s fixed terms)'],
@@ -2086,6 +2129,13 @@ async function reviewMixed(q){
   ok.onclick = async () => {
     modal.remove();
     resetComposer();
+    if (isSubAssetSell){
+      // Sub-asset SELL: pay the asset over LN, then CLAIM the maker's BTC HTLC on-chain with the
+      // revealed preimage (device claim key via the wasm's xchainBtcClaim). Persisted/resumable —
+      // the claim is the fund step and must survive a reload.
+      await startSell({ asset: q.seqAsset, amount, offer: q.sellOffer || null });
+      return;
+    }
     // Hand off to the persisted, RESUMABLE submarine stepper. The on-chain HTLC leg
     // must survive a page reload (it is only recoverable via its CLTV timeout otherwise),
     // so from here the swap lives in localStorage + the trade-process view, not a modal.
@@ -2093,6 +2143,84 @@ async function reviewMixed(q){
   };
 }
 
+// ===========================================================================
+// Sub-asset SELL flow — pay the asset over Lightning, then CLAIM the counterparty's BTC HTLC
+// on-chain with the maker-revealed preimage, using the device CLAIM key. FUND-CRITICAL: the
+// on-chain claim is built by the wasm's xchainBtcClaim (the audited legacy-P2SH spend that
+// mirrors the proven xchainBtcRefund) — never hand-rolled here. Flow: xchainBtcClaimPubkey ->
+// /swap {side:sell, node_key, btc_claim_pub, offer_id?} -> {settled, preimage, btc_htlc} ->
+// VERIFY the returned redeem_script by rebuilding it via xchainBtcHtlc -> xchainBtcClaim ->
+// broadcast. Persisted/resumable (the claim is the fund step, must survive a reload).
+// [Finalized + testnet-verified once xchainBtcClaim lands in the wasm — stubbed until then so
+//  the rail is gated honestly and never half-executes a real BTC claim.]
+const SELL_KEY = 'swk.subasset.sell';
+let SELL = null;
+function saveSell(){ try { localStorage.setItem(SELL_KEY, JSON.stringify(SELL)); } catch {} }
+function clearSell(){ SELL = null; try { localStorage.removeItem(SELL_KEY); } catch {} }
+// True while a sell is persisted with the preimage but its BTC claim is not yet confirmed —
+// the claim is the FUND step, so it must survive a reload (resumeSell re-attempts it).
+export function hasSellInFlight(){ return !!(SELL && SELL.state === 'claiming'); }
+
+async function startSell(params){
+  const { $ } = C;
+  const asset = params.asset, am = C.assetMeta(asset);
+  const modal = C.el('div','modal'); const card = C.el('div','card');
+  card.appendChild(C.el('label','lbl','Selling ' + am.ticker + ' over Lightning'));
+  const st = C.el('div','status'); card.appendChild(st);
+  const act = C.el('div','row'); act.style.marginTop = '12px';
+  const closeBtn = C.el('button','ghost','Close'); closeBtn.style.display = 'none'; closeBtn.onclick = () => modal.remove();
+  act.appendChild(closeBtn); card.appendChild(act);
+  modal.appendChild(card); document.body.appendChild(modal);
+  const say = (t, cls) => { st.className = 'status' + (cls ? ' ' + cls : ''); st.innerHTML = (cls ? '' : '<span class="spin"></span>') + esc(t); };
+  const done = () => { closeBtn.style.display = ''; };
+  try {
+    if (!(L && L.swap && L.assetNodeKey)) throw new Error('The Lightning service is unavailable in this build.');
+    if (!(C.btcLeg && C.btcLeg.claim && C.btcLeg.claimKey && C.btcLeg.verifyClaimable)) throw new Error('The BTC claim service is unavailable in this build.');
+    say('Preparing your sell…');
+    const btc_claim_pub = C.btcLeg.claimKey().public_key;   // the device claim key; only we can claim
+    const node_key = await L.assetNodeKey(asset);           // our own hosted asset node pays over LN
+    const offer = params.offer || null;
+    // Pay the asset over Lightning (LSP drives the hold-invoice pay from our node; device co-signs).
+    // On settle the maker reveals the preimage, returned here WITH the BTC HTLC terms — the LSP
+    // never claims (no claim key) and we claim on-chain ourselves.
+    say('Paying ' + am.ticker + ' over Lightning…');
+    const resp = await L.swap({ side: 'sell', asset, node_key, btc_claim_pub, amount: params.amount,
+      offer_id: offer && offer.offer_id, maker_pubkey: offer && offer.maker_pubkey });
+    if (!(resp && resp.settled && resp.preimage && resp.btc_htlc)) throw new Error(resp && resp.error ? resp.error : 'The sell did not settle over Lightning.');
+    const H = resp.btc_htlc;
+    // Persist BEFORE the on-chain claim: the asset is now paid, so the BTC claim is the fund step
+    // and MUST survive a reload — resumeSell() re-attempts it from here.
+    SELL = { state: 'claiming', asset, ticker: am.ticker, preimage: resp.preimage, hash_h: resp.hash_h, btc_htlc: H, ts: mixedTip() }; saveSell();
+    say('Preimage revealed — verifying and claiming your BTC on-chain…');
+    await claimSell();   // verify + claim; updates SELL + st
+    say('Done. You paid ' + am.ticker + ' over Lightning and claimed BTC on-chain (' + String(SELL.claim_txid || '').slice(0,16) + '…).', 'ok');
+    done();
+    try { await C.sync(); } catch {}
+    clearSell();
+  } catch (e){
+    // If the asset was already paid (SELL persisted), keep it for re-claim on reload — never lose it.
+    say('Failed: ' + C.prettyErr(e) + (SELL && SELL.state === 'claiming' ? ' — your BTC is still claimable; reopen the wallet to retry the claim.' : ''), 'err');
+    done();
+  }
+}
+// Verify the maker's BTC HTLC binds our claim key + H, then claim it on-chain with the preimage.
+// Idempotent-ish: a duplicate claim of an already-spent HTLC just errors, which we surface.
+async function claimSell(){
+  const H = SELL.btc_htlc;
+  await C.btcLeg.verifyClaimable({ redeem_script: H.redeem_script, hash_h: SELL.hash_h,
+    claim_pub: H.taker_claim_pubkey, maker_refund_pub: H.maker_refund_pubkey, t_btc: H.t_btc,
+    preimage: SELL.preimage, txid: H.txid, vout: H.vout, amount: H.amount });
+  const claimTxid = await C.btcLeg.claim({ txid: H.txid, vout: H.vout, amount: H.amount, redeem_script: H.redeem_script, preimage: SELL.preimage });
+  SELL.state = 'done'; SELL.claim_txid = (claimTxid && claimTxid.toString) ? claimTxid.toString() : String(claimTxid); saveSell();
+}
+// On wallet load: if a sell paid the asset but its BTC claim never confirmed, re-attempt the
+// claim (the preimage + HTLC terms are persisted). This is the fund-recovery path.
+export async function resumeSell(){
+  try { SELL = JSON.parse(localStorage.getItem(SELL_KEY) || 'null'); } catch { SELL = null; }
+  if (!SELL || SELL.state !== 'claiming' || !SELL.preimage || !SELL.btc_htlc) return;
+  try { await claimSell(); try { C.toast && C.toast('Recovered your sell — BTC claimed on-chain (' + String(SELL.claim_txid||'').slice(0,16) + '…).'); } catch {} try { await C.sync(); } catch {} clearSell(); }
+  catch (e){ /* leave persisted; the HTLC may already be claimed, or needs a retry — surfaced when the user re-enters Swap */ }
+}
 // ===========================================================================
 // Mixed-rail (submarine) swap — PERSISTED + RESUMABLE trade-process view.
 // The asset leg is an anchored on-chain HTLC; if the swap stalls the ONLY recovery is
