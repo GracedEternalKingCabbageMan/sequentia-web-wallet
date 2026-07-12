@@ -480,9 +480,11 @@
         <p class="sub" style="margin:0 0 10px">Restricted assets settle on the OpenAMP enclave ledger. Give a sender your account id (AID), or the enclave deposit address for a specific asset.</p>
         <label class="lbl">Your account id (AID)</label>
         <div class="mono" id="recvOampAid" style="margin:4px 0 10px">—</div>
+        <img id="recvOampAidQr" alt="AID QR" style="image-rendering:pixelated;border:12px solid #fff;width:180px;height:180px;display:none;margin:0 0 10px">
         <label class="lbl">Deposit address for</label>
         <select id="recvOampAsset" style="width:100%;margin-top:4px"></select>
         <div class="mono" id="recvOampAddr" style="margin-top:10px">—</div>
+        <img id="recvOampAddrQr" alt="Deposit address QR" style="image-rendering:pixelated;border:12px solid #fff;width:180px;height:180px;display:none;margin-top:10px">
       </div>
     </section>
 
@@ -794,7 +796,8 @@
 <script type="module">
 import init, { Mnemonic, Network, Signer, Wollet, EsploraClient, Address, AssetId, Txid, Contract, Pset, Transaction,
   generateSwapSecret, buildSeqHtlcRedeemScript, buildSeqHtlcClaimTx, buildSeqHtlcRefundTx,
-  scriptToAddress, buildCovenantFillTx }
+  scriptToAddress, buildCovenantFillTx,
+  openampComputeAid, enclaveSighash, decodeEnclaveSpend, stringToQr }
   from './pkg/lwk_wasm.js';
 import { HDKey, mnemonicToSeedSync, btc, schnorr } from './btc.js';
 import { initSwap, renderSwap, resumeCrossMakers, resumeCovenantOrders, resumeMixedSwap, resumeSell, resumeBuy, hasBuyInFlight, scanCovenantCompanion, setConfidentialReceive, confidentialReceive } from './swap.js';
@@ -892,17 +895,25 @@ function sendPrecision(hex){
 
 // ---------- OpenAMP restricted assets ----------
 // OpenAMP is an enclave-custodied ledger for restricted (permissioned/clawback) assets that live
-// off the transparent Sequentia UTXO set. A wallet identity there is an "AID", registered from the
-// same wallet-derived key we use for HTLC claims (deterministic → the same key always maps to the
-// same AID, so registration is idempotent). Restricted balances/transfers are equal-standing rows
-// in the same UI as every on-chain asset — NO privileged label or badge (principle 3).
+// off the transparent Sequentia UTXO set. A wallet identity there is an "AID", derived from the
+// canonical enclave key at BIP32 m/5/0 (spec 1.1; matches Ambra) — deterministic, so the same seed
+// always maps to the same AID and registration is idempotent. The secret NEVER leaves Rust: signing
+// happens inside the SWK signer (openampSignSighash), so there is no key material in the JS heap.
+// Restricted balances/transfers are equal-standing rows in the same UI as every on-chain asset — NO
+// privileged label or badge (principle 3).
 // Dropdown/route values are prefixed "oamp:<assetId>" so the send/receive paths can tell an enclave
 // transfer apart from an on-chain (lwk) or BTC send without colliding with 64-hex on-chain ids.
-let OAMP_XONLY='';        // 32-byte x-only pubkey hex (this wallet's enclave identity key)
-let OAMP_SECRET='';       // matching 32-byte secret hex — signs enclave sighashes (BIP340 schnorr)
-let OAMP_AID='';          // enclave account id, from POST /v1/users
+let OAMP_XONLY='';        // 32-byte x-only pubkey hex (m/5/0 enclave identity key)
+let OAMP_AID='';          // enclave account id, from POST /v1/users (asserted == local AID)
 let oampAssets={};        // assetId -> { id, ticker, name, precision, clawback, confidential, ... }
 let oampBalances={};      // assetId -> { atoms:BigInt, utxos }
+let oampUser=null;        // GET /v1/users/{aid} -> { categories[], frozen } (defaults applied)
+// Legacy m/3/0 (SeqDEX-HTLC) identity: the wallet USED to register OpenAMP from this key (WW-1 bug).
+// We compute its AID and show any balances READ-ONLY under a "legacy identity" note. NO auto-migration
+// (that needs the platform to copy category grants onto the new AID; spec 1.9).
+let OAMP_LEGACY_XONLY='';
+let OAMP_LEGACY_AID='';
+let oampLegacyBalances={}; // assetId -> { atoms:BigInt, utxos } held by the legacy AID
 function isOampAsset(v){ return typeof v==='string' && v.startsWith('oamp:'); }
 function oampId(v){ return v.slice(5); }
 // Minimal hex<->bytes (btc.js keeps its own private; keep these local + explicit for the enclave path).
@@ -915,20 +926,38 @@ async function oampFetch(path, opts){
   if(!r.ok) throw new Error(j.error||j.message||('OpenAMP HTTP '+r.status));
   return j;
 }
-// Derive this wallet's enclave identity from the deterministic HTLC keypair, then register (idempotent).
-// Non-fatal: if OpenAMP isn't reachable the wallet keeps working, just without restricted-asset rows.
+// Derive this wallet's enclave identity at m/5/0, compute the AID LOCALLY, register (idempotent), then
+// ASSERT the server's AID equals the locally computed one (spec 1.3) — the server is never trusted to
+// name the account. Non-fatal: if OpenAMP isn't reachable the wallet keeps working, just without
+// restricted-asset rows. Registration failure must never block the rest of the wallet.
 async function oampInit(){
   try{
-    const kp=signer.htlcKeypair();            // { public_key: 33-byte compressed hex, secret_hex }
-    OAMP_XONLY=(kp.public_key||'').slice(2);  // x-only = drop the compressed-parity prefix byte
-    OAMP_SECRET=kp.secret_hex||'';
-    if(!(OAMP_XONLY.length===64 && OAMP_SECRET.length===64)) throw new Error('bad htlc keypair');
+    OAMP_XONLY=signer.openampXonlyPubkey();    // m/5/0 x-only pubkey hex; the secret stays in Rust
+    if(OAMP_XONLY.length!==64) throw new Error('bad m/5/0 enclave key');
+    const localAid=openampComputeAid([OAMP_XONLY]);   // spec 0.2, computed in wasm
     const j=await oampFetch('/v1/users', {method:'POST', headers:{'Content-Type':'application/json'},
       body:JSON.stringify({pubkeys:[OAMP_XONLY]})});
-    OAMP_AID=j.aid||'';
+    const serverAid=j.aid||'';
+    if(serverAid!==localAid) throw new Error('AID mismatch (server '+serverAid+' != local '+localAid+')');
+    OAMP_AID=localAid;
+    // Legacy m/3/0 identity: compute its AID (read-only). No secret is retained; balances only.
+    try{
+      const kp=signer.htlcKeypair();            // { public_key: 33-byte compressed hex }
+      OAMP_LEGACY_XONLY=(kp.public_key||'').slice(2);
+      if(OAMP_LEGACY_XONLY.length===64) OAMP_LEGACY_AID=openampComputeAid([OAMP_LEGACY_XONLY]);
+    }catch(e){ OAMP_LEGACY_AID=''; }
     await oampLoadAssets();
+    await oampRefreshUser();
     return true;
   }catch(e){ console.warn('[openamp] init skipped:', e?.message??e); OAMP_AID=''; return false; }
+}
+// Poll the user record (categories/frozen) for the frozen banner (spec 1.5(c)). categories/frozen are
+// omitempty on the wire, so default them (no categories, not frozen) — never treat absence as an error.
+async function oampRefreshUser(){
+  if(!OAMP_AID){ oampUser=null; return; }
+  try{ const j=await oampFetch('/v1/users/'+encodeURIComponent(OAMP_AID));
+    oampUser={ categories: Array.isArray(j.categories)?j.categories:[], frozen: !!j.frozen }; }
+  catch{ /* leave the previous record rather than blank it on a transient error */ }
 }
 async function oampLoadAssets(){
   try{
@@ -939,7 +968,7 @@ async function oampLoadAssets(){
 // Balance per restricted asset for this AID. atoms parsed to BigInt so it slots into the same
 // fmtAtoms/refValue machinery as on-chain rows.
 async function oampRefreshBalances(){
-  if(!OAMP_AID){ oampBalances={}; return; }
+  if(!OAMP_AID){ oampBalances={}; oampLegacyBalances={}; return; }
   const next={};
   await Promise.all(Object.keys(oampAssets).map(async id=>{
     try{ const j=await oampFetch('/v1/users/'+encodeURIComponent(OAMP_AID)+'/balance?asset='+encodeURIComponent(id));
@@ -947,6 +976,66 @@ async function oampRefreshBalances(){
     catch{ /* leave this asset out on error rather than fail the whole refresh */ }
   }));
   oampBalances=next;
+  // Legacy m/3/0 balances, READ-ONLY (shown under a "legacy identity" note; no migration here).
+  const legacy={};
+  if(OAMP_LEGACY_AID && OAMP_LEGACY_AID!==OAMP_AID){
+    await Promise.all(Object.keys(oampAssets).map(async id=>{
+      try{ const j=await oampFetch('/v1/users/'+encodeURIComponent(OAMP_LEGACY_AID)+'/balance?asset='+encodeURIComponent(id));
+        const a=BigInt(j.atoms||0); if(a>0n) legacy[id]={ atoms:a, utxos:j.utxos }; }
+      catch{ /* legacy AID may not exist; ignore */ }
+    }));
+  }
+  oampLegacyBalances=legacy;
+}
+// The parsed issuance contract for a restricted asset (openampd returns it embedded in the record).
+function oampContract(a){ const c=a&&a.contract; if(!c) return null;
+  if(typeof c==='string'){ try{ return JSON.parse(c); }catch{ return null; } } return c; }
+function oampTermsHash(a){ const c=oampContract(a); return (c && c.openamp && c.openamp.terms_hash) || ''; }
+// A plain-language restriction legend composed from the asset record + rules. No privileged framing:
+// this is disclosure, one row among equals (principle 3; spec 0.6/1.5(d)). No em dashes.
+function oampComposeLegend(a){
+  const parts=['Restricted asset: every transfer needs the policy server co-signature.'];
+  const r=(a&&a.rules)||{};
+  if(a&&a.clawback) parts.push('Issuer clawback is disclosed and in force.');
+  if(Array.isArray(r.allowed_categories) && r.allowed_categories.length) parts.push('Only eligible, categorised holders may receive it.');
+  if(r.lockin_until_height>0) parts.push('Locked until Sequentia block '+r.lockin_until_height+'.');
+  return parts.join(' ');
+}
+// One restricted-asset balance row, styled like every other asset row, with the restriction legend,
+// custody qualifier, terms link, and a Send affordance (WW-5). Legacy rows are read-only.
+function oampAssetRow(list, id, atoms, opts){
+  opts=opts||{}; const a=oampAssets[id]||{}; const meta=assetMeta('oamp:'+id);
+  const r=el('div','asset-row arow2');
+  const head=el('div','arow-head');
+  head.appendChild(el('span','tk', meta.ticker));
+  const mid=el('div','grow'); const sub=el('div');
+  sub.appendChild(txLink('/explorer/asset/'+id, id.slice(0,10)+'…'+id.slice(-6)));
+  if(opts.legacy){ const w=el('span','sub'); w.textContent=' · legacy identity (read-only)'; w.style.cssText='color:var(--amber2);margin-left:6px'; sub.appendChild(w); }
+  mid.appendChild(sub); head.appendChild(mid);
+  const amt=el('span','amt');
+  amt.appendChild(el('div',null, fmtAtoms(atoms, meta.precision)));
+  const ref=refValueStr('oamp:'+id, atoms); if(ref) amt.appendChild(el('div','sub', ref));
+  head.appendChild(amt); r.appendChild(head);
+  const det=el('div','ln-meta');
+  det.appendChild(el('div','sub', oampComposeLegend(a)));
+  det.appendChild(el('div','sub','Self-custodial subject to disclosed clawback and co-sign powers.'));
+  const th=oampTermsHash(a);
+  if(th){ const tl=el('div','sub'); tl.appendChild(document.createTextNode('Terms: '));
+    tl.appendChild(txLink('/explorer/asset/'+id, th.slice(0,16)+'…')); det.appendChild(tl); }
+  if(opts.legacy){ det.appendChild(el('div','sub','Held by this wallet’s legacy m/3/0 identity. Not spendable from here; moving it to the m/5/0 identity needs the platform.')); }
+  else { const acts=el('div','bal-acts'); const sb=el('button','ghost','Send'); sb.onclick=()=>oampStartSend(id); acts.appendChild(sb); det.appendChild(acts); }
+  r.appendChild(det); list.appendChild(r);
+}
+// Send-from-row: open the Send tab with this restricted asset preselected on the first recipient row.
+function oampStartSend(id){
+  tab('send');
+  const box=$('recipients'); if(!box) return;
+  if(!box.children.length) addRecipientRow();
+  const row=box.children[0]; const sel=row.querySelector('.rasset'); if(!sel) return;
+  const v='oamp:'+id;
+  if(![...sel.options].some(o=>o.value===v)){ const o=el('option'); o.value=v; o.textContent=assetMeta(v).ticker; sel.appendChild(o); }
+  sel.value=v; sel.dispatchEvent(new Event('change'));
+  try{ row.querySelector('.raddr').focus(); }catch{}
 }
 
 // ---------- fee-asset exchange rates (Sequentia any-asset-fees) ----------
@@ -2431,7 +2520,7 @@ async function _syncImpl(){
   $('syncStatus').className='status'; $('syncStatus').innerHTML='<span class="spin"></span>Syncing…';
   try{
     // scan both chains + refresh fee-asset rates + restricted-asset balances in parallel
-    const [update] = await Promise.all([client.fullScan(wollet), btcScan(), fetchFeeRates(), oampRefreshBalances()]);
+    const [update] = await Promise.all([client.fullScan(wollet), btcScan(), fetchFeeRates(), oampRefreshBalances(), oampRefreshUser()]);
     if(update) wollet.applyUpdate(update);
     // Rescan the covenant maker-credit companion wollet AFTER the main scan: it shares the same esplora
     // client, and wasm-bindgen forbids re-entrant &mut use of one object (a concurrent fullScan throws
@@ -2543,6 +2632,10 @@ function renderBalance(){
   const addToTotal=(refKey, atoms)=>{ const rv=refValue(refKey, atoms); if(rv){ total+=rv.v; totalRef=rv.ref; anyPriced=true; } else if((atoms||0n)>0n) allPriced=false; };
   addToTotal('BTC', btcBalance + (lnOn?lnAtomsFor('BTC'):0n));
   for(const h of seqKeys) addToTotal(h, BigInt(b[h]||0n) + (lnOn?lnAtomsFor(h):0n));
+  // Restricted (OpenAMP) balances are ONE ROW AMONG EQUALS: price them into the headline total too
+  // (WW-4 / spec 1.5(a)). Keyed 'oamp:'+id so assetMeta/priceTicker resolve the real ticker+precision;
+  // an unpriced restricted asset falls into the allPriced=false path like any other unpriced asset.
+  for(const id of Object.keys(oampBalances)) addToTotal('oamp:'+id, BigInt(oampBalances[id]?.atoms||0n));
   const card=$('balTotal');
   if(card){ card.innerHTML='';
     card.appendChild(el('div','bal-total-label','Total balance'));
@@ -2583,12 +2676,19 @@ function renderBalance(){
   // Restricted (OpenAMP) assets: enclave-custodied, one row among equals, no Lightning affordance.
   const oids = Object.keys(oampBalances).filter(id=>(oampBalances[id]?.atoms||0n)>0n)
     .sort((x,y)=> (oampAssets[x]?.ticker||x).localeCompare(oampAssets[y]?.ticker||y));
-  for(const id of oids){
-    const a=oampAssets[id]||{}; const sub=el('div');
-    sub.appendChild(el('span','sub', id.slice(0,10)+'…'+id.slice(-6)));
-    rowFull({ ticker:a.ticker||id.slice(0,8)+'…', refKey:null, precision:a.precision||0, onchainAtoms:BigInt(oampBalances[id].atoms||0n),
-      kind:'__oamp_'+id, nameNode:sub, movable:false, leg:null, known:true });
+  const legacyIds = Object.keys(oampLegacyBalances).filter(id=>(oampLegacyBalances[id]?.atoms||0n)>0n)
+    .sort((x,y)=> (oampAssets[x]?.ticker||x).localeCompare(oampAssets[y]?.ticker||y));
+  // Frozen banner (spec 1.5(c)): the freeze is GLOBAL per user across every restricted asset.
+  if(oampUser && oampUser.frozen && (oids.length || legacyIds.length)){
+    const banner=el('div','asset-row arow2'); const h=el('div','arow-head');
+    h.appendChild(el('span','tk','⚠'));
+    const mid=el('div','grow');
+    mid.appendChild(el('div',null,'OpenAMP account frozen'));
+    mid.appendChild(el('div','sub','The policy server has frozen this account across every restricted asset. Transfers are refused until the freeze is lifted.'));
+    h.appendChild(mid); banner.appendChild(h); list.appendChild(banner);
   }
+  for(const id of oids) oampAssetRow(list, id, BigInt(oampBalances[id].atoms||0n), {});
+  for(const id of legacyIds) oampAssetRow(list, id, BigInt(oampLegacyBalances[id].atoms||0n), {legacy:true});
   refreshAllAvail();   // keep the Send tab's "Available:" lines in sync with balances
 }
 // Wallet-local "label this asset" affordance (T9 / W2): give a received-but-unknown asset a ticker,
@@ -2664,6 +2764,8 @@ function renderOampReceive(){
   if(!OAMP_AID || !ids.length){ card.classList.add('hide'); return; }
   card.classList.remove('hide');
   $('recvOampAid').textContent=OAMP_AID;
+  // WW-7: QR-encode the AID (bare string payload; scannable, no network scheme). Pure-in-wasm encoder.
+  oampSetQr('recvOampAidQr', OAMP_AID);
   const sel=$('recvOampAsset'); const prev=sel.value; sel.innerHTML='';
   for(const id of ids.sort((x,y)=>(oampAssets[x].ticker||x).localeCompare(oampAssets[y].ticker||y))){
     const o=el('option'); o.value=id; o.textContent=oampAssets[id].ticker||id.slice(0,8)+'…'; sel.appendChild(o); }
@@ -2671,11 +2773,21 @@ function renderOampReceive(){
   sel.onchange=oampShowDepositAddr; oampShowDepositAddr();
 }
 async function oampShowDepositAddr(){
-  const out=$('recvOampAddr'); const id=$('recvOampAsset').value; if(!id){ out.textContent='—'; return; }
-  out.textContent='…';
+  const out=$('recvOampAddr'); const id=$('recvOampAsset').value; if(!id){ out.textContent='—'; oampSetQr('recvOampAddrQr',''); return; }
+  out.textContent='…'; oampSetQr('recvOampAddrQr','');
   try{ const j=await oampFetch('/v1/users/'+encodeURIComponent(OAMP_AID)+'/address?asset='+encodeURIComponent(id));
-    out.textContent=j.address||'(no address)'; }
-  catch(e){ out.textContent='Unavailable: '+(e?.message??e); }
+    const addr=j.address||'(no address)'; out.textContent=addr;
+    // WW-7: QR the bare deposit address (tb1 P2TR, or blech32 for an opt-in confidential asset).
+    oampSetQr('recvOampAddrQr', j.address ? addr : ''); }
+  catch(e){ out.textContent='Unavailable: '+(e?.message??e); oampSetQr('recvOampAddrQr',''); }
+}
+// Render a QR into an <img> from a bare string payload, or hide it when empty. stringToQr returns a
+// base64 data URI for a monochrome bitmap (image-rendering:pixelated scales it crisply).
+function oampSetQr(imgId, payload){
+  const img=$(imgId); if(!img) return;
+  if(!payload){ img.style.display='none'; img.removeAttribute('src'); return; }
+  try{ img.src=stringToQr(payload); img.style.display='block'; }
+  catch{ img.style.display='none'; img.removeAttribute('src'); }
 }
 
 // ---------- send ----------
@@ -2969,34 +3081,89 @@ async function reviewBroadcast(pset, title, onDone, feeAssetHex, review){
 }
 
 // ---------- OpenAMP restricted-asset transfer ----------
-// Sign one enclave sighash with the wallet-derived BIP340 key. schnorr.sign() (pure JS, from btc.js)
-// yields a 64-byte signature valid against OAMP_XONLY = the compressed htlc pubkey minus its parity
-// byte — the same key we registered the AID with, so the enclave accepts it.
-function oampSign(sighashHex){
-  const sig=schnorr.sign(hexToBytes(sighashHex), hexToBytes(OAMP_SECRET));
-  return bytesToHex(sig);
+// Resolve each input's prevout (asset, value, scriptPubKey) from the Sequentia explorer, aligned with
+// the transaction's input order. The taproot SIGHASH_DEFAULT commits to EVERY prevout's amount and
+// script, so all of them are needed to recompute a sighash locally (SWK-6 / spec 0.4(3)).
+// `inputs` are the decoded inputs from decodeEnclaveSpend (each carries txid/vout/index).
+async function oampResolvePrevouts(inputs){
+  const prevouts=new Array(inputs.length);
+  await Promise.all(inputs.map(async inp=>{
+    const r=await fetch(ESPLORA+'/tx/'+encodeURIComponent(inp.txid));
+    if(!r.ok) throw new Error('explorer lookup failed for input '+inp.index+' ('+inp.txid+':'+inp.vout+')');
+    const j=await r.json();
+    const o=(j.vout||[])[inp.vout];
+    if(!o) throw new Error('prevout '+inp.txid+':'+inp.vout+' not found');
+    if(o.value==null || !o.asset) throw new Error('input '+inp.index+' spends a confidential/unresolved prevout; cannot verify the sighash');
+    prevouts[inp.index]={ asset:o.asset, value:BigInt(o.value), script:o.scriptpubkey };
+  }));
+  return prevouts;
 }
-// Build → review → sign → complete a restricted-asset transfer. The enclave returns the sighashes to
-// sign (fee_mode "convert" nets the fee out of the transferred asset); we sign each locally and post
-// them back to finalize. Mirrors reviewBroadcast's confirm-then-do UX (never blind-sign).
+// Build -> RECOMPUTE + DECODE -> review -> sign -> complete a restricted-asset transfer (spec 1.6).
+// The wallet NEVER blind-signs the server's digest (spec 0.4(3)): for each enclave input it recomputes
+// the Elements taproot sighash itself from the returned tx + resolved prevouts + its enclave leaf and
+// control block, ABORTS on any mismatch, decodes the transaction, and shows the real effects before the
+// user confirms. Signing is deterministic BIP340 at m/5/0 inside Rust (openampSignSighash); no key
+// material touches JS. fee_mode "convert" nets the fee out of the transferred asset.
 async function oampReviewBroadcast(assetId, recipientAid, atoms, onDone){
   const meta=assetMeta('oamp:'+assetId);
-  let draft;
+  let draft, prevouts, effects, leaf, control, myScript, localDigests;
   try{
-    draft=await oampFetch('/v1/transfers', {method:'POST', headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({asset:assetId, sender_aid:OAMP_AID, recipient_aid:recipientAid, atoms:atoms.toString(), fee_mode:'convert'})});
+    // WW-8: atoms MUST be a JSON NUMBER (openampd uint64-decodes and rejects strings). atoms is a
+    // BigInt and JSON.stringify(BigInt) throws, so the body is hand-assembled with a bare number literal.
+    if(atoms > 0x7fffffffffffffffn) throw new Error('amount exceeds the protocol maximum');
+    const body='{"asset":'+JSON.stringify(assetId)+',"sender_aid":'+JSON.stringify(OAMP_AID)+
+      ',"recipient_aid":'+JSON.stringify(recipientAid)+',"atoms":'+atoms.toString()+',"fee_mode":"convert"}';
+    draft=await oampFetch('/v1/transfers', {method:'POST', headers:{'Content-Type':'application/json'}, body});
+    if(!draft || !draft.tx || !Array.isArray(draft.to_sign)) throw new Error('malformed transfer draft');
+    // Enumerate the draft's inputs (outpoints) by decoding it with no prevouts yet.
+    const probe=decodeEnclaveSpend(draft.tx, [], []);
+    // My per-asset enclave address gives the transfer leaf + control block + scriptPubKey shared by all
+    // my enclave inputs of this asset.
+    const addr=await oampFetch('/v1/users/'+encodeURIComponent(OAMP_AID)+'/address?asset='+encodeURIComponent(assetId));
+    leaf=addr.transfer_leaf; control=addr.transfer_control; myScript=addr.script_pubkey;
+    if(!leaf || !control) throw new Error('enclave address is missing the transfer leaf/control');
+    prevouts=await oampResolvePrevouts(probe.inputs||[]);
+    // MANDATORY safety mechanism: recompute each sighash and refuse on mismatch (never trust to_sign).
+    const genesis=network.genesisBlockHash();
+    localDigests={};
+    for(const s of draft.to_sign){
+      const local=enclaveSighash(draft.tx, s.input, prevouts, leaf, control, genesis);
+      if(String(local).toLowerCase()!==String(s.sighash||'').toLowerCase())
+        throw new Error('sighash mismatch at input '+s.input+' (local '+String(local).slice(0,16)+'… vs server '+String(s.sighash||'').slice(0,16)+'…); refusing to sign');
+      localDigests[s.input]=local;
+    }
+    // Decode the real effects with the resolved prevouts + my scripts for the confirm modal.
+    effects=decodeEnclaveSpend(draft.tx, prevouts, [myScript]);
   }catch(e){ $('sendErr').textContent='OpenAMP transfer failed: '+(e?.message??e); return; }
+
+  // Build the confirm modal from the DECODED, LOCALLY VERIFIED effects (never the server's word).
   const kv=[];
   kv.push(['Network', 'OpenAMP restricted asset (enclave ledger)']);
   kv.push(['Recipient AID', recipientAid]);
   kv.push(['Amount', fmtAtoms(atoms, meta.precision)+' '+meta.ticker]);
-  if(draft.convert_atoms!=null) kv.push(['Fee (converted)', fmtAtoms(BigInt(draft.convert_atoms), meta.precision)+' '+meta.ticker]);
+  if(draft.convert_atoms!=null && BigInt(draft.convert_atoms)>0n)
+    kv.push(['Fee (converted)', fmtAtoms(BigInt(draft.convert_atoms), meta.precision)+' '+meta.ticker+' (in-asset)']);
+  if(draft.fee_sats!=null) kv.push(['Network fee', fmtAtoms(BigInt(draft.fee_sats), 8)+' tSEQ']);
+  const spent=(effects.my_inputs_spent||[]).length;
+  kv.push(['Spending', spent+' of your '+meta.ticker+' enclave '+(spent===1?'output':'outputs')]);
+  // The tx's transparent outputs, labelled by destination (receipt to you / recipient / network fee).
+  const tickerOf=(hex)=> hex===assetId ? meta.ticker : (hex===POLICY_HEX ? 'tSEQ' : (assetMeta(hex).ticker||(hex?hex.slice(0,8)+'…':'?')));
+  const precOf=(hex)=> hex===assetId ? meta.precision : (hex===POLICY_HEX ? 8 : (assetMeta(hex).precision||0));
+  for(const o of (effects.outputs||[])){
+    if(o.is_fee){ continue; }   // the explicit fee output is summarised above
+    const amt=(o.value!=null && o.asset) ? (fmtAtoms(BigInt(o.value), precOf(o.asset))+' '+tickerOf(o.asset)) : 'confidential';
+    const dest=o.mine ? 'to you (change/receipt)' : 'to recipient';
+    kv.push(['Output', amt+' '+dest]);
+  }
+  if(effects.any_confidential) kv.push(['Note', 'This transaction contains confidential outputs the wallet cannot fully decode; review carefully.']);
+
   const {m, ok, st} = modalRows({title:'Confirm restricted-asset transfer', kv});
   ok.onclick=async()=>{
     ok.disabled=true; st.className='status'; st.innerHTML='<span class="spin"></span>Signing &amp; submitting…';
     try{
+      // Sign the LOCALLY RECOMPUTED digest (plain BIP340, deterministic, m/5/0 inside Rust).
       const sigs={};
-      for(const s of (draft.to_sign||[])) sigs[String(s.input)]=oampSign(s.sighash);
+      for(const s of draft.to_sign) sigs[String(s.input)]=signer.openampSignSighash(localDigests[s.input]);
       const done=await oampFetch('/v1/transfers/'+encodeURIComponent(draft.id)+'/complete',
         {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({sigs})});
       m.remove();
