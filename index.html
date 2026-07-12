@@ -190,6 +190,10 @@
   .swseg button:hover{filter:none;color:var(--txt);transform:none}
   .swseg button.on{background:#1d242d;color:var(--txt);box-shadow:0 1px 0 #0006}
   .swseg button .z{color:var(--amber2)}
+  /* Unblinded / Blinded book toggle bar. */
+  .swbookbar{display:flex;align-items:center;gap:12px;flex-wrap:wrap;margin-bottom:12px}
+  .swbook-seg{flex:0 0 auto;max-width:320px}
+  .swbookbar .sub{flex:1;min-width:180px;font-size:12px;color:var(--dim)}
   /* A rail toggle that would form an unsupported mixed combo is greyed + non-clickable. */
   .swseg button:disabled{opacity:.4;cursor:not-allowed;color:var(--dim);background:transparent;box-shadow:none}
   .swseg button:disabled:hover{color:var(--dim);filter:none}
@@ -495,6 +499,19 @@
 
       <!-- ===== the composer (the signature) ===== -->
       <div id="swComposer">
+
+        <!-- Book namespace toggle: the transparent (Unblinded) book is the default and
+             is the live cross-chain-capable book; the Blinded book is a SEPARATE relay
+             namespace where both swap legs settle confidentially (Sequentia assets only,
+             matched confidential-vs-confidential so the swap ratio never leaks a hidden
+             amount). Persisted; switching reloads the selected book. -->
+        <div class="swbookbar">
+          <div class="swseg swbook-seg" id="swBookSeg" role="group" aria-label="Order book privacy">
+            <button type="button" data-book="public">Unblinded book</button>
+            <button type="button" data-book="confidential">Blinded book</button>
+          </div>
+          <span class="sub" id="swBookNote"></span>
+        </div>
 
         <!-- (the per-asset balance cards used to live here; their info now lives inside the
              asset dropdown's "Your assets" group, so the Swap view stays uncluttered.) -->

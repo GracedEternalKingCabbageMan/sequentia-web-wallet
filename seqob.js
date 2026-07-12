@@ -265,6 +265,12 @@ export function canonicalOfferBytes(o){
   w.str(17, O(o,'maker_ln_node_pubkey','makerLnNodePubkey'));
   const hints = O(o,'ln_connect_hints','lnConnectHints') || [];
   for (const h of hints) w.str(18, h);
+  // confidential (19): the SIGNED book-namespace tag. false (proto3 default) is
+  // OMITTED, so a transparent offer encodes byte-for-byte as before — the live
+  // unblinded book is untouched. A true value segregates the offer into the
+  // relay's blinded book (matches confidential-vs-confidential only). Placed
+  // BEFORE the settlement oneof (20+) so the ascending field order is preserved.
+  w.bool(19, O(o,'confidential','confidential'));
   // oneof settlement, in field-number order: same_chain = 20, cross_chain = 21.
   // Only the set variant is present in a served offer, so exactly one emits; a
   // cross offer now verifies here too (was: cross offers could never verify).
@@ -369,8 +375,12 @@ async function postJSON(path, body){
 
 // Order book for a pair. Returns { pair, offers:[...] } with each offer carrying a
 // `_verified` flag (maker signature checked locally; the relay is untrusted).
-export async function fetchBook(baseAsset, quoteAsset){
-  const j = await getJSON(`/v1/market/${baseAsset}/${quoteAsset}/orderbook`);
+// opts.confidential requests the BLINDED book namespace (a distinct order set the
+// relay keeps segregated from the transparent book); the default (omitted/false)
+// is the transparent book, byte-identical to the live route.
+export async function fetchBook(baseAsset, quoteAsset, opts){
+  const q = (opts && opts.confidential) ? '?confidential=1' : '';
+  const j = await getJSON(`/v1/market/${baseAsset}/${quoteAsset}/orderbook${q}`);
   const offers = (j.offers || j.Offers || []).map(o => ({ ...o, _verified: verifyOffer(o) }));
   return { pair: j.pair || { base_asset: baseAsset, quote_asset: quoteAsset }, offers };
 }

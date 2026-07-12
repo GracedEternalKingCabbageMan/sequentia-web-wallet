@@ -84,6 +84,59 @@ function covReceiveAddr(){
   return (_confidentialReceive ? a : (a.toUnconfidential ? a.toUnconfidential() : a)).toString();
 }
 
+// ---------------------------------------------------------------------------
+// Book namespace: Unblinded (transparent, default, live) vs Blinded (confidential).
+// ---------------------------------------------------------------------------
+// The Swap tab reads from + posts to ONE of two DISTINCT relay books. Transparent
+// is the default (principle #6: transparent-by-default); the user opts into the
+// blinded book with the toggle. The blinded book is a SEPARATE namespace on the
+// relay (?confidential=1 / a signed confidential=true tag on the offer) that
+// matches confidential-vs-confidential only, so BOTH swap legs blind on-chain and
+// the public swap ratio never leaks a confidential amount. Persisted wallet-wide.
+let _book = 'public';
+try { _book = localStorage.getItem('swk.dex.book') === 'confidential' ? 'confidential' : 'public'; } catch {}
+function isConfBook(){ return _book === 'confidential'; }
+export function dexBook(){ return _book; }
+function persistBook(){ try { localStorage.setItem('swk.dex.book', _book); } catch {} }
+
+// blech32 charset (same symbol table as bech32; blech32 differs only in its 12-char
+// checksum, which we do not need to verify — the address is minted by our own wasm).
+const _B32_CS = 'qpzry9x8gf2tvdw0s3jn54khce6mua7l';
+function _convertBits(data, from, to){
+  let acc = 0, bits = 0; const out = []; const maxv = (1 << to) - 1;
+  for (const v of data){ acc = (acc << from) | v; bits += from; while (bits >= to){ bits -= to; out.push((acc >> bits) & maxv); } }
+  return out;   // pad=false: leftover bits are dropped (correct for decode)
+}
+// Extract the 33-byte confidential blinding pubkey (hex) embedded in a blech32
+// confidential (tsqb1…/sqb1…) address. Returns '' if the address is not blech32 or
+// cannot be parsed; the caller still sets the signed confidential tag, so a failed
+// extraction never mis-routes the book (the relay can also recover the key from the
+// blech32 recv address itself). blech32 data = [witver] + convertbits(blinding_pub(33)
+// || witness_program, 8, 5) + checksum(12); we drop the 12-char checksum + witver
+// symbol, convert 5->8, and take the first 33 bytes.
+function blindingPubFromAddr(addr){
+  try {
+    const s = String(addr).toLowerCase();
+    const pos = s.lastIndexOf('1');
+    if (pos < 1) return '';
+    const vals = [];
+    for (const ch of s.slice(pos + 1)){ const d = _B32_CS.indexOf(ch); if (d < 0) return ''; vals.push(d); }
+    if (vals.length < 12 + 1) return '';
+    const payload5 = vals.slice(1, vals.length - 12);   // drop witver symbol + 12-char checksum
+    const bytes = _convertBits(payload5, 5, 8);
+    if (bytes.length < 33) return '';
+    return bytes.slice(0, 33).map(b => b.toString(16).padStart(2, '0')).join('');
+  } catch { return ''; }
+}
+// This wallet's own BLINDED (blech32) receive address + its blinding pubkey, for a
+// confidential-book offer/lift. Both legs must blind, so a confidential offer always
+// publishes the blinded form (never toUnconfidential).
+function blindedReceive(){
+  const a = C.wollet.address(C.addrIndex == null ? undefined : C.addrIndex).address();
+  const addr = a.toString();
+  return { address: addr, blindingPub: blindingPubFromAddr(addr) };
+}
+
 // The wallet's SeqOB MAKER identity: a stable per-browser key that signs resting
 // offers + doubles as the E2E session key. It is NOT a fund key (funds move via the
 // on-chain co-sign with the wallet's real keys), so persisting it locally is safe.
@@ -185,6 +238,8 @@ export function initSwap(ctx){
     wireRailSeg('swRecvRailSeg', 'recv');
     // Take / Post chooser (switching to Post unlinks the two amount fields).
     wireModeSeg();
+    // Unblinded / Blinded book toggle (switches which relay namespace we read + post to).
+    wireBookSeg();
     if ($('swXBack')) $('swXBack').onclick = () => { if (X && X.hasInFlight && X.hasInFlight()) _dismissed.add('cross'); showCross(false); renderSwap(); };
     // Live re-quote as the user types. The edited side is the "fixed" leg; the
     // other side is quoted. Debounced so we don't hammer the daemon per keystroke.
@@ -329,6 +384,9 @@ function startableAssets(){
   if (C.registryAssets){ for (const h of C.registryAssets()){ if (h && h !== 'BTC') set.add(h); } }
   for (const m of MARKETS){ set.add(m.market.base_asset); set.add(m.market.quote_asset); }
   for (const xm of XMARKETS){ set.add('BTC'); set.add(xm.seq_asset); }
+  // The blinded book is Sequentia-only: BTC lives on the parent chain, which has no
+  // confidential transactions, so a BTC leg cannot blind. Drop it from the picker.
+  if (isConfBook()) set.delete('BTC');
   return [...set];
 }
 
@@ -345,10 +403,10 @@ function counterpartsOf(other){
     for (const h of startableAssets()){ if (h !== 'BTC') set.add(h); }
   } else {
     // Same-chain: any OTHER Sequentia asset is a valid counterpart (the pair may
-    // have no resting offers yet — then it's startable). BTC is always a valid
-    // cross-chain counterpart for a Sequentia asset.
+    // have no resting offers yet — then it's startable). BTC is a valid cross-chain
+    // counterpart on the transparent book only (the blinded book is Sequentia-only).
     for (const h of startableAssets()){ if (h !== other && h !== 'BTC') set.add(h); }
-    set.add('BTC');
+    if (!isConfBook()) set.add('BTC');
   }
   return [...set];
 }
@@ -572,7 +630,52 @@ function paintPanes(){
   paintRouteLine();
   updateRails();
   paintModeSeg();
+  paintBookSeg();
+  paintConfControl();
   const cta = $('swReview'); if (cta) cta.textContent = 'Place order';   // one CTA, always
+}
+
+// The opt-in confidential-RECEIVE control (transparent book only) is meaningless when
+// the received leg is BTC — the parent chain has no confidential transactions — so it
+// is HIDDEN whenever S.receiveAsset === 'BTC'. It is also hidden on the Blinded book,
+// where both legs already blind by construction (a per-swap opt-in would be redundant).
+function paintConfControl(){
+  const wrap = C.$('swConfWrap'); if (!wrap) return;
+  const hide = S.receiveAsset === 'BTC' || isConfBook();
+  wrap.style.display = hide ? 'none' : 'flex';
+}
+
+// --- Unblinded / Blinded book toggle -------------------------------------------
+function wireBookSeg(){
+  const seg = C.$('swBookSeg'); if (!seg || seg._wired) return; seg._wired = true;
+  seg.querySelectorAll('button[data-book]').forEach(b => b.onclick = () => setBook(b.dataset.book));
+}
+function paintBookSeg(){
+  const seg = C.$('swBookSeg'); if (!seg) return;
+  seg.querySelectorAll('button[data-book]').forEach(b => b.classList.toggle('on', b.dataset.book === _book));
+  const note = C.$('swBookNote');
+  if (note) note.textContent = isConfBook()
+    ? 'Blinded book: both legs settle confidentially (amounts and assets hidden on-chain). Sequentia assets only.'
+    : 'Unblinded book: transparent settlement, the default. Bitcoin (cross-chain) pairs trade here.';
+}
+// Switch the active book namespace. Distinct order sets: the desk reloads from the
+// selected namespace and posts into it. Blinded is Sequentia-only, so a BTC pick is
+// dropped on the way in.
+function setBook(next){
+  next = next === 'confidential' ? 'confidential' : 'public';
+  if (next === _book){ paintBookSeg(); return; }
+  _book = next; persistBook();
+  if (isConfBook()){
+    if (S.payAsset === 'BTC') S.payAsset = null;
+    if (S.receiveAsset === 'BTC') S.receiveAsset = null;
+  }
+  // Fresh namespace: drop the stale book/quote and re-derive defaults + pickers.
+  BOOK = { offers: [], pair: null };
+  LAST_QUOTE = null; setReviewEnabled(false);
+  S.railsTouched = false; S.modeTouched = false;
+  ensureDefaults();
+  paintPanes();
+  requote().catch(()=>{});
 }
 
 // ---------------------------------------------------------------------------
@@ -934,8 +1037,9 @@ async function requoteSame(route, amtStr){
     // such market yet" (genuinely empty); a network/5xx error means the relay is UNREACHABLE. T7:
     // never conflate the two, or an outage looks like an empty book and invites posting into the void.
     let reachErr = null;
+    const bookOpts = { confidential: isConfBook() };   // read the selected namespace
     const safeBook = async (a, b) => {
-      try { return await seqob.fetchBook(a, b); }
+      try { return await seqob.fetchBook(a, b, bookOpts); }
       catch (e){ if (/HTTP\s*4\d\d/.test(e.message||'')) return { offers: [] };   // 4xx: empty/unknown market
                  reachErr = e; return { offers: [] }; }                            // network/5xx: unreachable
     };
@@ -985,6 +1089,29 @@ async function requoteSame(route, amtStr){
     if (payAtoms > balAtoms(pay)){
       LAST_QUOTE = null; setReviewEnabled(false);
       $('swErr').textContent = `You only hold ${C.fmtAtoms(balAtoms(pay), pm.precision)} ${pm.ticker}.`;
+      return;
+    }
+    if (isConfBook()){
+      // The BLINDED book rides the INTERACTIVE co-sign rail (seqob.lift for a taker,
+      // seqob.postOffer for a maker) — NEVER the covenant rail: a covenant FILL leaf
+      // introspects EXPLICIT output amounts, which CT (Pedersen-committed amounts)
+      // cannot satisfy. Lift a crossable blinded offer if one rests; otherwise rest a
+      // blinded offer (both legs blind to each party's blinding pubkey).
+      const editedAsset = S.edited === 'pay' ? pay : receive;
+      const editedAtoms = S.edited === 'pay' ? payAtoms : recvAtoms;
+      if (liftable.length){
+        const q = executableQuote(liftable[0], pay, receive, editedAsset, editedAtoms);
+        q.confidential = true;
+        if (q.amountP > balAtoms(pay)){
+          LAST_QUOTE = null; setReviewEnabled(false);
+          $('swErr').textContent = `You only hold ${C.fmtAtoms(balAtoms(pay), pm.precision)} ${pm.ticker}.`;
+          return;
+        }
+        LAST_QUOTE = q;
+      } else {
+        LAST_QUOTE = { kind:'same', startMarket:true, post:true, confidential:true, pay, receive };
+      }
+      setReviewEnabled(true);
       return;
     }
     LAST_QUOTE = { kind:'same', place:true, pay, receive, payAtoms, recvAtoms };
@@ -2779,6 +2906,7 @@ async function reviewSame(q){
   const fm = C.assetMeta(q.feeAsset);
   const kv = [
     ['Network', 'Sequentia (testnet) atomic swap via the order book; not parent-chain BTC'],
+    ...(q.confidential ? [['Privacy', 'Blinded book — both legs settle confidentially; amounts and assets are hidden on-chain (Confidential Transactions).']] : []),
     ['You pay', amtRow(q.assetP, q.amountP) + refSuffix(q.assetP, q.amountP)],
     ['You receive', amtRow(q.assetR, q.amountR) + refSuffix(q.assetR, q.amountR)],
     ['Network fee', amtRow(q.feeAsset, q.feeAmount) + '  (estimate)'],
@@ -2954,7 +3082,10 @@ async function liftOffer(q, st){
   // swap (q.confidential — the opt-in Confidential sub-tab) receives to the blinded blech32 address;
   // everywhere else the received amount is explicit, like the Receive tab and the cross-chain wizards.
   const _raw = C.wollet.address(C.addrIndex == null ? undefined : C.addrIndex).address();
-  const receiveAddr = (q.confidential || _confidentialReceive) ? _raw : (_raw.toUnconfidential ? _raw.toUnconfidential() : _raw);
+  // Blinded receive when: the offer is a confidential-book lift (q.confidential), the
+  // wallet-wide opt-in is on, OR the Blinded book is active (both legs MUST blind, so a
+  // transparent taker output would leak the amount via the swap ratio).
+  const receiveAddr = (q.confidential || _confidentialReceive || isConfBook()) ? _raw : (_raw.toUnconfidential ? _raw.toUnconfidential() : _raw);
   const buildRequest = async () => {
     const sreq = C.wollet.seqdexSwapRequest(
       new wasm.AssetId(q.assetP), q.amountP,
@@ -2994,6 +3125,7 @@ async function postOfferReview(q){
   const payU = Number(payAtoms)/Math.pow(10, pm.precision||0), recvU = Number(recvAtoms)/Math.pow(10, rm.precision||0);
   const kv = [
     ['Posting', 'A resting offer - you become the maker of this market'],
+    ...((q.confidential || isConfBook()) ? [['Privacy', 'Blinded book — your offer rests confidentially and fills confidentially; a blinded receive address and blinding pubkey are published so the counterparty can blind their leg too.']] : []),
     ['You give', amtRow(pay, payAtoms) + refSuffix(pay, payAtoms)],
     ['You want', amtRow(receive, recvAtoms) + refSuffix(receive, recvAtoms)],
     ['Price', payU>0 ? `1 ${pm.ticker} = ${trim(recvU/payU)} ${rm.ticker}` : '-'],
@@ -3006,7 +3138,20 @@ async function postOfferReview(q){
   ok.onclick = async () => {
     ok.disabled = true; st.className = 'status'; st.innerHTML = '<span class="spin"></span>Signing + posting…';
     try {
-      const recvAddr = C.wollet.address(C.addrIndex == null ? undefined : C.addrIndex).address();
+      const conf = !!q.confidential || isConfBook();
+      // Transparent book: publish the transparent recv address (principle #6). Blinded
+      // book: publish the BLINDED (blech32) recv address + its blinding pubkey so the
+      // counterparty can add a blinded output for this leg — both legs blind on-chain.
+      let sameChain;
+      if (conf){
+        const br = blindedReceive();
+        sameChain = { maker_recv_address: br.address, maker_blinding_pub: br.blindingPub };
+      } else {
+        // Transparent (toUnconfidential) by DEFAULT (principle #6), matching covReceiveAddr.
+        const raw = C.wollet.address(C.addrIndex == null ? undefined : C.addrIndex).address();
+        const t = raw.toUnconfidential ? raw.toUnconfidential() : raw;
+        sameChain = { maker_recv_address: t.toString() };
+      }
       const now = Math.floor(Date.now()/1000);
       const offer = {
         offer_id: seqob.randHex(16), schema_version: 1,
@@ -3017,7 +3162,8 @@ async function postOfferReview(q){
         allow_partial: true,
         created_at_unix: String(now), expires_at_unix: String(now + 3600),
         fee_asset_hint: S.feeAsset || pay,
-        same_chain: { maker_recv_address: recvAddr },
+        confidential: conf,                 // signed book-namespace tag (field 19)
+        same_chain: sameChain,
       };
       seqob.signOffer(offer, makerPriv());
       await seqob.postOffer(offer);
