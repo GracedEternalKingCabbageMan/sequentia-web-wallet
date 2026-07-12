@@ -373,6 +373,7 @@
       <button data-tab="assets">Assets</button>
       <button data-tab="stake">Stake</button>
       <button data-tab="history">History</button>
+      <button data-tab="sign">Sign</button>
       <button data-tab="settings">Settings</button>
     </div>
 
@@ -749,6 +750,54 @@
         <p class="sub" style="margin:0 0 6px">Parent-chain BTC on the shared tb1 address. Links open the testnet4 explorer.</p>
         <div class="list" id="btcHistList"><div class="muted">No Bitcoin transactions yet.</div></div>
       </div>
+      <div class="card">
+        <label class="lbl">Restricted transfers (OpenAMP)</label>
+        <p class="sub" style="margin:0 0 6px">Transfers you've sent on the OpenAMP enclave ledger from this wallet, tracked here until they confirm. Nothing is final at 0-conf; depth is the Bitcoin block the transfer's Sequentia block anchors to.</p>
+        <div class="list" id="oampHistList"><div class="muted">No restricted transfers yet.</div></div>
+      </div>
+    </section>
+
+    <!-- sign: neutral tagged-signing utility for OpenAMP requests (spec 1.8). Handles ONLY
+         tagged, non-spending signatures (a challenge or a document hash); it can NEVER
+         authorize an enclave spend, by construction, there is no mode here that signs a bare
+         transaction digest (spec 0.4(3)). No platform branding. -->
+    <section data-panel="sign" class="hide">
+      <div class="card">
+        <label class="lbl">Sign an OpenAMP request</label>
+        <p class="sub" style="margin:0 0 10px">Sign a tagged, non-spending request with your account id (AID): a wallet-link or login challenge, or a document hash. This can never move funds or authorize a transfer.</p>
+        <div class="warn hide" id="oampSignOriginWarn"></div>
+        <div class="field">
+          <label class="lbl">What are you signing</label>
+          <select id="oampSignMode">
+            <option value="challenge">A challenge (wallet link or login)</option>
+            <option value="document">A document hash (e-signature)</option>
+          </select>
+        </div>
+        <div class="field" id="oampSignChallengeField">
+          <label class="lbl">Challenge string</label>
+          <textarea id="oampSignChallenge" rows="2" placeholder="the challenge text you were given"></textarea>
+        </div>
+        <div class="field hide" id="oampSignDocField">
+          <label class="lbl">Document hash (32 bytes, 64-hex)</label>
+          <input id="oampSignDocHash" class="mono" placeholder="64-hex sha256 of the document">
+        </div>
+        <div class="sub" id="oampSignLabel" style="margin-top:6px"></div>
+        <button class="primary" id="oampSignBtn" style="margin-top:14px">Sign</button>
+        <div class="status err" id="oampSignErr"></div>
+        <div class="rec hide" id="oampSignResult">
+          <label class="lbl">Signature</label>
+          <div class="mono" id="oampSignSig" style="word-break:break-all">—</div>
+          <button class="ghost" id="oampSignCopySig" style="margin-top:6px">Copy signature</button>
+          <label class="lbl" style="margin-top:12px">Your x-only pubkey</label>
+          <div class="mono" id="oampSignPubkey" style="word-break:break-all">—</div>
+          <label class="lbl" style="margin-top:12px">Your account id (AID)</label>
+          <div class="mono" id="oampSignAid" style="word-break:break-all">—</div>
+          <div class="row hide" id="oampSignCallbackRow" style="margin-top:14px">
+            <button class="primary" id="oampSignSendCallback">Send to <span id="oampSignCallbackOrigin"></span></button>
+          </div>
+          <div class="status" id="oampSignCallbackStatus"></div>
+        </div>
+      </div>
     </section>
 
     <!-- settings -->
@@ -818,6 +867,7 @@ const LBL = 'swk.sequentia.assets';      // { assetHex: {name,ticker,precision} 
 const DEFAULT_FEERATE = 2000;            // sat/kvB (2 sat/vB) — above the network min relay fee
 const BUMP_FEERATE = 10000;              // sat/kvB (10 sat/vB) — rescue rate for RBF/CPFP; the node arbitrates BIP125 in reference value
 const STAKES = 'swk.sequentia.stakes';   // [{pubkey,csv,period,atoms,txid,time}]
+const OAMP_XFERS = 'swk.sequentia.oampTransfers';   // [{asset,ticker,precision,recipient_aid,atoms,txid,time,confirmed,blockHash,anchorDepth}] (WW-6)
 // Network minimum unbonding (~15 days, height-based csv=43200). Bonding longer
 // earns nothing — stake weight is the amount, not the lock duration — so the
 // wallet always uses the minimum.
@@ -914,6 +964,14 @@ let oampUser=null;        // GET /v1/users/{aid} -> { categories[], frozen } (de
 let OAMP_LEGACY_XONLY='';
 let OAMP_LEGACY_AID='';
 let oampLegacyBalances={}; // assetId -> { atoms:BigInt, utxos } held by the legacy AID
+// The tagged sign card (WW-2 / spec 1.8) is reached either by the "Sign" tab directly or by the
+// `#oamp-sign` deep link; when it's a deep link this holds the parsed payload (mode, challenge or
+// doc_hash, an optional callback URL, an optional label) so the confirm-before-POST step can show
+// the requesting origin. Nothing in this flow ever triggers a network call on its own.
+let oampSignPending=null;
+// Set true once a wallet is unlocked and the app view is live (openWallet() completed); guards the
+// `hashchange` listener from acting on a deep link before there is a signer or a Send tab to route to.
+let walletReady=false;
 function isOampAsset(v){ return typeof v==='string' && v.startsWith('oamp:'); }
 function oampId(v){ return v.slice(5); }
 // Minimal hex<->bytes (btc.js keeps its own private; keep these local + explicit for the enclave path).
@@ -1026,8 +1084,12 @@ function oampAssetRow(list, id, atoms, opts){
   else { const acts=el('div','bal-acts'); const sb=el('button','ghost','Send'); sb.onclick=()=>oampStartSend(id); acts.appendChild(sb); det.appendChild(acts); }
   r.appendChild(det); list.appendChild(r);
 }
-// Send-from-row: open the Send tab with this restricted asset preselected on the first recipient row.
-function oampStartSend(id){
+// Open the Send tab with this restricted asset preselected on the first recipient row, and
+// optionally a recipient AID + amount (atoms) already filled in. Shared by the row-level Send
+// button (oampStartSend, below) and the WW-3 send-handoff deep link (`#oamp-send`, spec 1.9):
+// from here the existing restricted-send review path (recompute + decode + confirm, spec 0.4(3))
+// takes over unchanged — this function only fills the form, it never submits anything.
+function oampPrefillSend(id, toAid, atomsStr){
   tab('send');
   const box=$('recipients'); if(!box) return;
   if(!box.children.length) addRecipientRow();
@@ -1035,8 +1097,16 @@ function oampStartSend(id){
   const v='oamp:'+id;
   if(![...sel.options].some(o=>o.value===v)){ const o=el('option'); o.value=v; o.textContent=assetMeta(v).ticker; sel.appendChild(o); }
   sel.value=v; sel.dispatchEvent(new Event('change'));
-  try{ row.querySelector('.raddr').focus(); }catch{}
+  const raddr=row.querySelector('.raddr');
+  if(toAid) raddr.value=toAid;
+  if(atomsStr!=null){
+    try{ const prec=oampAssets[id]?.precision ?? 0; row.querySelector('.ramt').value=fmtAtoms(BigInt(atomsStr), prec); }
+    catch{ /* malformed atoms param: leave the amount blank rather than guess */ }
+  }
+  try{ (toAid ? row.querySelector('.ramt') : raddr).focus(); }catch{}
 }
+// Send-from-row: open the Send tab with this restricted asset preselected on the first recipient row.
+function oampStartSend(id){ oampPrefillSend(id, null, null); }
 
 // ---------- fee-asset exchange rates (Sequentia any-asset-fees) ----------
 // The node publishes a fee whitelist: each asset's rate is atoms-of-asset per
@@ -1676,6 +1746,64 @@ function tab(name){
   if(name==='send'){ feeAssetManual=false; refreshRecipientAssets(); populateFeeAssets(); defaultFeeAssetToSent(); updateFeeForSendType(); try{ initLnSendReceive(); refreshLnSendReceive(); }catch{} }
 }
 
+// ---------- deep-link routing (OpenAMP: WW-2 sign card, WW-3 send handoff) ----------
+// The wallet parses no hash/query route at startup otherwise; these two routes are the only ones.
+// Decode a base64url string to UTF-8 text (`#oamp-sign?payload=` carries a base64url JSON object).
+function b64urlDecode(s){
+  s=(s||'').replace(/-/g,'+').replace(/_/g,'/');
+  while(s.length % 4) s+='=';
+  const bin=atob(s);
+  const bytes=new Uint8Array(bin.length);
+  for(let i=0;i<bin.length;i++) bytes[i]=bin.charCodeAt(i);
+  return new TextDecoder().decode(bytes);
+}
+function urlOrigin(u){ try{ return new URL(u).origin; }catch{ return String(u||''); } }
+// Fill the Sign card from a parsed `#oamp-sign` payload (or clear it back to a blank card when
+// `payload` is null, i.e. the tab was opened directly rather than via a deep link). Only fills
+// fields and shows the requesting origin up front; it never signs or sends anything by itself.
+function oampPrefillSignCard(payload){
+  oampSignPending = (payload && typeof payload==='object') ? payload : null;
+  show('oampSignResult', false);
+  $('oampSignErr').textContent='';
+  const mode = (oampSignPending && oampSignPending.mode==='document') ? 'document' : 'challenge';
+  $('oampSignMode').value=mode;
+  $('oampSignMode').dispatchEvent(new Event('change'));
+  $('oampSignChallenge').value = (oampSignPending && mode==='challenge' && typeof oampSignPending.challenge==='string') ? oampSignPending.challenge : '';
+  $('oampSignDocHash').value = (oampSignPending && mode==='document' && typeof oampSignPending.doc_hash==='string') ? oampSignPending.doc_hash : '';
+  const warn=$('oampSignOriginWarn'), lbl=$('oampSignLabel');
+  if(oampSignPending && oampSignPending.callback){
+    warn.textContent = urlOrigin(oampSignPending.callback)+' is requesting this signature. Review it below; nothing is sent until you press Send after signing.';
+    show('oampSignOriginWarn', true);
+  } else { warn.textContent=''; show('oampSignOriginWarn', false); }
+  if(oampSignPending && (oampSignPending.label || oampSignPending.callback)){
+    const parts=[];
+    if(oampSignPending.callback) parts.push('Requested by '+urlOrigin(oampSignPending.callback));
+    if(oampSignPending.label) parts.push(String(oampSignPending.label));
+    lbl.textContent=parts.join('. ');
+  } else lbl.textContent='';
+}
+// Parse and act on the current location.hash. Two routes (spec 1.9 WW-2/WW-3); anything else is
+// left alone. Called once after a wallet is unlocked (openWallet) and again on every hashchange
+// while the wallet stays open — never before a wallet exists, since neither route can do anything
+// useful without a signer.
+function handleDeepLinkRoute(){
+  const h=location.hash||''; if(!h.startsWith('#')) return;
+  const qm=h.indexOf('?');
+  const route=(qm<0?h.slice(1):h.slice(1,qm));
+  const params=new URLSearchParams(qm<0?'':h.slice(qm+1));
+  if(route==='oamp-sign'){
+    let payload=null; const p=params.get('payload');
+    if(p){ try{ payload=JSON.parse(b64urlDecode(p)); }catch(e){ console.warn('[oamp-sign] malformed deep-link payload:', e?.message??e); } }
+    tab('sign');
+    oampPrefillSignCard(payload);
+  } else if(route==='oamp-send'){
+    const asset=(params.get('asset')||'').trim().toLowerCase();
+    const to=(params.get('to')||'').trim();
+    const atoms=(params.get('atoms')||'').trim();
+    if(/^[0-9a-f]{64}$/.test(asset)) oampPrefillSend(asset, to||null, /^\d+$/.test(atoms)?atoms:null);
+  }
+}
+
 // ---------- boot ----------
 async function boot(){
   await init();
@@ -1724,6 +1852,11 @@ async function openWallet(phrase){
   // swap rail becomes available. Non-fatal + opt-in: if the wss endpoint / host key
   // aren't configured, LN stays off and the composer uses the on-chain rail.
   try{ initLightning(phrase); }catch(e){ console.warn('[ln] init failed:', e?.message??e); }
+  // The wallet is fully up: apply any OpenAMP deep-link route now (WW-2/WW-3, spec 1.9). This is
+  // the ONLY place a deep link is acted on at startup — neither route does anything useful without
+  // a signer, so this runs after openWallet() rather than at boot() before a wallet exists.
+  walletReady=true;
+  try{ handleDeepLinkRoute(); }catch(e){ console.warn('[deeplink] route handling failed:', e?.message??e); }
 }
 
 // ---------- Lightning (hosted-SeqLN LSP, two-node cross-chain rail) ----------
@@ -3238,7 +3371,13 @@ $('btnReview').onclick=async()=>{ $('sendErr').textContent='';
       const id=oampId(r.asset);
       const atoms=parseAtoms(r.amtS, sendPrecision(r.asset));
       if(atoms<=0n) throw new Error('amount must be greater than zero');
-      await oampReviewBroadcast(id, r.addr.trim(), atoms, reset);
+      const recipientAid=r.addr.trim();
+      // WW-6: track this transfer's txid locally so it shows in the History tab with a
+      // pending/confirmed chip and Bitcoin anchor depth until it confirms.
+      await oampReviewBroadcast(id, recipientAid, atoms, (txid)=>{
+        if(txid) oampRecordTransfer({asset:id, recipient_aid:recipientAid, atoms, txid});
+        reset();
+      });
       return;
     }
     const btcRows=rows.filter(r=>r.asset==='BTC');
@@ -3309,6 +3448,7 @@ $('btnLock').onclick=()=>{ if(confirm('Remove this wallet from the browser? Make
 // ---------- history ----------
 function renderHistory(){
   renderBtcHistory().catch(()=>{});   // dual-chain (T6): parent-chain BTC history alongside Sequentia; async + independent
+  renderOampHistory(); refreshOampHistory().catch(()=>{});   // WW-6: restricted-transfer history + confirmation/anchor chips
   const list=$('histList'); if(!wollet){ return; } list.innerHTML='';
   let txs; try{ txs=wollet.transactions(); }catch(e){ list.appendChild(el('div','err','History error: '+(e?.message??e))); return; }
   if(!txs.length){ list.appendChild(el('div','muted','No transactions yet.')); return; }
@@ -3581,12 +3721,155 @@ $('btnStake').onclick=async()=>{ $('stakeErr').textContent='';
   }catch(e){ $('stakeErr').textContent=e?.message??String(e); }
 };
 
+// ---------- OpenAMP sign card (WW-2, spec 1.8) ----------
+// Copy-to-clipboard for the signature/pubkey/AID outputs (paste-in/copy-out transport always
+// works, deep link or not). Same fallback as the receive-address copy button, generalized.
+async function copyToClipboard(text, btn){
+  if(!text || text==='—') return false;
+  const old=btn?btn.textContent:null;
+  let ok=false;
+  try{ if(navigator.clipboard?.writeText){ await navigator.clipboard.writeText(text); ok=true; } }catch{}
+  if(!ok){
+    const ta=document.createElement('textarea'); ta.value=text;
+    ta.style.cssText='position:fixed;top:0;left:0;opacity:0';
+    document.body.appendChild(ta); ta.focus(); ta.select();
+    try{ ok=document.execCommand('copy'); }catch{}
+    document.body.removeChild(ta);
+  }
+  if(btn){ btn.textContent = ok?'Copied!':'Copy failed'; setTimeout(()=>{ btn.textContent=old; }, 1200); }
+  return ok;
+}
+$('oampSignMode').onchange=()=>{
+  const doc=$('oampSignMode').value==='document';
+  show('oampSignChallengeField', !doc); show('oampSignDocField', doc);
+};
+$('oampSignBtn').onclick=async()=>{
+  $('oampSignErr').textContent='';
+  try{
+    if(!signer) throw new Error('open your wallet first');
+    const mode=$('oampSignMode').value;
+    let sig;
+    // Only two tagged, non-spending modes exist here (spec 0.4(2)): there is no third path that
+    // takes a bare digest, so this card structurally cannot become an enclave-spend authorization.
+    if(mode==='challenge'){
+      const c=$('oampSignChallenge').value;
+      if(!c || !c.trim()) throw new Error('enter the challenge text');
+      sig = signer.openampSignChallenge(c);   // tagged "openamp-challenge-v1" over the UTF-8 string
+    } else {
+      const h=$('oampSignDocHash').value.trim().toLowerCase();
+      if(!/^[0-9a-f]{64}$/.test(h)) throw new Error('document hash must be 64 hex characters (32 bytes)');
+      sig = signer.openampSignTagged('openamp-document-v1', h);
+    }
+    // Derive fresh rather than reuse OAMP_XONLY/OAMP_AID: those are only set when server
+    // registration succeeded, but signing here is a purely local operation (spec 1.3's
+    // "registration failure must never block the rest of the wallet" applies here too).
+    const xonly=signer.openampXonlyPubkey();
+    const aid=openampComputeAid([xonly]);
+    $('oampSignSig').textContent=sig;
+    $('oampSignPubkey').textContent=xonly;
+    $('oampSignAid').textContent=aid;
+    show('oampSignResult', true);
+    $('oampSignCallbackStatus').className='status'; $('oampSignCallbackStatus').textContent='';
+    // Consent-gated transport: the callback is never POSTed here. It is only reachable through the
+    // explicit "Send to <origin>" button below, and only exists at all when a deep link supplied one.
+    if(oampSignPending && oampSignPending.callback){
+      show('oampSignCallbackRow', true);
+      $('oampSignCallbackOrigin').textContent = urlOrigin(oampSignPending.callback);
+      $('oampSignSendCallback').onclick=async()=>{
+        $('oampSignCallbackStatus').className='status'; $('oampSignCallbackStatus').innerHTML='<span class="spin"></span>Sending…';
+        try{
+          const body=JSON.stringify({ mode, challenge: mode==='challenge' ? $('oampSignChallenge').value : undefined,
+            doc_hash: mode==='document' ? $('oampSignDocHash').value.trim().toLowerCase() : undefined,
+            signature: sig, pubkey: xonly, aid });
+          const r=await fetch(oampSignPending.callback, {method:'POST', headers:{'Content-Type':'application/json'}, body});
+          $('oampSignCallbackStatus').className='status ok';
+          $('oampSignCallbackStatus').textContent = r.ok ? 'Sent to '+urlOrigin(oampSignPending.callback)+'.' : ('The requester responded with HTTP '+r.status+'.');
+        }catch(e){ $('oampSignCallbackStatus').className='status err'; $('oampSignCallbackStatus').textContent='Send failed: '+(e?.message??e); }
+      };
+    } else {
+      show('oampSignCallbackRow', false);
+    }
+  }catch(e){ $('oampSignErr').textContent=e?.message??String(e); }
+};
+$('oampSignCopySig').onclick=()=>copyToClipboard($('oampSignSig').textContent, $('oampSignCopySig'));
+
+// ---------- OpenAMP restricted-transfer history (WW-6, spec 1.5(b), 1.7) ----------
+// openampd exposes no per-holder history endpoint (spec 0.5(2)): the wallet tracks its OWN sent
+// transfers locally (mirrors the STAKES pattern above) and polls the Sequentia explorer for
+// confirmation + the Bitcoin anchor depth, the same self-derived /anchor + testnet4-tip pattern
+// the cross-chain swap watchers use (xmaker.js anchorHeightOf/tipHeight). Nothing here is ever
+// labelled final at 0-conf.
+function oampLoadTransfers(){ try{ return JSON.parse(localStorage.getItem(OAMP_XFERS)||'[]'); }catch{ return []; } }
+function oampSaveTransfers(list){ try{ localStorage.setItem(OAMP_XFERS, JSON.stringify(list)); }catch{} }
+function oampRecordTransfer(rec){
+  if(!rec || !rec.txid) return;
+  const list=oampLoadTransfers();
+  const meta=assetMeta('oamp:'+rec.asset);
+  list.push({ asset:rec.asset, ticker:meta.ticker, precision:meta.precision, recipient_aid:rec.recipient_aid,
+              atoms:String(rec.atoms), txid:String(rec.txid), time:Date.now(),
+              confirmed:false, blockHash:null, anchorDepth:null });
+  oampSaveTransfers(list);
+}
+function renderOampHistory(){
+  const list=$('oampHistList'); if(!list) return; list.innerHTML='';
+  const xfers=oampLoadTransfers();
+  if(!xfers.length){ list.appendChild(el('div','muted','No restricted transfers yet.')); return; }
+  for(const x of xfers.slice().reverse()){
+    const item=el('div','item');
+    const pending=!x.confirmed;
+    const badge=el('span','badge '+(pending?'b-iss':'b-out'), pending?'pending':'confirmed');
+    if(pending) badge.style.opacity='.6';
+    item.appendChild(badge);
+    const mid=el('div','grow');
+    { const _d=el('div'); _d.appendChild(txLink('/explorer/tx/'+x.txid, x.txid.slice(0,18)+'…')); mid.appendChild(_d); }
+    let when = new Date(x.time).toLocaleString()+' · to '+x.recipient_aid.slice(0,10)+'…';
+    if(x.confirmed) when += x.anchorDepth!=null ? (' · Bitcoin anchor depth '+x.anchorDepth) : ' · confirmed, anchor depth pending';
+    else when += ' · pending, not final at 0-conf';
+    mid.appendChild(el('div','sub', when));
+    item.appendChild(mid);
+    item.appendChild(el('span','amt', fmtAtoms(BigInt(x.atoms), x.precision)+' '+x.ticker));
+    list.appendChild(item);
+  }
+}
+// Re-check every tracked transfer against the Sequentia explorer + the Bitcoin anchor. Reorg-aware:
+// a transfer that was confirmed can go back to pending if the anchoring Bitcoin block (and so the
+// Sequentia block) is orphaned (principle 1) — never sticky, always re-derived from the live chain.
+async function refreshOampHistory(){
+  const xfers=oampLoadTransfers(); if(!xfers.length) return;
+  let changed=false;
+  await Promise.all(xfers.map(async x=>{
+    try{
+      const r=await fetch(`/api/tx/${x.txid}/status`);
+      if(!r.ok) return;
+      const j=await r.json();
+      if(!!j.confirmed !== x.confirmed){ x.confirmed=!!j.confirmed; changed=true; if(!x.confirmed) x.anchorDepth=null; }
+      if(j.confirmed && j.block_hash && j.block_hash!==x.blockHash){ x.blockHash=j.block_hash; changed=true; }
+      if(x.confirmed && x.blockHash){
+        const a=await fetch(location.origin+'/anchor/'+x.blockHash).then(rr=>rr.ok?rr.json():null).catch(()=>null);
+        const anchorH = a && a.anchorheight!=null ? Number(a.anchorheight) : null;
+        if(anchorH!=null){
+          const tipTxt=await fetch(`${T4_API}/blocks/tip/height`).then(rr=>rr.ok?rr.text():null).catch(()=>null);
+          const tip=tipTxt!=null?parseInt(tipTxt,10):NaN;
+          if(!Number.isNaN(tip)){ const d=Math.max(0, tip-anchorH+1); if(d!==x.anchorDepth){ x.anchorDepth=d; changed=true; } }
+        }
+      }
+    }catch{ /* transient/network error — leave this entry as last known, don't drop it */ }
+  }));
+  if(changed) oampSaveTransfers(xfers);
+  renderOampHistory();
+}
+
 // ---------- toast ----------
 let toastT;
 function toast(text, link){ clearTimeout(toastT); let t=$('_toast'); if(!t){ t=el('div','toast'); t.id='_toast'; document.body.appendChild(t); }
   t.textContent=text||'';   // TEXT only — error/server strings can't inject markup
   if(link && link.href){ t.appendChild(document.createTextNode(' ')); t.appendChild(txLink(link.href, link.label||link.href)); }
   t.style.display='block'; toastT=setTimeout(()=>t.style.display='none', 9000); }
+
+// A deep link followed while the wallet is already open (the tab was already sitting on
+// sequentiatestnet.com and something navigated the hash) — same two routes, applied live.
+// Guarded by walletReady so it never fires before openWallet() has a signer to route to.
+window.addEventListener('hashchange', ()=>{ if(walletReady) handleDeepLinkRoute(); });
 
 boot().catch(e=>{ $('boot').innerHTML='<span class="err">Failed to load: '+(e?.message??e)+'</span>'; });
 </script>
