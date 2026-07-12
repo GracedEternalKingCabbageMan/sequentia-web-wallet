@@ -2218,6 +2218,14 @@ async function reviewMixed(q){
       await startSell({ asset: q.seqAsset, amount, offer: q.sellOffer || null });
       return;
     }
+    if (isSubAsset){
+      // Sub-asset BUY: pay BTC in an on-chain HTLC, receive the asset over Lightning, bound by one
+      // preimage the DEVICE owns. Persisted/resumable — the BTC HTLC is funded BEFORE /swap. Source
+      // the best resting buy offer here (the composer's mixed-BUY quote doesn't attach one).
+      const buyOffer = q.buyOffer || subassetOffers(q.seqAsset, 'buy')[0] || null;
+      await startBuy({ asset: q.seqAsset, amount, offer: buyOffer });
+      return;
+    }
     // Hand off to the persisted, RESUMABLE submarine stepper. The on-chain HTLC leg
     // must survive a page reload (it is only recoverable via its CLTV timeout otherwise),
     // so from here the swap lives in localStorage + the trade-process view, not a modal.
@@ -2313,6 +2321,150 @@ export async function resumeSell(){
   if (!SELL || SELL.state !== 'claiming' || !SELL.preimage || !SELL.btc_htlc) return;
   try { await claimSell(); try { C.toast && C.toast('Recovered your sell — BTC claimed on-chain (' + String(SELL.claim_txid||'').slice(0,16) + '…).'); } catch {} try { await C.sync(); } catch {} clearSell(); }
   catch (e){ /* leave persisted; the HTLC may already be claimed, or needs a retry — surfaced when the user re-enters Swap */ }
+}
+// ===========================================================================
+// Sub-asset BUY flow — the MIRROR of the sub-asset SELL, roles flipped. The taker pays BTC in an
+// ON-CHAIN HTLC and receives the asset over LIGHTNING, bound by ONE preimage the DEVICE owns.
+// The device generates P/H, registers a HODL invoice on H at its OWN hosted asset node (no
+// bolt11 — the maker pays H BY HASH), FUNDS a BTC HTLC on H (maker claims with P, device refunds
+// after T_btc), then commands the LSP to drive the maker's pay-by-hash. Once the asset payment is
+// HELD at the device's node, the device SETTLES with P — releasing the asset to itself AND
+// revealing P so the maker claims the BTC. FUND-CRITICAL: the BTC HTLC is locked BEFORE /swap, so
+// BUY is persisted+resumable; resumeBuy() settles (asset in) once held, or refunds the BTC after
+// T_btc. INVARIANT: the LSP/maker are BLIND to P until the device settles; the maker claims BTC
+// with its identity key (seqdex 2152f33). BUY and SELL stay on SEPARATE books (ln_direction 5 vs 4).
+const BUY_KEY = 'swk.subasset.buy';
+let BUY = null;
+function saveBuy(){ try { localStorage.setItem(BUY_KEY, JSON.stringify(BUY)); } catch {} }
+function clearBuy(){ BUY = null; try { localStorage.removeItem(BUY_KEY); } catch {} }
+// True while a buy has FUNDED its BTC HTLC but is not yet settled/refunded — the BTC is locked, so
+// the record must survive a reload (resumeBuy settles on hold, or refunds after T_btc).
+export function hasBuyInFlight(){ return !!(BUY && (BUY.state === 'funded' || BUY.state === 'holding')); }
+// T_btc safety delta over the current BTC tip (parent-chain blocks), matching the maker's
+// BtcLocktimeDelta so the refund branch matures well after the swap should have settled.
+const BUY_CLTV_DELTA = 100;
+
+async function startBuy(params){
+  const { $ } = C;
+  const asset = params.asset, am = C.assetMeta(asset);
+  const offer = params.offer || null;
+  const modal = C.el('div','modal'); const card = C.el('div','card');
+  card.appendChild(C.el('label','lbl','Buying ' + am.ticker + ' over Lightning'));
+  const st = C.el('div','status'); card.appendChild(st);
+  const act = C.el('div','row'); act.style.marginTop = '12px';
+  const closeBtn = C.el('button','ghost','Close'); closeBtn.style.display = 'none'; closeBtn.onclick = () => modal.remove();
+  act.appendChild(closeBtn); card.appendChild(act);
+  modal.appendChild(card); document.body.appendChild(modal);
+  const say = (t, cls) => { st.className = 'status' + (cls ? ' ' + cls : ''); st.innerHTML = (cls ? '' : '<span class="spin"></span>') + esc(t); };
+  const done = () => { closeBtn.style.display = ''; };
+  try {
+    if (!(L && L.swap && L.assetNodeKey && L.nodeInvoice && L.invoiceStatus && L.nodeSettle)) throw new Error('The Lightning service is unavailable in this build.');
+    if (!(C.btcLeg && C.btcLeg.fund && C.btcLeg.refund && C.btcLeg.refundKey && C.btcLeg.tipHeight)) throw new Error('The BTC HTLC service is unavailable in this build.');
+    if (!(C.wasm && C.wasm.generateSwapSecret && C.wasm.buildSeqHtlcRedeemScript)) throw new Error('The HTLC builder is unavailable in this build.');
+    const makerClaimPub = offer && (offer.maker_claim_pub || offer.maker_claim_pubkey);
+    if (!offer || !makerClaimPub) throw new Error('No resting ' + am.ticker + ' buy offer right now — try again shortly.');
+    say('Preparing your buy…');
+    // 1. DEVICE generates the secret. Only we ever hold P until WE settle.
+    const sec = C.wasm.generateSwapSecret();            // { secret_hex, hash_hex }
+    const H = sec.hash_hex, P = sec.secret_hex;
+    const node_key = await L.assetNodeKey(asset);       // our OWN hosted asset node RECEIVES the asset over LN
+    const assetAtoms = Number(offer.asset_amount);      // whole-offer lift at the maker's fixed terms
+    const btcSats = Number(offer.btc_sats);
+    // Bring our asset LN node's device signer ONLINE so it can register + settle the HODL invoice.
+    if (L.connectNode){
+      say('Bringing your ' + am.ticker + ' Lightning node online…');
+      const prov = await L.connectNode(asset);
+      if (!(prov && prov.connected)) throw new Error('Could not bring your ' + am.ticker + ' Lightning node online — reopen the wallet and try again.');
+    }
+    // Ensure inbound asset liquidity so the maker can pay us over LN (JIT 0-conf; idempotent, best-effort).
+    if (L.channelInbound){ say('Preparing inbound Lightning liquidity…'); try { await L.channelInbound({ node_key, asset, amount: assetAtoms }); } catch {} }
+    // 2. Register a HODL invoice on H at our OWN node (NO bolt11; the maker pays H BY HASH). Device keeps P.
+    say('Registering the Lightning invoice on your node…');
+    const inv = await L.nodeInvoice({ node_key, asset, amount: assetAtoms, payment_hash: H });
+    if (!(inv && (inv.payment_hash || inv.hodl))) throw new Error('Could not register the Lightning invoice on your node.');
+    // 3. Build + FUND the BTC HTLC on H: maker claims with P, device refunds after T_btc (the PROVEN
+    //    xswap.js:689-695 engine, roles flipped). T_btc = max(offer.onchain_cltv, tip + delta).
+    const refund = C.btcLeg.refundKey();                // device refund key; only we can refund
+    const tip = await C.btcLeg.tipHeight();
+    const T_btc = Math.max(Number(offer.onchain_cltv || 0), tip + BUY_CLTV_DELTA);
+    const redeem = C.wasm.buildSeqHtlcRedeemScript(H, makerClaimPub, refund.public_key, T_btc);
+    say('Locking your Bitcoin in the on-chain HTLC…');
+    const funded = await C.btcLeg.fund(redeem, btcSats);   // { txid, vout, height, amount }
+    const btc_htlc = { txid: String(funded.txid), vout: funded.vout, amount: btcSats,
+      redeem_script: redeem, cltv: T_btc, maker_claim_pub: makerClaimPub, taker_refund_pub: refund.public_key };
+    // PERSIST BEFORE /swap: the BTC is now locked, so this record is the ONLY recovery handle.
+    BUY = { state: 'funded', asset, ticker: am.ticker, preimage: P, hash_h: H, node_key, btc_htlc,
+      t_btc: T_btc, asset_amount: assetAtoms, offer_id: offer.offer_id, maker_pubkey: offer.maker_pubkey, ts: mixedTip() };
+    saveBuy();
+    logTrade({ id: 'buy:' + H, title: 'Buying ' + am.ticker + ' with BTC', status: 'BTC locked' });
+    // 4. Command the LSP to drive the maker's pay-by-hash (ASYNC job -> 202 { job_id, poll, held:false }).
+    say('Asking the maker to pay you ' + am.ticker + ' over Lightning…');
+    const job = await L.swap({ side: 'buy', hodl: true, asset, node_key, payment_hash: H, asset_amount: assetAtoms,
+      payRail: 'chain', recvRail: 'ln', btc_htlc, offer_id: offer.offer_id, maker_pubkey: offer.maker_pubkey });
+    BUY.job_id = job && (job.job_id || job.jobId); BUY.poll = job && job.poll; saveBuy();
+    // 5. Wait for the maker's asset payment to arrive HELD, then DEVICE-SETTLE with P (or refund after T_btc).
+    say('Waiting for the maker’s ' + am.ticker + ' payment to arrive…');
+    await driveBuy(say);
+    if (BUY && BUY.state === 'settled'){ say('Done. Your BTC bought ' + am.ticker + ' — received over Lightning.', 'ok'); done(); try { await C.sync(); } catch {} clearBuy(); }
+    else if (BUY && BUY.state === 'refunded'){ say('The maker didn’t pay in time — your Bitcoin was refunded on-chain (' + String(BUY.refund_txid||'').slice(0,16) + '…).', 'ok'); done(); try { await C.sync(); } catch {} clearBuy(); }
+    else { done(); }
+  } catch (e){
+    // If the BTC HTLC was already funded (BUY persisted), keep it for settle/refund on reload — never lose it.
+    say('Failed: ' + C.prettyErr(e) + (BUY && (BUY.state === 'funded' || BUY.state === 'holding') ? ' — your Bitcoin is still locked; reopen the wallet to finish or refund it.' : ''), 'err');
+    done();
+  }
+}
+// Poll the HODL invoice on our node until the maker's asset payment is HELD, then device-settle with
+// P (releases the asset to us AND reveals P so the maker claims the BTC), then best-effort confirm the
+// LSP job settled. Bounded by T_btc: if the asset never holds before the BTC HTLC times out, refund
+// the BTC (the ONLY loss-avoiding path). Shared by startBuy and resumeBuy. Mutates + persists BUY.
+async function driveBuy(say){
+  say = say || (() => {});
+  const H = BUY.hash_h, node_key = BUY.node_key;
+  // Resume-after-crash-before-swap: if we funded the BTC but never commanded the LSP, (re)issue it.
+  if (!BUY.job_id && BUY.btc_htlc){
+    try {
+      const job = await L.swap({ side: 'buy', hodl: true, asset: BUY.asset, node_key, payment_hash: H,
+        asset_amount: BUY.asset_amount, payRail: 'chain', recvRail: 'ln', btc_htlc: BUY.btc_htlc,
+        offer_id: BUY.offer_id, maker_pubkey: BUY.maker_pubkey });
+      BUY.job_id = job && (job.job_id || job.jobId); BUY.poll = job && job.poll; saveBuy();
+    } catch {}   // never mind — the refund guard below still protects the funds
+  }
+  for (;;){
+    let tip = 0; try { tip = await C.btcLeg.tipHeight(); } catch {}
+    const status = await L.invoiceStatus({ node_key, payment_hash: H }).catch(() => null);
+    if (status && status.settled){ BUY.state = 'settled'; saveBuy(); return; }   // already settled (resume)
+    if (status && status.held){
+      BUY.state = 'holding'; saveBuy();
+      say('Payment received — releasing your ' + BUY.ticker + ' and revealing the preimage…');
+      await L.nodeSettle({ node_key, payment_hash: H, preimage: BUY.preimage });   // 5. device-settle
+      BUY.state = 'settled'; saveBuy();
+      logTrade({ id: 'buy:' + H, title: 'Bought ' + BUY.ticker + ' with BTC', status: 'asset received' });
+      // 6. best-effort: confirm the maker claimed the BTC (job settled). Non-fatal.
+      if (L.jobStatus && (BUY.poll || BUY.job_id)){ try { const j = await L.jobStatus(BUY.poll || ('/swap/' + BUY.job_id)); if (j && j.status) { BUY.detail = j.status; saveBuy(); } } catch {} }
+      return;
+    }
+    if (tip && BUY.t_btc && tip >= BUY.t_btc){ say('The maker didn’t pay in time — refunding your Bitcoin on-chain…'); await refundBuy(); return; }   // 7. refund branch
+    await new Promise(r => setTimeout(r, 6000));
+  }
+}
+// Refund the funded BTC HTLC via its CLTV branch after T_btc (a real on-chain reclaim). Terminal.
+async function refundBuy(){
+  const H = BUY.btc_htlc;
+  const txid = await C.btcLeg.refund({ txid: H.txid, vout: H.vout, amount: H.amount, redeem_script: H.redeem_script, locktime: BUY.t_btc });
+  BUY.state = 'refunded'; BUY.refund_txid = (txid && txid.toString) ? txid.toString() : String(txid); saveBuy();
+  logTrade({ id: 'buy:' + (BUY.hash_h || ''), title: 'Buy refunded (' + BUY.ticker + ')', status: 'BTC refunded', txid: BUY.refund_txid });
+}
+// On wallet load: if a buy funded its BTC HTLC but never completed, resume it — settle if the asset
+// is now held, or refund the BTC once past T_btc. The fund-recovery path (mirrors resumeSell).
+export async function resumeBuy(){
+  try { BUY = JSON.parse(localStorage.getItem(BUY_KEY) || 'null'); } catch { BUY = null; }
+  if (!BUY || !(BUY.state === 'funded' || BUY.state === 'holding') || !BUY.preimage || !BUY.btc_htlc) return;
+  try {
+    await driveBuy();
+    if (BUY.state === 'settled'){ try { C.toast && C.toast('Recovered your buy — ' + BUY.ticker + ' received over Lightning.'); } catch {} try { await C.sync(); } catch {} clearBuy(); }
+    else if (BUY.state === 'refunded'){ try { C.toast && C.toast('Your buy timed out — Bitcoin refunded on-chain (' + String(BUY.refund_txid||'').slice(0,16) + '…).'); } catch {} try { await C.sync(); } catch {} clearBuy(); }
+  } catch (e){ /* leave persisted; the BTC is still refundable at T_btc — retried when the user re-enters Swap */ }
 }
 // ===========================================================================
 // Mixed-rail (submarine) swap — PERSISTED + RESUMABLE trade-process view.
@@ -2986,6 +3138,10 @@ function renderInFlightCard(){
   if (hasSellInFlight()){
     rows.push({ view: null, need: true, title: 'Sell ' + esc(SELL.ticker) + ' for BTC',
       status: 'claiming your BTC on-chain (automatic)' });
+  }
+  if (hasBuyInFlight()){
+    rows.push({ view: null, need: true, title: 'Buy ' + esc(BUY.ticker || 'asset') + ' with BTC',
+      status: BUY.state === 'holding' ? 'held — settle from your wallet to receive' : 'BTC HTLC funded; awaiting the asset over Lightning' });
   }
   if (X && X.hasInFlight && X.hasInFlight()){
     rows.push({ view: 'cross', need: true, title: 'Buy asset with BTC · cross-chain', status: 'in progress' });

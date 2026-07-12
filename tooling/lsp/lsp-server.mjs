@@ -683,6 +683,140 @@ function startChannelOpen(body) {
   return { ...job, poll: `/channel/open/${jobId}` };
 }
 
+// ---------------------------------------------------------------------------
+// Sub-asset external-BTC HODL BUY (async, pollable) — the EXACT mirror of the proven
+// sub-asset SELL, roles flipped. The taker pays BTC ON-CHAIN and receives the asset OVER
+// LIGHTNING; the taker's OWN hosted node holds the asset payment by H (holdinvoice-seq, NO
+// bolt11 — the maker pays H by BARE HASH) and the DEVICE settles with P out-of-band. Always
+// ASYNC (the maker must PayHash + the device must settle). INVARIANT: the LSP only READS
+// holdinvoicelookup — it NEVER calls settle, so it stays blind to P (the whole point of
+// HODL). Wired from POST /swap {side:'buy',hodl:true}; polled via GET /swap/<job_id>.
+async function runSubasBuyHodl(job, body) {
+  // (a) resolve the user's hosted asset node (the payee of the held asset payment).
+  const rec = PROV && PROV.getByKey(job.node_key);
+  const userRpc = rec && rec.rpc;
+  if (!userRpc) throw new Error('user node not provisioned for this asset (POST /node/provision first)');
+  // (b) JIT inbound so the user node can RECEIVE the asset over LN (idempotent, fail-closed).
+  try {
+    job.inbound = await provisionInbound({ nodeKey: job.node_key, assetId: job.asset, amount: job.asset_amount });
+  } catch (e) {
+    throw new Error(`inbound provisioning failed: ${(e && e.message) || e}`);
+  }
+  // (c) the external-BTC xsubas vector (the DEVICE funded the BTC HTLC, so NO -btc-wallet)
+  //     MINUS -asset-bolt11, PLUS the HODL signal: announce THIS node id + H, the maker pays
+  //     H by BARE HASH, and the device settles out-of-band. body.btc_htlc carries the full
+  //     redeem_script + taker_refund_pub the driver relays (job.btc_htlc keeps only a subset).
+  const bh = body.btc_htlc;
+  // Resolve the user node's LN id — the HODL trigger is `-taker-ln-node-id <id>` (the maker pays the
+  // hold by BARE HASH to it). `-asset-hodl` is NOT a real xsubas flag; passing it breaks flag parsing
+  // (every later flag is dropped) so hodl mode never engages and the flow silently mis-settles.
+  let userNodeId = (rec && rec.node_id) || '';
+  if (!userNodeId) { try { const gi = await lnrpc('getinfo', [], userRpc); userNodeId = gi.id || ''; } catch {} }
+  if (!userNodeId) throw new Error('could not resolve the user node LN id for the HODL buy');
+  const args = ['xsubas', '-asset', job.asset, '-relay', CFG.subasRelay,
+    '-btc-rpc', CFG.subasBtcRpc, '-btc-chain', CFG.subasBtcChain,
+    '-btc-htlc-txid', String(bh.txid), '-btc-htlc-vout', String(bh.vout),
+    '-btc-htlc-amount', String(bh.amount), '-btc-htlc-script', String(bh.redeem_script),
+    '-btc-locktime', String(bh.cltv), '-btc-refund-pub', String(bh.taker_refund_pub),
+    '-asset-ln-socket', userRpc, '-taker-ln-node-id', String(userNodeId),
+    '-payment-hash', job.payment_hash, '-state-file', `/tmp/xsubas-${job.job_id}.json`,
+    '-min-btc-conf', String(CFG.subasMinBtcConf)];
+  if (job.offer_id) args.push('-offer-id', String(job.offer_id));
+  if (job.maker_pubkey) args.push('-maker-pubkey', String(job.maker_pubkey));
+  // (d) READ-ONLY held/settled watcher — the SAME holdinvoicelookup /node/invoice-status uses.
+  //     The LSP NEVER settles (the DEVICE does), so this only surfaces state on the job.
+  let watching = true;
+  (async () => {
+    while (watching) {
+      try {
+        const l = await lnrpc('holdinvoicelookup', [job.payment_hash], userRpc);
+        if (l.state === 'accepted' && !job.held) {
+          job.held = true; job.held_ms = Date.now();
+          if (job.status === 'pending') job.status = 'held';
+        }
+        if (l.state === 'settled') job.settled = true;
+      } catch { /* transient; keep polling */ }
+      await sleep(2000);
+    }
+  })();
+  // (e) drive the maker's pay-by-hash to completion (bounded by the mixed timeout).
+  const { err, out } = await new Promise((resolve) =>
+    execFile(CFG.seqobCli, args, { timeout: CFG.mixedTimeoutMs, maxBuffer: 8 << 20 },
+      (e2, so, se) => resolve({ err: e2, out: (so || '') + (se || '') })));
+  // (f) The HODL taker CLI RETURNS AT HELD (prints "HELD", exits 0); the on-chain SETTLED happens
+  //     LATER, after the DEVICE settles (/node/settle) and the maker claims the BTC HTLC. So a clean
+  //     CLI exit is success-IN-PROGRESS, not terminal — only a pre-held error is a real failure.
+  const heldBanner = /HELD on H|HODL BUY[^\n]*HELD/i.test(out);
+  if (err && !job.held && !heldBanner) {
+    watching = false;
+    job.status = 'failed';
+    job.error = `sub-asset buy failed before held: ${err.message}`;
+    job.detail = out.split('\n').filter(Boolean).slice(-6).join(' | ');
+    job.note = 'the BTC HTLC is refundable after T_btc via btcLeg.refund (the device holds the refund key).';
+    job.done_ms = Date.now();
+    return job;
+  }
+  if (job.status === 'pending') { job.held = true; job.held_ms = job.held_ms || Date.now(); job.status = 'held'; }
+  // Keep the read-only holdinvoicelookup watcher ALIVE past the CLI exit: the wallet drives
+  // /node/settle (the device reveals P), the maker claims the BTC, and holdinvoicelookup flips to
+  // 'settled' -> the watcher sets job.settled. The LSP never sees P.
+  const settleDeadline = Date.now() + CFG.mixedTimeoutMs;
+  while (!job.settled && Date.now() < settleDeadline) { await sleep(2000); }
+  watching = false;
+  job.done_ms = Date.now();
+  job.settled_ms = Date.now() - job.started_ms;
+  if (job.settled) {
+    job.status = 'settled';
+    job.note = 'received the asset over Lightning; the maker claimed your BTC HTLC with the device-revealed preimage.';
+  } else {
+    job.status = 'held';
+    job.note = 'the asset payment is HELD on your node; settle it from your wallet (the device reveals the preimage) to complete.';
+  }
+  return job;
+}
+
+// POST /swap {side:'buy',hodl:true,...}: validate the HODL-buy contract, create the pollable
+// job in the shared `jobs` Map, launch the worker, and hand back a 202 job shell (or
+// {ok:false,code}). Mirrors startChannelOpen. GET /swap/<job_id> then surfaces the job verbatim.
+function startSubasBuyHodl(body) {
+  const assetId = resolveAsset(body.asset);
+  if (!assetId || assetId === CFG.btcx) return { ok: false, error: 'a Sequentia asset id is required for a sub-asset buy (not BTC)' };
+  const nodeKey = String((body && body.node_key) || '').toLowerCase();
+  if (!nodeKey) return { ok: false, error: 'node_key (your hosted asset node that receives the asset over LN) is required' };
+  const H = String((body && body.payment_hash) || '').toLowerCase();
+  if (!/^[0-9a-f]{64}$/.test(H)) return { ok: false, error: 'payment_hash must be a 32-byte hex H = SHA256(P)' };
+  const assetAmount = Number(body.asset_amount);
+  if (!Number.isFinite(assetAmount) || assetAmount <= 0) return { ok: false, error: 'asset_amount must be a positive number (asset atoms)' };
+  const bh = body.btc_htlc;
+  const need = ['txid', 'vout', 'amount', 'redeem_script', 'cltv', 'maker_claim_pub', 'taker_refund_pub'];
+  if (!bh || need.some((k) => bh[k] === undefined || bh[k] === null || bh[k] === '')) {
+    return { ok: false, error: 'btc_htlc must carry {txid,vout,amount,redeem_script,cltv,maker_claim_pub,taker_refund_pub} (the device-funded on-chain HTLC on H)' };
+  }
+  // Backend gates (fail closed).
+  if (!CFG.subasBtcRpc || !CFG.subasRelay) {
+    return { ok: false, code: 503, error: 'the sub-asset BUY rail is not configured on this LSP (set SUBAS_BTC_RPC + SUBAS_RELAY + a sub-asset maker on SUBAS_RELAY)' };
+  }
+  if (!PROV) return { ok: false, code: 501, error: 'per-asset node provisioning is not enabled on this LSP' };
+  const rec = PROV.getByKey(nodeKey);
+  if (!rec || !rec.rpc) return { ok: false, code: 404, error: 'unknown/unprovisioned node_key (POST /node/provision first)' };
+
+  const jobId = crypto.randomUUID();
+  const job = {
+    job_id: jobId, side: 'buy', hodl: true, rail: 'subasset',
+    pay_rail: 'chain', recv_rail: 'ln', asset: assetId, asset_label: assetLabel(assetId),
+    node_key: nodeKey, payment_hash: H, asset_amount: assetAmount,
+    btc_htlc: { txid: String(bh.txid), vout: bh.vout, amount: bh.amount, cltv: bh.cltv },
+    offer_id: body.offer_id || null, maker_pubkey: body.maker_pubkey || null,
+    status: 'pending', held: false, settled: false,
+    finality: 'confirming', anchor_bound: true, inbound: null, started_ms: Date.now() };
+  jobs.set(jobId, job);
+  runSubasBuyHodl(job, body).catch((e) => {
+    job.status = 'failed'; job.error = String((e && e.message) || e); job.done_ms = Date.now();
+  });
+  return { ...job, ok: true, held: false, poll: `/swap/${jobId}`,
+    note: 'Sub-asset HODL buy: poll GET /swap/<job_id>; when held:true, settle via /node/settle to release P and let the maker claim your BTC.' };
+}
+
 // POST /channel/close {chain, asset?, node?, scid?, destination}. The INVERSE of Move-to-Lightning:
 // cooperatively close a channel on the user's OWN hosted node and send the reclaimed funds straight
 // to `destination` (the wallet's own on-chain address), so nothing is left parked on the hosted node
@@ -1361,6 +1495,17 @@ const server = http.createServer(async (req, res) => {
     if (req.method === 'POST' && url.pathname === '/swap') {
       const body = await readBody(req);
       if (!body) return send(res, 400, { ok: false, error: 'bad json body' });
+      // SUB-ASSET external-BTC HODL BUY: taker pays BTC ON-CHAIN, receives the asset OVER
+      // LIGHTNING; the taker's OWN hosted node holds the asset payment by H (holdinvoice-seq,
+      // no bolt11) and the DEVICE settles with P out-of-band. Always ASYNC (the maker must
+      // PayHash + the device must settle), and the LSP never sees P. Distinct from the legacy
+      // asset_bolt11 per-user path (auto-settle); keyed on body.hodl===true. Fires BEFORE the
+      // ln/ln default so it never falls through to runSwap (pure-LN).
+      if (body.side === 'buy' && body.hodl === true) {
+        reapJobs();
+        const r = startSubasBuyHodl(body);
+        return send(res, r.ok ? 202 : (r.code || 400), r);
+      }
       // Rails select the settlement path (default ln/ln = the unchanged pure-LN route).
       // EXCEPTION: a SELL carrying a device btc_claim_pub is a SUB-ASSET sell (asset over
       // Lightning -> BTC ON-CHAIN HTLC, ln_direction=5). The wallet omits rails, so default

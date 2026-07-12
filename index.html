@@ -797,13 +797,13 @@ import init, { Mnemonic, Network, Signer, Wollet, EsploraClient, Address, AssetI
   scriptToAddress, buildCovenantFillTx }
   from './pkg/lwk_wasm.js';
 import { HDKey, mnemonicToSeedSync, btc, schnorr } from './btc.js';
-import { initSwap, renderSwap, resumeCrossMakers, resumeCovenantOrders, resumeMixedSwap, resumeSell, scanCovenantCompanion, setConfidentialReceive, confidentialReceive } from './swap.js';
+import { initSwap, renderSwap, resumeCrossMakers, resumeCovenantOrders, resumeMixedSwap, resumeSell, resumeBuy, hasBuyInFlight, scanCovenantCompanion, setConfidentialReceive, confidentialReceive } from './swap.js';
 import { initXswap, renderXswap, fetchXmarkets, fetchXquote, fetchXbook, openFromComposer, hasInFlight } from './xswap.js';
 import { initXrswap, fetchRQuote, openReverseFromComposer, hasInFlight as hasReverseInFlight, renderReverse } from './xrswap.js';
 import { initXmaker, startForwardMaker, startReverseMaker, liveMakerOffers, resumeMakerSwaps } from './xmaker.js';
 import { initSeqln, connectDevice as lnConnectDevice, disconnectDevice as lnDisconnect,
   onSeqlnStatus, seqlnState, seqlnAvailable, seqlnGetStatus, seqlnListNodes, seqlnNodeOnchain, seqlnSwap, seqlnBook, seqlnPostOffer, lnFinalityCopy,
-  seqlnChannelInbound, seqlnNodeInvoice, seqlnInvoiceStatus, seqlnNodeSettle, seqlnNodeReceive, seqlnNodePay,
+  seqlnChannelInbound, seqlnNodeInvoice, seqlnInvoiceStatus, seqlnNodeSettle, seqlnNodeReceive, seqlnNodePay, seqlnJobStatus,
   seqlnChannels, seqlnFunding, fundChannel, resumeFundChannel, provisionAndConnect, waitNodeReady, provisionedState,
   disconnectProvisioned, deviceTransportPubkey, registerOwnStatusKeys, closeChannelLsp } from './seqln.js';
 import { lnDeriveNode, lnDeriveAsset } from './seqln-keys.js';
@@ -1627,6 +1627,7 @@ async function openWallet(phrase){
   // A sub-asset SELL that paid the asset over LN but whose on-chain BTC claim never confirmed:
   // re-attempt the claim from the persisted preimage + HTLC terms (the claim is the fund step).
   try{ resumeSell(); }catch(e){ console.warn('[resume] sub-asset sell resume failed:', e?.message??e); }
+  try{ resumeBuy(); }catch(e){ console.warn('[resume] sub-asset buy resume failed:', e?.message??e); }
   // Finish a Move-to-Lightning that was interrupted after its deposit landed (funds on the user's
   // own node, never lost) — self-healing so a network blip / reload can't strand a deposit.
   try{ resumeMove(); }catch(e){ console.warn('[resume] move resume failed:', e?.message??e); }
@@ -2355,6 +2356,7 @@ function initSwapTab(){
       nodeSettle: (p) => seqlnNodeSettle(p),
       nodeReceive: (p) => seqlnNodeReceive(p),
       nodePay: (p) => seqlnNodePay(p),
+      jobStatus: (pathOrId) => seqlnJobStatus(pathOrId),   // advisory async-job status (sub-asset HODL BUY)
       // The registry node_key for the user's OWN hosted LN node for `assetHex`
       // (seq:<asset>:<deviceTransportPubkey>) — matches refreshOwnLnNodeKeys. Needed by the
       // sub-asset sell/buy /swap calls to name which hosted node pays over Lightning.

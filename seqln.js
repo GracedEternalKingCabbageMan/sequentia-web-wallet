@@ -394,6 +394,13 @@ export function seqlnNodeReceive({ node_key, amount, description }) {
 export function seqlnNodePay({ node_key, bolt11 }) {
   return lspFetch('/node/pay', { method: 'POST', body: JSON.stringify({ node_key, bolt11 }) });
 }
+// Advisory status of an async LSP job (e.g. the sub-asset HODL BUY /swap job). Takes the poll path
+// ('/swap/<id>') the /swap 202 returned, or a bare id. The wallet drives its own settle; this is only
+// a display hint (pending|held|settled|failed).
+export function seqlnJobStatus(pathOrId) {
+  const p = String(pathOrId || '');
+  return lspFetch(p.startsWith('/') ? p : ('/swap/' + p));
+}
 
 // "Move back to chain": cooperatively close a channel on the user's own hosted node and send the
 // reclaimed funds to `destination` (the wallet's own on-chain address). The INVERSE of fundChannel.
