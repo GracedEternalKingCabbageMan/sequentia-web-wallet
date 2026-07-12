@@ -98,7 +98,14 @@ export function acceptUpgrade(req, socket) {
 // sees a clean EOF and awaits a reconnect) if no ws frame arrives within
 // `pongTimeoutMs`. Set `pingMs = 0` to disable (used only to isolate the
 // proxy-side recovery in tests).
-export function bridgeWsToTcp(wsSocket, req, { tcpHost, tcpPort, tcpRetryMs = 20000, log = () => {}, id = 0, pingMs = 15000, pongTimeoutMs = 0 }) {
+// DEVICE-PRESENCE CALLBACKS (Specula preempt-arm wiring): `onUp()` fires once when
+// the device's byte-path is fully spliced (the device signer is present), `onDrop(why)`
+// fires once when the bridge tears the link down (graceful ws close OR keepalive
+// timeout — the device went silent mid-session). Both are optional no-ops so existing
+// callers/tests are unaffected, and both are wrapped so a callback error can never
+// disturb the byte relay. The LSP uses these to arm/dis-arm the watchtower preempt
+// broadcast on a mid-round device drop; this module itself stays keyless + policy-free.
+export function bridgeWsToTcp(wsSocket, req, { tcpHost, tcpPort, tcpRetryMs = 20000, log = () => {}, id = 0, pingMs = 15000, pongTimeoutMs = 0, onUp = () => {}, onDrop = () => {} }) {
   const peer = `${req.socket.remoteAddress}:${req.socket.remotePort}`;
   log(`#${id} WebSocket up from ${peer}; dialing ${tcpHost}:${tcpPort}`);
   if (!pongTimeoutMs) pongTimeoutMs = pingMs ? pingMs * 2 : 0;
@@ -114,6 +121,7 @@ export function bridgeWsToTcp(wsSocket, req, { tcpHost, tcpPort, tcpRetryMs = 20
     if (closed) return; closed = true;
     if (keepalive) { clearInterval(keepalive); keepalive = null; }
     log(`#${id} closing (${why}); relayed ws->tcp ${wsToTcp}B, tcp->ws ${tcpToWs}B`);
+    try { onDrop(why); } catch {}   // device gone — never let a callback error break teardown
     try { wsSend(0x8, Buffer.alloc(0)); } catch {}
     try { wsSocket.destroy(); } catch {}
     try { tcp?.destroy(); } catch {}
@@ -144,6 +152,7 @@ export function bridgeWsToTcp(wsSocket, req, { tcpHost, tcpPort, tcpRetryMs = 20
       s.setNoDelay(true);
       tcp = s; tcpReady = true;
       log(`#${id} target TCP up; splicing`);
+      try { onUp(); } catch {}   // device signer present — never let a callback error break the splice
       for (const b of pending) { tcp.write(b); wsToTcp += b.length; }
       pending = [];
       s.on('data', (d) => { tcpToWs += d.length; wsSend(0x2, d); });

@@ -1654,7 +1654,12 @@ async function openWallet(phrase){
 //   SEQ_LSP_DEV_SEED_ASSET / _BTC  (signing seed string)
 // and the legacy single-node overrides (SEQ_LSP_DEV_KEY / _DEV_MNEMONIC) still
 // pin the ASSET slot so an existing one-node harness keeps working.
-function lnPolicy(){ return ((typeof window!=='undefined') && window.SEQ_LSP_POLICY) || 'permissive'; }
+// Device-signer custody policy. DEFAULT is 'enforce' (the on-device signer rejects any
+// sweep whose output is not the node's own cached wallet scripts / reconstructed to_local
+// — the Specula watchtower non-custody invariant). window.SEQ_LSP_POLICY is the kill-switch:
+// set it to 'permissive' to override back to the legacy always-sign flow if an enforce
+// mis-cache ever wrongly rejected a legitimate sweep (recoverable without a rebuild).
+function lnPolicy(){ return ((typeof window!=='undefined') && window.SEQ_LSP_POLICY) || 'enforce'; }
 function lnHexOverride(v){ return (typeof v==='string' && /^[0-9a-fA-F]{64}$/.test(v)) ? v.toLowerCase() : null; }
 function lnNodeIdentity(phrase, node){
   const W = (typeof window!=='undefined') ? window : {};
@@ -1708,7 +1713,7 @@ function initLightning(phrase){
   lnStatusPill();
   const nodes = lnEnabledNodes();
   if (!nodes.length) return;         // LN not deployed here; composer stays on-chain-only
-  const policy = ((typeof window!=='undefined') && window.SEQ_LSP_POLICY) || 'permissive';
+  const policy = ((typeof window!=='undefined') && window.SEQ_LSP_POLICY) || 'enforce';   // enforce by default; SEQ_LSP_POLICY='permissive' is the kill-switch
   // Bring up each enabled hosted node's device signer. The rail becomes available
   // (seqlnAvailable) only once BOTH legs are serving; each connect is independent
   // and non-fatal so one slow/failed leg doesn't wedge the other.

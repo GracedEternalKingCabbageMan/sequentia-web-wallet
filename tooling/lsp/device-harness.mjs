@@ -12,7 +12,12 @@
 // hsm_secret keeps the hosted node's identity (and its existing channels) intact.
 //
 // Usage:
-//   node device-harness.mjs <label> <wsUrl> <hsm_secret_file> <host_pub_hex> <device_priv_hex_or_file> [--enforce]
+//   node device-harness.mjs <label> <wsUrl> <hsm_secret_file> <host_pub_hex> <device_priv_hex_or_file> [--permissive]
+//
+// The device signer ENFORCES custody by default (rejects any sweep that does not
+// pay the node's own wallet scripts / reconstructed to_local). Pass --permissive
+// to opt back into the legacy always-sign flow (the kill-switch, mirroring the
+// wallet's window.SEQ_LSP_POLICY='permissive').
 //
 // The device transport privkey may be given as 64-hex or as a path to a file
 // holding that hex (preferred: the secret never lands in argv/ps).
@@ -33,10 +38,11 @@ const WASM = readFileSync(join(HERE, '..', '..', 'lightning', 'pkg', 'seqln_sign
 
 const [label, wsUrl, secretPath, hostPubHex, devicePrivArg, ...rest] = process.argv.slice(2);
 if (!label || !wsUrl || !secretPath || !hostPubHex || !devicePrivArg) {
-  console.error('usage: node device-harness.mjs <label> <wsUrl> <hsm_secret_file> <host_pub_hex> <device_priv_hex_or_file> [--enforce]');
+  console.error('usage: node device-harness.mjs <label> <wsUrl> <hsm_secret_file> <host_pub_hex> <device_priv_hex_or_file> [--permissive]');
   process.exit(2);
 }
-const enforce = rest.includes('--enforce');
+// Enforce custody by default; --permissive is the opt-out kill-switch.
+const enforce = !rest.includes('--permissive');
 // Accept the device transport privkey as raw hex or as a file path holding it
 // (a file keeps the key out of argv/ps).
 let devicePrivHex = devicePrivArg;
@@ -58,7 +64,7 @@ const NAME = {
 
 const secret = new Uint8Array(readFileSync(secretPath));
 const signer = await SeqlnSigner.fromHsmSecret(secret, { wasm: WASM });
-if (enforce) signer.setPolicy('enforce');
+signer.setPolicy(enforce ? 'enforce' : 'permissive');   // enforce by default; --permissive opts out
 
 signer.onStatus = (st) => {
   if (st.state === 'node_id') console.error(`[${label}] wasm derived node id ${st.nodeId}`);

@@ -1592,6 +1592,71 @@ const server = http.createServer(async (req, res) => {
 // exactly this path. The router is keyless: the Noise_XK handshake + signer
 // frames flow end-to-end browser<->proxy; the LSP never sees a plaintext byte.
 // ---------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+// PREEMPT-ARM WIRING (Specula watchtower, Phase G — withhold-revoke defense).
+//
+// When a device signer drops MID-ROUND (a commitment_signed is in flight and the
+// peer's revoke is still outstanding — an HTLC in any non-terminal state), arm
+// speculad to broadcast OUR CURRENT commitment first, so a peer who withholds the
+// revoke cannot later force a stale close in their favour. On a clean device
+// reconnect, dis-arm. The device-presence signal is the ws-bridge itself (onDrop
+// = the device's Noise ws went down; onUp = it is spliced back), which is the only
+// authoritative source because the arm/dis-arm must run on the box WHILE the device
+// is gone (the browser cannot reach the node RPC then).
+//
+// This wiring's ONLY responsibility is flipping the boolean. It never computes or
+// passes a commit_num: speculad's own guards (broadcast only when
+// preempt_commit_num == meta.current_commit_num == armed_commit_num, AND the
+// funding outpoint is still unspent) make a stale/revoked broadcast impossible, so
+// this is reorg-safe by construction. Idempotent: re-arming/re-disarming is a no-op
+// in wt_store_set_preempt_armed (write/unlink), and a completed round auto-clears
+// the flag via wt_store_advance regardless. Fail-soft: a node that is itself down
+// just skips (a missed disarm is harmless — the next clean advance clears it).
+// ---------------------------------------------------------------------------
+
+// A commitment round is complete only once every HTLC is irrevocably committed (or
+// removed) — i.e. it sits in a terminal *_ACK_REVOCATION state. Any other htlc state
+// (ADD/REMOVE paired with COMMIT / REVOCATION / ACK_COMMIT) means a commitment_signed
+// is in flight and the peer revoke is still outstanding: the withhold-revoke window.
+function htlcMidRound(state) { return !/ACK_REVOCATION$/.test(String(state || '')); }
+
+const armInflight = new Map();   // rec.key -> Promise: single-flight per node so a flapping link never fires overlapping RPC storms
+function armForNode(recRaw, down) {
+  const key = recRaw && recRaw.key;
+  if (!key) return Promise.resolve();
+  const prev = armInflight.get(key) || Promise.resolve();
+  const next = prev.then(() => armForNodeInner(recRaw, down)).catch(() => {});
+  armInflight.set(key, next);
+  return next;
+}
+async function armForNodeInner(recRaw, down) {
+  // Resolve the FULL record (getByWsId does not attach .rpc); getByKey applies withRpc.
+  const rec = PROV.getByKey(recRaw.key) || recRaw;
+  if (!rec || !rec.rpc) return;
+  let channels;
+  try {
+    const pc = await lnrpc('listpeerchannels', [], rec.rpc, 8000);
+    channels = pc.channels || [];
+  } catch { return; }   // node down/booting/awaiting-signer: nothing to (or need to) arm
+  for (const ch of channels) {
+    const cid = ch.channel_id || ch.short_channel_id;
+    if (!cid) continue;
+    if (down) {
+      // Arm ONLY channels caught mid-round; a plain idle tab-close must never force-close.
+      const mid = Array.isArray(ch.htlcs) && ch.htlcs.some((h) => htlcMidRound(h.state));
+      if (!mid) continue;
+      try {
+        await lnrpcKw('setpreemptarmed', [`id=${cid}`, 'armed=true'], rec.rpc, 8000);
+        console.error('[preempt-arm]', rec.key, cid, 'ARMED (mid-round device drop)');
+      } catch (e) { console.error('[preempt-arm] arm failed', rec.key, cid, e.message); }
+    } else {
+      // Clean disarm on reconnect (belt-and-suspenders; speculad also auto-clears on
+      // every advance). Idempotent: disarming an un-armed channel is a harmless no-op.
+      try { await lnrpcKw('setpreemptarmed', [`id=${cid}`, 'armed=false'], rec.rpc, 8000); } catch { /* un-armed / node down: harmless */ }
+    }
+  }
+}
+
 let wsConnSeq = 0;
 server.on('upgrade', (req, socket) => {
   try {
@@ -1606,6 +1671,11 @@ server.on('upgrade', (req, socket) => {
     bridgeWsToTcp(socket, req, {
       tcpHost: '127.0.0.1', tcpPort: rec.signerPort, tcpRetryMs: 120000, id,
       log: (...a) => console.error('[ws-router]', `[${rec.public_ws_path}]`, ...a),
+      // Device-presence -> watchtower preempt-arm. onUp: device signer back -> dis-arm.
+      // onDrop: device gone -> arm any channel caught mid-round. Fire-and-forget: the
+      // callbacks must never throw into the bridge's socket handlers (armForNode swallows).
+      onUp: () => { armForNode(rec, false); },
+      onDrop: () => { armForNode(rec, true); },
     });
   } catch (e) {
     try { socket.end('HTTP/1.1 500 Internal Server Error\r\n\r\n'); } catch {}

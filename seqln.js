@@ -163,7 +163,7 @@ export function lnFinalityCopy() {
 //                          (default: CFG.nodes[node], read from the window vars).
 export async function connectDevice({
   node, deviceSigningSeed, deviceTransportPrivkey,
-  wsUrl, hostStaticPubkey, policy = 'permissive',
+  wsUrl, hostStaticPubkey, policy = 'enforce',   // enforce custody by default; callers pass 'permissive' (SEQ_LSP_POLICY kill-switch) to override
 } = {}) {
   if (!node || !NODES.includes(node)) { throw new Error("connectDevice: node must be 'asset' or 'btc'"); }
   const cfgNode = CFG.nodes[node] || {};
@@ -235,7 +235,7 @@ function provWsUrl(publicWsPath) {
 
 // Connect the on-device signer to a PROVISIONED node's responder (arbitrary asset).
 export async function connectProvisioned({ assetId, key, deviceSigningSeed, deviceTransportPrivkey,
-  wsUrl, hostStaticPubkey, policy = 'permissive' } = {}) {
+  wsUrl, hostStaticPubkey, policy = 'enforce' } = {}) {   // enforce custody by default; SEQ_LSP_POLICY='permissive' overrides
   // The provNodes map key: an explicit LSP registry key (e.g. `btc:<devicepub>` for a
   // per-user BTC node), else a 32-byte-hex asset id (a Sequentia asset node is keyed by
   // its asset id). One of the two is required so the signer state is addressable.
@@ -282,7 +282,7 @@ export async function connectProvisioned({ assetId, key, deviceSigningSeed, devi
 // it ignores the arg (the btc device identity, lnDeriveNode(phrase,'btc')). Returns
 // { node, nodeId, connected, key } — `key` is the LSP registry key the wallet then hands to
 // fundChannel so the deposit + device-co-signed funding target THIS node, not a demo node.
-export async function provisionAndConnect({ chain = 'seq', assetId, deriveIdentity, policy = 'permissive', label } = {}) {
+export async function provisionAndConnect({ chain = 'seq', assetId, deriveIdentity, policy = 'enforce', label } = {}) {   // enforce custody by default; SEQ_LSP_POLICY='permissive' overrides
   if (typeof deriveIdentity !== 'function') throw new Error('provisionAndConnect: deriveIdentity(assetId) is required');
   const id = deriveIdentity(assetId);
   const devicePubkey = await deviceTransportPubkey(id.transportPrivkey);
