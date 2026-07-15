@@ -719,6 +719,10 @@
           <div style="width:120px"><label class="lbl">Precision</label><input id="isPrec" class="mono" value="0"></div>
           <div style="width:130px"><label class="lbl">Reissue tokens</label><input id="isTokens" class="mono" value="0"></div>
         </div>
+        <div class="row" style="margin-top:10px">
+          <div class="grow"><label class="lbl">Issuer domain</label><input id="isDomain" placeholder="example.com (optional)"></div>
+        </div>
+        <p class="sub" style="margin-top:6px">Add a domain to commit an on-chain contract and list the asset in the public registry (so other wallets show its name and ticker). Leave it blank to issue a private, unlisted asset. To also get a domain-verified badge, serve the proof file the registry asks for at that domain.</p>
         <button class="primary" id="btnIssue" style="margin-top:14px">Review issuance</button>
         <div class="status err" id="issueErr"></div>
       </div>
@@ -3337,8 +3341,42 @@ function buildIssuePset(){
   const amount=parseAtoms($('isAmount').value, prec);
   const tokens=BigInt(parseInt($('isTokens').value||'0',10));
   if(amount<=0n) throw new Error('issue amount must be greater than zero');
-  const pset = network.txBuilder().issueAsset(amount, undefined, tokens, undefined, undefined).feeRate(DEFAULT_FEERATE).finish(wollet);
-  return {pset, meta:{name, ticker:ticker||'ASSET', precision:prec}};
+  // Optional on-chain contract. When the issuer supplies a domain we commit a Liquid-style
+  // contract hash in the asset entropy, so the asset id BINDS to {name, ticker, precision,
+  // domain, issuer_pubkey}. That commitment is what lets the public registry verify the asset
+  // cryptographically (it re-derives the id from the same contract). Without a domain we issue
+  // a bare, unlisted asset (no contract) exactly as before.
+  const domain=$('isDomain').value.trim().toLowerCase();
+  let contract, contractJson;
+  if(domain){
+    if(!/^(?=.{1,253}$)([a-z0-9](-?[a-z0-9])*\.)+[a-z]{2,}$/.test(domain)) throw new Error('issuer domain is not a valid domain name');
+    const issuerPubkey=signer.stakerPublicKey();   // 33-byte compressed key this wallet controls
+    contract=new Contract(domain, issuerPubkey, name||'Asset', prec, ticker||'ASSET', 0);
+    // Mirror the contract fields for the registry POST. The registry canonicalises (sorts keys)
+    // and hashes this itself; SWK commits the identical SHA256(canonical-JSON) on-chain, so the
+    // ids line up. Field values must match byte-for-byte (domain lowercased, pubkey hex).
+    contractJson={ entity:{domain}, issuer_pubkey:issuerPubkey, name:name||'Asset', precision:prec, ticker:ticker||'ASSET', version:0 };
+  }
+  const pset = network.txBuilder().issueAsset(amount, undefined, tokens, undefined, contract||undefined).feeRate(DEFAULT_FEERATE).finish(wollet);
+  return {pset, meta:{name, ticker:ticker||'ASSET', precision:prec, contract:contractJson}};
+}
+
+// Submit a freshly-issued asset to the public asset registry. The registry re-derives the asset
+// id from the on-chain issuance prevout + the committed contract hash, so this only succeeds once
+// the issuance tx is visible to the registry's chain index; until then we say so honestly rather
+// than claim it's listed. Chain-verified is automatic; domain-verified needs the .well-known proof.
+const REGISTRY_SUBMIT_URL = (typeof window!=='undefined' && window.SEQ_REGISTRY_SUBMIT_URL) || '/registry/';
+async function registerIssuedAsset(assetId, contract){
+  try{
+    const r = await fetch(REGISTRY_SUBMIT_URL, { method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({ asset_id: assetId, contract }) });
+    const j = await r.json().catch(()=>({}));
+    if(r.ok){ toast(j && j.verified_domain ? 'Listed in the asset registry (domain-verified).'
+                                            : 'Listed in the asset registry (chain-verified).'); loadRegistry(); }
+    else if(/not.*found|issuance|chain|prevout|unconfirmed/i.test((j&&j.error)||'')){
+      toast('Issued. It lists in the public registry once the issuance confirms on-chain.'); }
+    else { toast('Issued. Registry listing was declined: '+((j&&j.error)||('HTTP '+r.status))); }
+  }catch(e){ toast('Issued. Could not reach the asset registry ('+(e?.message??e)+').'); }
 }
 
 // ---------- wiring ----------
@@ -3440,8 +3478,10 @@ $('feeAsset').onchange=()=>{ feeAssetManual=true; updateFeeForSendType(); };
 $('btnIssue').onclick=async()=>{ $('issueErr').textContent='';
   try{ const {pset, meta}=buildIssuePset();
     await reviewBroadcast(pset, `Issue ${meta.ticker}`, ()=>{
-      try{ const ids=pset.issuanceIds?.(); if(ids&&ids[0]) saveLabel(ids[0].toString(), meta); }catch{}
-      $('isName').value=$('isTicker').value=$('isAmount').value=''; });
+      let assetId;
+      try{ const ids=pset.issuanceIds?.(); if(ids&&ids[0]){ assetId=ids[0].toString(); saveLabel(assetId, meta); } }catch{}
+      $('isName').value=$('isTicker').value=$('isAmount').value=$('isDomain').value='';
+      if(assetId && meta.contract) registerIssuedAsset(assetId, meta.contract); });
   }catch(e){ $('issueErr').textContent=e?.message??String(e); } };
 
 $('btnReissue').onclick=async()=>{ $('raErr').textContent='';
