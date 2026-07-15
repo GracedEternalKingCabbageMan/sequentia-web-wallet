@@ -393,7 +393,6 @@ function startableAssets(){
   // preferring the id the current registry knows, then a held id; and drop unresolved
   // ids that are not actually held.
   const reg = new Set(C.registryAssets ? C.registryAssets() : []);
-  const bal = C.balObj() || {};
   const held = h => { try { return big(bal[h] || 0n) > 0n; } catch { return false; } };
   const byKey = new Map();
   for (const h of set){
