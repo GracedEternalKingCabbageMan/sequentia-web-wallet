@@ -2535,8 +2535,12 @@ function initSwapTab(){
     // order-book driven; this is where the book + lift + post offers live.
     SEQOB: (typeof window!=='undefined' && window.SEQ_SEQOB_URL) || (location.origin + '/seqob'),
     // Every known asset, so the composer can trade/start ANY pair (not just markets
-    // that already have resting offers).
-    registryAssets: () => Object.keys({ ...DEFAULT_ASSETS, ...REGISTRY_ASSETS }),
+    // that already have resting offers). Source is the live registry ONLY, never the
+    // hardcoded DEFAULT_ASSETS: those ids are pre-reissuance and go stale, so mixing
+    // them in made every reissued asset appear twice in the picker (a current id + a
+    // stale one). DEFAULT_ASSETS stays purely as an offline metadata fallback in
+    // assetMeta(); the registry is authoritative for which assets exist.
+    registryAssets: () => Object.keys(REGISTRY_ASSETS),
     // Cross-chain bridge: the composer routes a BTC swap into the xswap.js wizard
     // (forward: pay BTC, receive asset) or the xrswap.js wizard (reverse: sell
     // asset for BTC). Markets are the same pairs in both directions.

@@ -387,7 +387,26 @@ function startableAssets(){
   // The blinded book is Sequentia-only: BTC lives on the parent chain, which has no
   // confidential transactions, so a BTC leg cannot blind. Drop it from the picker.
   if (isConfBook()) set.delete('BTC');
-  return [...set];
+  // Dedup by resolved ticker. Reissued assets leave STALE ids behind: an old id may
+  // resolve to the SAME ticker as the current one (making the asset appear twice), or
+  // to a metadata-less "Asset" (dust of a long-dead id). Keep ONE id per ticker,
+  // preferring the id the current registry knows, then a held id; and drop unresolved
+  // ids that are not actually held.
+  const reg = new Set(C.registryAssets ? C.registryAssets() : []);
+  const bal = C.balObj() || {};
+  const held = h => { try { return big(bal[h] || 0n) > 0n; } catch { return false; } };
+  const byKey = new Map();
+  for (const h of set){
+    if (h === 'BTC'){ byKey.set('BTC', 'BTC'); continue; }
+    const meta = (C.assetMeta && C.assetMeta(h)) || {};
+    const resolved = meta.name && meta.name !== 'Asset';
+    if (!resolved && !held(h)) continue;                  // stale dust of an old id, no metadata: hide it
+    const key = resolved ? meta.ticker : h;               // group resolved by ticker; keep unresolved-but-held unique
+    const cur = byKey.get(key);
+    if (!cur){ byKey.set(key, h); continue; }
+    if ((reg.has(h) && !reg.has(cur)) || (held(h) && !held(cur))) byKey.set(key, h);   // prefer registry-known, then held
+  }
+  return [...byKey.values()];
 }
 
 // Assets that have a market with `other` (the already-chosen side). If `other` is
@@ -1700,7 +1719,12 @@ function paintFee(feeAssetHex, feeAtoms, noteOverride){
   // Paying FROM Lightning is a single-asset payment (you pay one asset over one route), so the fee
   // is inherently in that same asset — freeze the fee asset to the pay asset and lock the picker.
   const payFromLn = !!(S.payRail === 'ln' && S.payAsset);
+  // Paying WITH BTC (cross-chain buy) settles the BTC leg on the parent chain, whose fee is a
+  // Bitcoin network fee in BTC (sat/vB) — never an any-asset Sequentia fee. Lock the displayed
+  // fee asset to BTC so it isn't shown as a stale Sequentia pick.
+  const payIsBtc = S.payAsset === 'BTC';
   if (payFromLn){ feeAssetHex = S.payAsset; if (S.payAsset !== 'BTC') S.feeAsset = S.payAsset; }
+  else if (payIsBtc){ feeAssetHex = 'BTC'; }
   const fm = C.assetMeta(feeAssetHex);
   $('swFeeTk').textContent = fm.ticker;
   $('swFeeAmt').textContent = (feeAtoms != null) ? (C.fmtAtoms(feeAtoms, fm.precision) + ' ' + fm.ticker) : '-';
@@ -1708,6 +1732,8 @@ function paintFee(feeAssetHex, feeAtoms, noteOverride){
   $('swFeeRef').textContent = ref;
   $('swFeeNote').textContent = noteOverride || (payFromLn
     ? `In ${fm.ticker} — the asset you pay over Lightning.`
+    : payIsBtc
+    ? 'In BTC — the Bitcoin network fee for the parent-chain leg (sat/vB).'
     : 'Pay the fee in any asset the network prices.');
   // The fee picker is disabled when paying from Lightning (fee frozen to the pay asset), and for
   // the cross-chain (BTC-only) leg / LN leg / mixed rail (their cost is the LP spread / BTC-leg fee
