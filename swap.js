@@ -792,8 +792,13 @@ function updateRails(){
 // Move-to-Lightning. Cleared when both legs' LN options are live (or LN is off).
 function renderRailNote(ra){
   const note = C.$('swRailNote'); if (!note) return;
-  if (!ra || (ra.payLn.ok && ra.recvLn.ok)){ note.innerHTML = ''; note.classList.add('hide'); return; }
-  const bad = !ra.payLn.ok ? ra.payLn : ra.recvLn;   // surface the first leg that isn't LN-ready
+  // Only nag about a missing/insufficient Lightning channel for a leg the user is ACTUALLY
+  // routing over Lightning. A leg switched back to on-chain needs no channel, so its note
+  // must clear (this is the fix for the note persisting after flipping a leg to on-chain).
+  const payBad  = ra && S.payRail  === 'ln' && !ra.payLn.ok  ? ra.payLn  : null;
+  const recvBad = ra && S.recvRail === 'ln' && !ra.recvLn.ok ? ra.recvLn : null;
+  const bad = payBad || recvBad;   // surface the first LN-selected leg that isn't LN-ready
+  if (!bad){ note.innerHTML = ''; note.classList.add('hide'); return; }
   note.classList.remove('hide');
   if (bad.cta === 'move'){
     // No channel yet is NOT a blocker any more — a channel is opened for you INLINE when you place
@@ -919,7 +924,9 @@ function setRail(leg, r){
   if (leg === 'pay') S.payRail = r; else S.recvRail = r;
   S.railsTouched = true; S.modeTouched = false;
   LAST_QUOTE = null; setReviewEnabled(false);
-  paintRailSegs();
+  const ra = railAvail(S.payAsset, S.receiveAsset);
+  paintRailSegs(ra);
+  try { renderRailNote(ra); } catch {}   // refresh/clear the LN-channel note for the newly-selected rail
   try { renderFeePicker(); } catch {}   // reflect the pay-from-Lightning fee freeze immediately
   requote().catch(()=>{});
 }
