@@ -936,7 +936,9 @@ function saveLabel(hex, info){ const m=labels(); m[hex]=info; localStorage.setIt
 // the built-in DEFAULT_ASSETS, which remain an offline fallback. Precedence:
 // user labels > registry > built-in defaults > generic.
 const REGISTRY_URL = (typeof window!=='undefined' && window.SEQ_REGISTRY_URL) || '/registry/index.minimal.json';
-let REGISTRY_ASSETS = {};
+// Restore last-good registry metadata SYNCHRONOUSLY so every asset resolves its ticker on first
+// paint — no window where only tSEQ (which resolves via POLICY_HEX without the registry) is known.
+let REGISTRY_ASSETS = (()=>{ try{ return JSON.parse(localStorage.getItem('swk.registryCache')||'{}'); }catch{ return {}; } })();
 async function loadRegistry(){
   try {
     const r = await fetch(REGISTRY_URL, {cache:'no-store'}); if(!r.ok) return;
@@ -944,6 +946,7 @@ async function loadRegistry(){
     const clean=(s,n)=> (typeof s==='string') ? s.replace(/[<>]/g,'').slice(0,n) : s;   // defense-in-depth: registry strings are display text
     for(const [id,v] of Object.entries(idx)) if(Array.isArray(v)) m[id]={ticker:clean(v[1],16), name:clean(v[2],48), precision:v[3], domain:v[0]};
     REGISTRY_ASSETS = m;
+    try { localStorage.setItem('swk.registryCache', JSON.stringify(m)); } catch {}   // cache for instant resolution next load
     try { if(typeof renderBalance==='function') renderBalance(); } catch {}   // refresh labels if the UI is already up
   } catch {}
 }
@@ -1142,7 +1145,9 @@ function oampStartSend(id){ oampPrefillSend(id, null, null); }
 // and value the rest relative to it. Consensus uses these published rates directly,
 // so a fee built with the same rate is exactly what the node requires.
 const EXCHANGE_RATE_SCALE = 100000000;
-let feeRates = {};                        // assetHex -> { rate, source }  (non-stale, positive)
+// Restore last-good fee rates SYNCHRONOUSLY so the fee pickers populate on first paint (cache from
+// the previous session), avoiding a load window where only tSEQ resolves. Refreshed by fetchFeeRates.
+let feeRates = (()=>{ try{ return JSON.parse(localStorage.getItem('swk.feeRatesCache')||'{}'); }catch{ return {}; } })();
 let feeRefRate = null;                     // the tSEQ reference rate, READ from the feed (never fabricated; null until the feed provides it)
 async function fetchFeeRates(){
   try{
@@ -1167,6 +1172,7 @@ async function fetchFeeRates(){
       map[k] = { rate: v };
     }
     feeRates = map;
+    try{ localStorage.setItem('swk.feeRatesCache', JSON.stringify(map)); }catch{}   // cache for instant pickers next load
     // Rates can arrive AFTER the user is already on a tab with a fee picker, which left the picker
     // stale (only the assets priced at first paint — often just tSEQ). Refresh both pickers now.
     try{ populateFeeAssets(); }catch{}
@@ -1208,14 +1214,14 @@ function applyFee(b, feeHex){
 // Value everything in a denomination the user picks — which need NOT be a Sequentia
 // asset (USD, BTC, ...). Prices come from the public market feed (/prices: per-asset
 // base/USD price); value = amount * price[asset] / price[reference]. Display only.
-let PRICES = {};   // TICKER -> base (USD) price
+let PRICES = (()=>{ try{ return JSON.parse(localStorage.getItem('swk.pricesCache')||'{}'); }catch{ return {}; } })();   // TICKER -> base (USD) price; restored from cache for instant reference values
 let REF = (typeof localStorage!=='undefined' && localStorage.getItem('seqRefCcy')) || 'USD';
 async function loadPrices(){
   try{
     const d = await fetch('/prices', {cache:'no-store'}).then(r=>r.json());
     const m = {};
     for(const [t,v] of Object.entries(d)){ const p=(v&&typeof v==='object')?v.price:v; if(p>0) m[t.toUpperCase()]=p; }
-    if(Object.keys(m).length) PRICES = m;   // keep last-good prices if a poll returns empty/unavailable
+    if(Object.keys(m).length){ PRICES = m; try{ localStorage.setItem('swk.pricesCache', JSON.stringify(m)); }catch{} }   // keep last-good; cache for instant reference values next load
     try{ initRefSelector(); }catch{}
     try{ if(typeof renderBalance==='function') renderBalance(); }catch{}
     try{ refreshAllRefHints(); }catch{}
@@ -1384,7 +1390,9 @@ function fillFeeAssetSelect(sel){
   const add=(val,label)=>{ const o=el('option'); o.value=val; o.textContent=label; sel.appendChild(o); };
   const b=balObj();
   for(const h of Object.keys(b)){
-    if(!(feeRateEntry(h) && feeRateEntry(h).rate>0)) continue;   // unpriced (incl. tSEQ): gate it out
+    let held=false; try{ held = BigInt(b[h]||'0') > 0n; }catch{}
+    if(!held) continue;                                         // ONLY a POSITIVE balance qualifies — tSEQ has NO privilege; if you hold 0 tSEQ it never appears
+    if(!(feeRateEntry(h) && feeRateEntry(h).rate>0)) continue;  // and only if this node prices the asset for fees
     add(h, h===POLICY_HEX ? 'tSEQ' : assetMeta(h).ticker);
   }
   if(prev && [...sel.options].some(o=>o.value===prev)) sel.value=prev;
@@ -1401,7 +1409,8 @@ function populateIssueFeeAssets(){
 // Apply the chosen fee asset (any held, node-priced asset) to a reissue/burn builder + return the
 // fee-asset hex so reviewBroadcast labels it correctly. Non-policy assets take feeAsset(id, rate).
 function applyRaFeeAsset(b){
-  const feeHex=($('raFeeAsset') && $('raFeeAsset').value) || POLICY_HEX;
+  const feeHex=($('raFeeAsset') && $('raFeeAsset').value) || '';   // no implicit tSEQ default
+  if(!feeHex) throw new Error('no asset in this wallet is priced for fees on this node');
   return {b: applyFee(b, feeHex), feeHex};   // callers must NOT pre-set feeRate
 }
 function updateFeeAssetHint(){
