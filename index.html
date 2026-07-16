@@ -3362,7 +3362,10 @@ function buildIssuePset(){
   // post-broadcast callback returned nothing (the pset is signed/finalized by then), which is why
   // issued assets were left unlabeled and never registered.
   let assetId;
-  try { const ids=pset.issuanceIds?.(); if(ids&&ids[0]) assetId=ids[0].toString(); } catch {}
+  // issuanceIds()/issuanceAsset() live on PsetInput, not Pset (the old pset.issuanceIds() was a
+  // no-op that silently returned undefined via ?.). Read the id off the issuance input directly;
+  // this avoids wollet.psetDetails(), which throws on Sequentia's transparent outputs.
+  try { for(const inp of pset.inputs()){ const a=inp.issuanceAsset?.(); if(a){ assetId=a.toString(); break; } } } catch {}
   return {pset, meta:{name, ticker:ticker||'ASSET', precision:prec, contract:contractJson, assetId}};
 }
 
