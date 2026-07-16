@@ -452,7 +452,13 @@ function findRoute(pay, receive){
     // so a stale rail state can never silently route into a dead LN path.
     const ra = ln ? railAvail(pay, receive) : null;
     const p = (ln && S.payRail === 'ln' && ra.payLn.ok) ? 'ln' : 'chain';
-    const r = (ln && S.recvRail === 'ln' && ra.recvLn.ok) ? 'ln' : 'chain';
+    // Receiving over LN normally needs a real inbound channel on that asset — EXCEPT the
+    // sub-asset BUY (pay BTC on-chain, receive the asset over LN). There the LSP JIT-provisions
+    // the user's inbound asset liquidity as part of the buy (provisionInbound), so recv=ln is
+    // honoured with no pre-existing channel; every OTHER 'ln' recv leg still needs ra.recvLn.ok.
+    const subAssetBuyRecvLn = ln && payIsBtc && S.payRail === 'chain'
+      && S.recvRail === 'ln' && subassetCapable(receive);
+    const r = (ln && S.recvRail === 'ln' && (ra.recvLn.ok || subAssetBuyRecvLn)) ? 'ln' : 'chain';
     // ln + ln -> the proven pure-LN LSP route (non-custodial, keys on device).
     // Offered only when BOTH legs have a real usable channel.
     if (p === 'ln' && r === 'ln')
@@ -855,14 +861,13 @@ function railSupported(p, r){
   if (payIsBtc){
     if (p === 'ln' && r === 'chain') return true;                       // buy: BTC over LN + asset on-chain
     if (p === 'chain' && r === 'ln')
-      // Sub-asset (buy asset over Lightning + BTC on-chain): a deployed maker is NECESSARY
-      // but not sufficient — the wallet must actually be able to RECEIVE the asset over
-      // Lightning, which needs real inbound liquidity on that asset's channel. Until the
-      // JIT-inbound receive is wired, also require a usable receive channel so the toggle
-      // never silently downgrades to the on-chain cross route (findRoute would otherwise
-      // recompute recv=chain and fall through to kind:'cross').
-      return subassetCapable(S.receiveAsset)
-        && lnDeployed() && railAvail(S.payAsset, S.receiveAsset).recvLn.ok;
+      // Sub-asset BUY (pay BTC on-chain, receive the asset over Lightning). The LSP now
+      // JIT-provisions inbound asset liquidity for the user's own hosted node as part of the
+      // buy (provisionInbound, funded from the LP node), so a pre-existing receive channel is
+      // NO LONGER required — offer it whenever a sub-asset buy maker exists for the asset. The
+      // inbound open happens on Place-order; if it can't be provisioned the buy fails closed
+      // and the on-chain BTC leg is refundable, so nothing is stranded.
+      return subassetCapable(S.receiveAsset) && lnDeployed();
     return false;
   }
   // SELL (pay the asset, receive BTC).
