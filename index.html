@@ -305,6 +305,8 @@
   .swlrow.mine{background:rgba(240,185,66,.09)} .swlrow.mine:hover{background:rgba(240,185,66,.16)}
   .swlrow.mine::before{content:"";position:absolute;left:0;top:3px;bottom:3px;width:2.5px;border-radius:2px;background:var(--amber2);z-index:2}
   .swlyou{display:inline-block;font-style:normal;font-size:9px;font-weight:700;letter-spacing:.04em;text-transform:uppercase;color:var(--amber2);background:rgba(240,185,66,.16);border-radius:4px;padding:0 4px;margin-right:5px;vertical-align:1px}
+  .swlrail{font-style:normal;font-size:10px;margin-right:4px;opacity:.7;vertical-align:1px}
+  .swlrail-ln{filter:hue-rotate(0deg)}
   .swlmid{display:flex;align-items:center;justify-content:space-between;gap:8px;padding:6px 9px;margin:5px 4px;background:var(--panel);border:1px solid var(--line);border-radius:8px;font:12.5px ui-monospace,monospace}
   .swlmid b{font-size:14px;color:var(--txt)} .swlmid .sp{color:var(--dim);font-size:11px}
   .swladder-empty{color:var(--dim);font-size:12.5px;padding:8px 4px}
@@ -887,7 +889,7 @@ import { initXswap, renderXswap, fetchXmarkets, fetchXquote, fetchXbook, openFro
 import { initXrswap, fetchRQuote, openReverseFromComposer, hasInFlight as hasReverseInFlight, renderReverse } from './xrswap.js';
 import { initXmaker, startForwardMaker, startReverseMaker, liveMakerOffers, resumeMakerSwaps } from './xmaker.js';
 import { initSeqln, connectDevice as lnConnectDevice, disconnectDevice as lnDisconnect,
-  onSeqlnStatus, seqlnState, seqlnAvailable, seqlnGetStatus, seqlnListNodes, seqlnNodeOnchain, seqlnSwap, seqlnBook, seqlnPostOffer, lnFinalityCopy,
+  onSeqlnStatus, seqlnState, seqlnAvailable, seqlnGetStatus, seqlnListNodes, seqlnNodeOnchain, seqlnSwap, seqlnBook, seqlnUnifiedBook, seqlnPostOffer, lnFinalityCopy,
   seqlnChannelInbound, seqlnNodeInvoice, seqlnInvoiceStatus, seqlnNodeSettle, seqlnNodeReceive, seqlnNodePay, seqlnJobStatus,
   seqlnChannels, seqlnFunding, fundChannel, resumeFundChannel, provisionAndConnect, waitNodeReady, provisionedState,
   disconnectProvisioned, deviceTransportPubkey, registerOwnStatusKeys, closeChannelLsp } from './seqln.js';
@@ -2678,6 +2680,8 @@ function initSwapTab(){
       // Sub-asset order book: dynamic rail gating (sell_available/buy_available) + resting
       // offers, and posting the wallet's own signed resting offer (LSP never signs).
       book: (asset) => seqlnBook(asset),
+      // Unified book: on-chain cross + sub-asset LN offers merged, price-sorted, rail-tagged.
+      unifiedBook: (asset) => seqlnUnifiedBook(asset),
       postOffer: (o) => seqlnPostOffer(o),
       // Which of the device's candidate node keys are actually provisioned (registry-resolved, works
       // for nodes blocked waiting for their signer). Used by the on-load reconnect to rediscover a

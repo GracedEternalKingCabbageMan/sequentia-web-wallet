@@ -51,6 +51,7 @@ let XMARKETS = [];       // cross-chain: [{ btc_asset, seq_asset, ... }] (BTC<->
 let LAST_QUOTE = null;   // the priced/oriented same-chain legs for the current composer state
 let BOOK = { offers: [], pair: null };   // the resting offers for the selected same-chain pair
 let XBOOK = { offers: [], seqAsset: null, payIsBtc: true };   // resting cross offers for the selected BTC<->asset pair
+let UBOOK = null;   // the UNIFIED book (on-chain + LN merged, rail-tagged) for the pair, from the LSP /book/unified
 let XMAKE = null;   // the wallet's OWN live resting cross offer (maker) + its settlement state, if any
 // Trades the user DISMISSED this session (kept live + resumable, just not force-shown). Gated in
 // renderSwap so a dismissed swap returns to the composer instead of bouncing straight back to its
@@ -1372,7 +1373,17 @@ async function loadBtcBook(route){
   const forward = book.forward || [], reverse = book.reverse || [];
   const offers = route.payIsBtc ? forward : reverse;   // the takeable side for this direction (quote + fill)
   XBOOK = { seqAsset, payIsBtc: route.payIsBtc, offers, forward, reverse };
-  renderXBook(seqAsset, route.payIsBtc, forward, reverse);   // render BOTH sides, like the same-chain book
+  // Stage 2 (rail-agnostic display): fetch the UNIFIED book (on-chain + LN merged, rail-tagged) and
+  // render THAT — the user sees ALL resting liquidity and a real price whichever rail carries it,
+  // never "no maker for your rail". Falls back to the on-chain-only cross book if the LSP is
+  // unreachable. The proven on-chain take path (XBOOK) is unchanged; an LN row seeds the amount and
+  // the composer requotes on the user's rail (the LSP bridges / fails closed cleanly on take).
+  let unified = null;
+  try {
+    if (L && L.unifiedBook){ const u = await L.unifiedBook(seqAsset); if (u && u.ok) unified = { asks: u.asks || [], bids: u.bids || [] }; }
+  } catch { /* unreachable LSP -> fall back to the on-chain cross book */ }
+  UBOOK = unified ? { seqAsset, ...unified } : null;
+  renderXBook(seqAsset, route.payIsBtc, forward, reverse, unified);
   return { offers, unreachable: book.unreachable };
 }
 function numVal(el){ return parseFloat((((el && el.value) || '')).replace(/,/g, '')) || 0; }
@@ -1626,39 +1637,61 @@ function xOfferAmts(o, payIsBtc){
 // rendered as the SAME ladder as the same-chain book — no rail distinction, orders
 // look identical. Buying asset with BTC => the offers are ASKS you can take; selling
 // asset for BTC => they are BIDS you can take. Prices are BTC per asset unit.
-function renderXBook(seqAsset, payIsBtc, forward, reverse){
+function renderXBook(seqAsset, payIsBtc, forward, reverse, unified){
   const host = C.$('swBook'); if (!host) return;
   const am = C.assetMeta(seqAsset);
   forward = forward || []; reverse = reverse || [];
-  // Two-sided, exactly like the same-chain book: asks = forward offers (someone SELLS the asset
-  // for BTC, so a BTC-payer BUYS at that price), bids = reverse offers (someone BUYS the asset with
-  // BTC). Both priced BTC/asset; map each offer's amounts by its OWN direction, not the user's side.
-  const toRow = (o, i, dirIsBtc) => {
-    const { asset, btc } = xOfferAmts(o, dirIsBtc);
-    const assetU = Number(big(asset)) / Math.pow(10, am.precision || 0), btcU = Number(big(btc)) / 1e8;
-    return { price: assetU > 0 ? btcU / assetU : 0, size: assetU, _i: i };
-  };
-  let asks = forward.map((o, i) => toRow(o, i, true)).filter(r => r.price > 0 && r.size > 0);
-  let bids = reverse.map((o, i) => toRow(o, i, false)).filter(r => r.price > 0 && r.size > 0);
+  let asks, bids, n;
+  const useUnified = !!(unified && ((unified.asks && unified.asks.length) || (unified.bids && unified.bids.length)));
+  if (useUnified){
+    // MERGED book (Stage 2): on-chain + LN offers, each row tagged with its rail, priced BTC/asset in
+    // whole units and sorted like the on-chain book. Clicking a level seeds the asset size
+    // (rail-agnostic); the composer requotes on the user's chosen rail (the LSP bridges on take).
+    const uRow = (o) => {
+      const assetU = Number(big(o.assetAtoms)) / Math.pow(10, am.precision || 0);
+      const btcU = Number(big(o.btcSats)) / 1e8;
+      return { price: assetU > 0 ? btcU / assetU : 0, size: assetU, rail: o.rail };
+    };
+    asks = (unified.asks || []).map(uRow).filter(r => r.price > 0 && r.size > 0);
+    bids = (unified.bids || []).map(uRow).filter(r => r.price > 0 && r.size > 0);
+    n = (unified.asks || []).length + (unified.bids || []).length;
+    const seed = (r) => () => {
+      const el = payIsBtc ? C.$('swRecvAmt') : C.$('swPayAmt');
+      if (el){ S.edited = payIsBtc ? 'receive' : 'pay'; el.value = trim(r.size); }
+      LAST_QUOTE = null; setReviewEnabled(false); requote().catch(()=>{});
+    };
+    (payIsBtc ? asks : bids).forEach(r => r.onClick = seed(r));
+  } else {
+    // On-chain-only fallback (LSP unreachable). asks = forward offers (someone SELLS the asset for
+    // BTC), bids = reverse offers (someone BUYS the asset with BTC). Priced BTC/asset by each offer's
+    // OWN direction, not the user's side.
+    const toRow = (o, i, dirIsBtc) => {
+      const { asset, btc } = xOfferAmts(o, dirIsBtc);
+      const assetU = Number(big(asset)) / Math.pow(10, am.precision || 0), btcU = Number(big(btc)) / 1e8;
+      return { price: assetU > 0 ? btcU / assetU : 0, size: assetU, _i: i };
+    };
+    asks = forward.map((o, i) => toRow(o, i, true)).filter(r => r.price > 0 && r.size > 0);
+    bids = reverse.map((o, i) => toRow(o, i, false)).filter(r => r.price > 0 && r.size > 0);
+    n = forward.length + reverse.length;
+    (payIsBtc ? asks : bids).forEach(r => r.onClick = () => fillFromXOffer(r._i));
+  }
   asks.sort((a, b) => a.price - b.price);
   { let c = 0; const t = asks.reduce((s, r) => s + r.size, 0) || 1; asks.forEach(r => { c += r.size; r.cum = c; r.frac = c / t; }); }
   asks.reverse();
   bids.sort((a, b) => b.price - a.price);
   { let c = 0; const t = bids.reduce((s, r) => s + r.size, 0) || 1; bids.forEach(r => { c += r.size; r.cum = c; r.frac = c / t; }); }
-  // Only the side takeable in the user's current direction is clickable (its _i indexes XBOOK.offers,
-  // which loadBtcBook set to that same side); the other side is display-only depth.
-  (payIsBtc ? asks : bids).forEach(r => r.onClick = () => fillFromXOffer(r._i));
+  // (onClick was assigned per-branch above: seed-amount for the merged book, fillFromXOffer for the
+  // on-chain fallback. The clickable side is the one takeable in the user's current direction.)
   const bestAsk = asks.length ? Math.min(...asks.map(a => a.price)) : null;
   const bestBid = bids.length ? Math.max(...bids.map(b => b.price)) : null;
   const mid = (bestAsk != null && bestBid != null) ? (bestAsk + bestBid) / 2 : (bestAsk != null ? bestAsk : bestBid);
   const spread = (bestAsk != null && bestBid != null) ? (bestAsk - bestBid) : null;
   LAST_MID = { price: mid, cross: true };
-  const n = forward.length + reverse.length;
   renderLadder(host, {
     asks: asks.slice(0, 8), bids: bids.slice(0, 8), mid, spread,
     priceLabel: `(BTC/${am.ticker})`, sizeLabel: am.ticker,
     refMidStr: oneUnitRefStr(seqAsset),
-    headTitle: 'Order book', headSub: `${n} offer${n === 1 ? '' : 's'}`,
+    headTitle: 'Order book', headSub: `${n} offer${n === 1 ? '' : 's'}${useUnified ? ' · all rails' : ''}`,
     emptyMsg: 'No resting offers yet - a market maker with BTC reserves needs to post one.',
   });
   renderPairBar();
@@ -1683,8 +1716,9 @@ function renderLadder(host, o){
   const rowHtml = (cls, r, i) => {
     const clk = typeof r.onClick === 'function';
     const w = Math.max(2, Math.min(100, Math.round((r.frac || 0) * 100)));
+    const railBadge = r.rail ? `<i class="swlrail swlrail-${esc(r.rail)}" title="${r.rail === 'ln' ? 'Lightning' : 'on-chain'}">${r.rail === 'ln' ? '⚡' : '⛓'}</i>` : '';
     return `<button type="button" class="swlrow ${cls}${clk ? '' : ' noclick'}${r.mine ? ' mine' : ''}" data-side="${cls}" data-i="${i}"${r.mine ? ' title="Your resting order"' : ''}${clk ? '' : ' tabindex="-1"'}>
-      <span>${r.mine ? '<i class="swlyou">you</i>' : ''}${esc(trim(r.price))}</span><span>${esc(trim(r.size))}</span><span>${esc(trim(r.cum != null ? r.cum : r.size))}</span>
+      <span>${railBadge}${r.mine ? '<i class="swlyou">you</i>' : ''}${esc(trim(r.price))}</span><span>${esc(trim(r.size))}</span><span>${esc(trim(r.cum != null ? r.cum : r.size))}</span>
       <i class="swldepth" style="width:${w}%"></i></button>`;
   };
   const asks = o.asks || [], bids = o.bids || [];

@@ -440,6 +440,15 @@ export function seqlnBook(asset) {
   return lspFetch('/book?asset=' + encodeURIComponent(asset));
 }
 
+// The UNIFIED order book for a BTC<->asset pair (Stage 2, rail-agnostic matching): ONE price-sorted
+// book merging the on-chain cross relay + the sub-asset LN relays, rail as metadata. Returns
+// { ok, asks[], bids[], best_ask, best_bid, counts } — each entry has { price, assetAtoms, btcSats,
+// rail:'ln'|'onchain', id, raw }. The composer shows all resting liquidity and prices off the best,
+// whichever rail carries it; the settlement router bridges the rails on take.
+export function seqlnUnifiedBook(asset) {
+  return lspFetch('/book/unified?asset=' + encodeURIComponent(asset));
+}
+
 // Post a resting sub-asset offer the wallet signed itself (the LSP never signs). `offer` is
 // the signed Offer protojson. Returns { offer_id, status }.
 export function seqlnPostOffer(offer) {
