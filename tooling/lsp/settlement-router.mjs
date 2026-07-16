@@ -118,3 +118,27 @@ function buildSteps(btcLeg, assetLeg) {
 function assertRail(r, where) {
   if (r !== 'ln' && r !== 'chain') throw new Error(`${where} must be 'ln' or 'chain' (got ${JSON.stringify(r)})`);
 }
+
+// --- Current-execution mapping (Stage 1b) ---------------------------------------
+// The live LSP is the counterparty and MIRRORS the user's chosen rails, so every leg is native
+// today (no bridge). settlementPlanForSide expresses that as a match; planExecutionName maps the
+// resulting no-bridge plan to the deployed seqob-cli binary. Kept here (not in the server) so it
+// is unit-testable without loading the http server. A bridge plan (a genuine rail crossing, which
+// arrives with rail-blind matching in Stage 2) has no current binary and maps to null.
+export function settlementPlanForSide(side, payRail, recvRail) {
+  const match = side === 'buy'
+    ? { asset: 'x', buyer:  { btcRail: payRail,  assetRail: recvRail },
+                    seller: { assetRail: recvRail, btcRail: payRail } }
+    : { asset: 'x', buyer:  { btcRail: recvRail, assetRail: payRail },
+                    seller: { assetRail: payRail, btcRail: recvRail } };
+  return planSettlement(match);
+}
+export function planExecutionName(side, plan) {
+  if (plan.btcLeg.bridge || plan.assetLeg.bridge) return null;   // rail crossing -> Stage-2 bridge
+  return {
+    'buy:ln:chain':   'xsubbuy',      // pay BTC over LN, claim asset on-chain
+    'buy:chain:ln':   'xsubas',       // pay BTC on-chain HTLC, receive asset over LN (HODL)
+    'sell:ln:chain':  'xsublift',     // fund asset HTLC on-chain, receive BTC over LN
+    'sell:chain:ln':  'xsubas-sell',  // pay asset over LN, receive BTC on-chain
+  }[`${side}:${plan.btcLeg.rail}:${plan.assetLeg.rail}`] || null;
+}

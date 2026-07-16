@@ -1,5 +1,5 @@
 // Tests for the settlement router. Run: node settlement-router.test.mjs
-import { planSettlement, planLeg } from './settlement-router.mjs';
+import { planSettlement, planLeg, settlementPlanForSide, planExecutionName } from './settlement-router.mjs';
 
 let passed = 0, failed = 0;
 function eq(actual, expected, msg) {
@@ -78,6 +78,20 @@ ok(p.assetLeg.jitInbound === true, '5: buyer LN-asset receive with no inbound ->
 ok(p.assetLeg.bridge === true && p.assetLeg.lnSide === 'receiver', '5: asset leg bridged, ln side is the receiver (buyer)');
 ok(p.steps[0].op === 'provision-inbound' && p.steps[0].leg === 'asset', '5: JIT provisioning comes first');
 ok(p.btcLeg.bridge === false, '5: BTC leg native (both on-chain)');
+
+// --- Stage 1b: router decision == the live runMixed if-chain, for all four shapes ---
+// The live dispatch (lsp-server.mjs runMixed) maps (side, payRail, recvRail) to a binary. The
+// router must pick the SAME binary before it's allowed to replace that dispatch. payRail/recvRail
+// are the USER's leg rails; for buy btcLeg=payRail/assetLeg=recvRail, for sell they swap.
+function execFor(side, payRail, recvRail){ return planExecutionName(side, settlementPlanForSide(side, payRail, recvRail)); }
+eq(execFor('buy',  'ln',    'chain'), 'xsubbuy',     'buy pay-BTC-LN recv-asset-onchain -> xsubbuy');
+eq(execFor('buy',  'chain', 'ln'),    'xsubas',      'buy pay-BTC-onchain recv-asset-LN -> xsubas (HODL)');
+eq(execFor('sell', 'chain', 'ln'),    'xsublift',    'sell pay-asset-onchain recv-BTC-LN -> xsublift');
+eq(execFor('sell', 'ln',    'chain'), 'xsubas-sell', 'sell pay-asset-LN recv-BTC-onchain -> xsubas-sell');
+// Same-rail shapes are NOT submarine binaries — they route pure-LN / pure-chain elsewhere, so
+// the mixed dispatch correctly has no binary for them.
+ok(execFor('buy', 'ln', 'ln') === null, 'ln/ln is not a mixed binary (pure-LN path)');
+ok(execFor('buy', 'chain', 'chain') === null, 'chain/chain is not a mixed binary (cross-book path)');
 
 // --- validation ---
 throws(() => planSettlement({}), 'missing buyer/seller throws');

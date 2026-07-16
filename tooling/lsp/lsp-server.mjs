@@ -92,6 +92,7 @@ import crypto from 'node:crypto';
 import { execFile } from 'node:child_process';
 import { makeProvisioner } from './provision.mjs';
 import { acceptUpgrade, bridgeWsToTcp } from './ws-bridge.mjs';
+import { settlementPlanForSide, planExecutionName } from './settlement-router.mjs';
 
 function reqEnv(name) {
   const v = process.env[name];
@@ -944,6 +945,13 @@ function runMixed({ side, asset, amount, payRail, recvRail, node_key, asset_bolt
     const assetId = resolveAsset(asset);
     if (side !== 'buy' && side !== 'sell') return resolve({ ok: false, error: "side must be 'buy' or 'sell'" });
     if (!assetId || assetId === CFG.btcx) return resolve({ ok: false, error: 'mixed swap needs a Sequentia asset id (not BTC)' });
+    // Stage 1b (observe-only): route the dispatch decision through the settlement router and log
+    // it. No behavior change yet — this proves the router picks the same binary the if-chain does
+    // before we let it replace the dispatch. See settlement-router.mjs.
+    try {
+      const plan = settlementPlanForSide(side, payRail, recvRail);
+      console.error(`[router] side=${side} pay=${payRail} recv=${recvRail} btcLeg=${plan.btcLeg.rail} assetLeg=${plan.assetLeg.rail} happy=${plan.happyCoincidence} -> ${planExecutionName(side, plan) || 'NO-BINARY(bridge/unsupported)'}`);
+    } catch (e) { console.error('[router] plan failed', e && e.message); }
     // Map (side, payRail, recvRail) -> the submarine CLI. The three deployed shapes:
     //   asset-on-chain <-> BTC-LN (xsubbuy/xsublift, via -seq-rpc/-seq-wallet), and
     //   the MIRROR asset-over-LN + BTC-on-chain (xsubas, via -btc-rpc/-asset-ln-socket).
