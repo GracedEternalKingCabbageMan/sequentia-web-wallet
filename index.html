@@ -2710,6 +2710,7 @@ function renderActiveSwap(){ renderSwap(); }
 
 // ---------- sync + balance ----------
 let _syncInFlight = null;
+let _scannedOnce = false;   // false until the first live scan completes; gates the cached-balance snapshot
 // Coalesce concurrent sync() calls. The covenant relay replays every resting order on
 // subscribe, and each relay event handler calls sync(); without coalescing those pile up
 // into overlapping wasm scans that block the main thread (frozen UI) and re-enter the
@@ -2726,6 +2727,7 @@ async function _syncImpl(){
     // scan both chains + refresh fee-asset rates + restricted-asset balances in parallel
     const [update] = await Promise.all([client.fullScan(wollet), btcScan(), fetchFeeRates(), oampRefreshBalances(), oampRefreshUser()]);
     if(update) wollet.applyUpdate(update);
+    _scannedOnce = true;   // the live balance is now authoritative — stop showing the cached snapshot
     // Rescan the covenant maker-credit companion wollet AFTER the main scan: it shares the same esplora
     // client, and wasm-bindgen forbids re-entrant &mut use of one object (a concurrent fullScan throws
     // "recursive use of an object detected"), so it must run sequentially, not inside the Promise.all above.
@@ -2749,7 +2751,16 @@ function availableFor(hex){ if(hex==='BTC') return (typeof btcBalance!=='undefin
 function refreshAllAvail(){ const box=document.getElementById('recipients'); if(!box) return; for(const r of box.children){ if(typeof r._refreshAvail==='function'){ try{ r._refreshAvail(); }catch{} } } }
 function renderBalance(){
   try{ populateFeeAssets(); populateIssueFeeAssets(); }catch{}   // keep the fee pickers in sync as balances load
-  const b = balObj();
+  const live = balObj();
+  let b = live, btcBal = btcBalance;
+  // Whole-wallet caching: cache the live balances, and BEFORE the first scan finishes render the
+  // cached snapshot so the list/total are populated instantly instead of empty. Guarded by
+  // _scannedOnce so a genuinely-empty scanned wallet is never masked by a stale snapshot.
+  if(Object.keys(live).length){
+    try{ localStorage.setItem('swk.balCache', JSON.stringify({seq:live, btc:(btcBalance||0n).toString()})); }catch{}
+  } else if(!_scannedOnce){
+    try{ const c=JSON.parse(localStorage.getItem('swk.balCache')||'null'); if(c){ if(c.seq&&Object.keys(c.seq).length) b=c.seq; if(c.btc!=null) btcBal=BigInt(c.btc); } }catch{}
+  }
   const list=$('assetList'); list.innerHTML='';
   // Equal-standing + dual-chain: a headline portfolio total across BTC (parent chain) and
   // every Sequentia asset in the chosen reference currency, then per-asset rows in a uniform
@@ -2835,7 +2846,7 @@ function renderBalance(){
   // Headline total across BTC + every asset (on-chain + Lightning), in the reference currency.
   let total=0, totalRef=null, anyPriced=false, allPriced=true;
   const addToTotal=(refKey, atoms)=>{ const rv=refValue(refKey, atoms); if(rv){ total+=rv.v; totalRef=rv.ref; anyPriced=true; } else if((atoms||0n)>0n) allPriced=false; };
-  addToTotal('BTC', btcBalance + (lnOn?lnAtomsFor('BTC'):0n));
+  addToTotal('BTC', btcBal + (lnOn?lnAtomsFor('BTC'):0n));
   for(const h of seqKeys) addToTotal(h, BigInt(b[h]||0n) + (lnOn?lnAtomsFor(h):0n));
   // Restricted (OpenAMP) balances are ONE ROW AMONG EQUALS: price them into the headline total too
   // (WW-4 / spec 1.5(a)). Keyed 'oamp:'+id so assetMeta/priceTicker resolve the real ticker+precision;
@@ -2850,9 +2861,9 @@ function renderBalance(){
   }
 
   // BTC (parent chain) leads only because it is the other chain, not a privileged unit.
-  rowFull({ ticker:'BTC', refKey:'BTC', precision:8, onchainAtoms:btcBalance, kind:'BTC',
+  rowFull({ ticker:'BTC', refKey:'BTC', precision:8, onchainAtoms:btcBal, kind:'BTC',
     nameNode: el('span','sub','Bitcoin testnet4'), movable: btcFunding, alwaysShow:true,
-    leg:{ kind:'BTC', ticker:'BTC', precision:8, onchain:btcBalance, chain:'btc', asset:null }, known:true });
+    leg:{ kind:'BTC', ticker:'BTC', precision:8, onchain:btcBal, chain:'btc', asset:null }, known:true });
 
   // Uniform order (by ticker); tSEQ is one row among equals, not pinned.
   const keys = [...seqKeys].sort((x,y)=> assetMeta(x).ticker.localeCompare(assetMeta(y).ticker));
