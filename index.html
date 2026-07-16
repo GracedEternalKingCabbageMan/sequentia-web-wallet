@@ -3358,7 +3358,12 @@ function buildIssuePset(){
     contractJson={ entity:{domain}, issuer_pubkey:issuerPubkey, name:name||'Asset', precision:prec, ticker:ticker||'ASSET', version:0 };
   }
   const pset = network.txBuilder().issueAsset(amount, undefined, tokens, undefined, contract||undefined).feeRate(DEFAULT_FEERATE).finish(wollet);
-  return {pset, meta:{name, ticker:ticker||'ASSET', precision:prec, contract:contractJson}};
+  // Capture the new asset id NOW, from the freshly-built (unsigned) pset. Reading it back in the
+  // post-broadcast callback returned nothing (the pset is signed/finalized by then), which is why
+  // issued assets were left unlabeled and never registered.
+  let assetId;
+  try { const ids=pset.issuanceIds?.(); if(ids&&ids[0]) assetId=ids[0].toString(); } catch {}
+  return {pset, meta:{name, ticker:ticker||'ASSET', precision:prec, contract:contractJson, assetId}};
 }
 
 // Submit a freshly-issued asset to the public asset registry. The registry re-derives the asset
@@ -3478,8 +3483,8 @@ $('feeAsset').onchange=()=>{ feeAssetManual=true; updateFeeForSendType(); };
 $('btnIssue').onclick=async()=>{ $('issueErr').textContent='';
   try{ const {pset, meta}=buildIssuePset();
     await reviewBroadcast(pset, `Issue ${meta.ticker}`, ()=>{
-      let assetId;
-      try{ const ids=pset.issuanceIds?.(); if(ids&&ids[0]){ assetId=ids[0].toString(); saveLabel(assetId, meta); } }catch{}
+      const assetId=meta.assetId;   // captured pre-broadcast in buildIssuePset
+      if(assetId) saveLabel(assetId, meta);
       $('isName').value=$('isTicker').value=$('isAmount').value=$('isDomain').value='';
       if(assetId && meta.contract) registerIssuedAsset(assetId, meta.contract); });
   }catch(e){ $('issueErr').textContent=e?.message??String(e); } };
