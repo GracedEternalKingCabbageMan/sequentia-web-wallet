@@ -868,10 +868,11 @@ function railSupported(p, r){
   // SELL (pay the asset, receive BTC).
   if (p === 'ln' && r === 'chain')
     // Sub-asset SELL (pay asset over Lightning + receive BTC on-chain): gated on a deployed
-    // sell-maker for the asset AND the user actually holding it in a usable Lightning channel
-    // (payLn.ok) so they can pay the asset over LN. This is the direction that spends a
-    // Lightning asset balance for BTC.
-    return sellCapable(S.payAsset) && lnDeployed() && railAvail(S.payAsset, S.receiveAsset).payLn.ok;
+    // sell-maker for the asset. The user does NOT need a pre-existing channel — if they have
+    // no usable asset channel yet, reviewMixed opens + funds one inline on Place-order (the
+    // same non-custodial provision+fund flow as the asset Move-to-Lightning), exactly like the
+    // pure-LN rail. So the rail lights up and provisions for you rather than being disabled.
+    return sellCapable(S.payAsset) && lnDeployed();
   return (p === 'chain' && r === 'ln');           // sell: asset on-chain + BTC over LN (submarine)
 }
 function wireRailSeg(id, leg){
@@ -2335,6 +2336,35 @@ async function reviewMixed(q){
       + `Put ${am.ticker} on-chain and BTC on Lightning, or set both legs the same way.`;
     try { C.toast('No resting liquidity for that mixed direction yet.'); } catch {}
     return;
+  }
+  // Inline channel provisioning (mirrors reviewLn): if the user PAYS a leg over Lightning
+  // but has no usable channel for it, OPEN + FUND it now via the same non-custodial
+  // provision+fund flow, then continue — fulfilling paintRailSegs' "one is opened for you
+  // when you place the order" promise (the rail lights up like the asset Move-to-Lightning
+  // flow). Fails CLOSED before any swap/HTLC step; never half-executes.
+  if (q.payRail === 'ln' && L && L.provisionChannel){
+    let ra0 = railAvail(S.payAsset, S.receiveAsset);
+    if (!ra0.payLn.ok){
+      const pm = metaOf(S.payAsset);
+      const chain = S.payAsset === 'BTC' ? 'btc' : 'seq';
+      const atoms = safeAtoms(C.$('swPayAmt').value, pm.precision || 0);
+      if (atoms <= 0n){ $('swErr').textContent = 'Enter an amount so the Lightning channel can be sized.'; return; }
+      try {
+        $('swErr').textContent = '';
+        await L.provisionChannel({ chain, asset: chain === 'seq' ? S.payAsset : undefined, ticker: pm.ticker,
+          amount: Number(atoms), onProgress: (t) => { $('swStatus').className = 'status'; $('swStatus').innerHTML = '<span class="spin"></span>' + t; } });
+        LNSTATUS = await L.status();
+        $('swStatus').textContent = '';
+      } catch (e){
+        $('swStatus').textContent = '';
+        $('swErr').textContent = 'Could not open your Lightning channel: ' + (e && e.message || e);
+        return;
+      }
+      if (!railAvail(S.payAsset, S.receiveAsset).payLn.ok){
+        $('swErr').textContent = 'Your Lightning channel opened but is not ready to trade yet — please try again in a moment.';
+        return;
+      }
+    }
   }
   const amount = parseFloat((($('swPayAmt').value || '') + '').trim()) || null;
   const dir = isSubAsset
