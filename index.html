@@ -1167,6 +1167,10 @@ async function fetchFeeRates(){
       map[k] = { rate: v };
     }
     feeRates = map;
+    // Rates can arrive AFTER the user is already on a tab with a fee picker, which left the picker
+    // stale (only the assets priced at first paint — often just tSEQ). Refresh both pickers now.
+    try{ populateFeeAssets(); }catch{}
+    try{ populateIssueFeeAssets(); }catch{}
   }catch(e){ console.warn('[feerates] fetch failed:', e?.message??e); }   // keep last-good rates on a transient failure (mirrors loadPrices)
 }
 // The published rate (atoms-of-asset per reference unit) the tx must build its fee with.
@@ -2735,6 +2739,7 @@ function availableFor(hex){ if(hex==='BTC') return (typeof btcBalance!=='undefin
 // Re-run every recipient row's "Available:" line after a sync changes balances.
 function refreshAllAvail(){ const box=document.getElementById('recipients'); if(!box) return; for(const r of box.children){ if(typeof r._refreshAvail==='function'){ try{ r._refreshAvail(); }catch{} } } }
 function renderBalance(){
+  try{ populateFeeAssets(); populateIssueFeeAssets(); }catch{}   // keep the fee pickers in sync as balances load
   const b = balObj();
   const list=$('assetList'); list.innerHTML='';
   // Equal-standing + dual-chain: a headline portfolio total across BTC (parent chain) and
