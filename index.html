@@ -735,6 +735,7 @@
         <div class="field"><label class="lbl">Asset id</label><input id="raAsset" class="mono" placeholder="64-hex asset id"></div>
         <div class="row" style="margin-top:10px">
           <div class="grow"><label class="lbl">Amount</label><input id="raAmount" class="mono" placeholder="0.0"></div>
+          <div style="width:150px"><label class="lbl">Pay fee in</label><select id="raFeeAsset"></select></div>
         </div>
         <div class="row" style="margin-top:12px">
           <button id="btnReissue">Reissue</button>
@@ -1370,9 +1371,17 @@ function populateFeeAssets(){ fillFeeAssetSelect($('feeAsset')); updateFeeAssetH
 // Issuance can pay its fee in ANY held, node-priced asset, exactly like Send. No default to tSEQ.
 function populateIssueFeeAssets(){
   const sel=$('isFeeAsset'); fillFeeAssetSelect(sel);
+  fillFeeAssetSelect($('raFeeAsset'));   // the reissue/burn card gets the same open fee choice
   const hint=$('isFeeHint');
   if(hint) hint.textContent = (sel && sel.options.length) ? 'The network fee is paid in this asset.'
     : 'No held asset is priced for fees on this node yet.';
+}
+// Apply the chosen fee asset (any held, node-priced asset) to a reissue/burn builder + return the
+// fee-asset hex so reviewBroadcast labels it correctly. Non-policy assets take feeAsset(id, rate).
+function applyRaFeeAsset(b){
+  const feeHex=($('raFeeAsset') && $('raFeeAsset').value) || POLICY_HEX;
+  if(feeHex && feeHex!==POLICY_HEX) b=b.feeAsset(new AssetId(feeHex), feeRateFor(feeHex));
+  return {b, feeHex};
 }
 function updateFeeAssetHint(){
   const sel=$('feeAsset'), hint=$('feeAssetHint'); if(!sel||!hint) return;
@@ -3523,8 +3532,9 @@ $('btnReissue').onclick=async()=>{ $('raErr').textContent='';
     const input=$('raAmount');
     const amt=parseAtoms(assetAmountOf(input, asset), prec);   // honours ⇄ ref-input mode
     const ref=(input._refMode && (input.value||'').trim()) ? {typed:(input.value||'').trim(), ccy:(input._refCcy||REF)} : null;
-    const pset=network.txBuilder().reissueAsset(new AssetId(asset), amt, undefined, undefined).feeRate(DEFAULT_FEERATE).finish(wollet);
-    await reviewBroadcast(pset, 'Confirm Sequentia payment', null, POLICY_HEX, {rows:[{atoms:amt, hex:asset, ref}], feeAssetHex:POLICY_HEX});
+    const rb=applyRaFeeAsset(network.txBuilder().reissueAsset(new AssetId(asset), amt, undefined, undefined).feeRate(DEFAULT_FEERATE));
+    const pset=rb.b.finish(wollet);
+    await reviewBroadcast(pset, 'Confirm Sequentia payment', null, rb.feeHex, {rows:[{atoms:amt, hex:asset, ref}], feeAssetHex:rb.feeHex});
   }catch(e){ $('raErr').textContent=e?.message??String(e); } };
 $('btnBurn').onclick=async()=>{ $('raErr').textContent='';
   try{ const asset=$('raAsset').value.trim();
@@ -3532,8 +3542,9 @@ $('btnBurn').onclick=async()=>{ $('raErr').textContent='';
     const input=$('raAmount');
     const amt=parseAtoms(assetAmountOf(input, asset), prec);   // honours ⇄ ref-input mode
     const ref=(input._refMode && (input.value||'').trim()) ? {typed:(input.value||'').trim(), ccy:(input._refCcy||REF)} : null;
-    const pset=network.txBuilder().addBurn(amt, new AssetId(asset)).feeRate(DEFAULT_FEERATE).finish(wollet);
-    await reviewBroadcast(pset, 'Confirm Sequentia payment', null, POLICY_HEX, {rows:[{atoms:amt, hex:asset, ref}], feeAssetHex:POLICY_HEX});
+    const bb=applyRaFeeAsset(network.txBuilder().addBurn(amt, new AssetId(asset)).feeRate(DEFAULT_FEERATE));
+    const pset=bb.b.finish(wollet);
+    await reviewBroadcast(pset, 'Confirm Sequentia payment', null, bb.feeHex, {rows:[{atoms:amt, hex:asset, ref}], feeAssetHex:bb.feeHex});
   }catch(e){ $('raErr').textContent=e?.message??String(e); } };
 
 $('btnReveal').onclick=()=>{ $('seedReveal').textContent=localStorage.getItem(KEY)||''; show('seedReveal'); $('btnReveal').classList.add('hide'); };
