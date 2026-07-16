@@ -945,13 +945,23 @@ function runMixed({ side, asset, amount, payRail, recvRail, node_key, asset_bolt
     const assetId = resolveAsset(asset);
     if (side !== 'buy' && side !== 'sell') return resolve({ ok: false, error: "side must be 'buy' or 'sell'" });
     if (!assetId || assetId === CFG.btcx) return resolve({ ok: false, error: 'mixed swap needs a Sequentia asset id (not BTC)' });
-    // Stage 1b (observe-only): route the dispatch decision through the settlement router and log
-    // it. No behavior change yet — this proves the router picks the same binary the if-chain does
-    // before we let it replace the dispatch. See settlement-router.mjs.
+    // Stage 1b: the settlement router is now the dispatch AUTHORITY. It maps (side, payRail,
+    // recvRail) to the deployed binary; the branches below are guarded on execName, NOT raw rails
+    // (the equivalence test proves these agree). A null execName is a rail crossing / unsupported
+    // shape — the current binaries can't execute it (that needs the Stage-2 bridge), so fail closed
+    // uniformly here with the router's plan attached.
+    let plan = null, execName = null;
     try {
-      const plan = settlementPlanForSide(side, payRail, recvRail);
-      console.error(`[router] side=${side} pay=${payRail} recv=${recvRail} btcLeg=${plan.btcLeg.rail} assetLeg=${plan.assetLeg.rail} happy=${plan.happyCoincidence} -> ${planExecutionName(side, plan) || 'NO-BINARY(bridge/unsupported)'}`);
+      plan = settlementPlanForSide(side, payRail, recvRail);
+      execName = planExecutionName(side, plan);
     } catch (e) { console.error('[router] plan failed', e && e.message); }
+    console.error(`[router] side=${side} pay=${payRail} recv=${recvRail} btcLeg=${plan ? plan.btcLeg.rail : '?'} assetLeg=${plan ? plan.assetLeg.rail : '?'} -> ${execName || 'NO-BINARY(bridge/unsupported)'}`);
+    if (!execName) {
+      return resolve({ ok: false, finality: 'unsupported',
+        error: `pay=${payRail}/recv=${recvRail} for a ${side} needs the settlement bridge (a rail crossing the deployed binaries can't execute yet). `
+             + 'Use both-Lightning, both-on-chain, or a supported mixed shape.',
+        settlement_plan: plan ? { btcLeg: plan.btcLeg.rail, assetLeg: plan.assetLeg.rail, bridged: !plan.happyCoincidence } : null });
+    }
     // Map (side, payRail, recvRail) -> the submarine CLI. The three deployed shapes:
     //   asset-on-chain <-> BTC-LN (xsubbuy/xsublift, via -seq-rpc/-seq-wallet), and
     //   the MIRROR asset-over-LN + BTC-on-chain (xsubas, via -btc-rpc/-asset-ln-socket).
@@ -966,7 +976,7 @@ function runMixed({ side, asset, amount, payRail, recvRail, node_key, asset_bolt
     // commands the USER's hosted asset node (node_key) to pay the held asset by bare hash
     // (device co-signs), learns P, and RETURNS P + the BTC HTLC terms for the WALLET to claim
     // on-chain with its device key. The LSP never claims the BTC HTLC -> non-custodial.
-    if (side === 'sell' && payRail === 'ln' && recvRail === 'chain') {
+    if (execName === 'xsubas-sell') {
       if (!CFG.subasBtcRpc || !CFG.subasSellRelay) {
         return resolve({ ok: false, finality: 'unsupported',
           error: 'the sub-asset SELL rail is not configured on this LSP (set SUBAS_BTC_RPC + SUBAS_SELL_RELAY + a sub-asset-sell maker).' });
@@ -1011,7 +1021,7 @@ function runMixed({ side, asset, amount, payRail, recvRail, node_key, asset_bolt
           detail: out.split('\n').filter(Boolean).slice(-6).join(' | '), settled_ms: dt });
       });
     }
-    if (side === 'buy' && payRail === 'chain' && recvRail === 'ln') {
+    if (execName === 'xsubas') {
       // SUB-ASSET: pay BTC ON-CHAIN, receive the asset OVER LIGHTNING. The LSP funds the
       // BTC HTLC from its bitcoind wallet; a sub-asset (ln_direction=4) maker on
       // SUBAS_RELAY pays the asset invoice. Two receive targets:
@@ -1079,17 +1089,17 @@ function runMixed({ side, asset, amount, payRail, recvRail, node_key, asset_bolt
         return resolve({ ok: false, error: 'the mixed (submarine) rail is not configured on this LSP (set SEQ_RPC + SEQ_WALLET)' });
       }
       let cmd, extra;
-      if (side === 'buy' && payRail === 'ln' && recvRail === 'chain') {
+      if (execName === 'xsubbuy') {
         cmd = 'xsubbuy';                                       // BTC-LN in, asset on-chain out
         extra = ['-ln-socket', CFG.mixedBtcRpc, '-min-anchor-depth', String(CFG.minAnchorDepth)];
         if (CFG.mixedMax0conf > 0) extra.push('-max-0conf', String(CFG.mixedMax0conf));
-      } else if (side === 'sell' && payRail === 'chain' && recvRail === 'ln') {
+      } else if (execName === 'xsublift') {
         cmd = 'xsublift';                                      // asset on-chain in, BTC-LN out
         extra = ['-ln-socket', CFG.mixedBtcRpc];
       } else {
+        // Unreachable: the top-level null guard already fails closed. Defensive belt-and-suspenders.
         return resolve({ ok: false, finality: 'unsupported',
-          error: `mixed pay=${payRail}/recv=${recvRail} for a ${side} is not a deployed submarine. `
-               + 'Use both-Lightning, both-on-chain, or a supported mixed shape.' });
+          error: `mixed pay=${payRail}/recv=${recvRail} for a ${side} is not a deployed submarine.` });
       }
       args = [cmd, '-asset', assetId, '-relay', CFG.relay,
         '-seq-rpc', CFG.seqRpc, '-seq-wallet', CFG.seqWallet, '-state-file', stateFile, ...extra];
@@ -1575,10 +1585,14 @@ const server = http.createServer(async (req, res) => {
       const perUserReq = !!(body.node_key && body.asset_bolt11 && body.payment_hash);
       const subasReady = !!(CFG.subasBtcRpc && (CFG.subasAssetLn || (perUserReq && CFG.subasLpRpc)));
       const subasSellReady = !!(CFG.subasBtcRpc && CFG.subasSellRelay);
-      const supported = (side === 'buy' && payRail === 'ln' && recvRail === 'chain') ||
-                        (side === 'sell' && payRail === 'chain' && recvRail === 'ln') ||
-                        (side === 'buy' && payRail === 'chain' && recvRail === 'ln' && subasReady) ||
-                        (side === 'sell' && payRail === 'ln' && recvRail === 'chain' && subasSellReady);
+      // The settlement router names the binary for this (rail-blind-matched) shape — a single
+      // source of truth shared with runMixed; the outer gate only adds backend readiness.
+      let execName = null;
+      try { execName = planExecutionName(side, settlementPlanForSide(side, payRail, recvRail)); } catch {}
+      const backendReady = (execName === 'xsubbuy' || execName === 'xsublift') ? true
+        : execName === 'xsubas' ? subasReady
+        : execName === 'xsubas-sell' ? subasSellReady : false;
+      const supported = !!execName && backendReady;
       if (!supported) {
         return send(res, 422, { ok: false, finality: 'unsupported',
           error: `mixed pay=${payRail}/recv=${recvRail} for a ${side} has no maker/backend on this LSP `
@@ -1587,7 +1601,7 @@ const server = http.createServer(async (req, res) => {
       }
       // SUB-ASSET SELL always answers SYNCHRONOUSLY: the wallet needs P + the BTC HTLC
       // terms in the response to claim on-chain with its device key.
-      if (side === 'sell' && payRail === 'ln' && recvRail === 'chain') {
+      if (execName === 'xsubas-sell') {
         const r = await runMixed({ ...body, payRail, recvRail });
         return send(res, r.ok ? 200 : 502, r);
       }
