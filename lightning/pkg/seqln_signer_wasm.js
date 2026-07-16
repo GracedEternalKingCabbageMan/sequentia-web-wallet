@@ -217,6 +217,22 @@ export class Signer {
     setEnforce(enforce) {
         wasm.signer_setEnforce(this.__wbg_ptr, enforce);
     }
+    /**
+     * The node's OWN wallet sweep scriptPubKey for key `index`: p2wpkh of the
+     * bip86 key when `taproot` is false (the Elements sweep destination), or the
+     * bip86 taproot output when true (the Bitcoin sweep destination). Lets a JS
+     * harness synthesize a legit sweep output (and tamper it) for the enforce
+     * custody proof, without hard-coding key derivation in JS.
+     * @param {number} index
+     * @param {boolean} taproot
+     * @returns {Uint8Array}
+     */
+    walletSweepScript(index, taproot) {
+        const ret = wasm.signer_walletSweepScript(this.__wbg_ptr, index, taproot);
+        var v1 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+        wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+        return v1;
+    }
 }
 if (Symbol.dispose) Signer.prototype[Symbol.dispose] = Signer.prototype.free;
 

@@ -79,6 +79,14 @@ export class Signer {
      * browser build has no env, so this is how a caller selects enforce mode.
      */
     setEnforce(enforce: boolean): void;
+    /**
+     * The node's OWN wallet sweep scriptPubKey for key `index`: p2wpkh of the
+     * bip86 key when `taproot` is false (the Elements sweep destination), or the
+     * bip86 taproot output when true (the Bitcoin sweep destination). Lets a JS
+     * harness synthesize a legit sweep output (and tamper it) for the enforce
+     * custody proof, without hard-coding key derivation in JS.
+     */
+    walletSweepScript(index: number, taproot: boolean): Uint8Array;
 }
 
 /**
@@ -105,6 +113,7 @@ export interface InitOutput {
     readonly signer_new: (a: number, b: number) => [number, number, number];
     readonly signer_processFrame: (a: number, b: number, c: number) => [number, number, number, number];
     readonly signer_setEnforce: (a: number, b: number) => void;
+    readonly signer_walletSweepScript: (a: number, b: number, c: number) => [number, number];
     readonly rustsecp256k1_v0_10_0_context_create: (a: number) => number;
     readonly rustsecp256k1_v0_10_0_context_destroy: (a: number) => void;
     readonly rustsecp256k1_v0_10_0_default_error_callback_fn: (a: number, b: number) => void;
