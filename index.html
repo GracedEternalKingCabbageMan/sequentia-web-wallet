@@ -1237,10 +1237,12 @@ async function loadPrices(){
 loadPrices();
 // Market-feed ticker for an asset (BTC parent-chain -> BTC price; tSEQ -> SEQ).
 function priceTicker(hex){ if(hex==='BTC') return 'BTC'; if(hex===POLICY_HEX) return 'SEQ'; return assetMeta(hex).ticker; }
-// USD price for a ticker, tolerating the historical BTC<->WBTC feed-key drift so
-// Bitcoin is always valued whichever key the feed uses.
-function priceFor(t){ if(!t) return null; return PRICES[t] || (t==='BTC'?PRICES['WBTC']:(t==='WBTC'?PRICES['BTC']:null)) || null; }
-function refOptions(){ const s=new Set(['USD']); for(const t of Object.keys(PRICES)) s.add(t==='WBTC'?'BTC':t); return [...s]; }
+// USD price for a ticker, tolerating BTC feed-key drift so Bitcoin is always valued whichever
+// key the feed uses (tBTC today; WBTC/BTC historically). PRICES keys are UPPER-CASED in loadPrices.
+const _BTC_KEYS = ['BTC', 'TBTC', 'WBTC'];
+function _btcUsd(){ for(const k of _BTC_KEYS){ if(PRICES[k]>0) return PRICES[k]; } return null; }
+function priceFor(t){ if(!t) return null; const u=String(t).toUpperCase(); if(PRICES[u]>0) return PRICES[u]; return _BTC_KEYS.includes(u) ? _btcUsd() : null; }
+function refOptions(){ const s=new Set(['USD']); for(const t of Object.keys(PRICES)) s.add(_BTC_KEYS.includes(t)?'BTC':t); return [...s]; }
 function priceOf(ref){ return ref==='USD' ? 1 : priceFor(ref); }
 // True when the chosen reference currency has no price and we are showing USD instead.
 function refUnpriced(){ return REF!=='USD' && !(priceOf(REF)>0); }
