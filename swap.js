@@ -1011,6 +1011,27 @@ async function requote(){
   $('swErr').textContent = '';
   LAST_MID = null;
   paintRouteLine();
+  // Rail-blind take (Stage 3): default the rails to the BEST-PRICE offer's rail across ALL rails,
+  // so a market take gets the best price whichever rail carries it — the taker matches on price, not
+  // rail. The user's explicit rail choice (railsTouched) always wins; then the rail is a settlement
+  // preference and the LSP bridges the difference. Only for a BTC<->asset pair (the one with a rail
+  // choice); the on-chain offer -> both legs on-chain (cross), an LN offer -> the ASSET leg over LN
+  // (recv for a buy, pay for a sell) + BTC on-chain (sub-asset). Cached, so it costs no extra fetch.
+  const oneBtc = (S.payAsset === 'BTC') !== (S.receiveAsset === 'BTC');
+  if (oneBtc && !S.railsTouched && S.payAsset && S.receiveAsset){
+    const seqAsset = S.payAsset === 'BTC' ? S.receiveAsset : S.payAsset;
+    const side = S.payAsset === 'BTC' ? 'buy' : 'sell';
+    try {
+      const ub = await getUnifiedBook(seqAsset);
+      const best = ub && (side === 'buy' ? (ub.best_ask || (ub.asks || [])[0]) : (ub.best_bid || (ub.bids || [])[0]));
+      if (best && best.rail){
+        if (best.rail === 'onchain'){ S.payRail = 'chain'; S.recvRail = 'chain'; }
+        else if (side === 'buy'){ S.payRail = 'chain'; S.recvRail = 'ln'; }
+        else                    { S.payRail = 'ln';    S.recvRail = 'chain'; }
+        try { paintRailSegs(); } catch {}
+      }
+    } catch {}
+  }
   const route = findRoute(S.payAsset, S.receiveAsset);
   renderTiming(route);   // timing banner reflects the rails immediately, before amounts
   // LN / mixed / no-route are take-only; keep the mode control honest before we quote.
@@ -1353,6 +1374,18 @@ function paintQuoteSame(){
 // Fetch + render the ONE (cross) order book for a BTC<->asset pair. Called on EVERY
 // rail (ln / cross / mixed) so the book is never blank and looks identical — there is
 // no on-chain/LN distinction in the book UI. Returns { offers, unreachable }.
+// Cached unified-book fetch (rail-blind matching). ONE fetch per pair per ~12s; both the composer's
+// rail auto-selection (requote) and the book render (loadBtcBook) read it. Returns the raw LSP
+// payload ({ asks, bids, best_ask, best_bid, ... }) or null.
+let _ubookCache = { key: null, ts: 0, book: null };
+async function getUnifiedBook(seqAsset){
+  if (!seqAsset || seqAsset === 'BTC') return null;
+  if (_ubookCache.key === seqAsset && (Date.now() - _ubookCache.ts) < 12000) return _ubookCache.book;
+  let book = null;
+  try { if (L && L.unifiedBook){ const u = await L.unifiedBook(seqAsset); if (u && u.ok) book = u; } } catch {}
+  _ubookCache = { key: seqAsset, ts: Date.now(), book };
+  return book;
+}
 async function loadBtcBook(route){
   const seqAsset = route.seqAsset;
   let book = { forward: [], reverse: [], unreachable: false };
@@ -1365,10 +1398,8 @@ async function loadBtcBook(route){
   // never "no maker for your rail". Falls back to the on-chain-only cross book if the LSP is
   // unreachable. The proven on-chain take path (XBOOK) is unchanged; an LN row seeds the amount and
   // the composer requotes on the user's rail (the LSP bridges / fails closed cleanly on take).
-  let unified = null;
-  try {
-    if (L && L.unifiedBook){ const u = await L.unifiedBook(seqAsset); if (u && u.ok) unified = { asks: u.asks || [], bids: u.bids || [] }; }
-  } catch { /* unreachable LSP -> fall back to the on-chain cross book */ }
+  const ub = await getUnifiedBook(seqAsset);
+  const unified = ub ? { asks: ub.asks || [], bids: ub.bids || [] } : null;
   UBOOK = unified ? { seqAsset, ...unified } : null;
   renderXBook(seqAsset, route.payIsBtc, forward, reverse, unified);
   return { offers, unreachable: book.unreachable };
