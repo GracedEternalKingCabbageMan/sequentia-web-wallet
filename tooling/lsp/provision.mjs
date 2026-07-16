@@ -210,7 +210,12 @@ export function makeProvisioner(opts) {
     };
     const lnLog = fs.openSync(path.join(rec.dir, 'boot.out'), 'a');
     const ld = spawn(CFG.lightningd,
-      [`--lightning-dir=${rec.dir}`, `--network=${rec.network}`, '--developer'],
+      // --database-upgrade=true is REQUIRED: the seqln binary carries an irreversible
+      // 285->286 DB migration (the robustness/watchtower schema). Without it, a prov
+      // node whose DB predates the migration refuses to boot ("Refusing to irreversibly
+      // upgrade db"), exits immediately, and the device just sees "target closed" — i.e.
+      // the user's hosted Lightning silently never comes up after a binary cutover.
+      [`--lightning-dir=${rec.dir}`, `--network=${rec.network}`, '--developer', '--database-upgrade=true'],
       { env, detached: true, stdio: ['ignore', lnLog, lnLog] });
     ld.unref();
     // The relay: ws front -> the proxy's Noise responder. --tcp-retry-ms rides out the
