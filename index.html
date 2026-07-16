@@ -300,6 +300,7 @@
   .swlrow.bid span:first-child{color:var(--green)} .swlrow.bid .swldepth{background:rgba(39,174,96,.13)}
   .swlrow:hover{background:#1d242d;filter:none;transform:none} .swlrow.picked{outline:1.5px solid var(--amber2);outline-offset:-1.5px}
   .swlrow.noclick{cursor:default} .swlrow.noclick:hover{background:transparent}
+  .lnmove-banner{position:fixed;left:50%;bottom:16px;transform:translateX(-50%);z-index:60;display:flex;align-items:center;gap:8px;background:var(--panel2);border:1px solid var(--line);border-radius:10px;padding:8px 14px;font:12.5px/1.4 inherit;color:var(--txt);box-shadow:0 6px 20px rgba(0,0,0,.35);max-width:92vw}
   /* Your own resting orders, marked inline in the book (a subtle amber left-rail + a "you" tag). */
   .swlrow.mine{background:rgba(240,185,66,.09)} .swlrow.mine:hover{background:rgba(240,185,66,.16)}
   .swlrow.mine::before{content:"";position:absolute;left:0;top:3px;bottom:3px;width:2.5px;border-radius:2px;background:var(--amber2);z-index:2}
@@ -1918,6 +1919,7 @@ async function openWallet(phrase){
   try{ resumeBuy(); }catch(e){ console.warn('[resume] sub-asset buy resume failed:', e?.message??e); }
   // Finish a Move-to-Lightning that was interrupted after its deposit landed (funds on the user's
   // own node, never lost) — self-healing so a network blip / reload can't strand a deposit.
+  try{ updateLnMoveBanner(); }catch{}   // show the in-flight banner immediately if a move is still pending from last session
   try{ resumeMove(); }catch(e){ console.warn('[resume] move resume failed:', e?.message??e); }
   // Lightning (LSP): bring the on-device signer online so the "Instant (Lightning)"
   // swap rail becomes available. Non-fatal + opt-in: if the wss endpoint / host key
@@ -2407,6 +2409,7 @@ async function resumeMove(){
     try{ await waitNodeReady({ nodeKey: prov.key, onProgress:()=>{} }); }catch{}
     await resumeFundChannel({ chain: rec.chain, asset: rec.asset || undefined, amount: rec.amount, node: prov.key, onProgress:()=>{} });
     clearMoveState();
+    try{ updateLnMoveBanner(); }catch{}
     try{ rememberOwnLnLeg(rec.chain==='btc' ? 'btc' : String(rec.asset||'').toLowerCase()); }catch{}
     try{ toast('Finished moving '+rec.ticker+' to Lightning'); }catch{}
     try{ await sync(); }catch{}
@@ -2429,6 +2432,7 @@ function moveToLightningDialog(leg){
   m.appendChild(c); document.body.appendChild(m);
   no.onclick=()=>{ if(!ok.disabled) m.remove(); };
   ok.onclick=async()=>{
+    let backgrounded=false;   // set once the user chooses to close the modal and let the move finish in the background
     let atoms;
     try{ atoms = parseAtoms((inp.value||'').trim(), leg.precision); }catch{ st.className='status err'; st.textContent='Enter a valid amount.'; return; }
     if(!(atoms>0n)){ st.className='status err'; st.textContent='Enter an amount greater than zero.'; return; }
@@ -2471,12 +2475,22 @@ function moveToLightningDialog(leg){
         chain: leg.chain, asset: leg.asset || undefined, amount: Number(atoms), node: prov.key,
         sendOnchain: lnSendDeposit,
         onProgress: (e)=>{
-          if(e.phase==='sent'){ try{ saveMoveState(moveRec); }catch{} }   // deposit is now on the node — a reload can finish the open
+          if(e.phase==='sent'){
+            try{ saveMoveState(moveRec); }catch{}   // deposit is now on the node — a reload (or the background job) can finish the open
+            try{ updateLnMoveBanner(); }catch{}
+            // The confirm + channel-open is now resumable, so stop blocking the wallet: turn Cancel
+            // into "Continue in background" — closing the modal leaves this job running (and it also
+            // survives a reload via resumeMove). The user gets a toast when the channel is ready.
+            no.disabled=false; no.textContent='Continue in background';
+            no.onclick=()=>{ backgrounded=true; m.remove();
+              try{ toast('Deposit sent — your '+leg.ticker+' Lightning channel is opening in the background. Keep using the wallet; we’ll let you know when it’s ready.'); }catch{} };
+          }
           if(e.phase==='reconnecting'){ say('Connection hiccup — reconnecting (your deposit is safe; this will finish)…'); return; }
           if(phaseCopy[e.phase]) say(phaseCopy[e.phase]);
         },
       });
       try{ clearMoveState(); }catch{}   // channel opened — the move is complete
+      try{ updateLnMoveBanner(); }catch{}
       st.className='status ok';
       st.textContent = 'Done. Lightning channel '+(res.short_channel_id||'')+' is active'
         + (res.spendable_msat!=null ? (' with '+fmtAtoms(BigInt(Math.round(res.spendable_msat/1000)), leg.precision)+' '+leg.ticker+' spendable.') : '.');
@@ -2501,8 +2515,24 @@ function moveToLightningDialog(leg){
         msg = 'Not enough '+leg.ticker+' to cover the amount plus the on-chain network fee (the fee is paid in '+leg.ticker+'). Move a slightly smaller amount so a little '+leg.ticker+' is left for the fee.';
       st.className='status err'; st.textContent='Failed: '+msg;
       ok.disabled=false; no.disabled=false;
+      // If the user already closed the modal, surface the failure as a toast + keep the banner
+      // (the move is still resumable — reopening the wallet / a later Move retries from the deposit).
+      if(backgrounded){ try{ toast('Couldn’t finish moving '+leg.ticker+' to Lightning: '+msg); }catch{} }
+      try{ updateLnMoveBanner(); }catch{}
     }
   };
+}
+
+// A small persistent banner shown while a Move-to-Lightning is finishing in the background (the
+// modal has been closed but the deposit is on the node and the channel open is still completing,
+// via the running job or resumeMove on the next open). Driven purely by the persisted move state,
+// so it is correct across reloads; cleared when the move completes.
+function updateLnMoveBanner(){
+  let b=document.getElementById('_lnMoveBanner');
+  const rec=loadMoveState();
+  if(!rec || !rec.ticker){ if(b) b.remove(); return; }
+  if(!b){ b=el('div'); b.id='_lnMoveBanner'; b.className='lnmove-banner'; document.body.appendChild(b); }
+  b.innerHTML='<span class="spin"></span><span>Opening your '+esc(rec.ticker)+' Lightning channel in the background…</span>';
 }
 // Hand the Swap module everything it needs from the app: the wasm classes, the
 // live wallet/signer/network handles (read fresh via getters so a re-open keeps
