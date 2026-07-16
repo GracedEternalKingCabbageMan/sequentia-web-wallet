@@ -720,6 +720,10 @@
           <div style="width:130px"><label class="lbl">Reissue tokens</label><input id="isTokens" class="mono" value="0"></div>
         </div>
         <div class="row" style="margin-top:10px">
+          <div style="width:160px"><label class="lbl">Pay fee in</label><select id="isFeeAsset"></select></div>
+          <div class="grow sub" id="isFeeHint" style="align-self:flex-end;padding-bottom:9px"></div>
+        </div>
+        <div class="row" style="margin-top:10px">
           <div class="grow"><label class="lbl">Issuer domain</label><input id="isDomain" value="sequentiatestnet.com" placeholder="example.com"></div>
         </div>
         <p class="sub" style="margin-top:6px">Commits an on-chain contract and lists the asset in the public registry, so wallets, explorers and the node UI show its name and ticker instead of a raw id. Defaults to the testnet demo domain, which verifies automatically. Use your own domain if you will serve the registry's proof file there, or clear it to issue a private, unlisted asset.</p>
@@ -1347,23 +1351,28 @@ function initAppRefUI(){
 }
 
 // Fill the "pay fee in" picker: tSEQ (default) + any owned asset the node accepts for fees.
-function populateFeeAssets(){
-  const sel=$('feeAsset'); if(!sel) return;
-  const prev=sel.value;
-  sel.innerHTML='';
+// Fill any "pay fee in" select with every OWNED asset the node prices — tSEQ has NO privilege,
+// it goes through the SAME gate as every asset (offered iff held AND the node's feed prices it;
+// a producer may price fees in USD and refuse SEQ, then tSEQ is simply not offered). Building a
+// fee in an unpriced asset has no valid rate (feeRateFor would throw), so those are gated out.
+// Shared by Send and Issuance so both honour the open fee market (first-principle #3/#4).
+function fillFeeAssetSelect(sel){
+  if(!sel) return; const prev=sel.value; sel.innerHTML='';
   const add=(val,label)=>{ const o=el('option'); o.value=val; o.textContent=label; sel.appendChild(o); };
-  // NO privileged policy asset: tSEQ goes through the SAME gate as every asset — offered iff the
-  // wallet holds it AND this node's published feed prices it (feeRateEntry resolves). A producer
-  // may price fees in USD and refuse SEQ; then the feed omits SEQ and tSEQ is NOT offered here.
-  // Only offer owned assets the node prices (building a fee in an unpriced asset has no valid rate,
-  // so feeRateFor would throw and the send would break).
   const b=balObj();
   for(const h of Object.keys(b)){
     if(!(feeRateEntry(h) && feeRateEntry(h).rate>0)) continue;   // unpriced (incl. tSEQ): gate it out
     add(h, h===POLICY_HEX ? 'tSEQ' : assetMeta(h).ticker);
   }
   if(prev && [...sel.options].some(o=>o.value===prev)) sel.value=prev;
-  updateFeeAssetHint();
+}
+function populateFeeAssets(){ fillFeeAssetSelect($('feeAsset')); updateFeeAssetHint(); }
+// Issuance can pay its fee in ANY held, node-priced asset, exactly like Send. No default to tSEQ.
+function populateIssueFeeAssets(){
+  const sel=$('isFeeAsset'); fillFeeAssetSelect(sel);
+  const hint=$('isFeeHint');
+  if(hint) hint.textContent = (sel && sel.options.length) ? 'The network fee is paid in this asset.'
+    : 'No held asset is priced for fees on this node yet.';
 }
 function updateFeeAssetHint(){
   const sel=$('feeAsset'), hint=$('feeAssetHint'); if(!sel||!hint) return;
@@ -1765,6 +1774,7 @@ function tab(name){
   if(name==='stake') refreshStakes();
   if(name==='swap') renderActiveSwap();
   if(name==='send'){ feeAssetManual=false; refreshRecipientAssets(); populateFeeAssets(); defaultFeeAssetToSent(); updateFeeForSendType(); try{ initLnSendReceive(); refreshLnSendReceive(); }catch{} }
+  if(name==='assets') populateIssueFeeAssets();
 }
 
 // ---------- deep-link routing (OpenAMP: WW-2 sign card, WW-3 send handoff) ----------
@@ -3357,7 +3367,13 @@ function buildIssuePset(){
     // ids line up. Field values must match byte-for-byte (domain lowercased, pubkey hex).
     contractJson={ entity:{domain}, issuer_pubkey:issuerPubkey, name:name||'Asset', precision:prec, ticker:ticker||'ASSET', version:0 };
   }
-  const pset = network.txBuilder().issueAsset(amount, undefined, tokens, undefined, contract||undefined).feeRate(DEFAULT_FEERATE).finish(wollet);
+  // Pay the issuance fee in the chosen asset (any held, node-priced asset — open fee market, no
+  // privileged coin). Non-policy assets take feeAsset(id, rate); the policy asset needs no rate.
+  let b = network.txBuilder().issueAsset(amount, undefined, tokens, undefined, contract||undefined).feeRate(DEFAULT_FEERATE);
+  const feeHex = ($('isFeeAsset') && $('isFeeAsset').value) || '';
+  if(!feeHex) throw new Error('no asset in this wallet is priced for fees on this node');
+  if(feeHex !== POLICY_HEX) b = b.feeAsset(new AssetId(feeHex), feeRateFor(feeHex));
+  const pset = b.finish(wollet);
   // Capture the new asset id NOW, from the freshly-built (unsigned) pset. Reading it back in the
   // post-broadcast callback returned nothing (the pset is signed/finalized by then), which is why
   // issued assets were left unlabeled and never registered.
