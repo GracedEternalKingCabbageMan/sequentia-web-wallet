@@ -374,7 +374,7 @@
       <button data-tab="send">Send</button>
       <button data-tab="receive">Receive</button>
       <button data-tab="swap">Swap</button>
-      <button data-tab="assets">Assets</button>
+      <button data-tab="assets">Issuance</button>
       <button data-tab="stake">Stake</button>
       <button data-tab="history">History</button>
       <button data-tab="sign">Sign</button>
@@ -1181,6 +1181,24 @@ function feeRateFor(hex){
   if(!(r>0)) throw new Error('no fee rate for '+assetMeta(hex).ticker+'; try again');
   return BigInt(r);
 }
+// The fee-rate to give feeRate() when the POLICY asset pays the fee. fee_rate is in the policy
+// asset's OWN units, so scale the reference feerate by the policy asset's PUBLISHED rate — the fee
+// then meets the node's ABSTRACT reference floor even when the policy asset is not 1:1 (a producer
+// may price fees in untokenized USD and treat SEQ as just another asset; SEQ has NO fee privilege).
+// This is exactly what non-policy assets get via feeAsset(id, rate), inlined because LWK's
+// fee_asset() is for non-policy assets only. Under a config where the policy asset IS 1:1 this is a
+// no-op (rate = EXCHANGE_RATE_SCALE => factor 1).
+function policyFeeRate(){
+  const pr = Number(feeRateFor(POLICY_HEX));   // throws if this node does not price the policy asset
+  return Math.max(1, Math.ceil(DEFAULT_FEERATE * EXCHANGE_RATE_SCALE / pr));
+}
+// Apply the fee for the chosen `feeHex` to builder `b`, targeting the reference feerate for ANY
+// asset including the policy asset (open fee market, no privileged coin). Callers must NOT pre-set
+// feeRate — this sets it.
+function applyFee(b, feeHex){
+  if(feeHex && feeHex !== POLICY_HEX) return b.feeRate(DEFAULT_FEERATE).feeAsset(new AssetId(feeHex), feeRateFor(feeHex));
+  return b.feeRate(policyFeeRate());
+}
 
 // ---------- reference-currency valuation (user-chosen display denomination) ----------
 // Value everything in a denomination the user picks — which need NOT be a Sequentia
@@ -1380,8 +1398,7 @@ function populateIssueFeeAssets(){
 // fee-asset hex so reviewBroadcast labels it correctly. Non-policy assets take feeAsset(id, rate).
 function applyRaFeeAsset(b){
   const feeHex=($('raFeeAsset') && $('raFeeAsset').value) || POLICY_HEX;
-  if(feeHex && feeHex!==POLICY_HEX) b=b.feeAsset(new AssetId(feeHex), feeRateFor(feeHex));
-  return {b, feeHex};
+  return {b: applyFee(b, feeHex), feeHex};   // callers must NOT pre-set feeRate
 }
 function updateFeeAssetHint(){
   const sel=$('feeAsset'), hint=$('feeAssetHint'); if(!sel||!hint) return;
@@ -1719,7 +1736,7 @@ const seqLeg = {
     const destSpk = hexOfBytes(unconf.scriptPubkey().bytes());
     let fee = 1;
     try {
-      const rate = (asset_id === POLICY_HEX) ? EXCHANGE_RATE_SCALE : Number(feeRateFor(asset_id));
+      const rate = Number(feeRateFor(asset_id));   // policy asset uses its OWN published rate, no 1:1 privilege
       const nativeFeeSats = Math.ceil(DEFAULT_FEERATE * 350 / 1000);
       fee = Math.max(1, Math.ceil(nativeFeeSats * EXCHANGE_RATE_SCALE / rate));
     } catch {}
@@ -2151,15 +2168,12 @@ async function lnSendDeposit({ chain, asset, amount, address }){
   const assetId = new AssetId(asset);
   let b = network.txBuilder();
   b = a.isBlinded() ? b.addRecipient(a, BigInt(amount), assetId) : b.addExplicitRecipient(a, BigInt(amount), assetId);
-  b = b.feeRate(DEFAULT_FEERATE);
   // Pay the funding transaction's fee STRICTLY IN THE ASSET BEING MOVED — moving an asset into a
   // single-asset Lightning channel must never require a DIFFERENT asset (least of all tSEQ: a fresh
   // wallet holding only this asset has none, which is exactly the "missing N units of tSEQ" failure).
   // Open fee market, no privileged coin (first-principle #3/#4). Movability is gated on this asset
   // being fee-priced, so feeRateFor() resolves; there is deliberately NO fallback to another asset.
-  if(asset!==POLICY_HEX){
-    b = b.feeAsset(assetId, feeRateFor(asset));
-  }
+  b = applyFee(b, asset);
   const pset = b.finish(wollet);
   const signed = signer.sign(pset);
   const finalized = wollet.finalize(signed);
@@ -3174,9 +3188,9 @@ function buildSendPset(rows){
   // sat/vB, which is a Bitcoin unit and only applies to an actual BTC send. Convert it to the
   // internal rate lwk needs: r * 10^precision * R / 1e5, where R is the asset's published rate
   // (tSEQ, the native asset, uses EXCHANGE_RATE_SCALE). Blank leaves it at the network default.
-  const feeR=(feeHex===POLICY_HEX)?EXCHANGE_RATE_SCALE:Number(feeRateFor(feeHex));
+  const feeR=Number(feeRateFor(feeHex));   // policy asset uses its OWN published rate, no 1:1 privilege
   const feePrec=assetMeta(feeHex).precision||0;   // genuine 0-precision asset must not be treated as 8 (would inflate the rate 1e8x)
-  b=b.feeRate(fr ? (parseFloat(fr)*Math.pow(10,feePrec)*feeR/1e5) : DEFAULT_FEERATE);
+  b=b.feeRate(fr ? (parseFloat(fr)*Math.pow(10,feePrec)*feeR/1e5) : (feeHex===POLICY_HEX ? policyFeeRate() : DEFAULT_FEERATE));
   // Pay the fee in whatever asset the user chose, at this node's published rate. There is no 1:1
   // fallback — a fabricated rate yields a wrong fee, so an unpriced asset is a hard error
   // (feeRateFor throws). The selectors already gate unpriced assets out; this is the last guard.
@@ -3378,10 +3392,10 @@ function buildIssuePset(){
   }
   // Pay the issuance fee in the chosen asset (any held, node-priced asset — open fee market, no
   // privileged coin). Non-policy assets take feeAsset(id, rate); the policy asset needs no rate.
-  let b = network.txBuilder().issueAsset(amount, undefined, tokens, undefined, contract||undefined).feeRate(DEFAULT_FEERATE);
+  let b = network.txBuilder().issueAsset(amount, undefined, tokens, undefined, contract||undefined);
   const feeHex = ($('isFeeAsset') && $('isFeeAsset').value) || '';
   if(!feeHex) throw new Error('no asset in this wallet is priced for fees on this node');
-  if(feeHex !== POLICY_HEX) b = b.feeAsset(new AssetId(feeHex), feeRateFor(feeHex));
+  b = applyFee(b, feeHex);
   const pset = b.finish(wollet);
   // Capture the new asset id NOW, from the freshly-built (unsigned) pset. Reading it back in the
   // post-broadcast callback returned nothing (the pset is signed/finalized by then), which is why
@@ -3532,7 +3546,7 @@ $('btnReissue').onclick=async()=>{ $('raErr').textContent='';
     const input=$('raAmount');
     const amt=parseAtoms(assetAmountOf(input, asset), prec);   // honours ⇄ ref-input mode
     const ref=(input._refMode && (input.value||'').trim()) ? {typed:(input.value||'').trim(), ccy:(input._refCcy||REF)} : null;
-    const rb=applyRaFeeAsset(network.txBuilder().reissueAsset(new AssetId(asset), amt, undefined, undefined).feeRate(DEFAULT_FEERATE));
+    const rb=applyRaFeeAsset(network.txBuilder().reissueAsset(new AssetId(asset), amt, undefined, undefined));
     const pset=rb.b.finish(wollet);
     await reviewBroadcast(pset, 'Confirm Sequentia payment', null, rb.feeHex, {rows:[{atoms:amt, hex:asset, ref}], feeAssetHex:rb.feeHex});
   }catch(e){ $('raErr').textContent=e?.message??String(e); } };
@@ -3542,7 +3556,7 @@ $('btnBurn').onclick=async()=>{ $('raErr').textContent='';
     const input=$('raAmount');
     const amt=parseAtoms(assetAmountOf(input, asset), prec);   // honours ⇄ ref-input mode
     const ref=(input._refMode && (input.value||'').trim()) ? {typed:(input.value||'').trim(), ccy:(input._refCcy||REF)} : null;
-    const bb=applyRaFeeAsset(network.txBuilder().addBurn(amt, new AssetId(asset)).feeRate(DEFAULT_FEERATE));
+    const bb=applyRaFeeAsset(network.txBuilder().addBurn(amt, new AssetId(asset)));
     const pset=bb.b.finish(wollet);
     await reviewBroadcast(pset, 'Confirm Sequentia payment', null, bb.feeHex, {rows:[{atoms:amt, hex:asset, ref}], feeAssetHex:bb.feeHex});
   }catch(e){ $('raErr').textContent=e?.message??String(e); } };
