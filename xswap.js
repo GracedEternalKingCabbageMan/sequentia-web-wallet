@@ -566,6 +566,32 @@ function resetQuote(){
 }
 
 // ---- markets ----
+// Resume hook: a courier forward BUY persisted at SEQ_LOCKED (asset locked, not yet claimed).
+// After a reload the courier WS session is gone, so runForwardCourier won't re-run — but the
+// claim is purely on-chain and session-independent. Re-run the anchor WAIT + claim in the
+// background so a reloaded wallet completes the swap once the anchor catches up, instead of
+// stranding it at the stale-snapshot failure. Idempotent: guarded against re-entry, and a
+// double claim just rebroadcasts the same preimage tx (same txid). Never waits on a mismatched
+// leg (verifyLeg gates first).
+let _resumeClaiming = false;
+async function resumeAnchorClaim(){
+  if (_resumeClaiming) return;
+  if (!SWAP || !SWAP.courier || SWAP.state !== ST.SEQ_LOCKED) return;
+  if (!SWAP.seq_leg || SWAP.seq_claim_txid) return;
+  const lg = verifyLeg(); if (!lg.ok) return;
+  _resumeClaiming = true;
+  try {
+    let gate = verifyAnchor(await fetchLiveAnchor());
+    if (!gate.ok && gate.lag) gate = await awaitAnchor();
+    if (!gate.ok) { renderStepper(); return; }   // timed out near T_btc; stepper shows refund guidance
+    const txid = await claimSeq();
+    renderStepper();
+    C.toast && C.toast('Swap complete - asset claimed (anchor-bound to Bitcoin).',
+      { href: '/explorer/tx/' + txid, label: String(txid).slice(0, 18) + '…' });
+  } catch { /* transient; the manual Claim button + next resume retry */ }
+  finally { _resumeClaiming = false; }
+}
+
 export async function renderXswap(){
   const { $ } = C;
   if (!C.wollet) return;
@@ -586,6 +612,8 @@ export async function renderXswap(){
   }
   // If a swap is in flight (persisted), show its stepper; otherwise the quote form.
   renderStepper();
+  // A reloaded forward buy stuck at the anchor gate finishes on its own (session-independent).
+  resumeAnchorClaim();
 }
 
 function marketLabel(m){
