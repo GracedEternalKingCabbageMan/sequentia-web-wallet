@@ -1814,6 +1814,7 @@ function tab(name){
   if(name==='swap') renderActiveSwap();
   if(name==='send'){ feeAssetManual=false; refreshRecipientAssets(); populateFeeAssets(); defaultFeeAssetToSent(); updateFeeForSendType(); try{ initLnSendReceive(); refreshLnSendReceive(); }catch{} }
   if(name==='assets') populateIssueFeeAssets();
+  if(name==='balance') try{ renderBalance(); }catch{}   // render immediately (from cache pre-scan), don't wait for the scan
 }
 
 // ---------- deep-link routing (OpenAMP: WW-2 sign card, WW-3 send handoff) ----------
@@ -2751,7 +2752,7 @@ function availableFor(hex){ if(hex==='BTC') return (typeof btcBalance!=='undefin
 function refreshAllAvail(){ const box=document.getElementById('recipients'); if(!box) return; for(const r of box.children){ if(typeof r._refreshAvail==='function'){ try{ r._refreshAvail(); }catch{} } } }
 function renderBalance(){
   try{ populateFeeAssets(); populateIssueFeeAssets(); }catch{}   // keep the fee pickers in sync as balances load
-  const live = balObj();
+  let live = {}; try{ live = balObj(); }catch{}   // wollet.balance() can throw before the first scan
   let b = live, btcBal = btcBalance;
   // Whole-wallet caching: cache the live balances, and BEFORE the first scan finishes render the
   // cached snapshot so the list/total are populated instantly instead of empty. Guarded by
