@@ -241,6 +241,7 @@ export function initSwap(ctx){
     // Unblinded / Blinded book toggle (switches which relay namespace we read + post to).
     wireBookSeg();
     if ($('swXBack')) $('swXBack').onclick = () => { if (X && X.hasInFlight && X.hasInFlight()) _dismissed.add('cross'); showCross(false); renderSwap(); };
+    if ($('swRBack')) $('swRBack').onclick = () => { if (X && X.hasReverseInFlight && X.hasReverseInFlight()) _dismissed.add('reverse'); showReverse(false); renderSwap(); };
     // Live re-quote as the user types. The edited side is the "fixed" leg; the
     // other side is quoted. Debounced so we don't hammer the daemon per keystroke.
     wireAmount($('swPayAmt'), 'pay');
@@ -349,6 +350,10 @@ function showReverse(on){
   if (rw) rw.classList.toggle('hide', !on);
   if (on && cw) cw.classList.add('hide');
   if (comp) comp.classList.toggle('hide', on);
+  // Symmetric with showCross: reveal "Back to composer" whenever the reverse host is open,
+  // including with a sell in flight (it's a DISMISS — the swap keeps running).
+  const back = C.$('swRBack');
+  if (back) back.classList.toggle('hide', !on);
 }
 
 // ---------------------------------------------------------------------------

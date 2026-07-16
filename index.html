@@ -694,6 +694,12 @@
       <!-- reverse cross-chain (asset -> BTC) wizard host: hidden until Review routes
            a "sell asset for BTC" swap here. Rendered entirely by xrswap.js. -->
       <div id="swapReverseWrap" class="hide" style="margin-top:16px">
+        <div class="row" style="margin-bottom:4px">
+          <!-- Symmetric with the forward host: a DISMISS. The sell keeps running and the
+               Active-trades card reopens it; without this a pending sell trapped the user
+               in the stepper with no way back to the composer. -->
+          <button class="ghost swback hide" id="swRBack">‹ Back to composer</button>
+        </div>
         <div id="xrStepper"></div>
         <span id="xrExpiry" class="hide"></span>
         <div class="status err" id="xrswapErr" style="margin-top:8px"></div>
