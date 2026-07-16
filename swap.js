@@ -457,7 +457,10 @@ function findRoute(pay, receive){
     // "LSP configured". Any 'ln' leg without a channel is downgraded to 'chain' here,
     // so a stale rail state can never silently route into a dead LN path.
     const ra = ln ? railAvail(pay, receive) : null;
-    const p = (ln && S.payRail === 'ln' && ra.payLn.ok) ? 'ln' : 'chain';
+    // Rail-agnostic (Stage 3): HONOR a chosen LN pay-leg even without a channel yet — review opens +
+    // funds it inline on Place-order (reviewMixed/reviewLn provisioning), so "pay from Lightning" is a
+    // preference, not gated on pre-existing liquidity. (No longer downgraded to 'chain' on !payLn.ok.)
+    const p = (ln && S.payRail === 'ln') ? 'ln' : 'chain';
     // Receiving over LN normally needs a real inbound channel on that asset — EXCEPT the
     // sub-asset BUY (pay BTC on-chain, receive the asset over LN). There the LSP JIT-provisions
     // the user's inbound asset liquidity as part of the buy (provisionInbound), so recv=ln is
@@ -862,29 +865,13 @@ async function refreshSubassetBook(seqAssetHex){
 //     for a pair that actually has a sub-asset maker (subassetCapable), else it fails
 //     closed at the LSP, so it must not be selectable.
 function railSupported(p, r){
-  if (p === r) return true;                       // both-LN or both-on-chain
-  const payIsBtc = (S.payAsset === 'BTC');        // buy asset (pay BTC) vs sell asset (pay the asset)
-  if (payIsBtc){
-    if (p === 'ln' && r === 'chain') return true;                       // buy: BTC over LN + asset on-chain
-    if (p === 'chain' && r === 'ln')
-      // Sub-asset BUY (pay BTC on-chain, receive the asset over Lightning). The LSP now
-      // JIT-provisions inbound asset liquidity for the user's own hosted node as part of the
-      // buy (provisionInbound, funded from the LP node), so a pre-existing receive channel is
-      // NO LONGER required — offer it whenever a sub-asset buy maker exists for the asset. The
-      // inbound open happens on Place-order; if it can't be provisioned the buy fails closed
-      // and the on-chain BTC leg is refundable, so nothing is stranded.
-      return subassetCapable(S.receiveAsset) && lnDeployed();
-    return false;
-  }
-  // SELL (pay the asset, receive BTC).
-  if (p === 'ln' && r === 'chain')
-    // Sub-asset SELL (pay asset over Lightning + receive BTC on-chain): gated on a deployed
-    // sell-maker for the asset. The user does NOT need a pre-existing channel — if they have
-    // no usable asset channel yet, reviewMixed opens + funds one inline on Place-order (the
-    // same non-custodial provision+fund flow as the asset Move-to-Lightning), exactly like the
-    // pure-LN rail. So the rail lights up and provisions for you rather than being disabled.
-    return sellCapable(S.payAsset) && lnDeployed();
-  return (p === 'chain' && r === 'ln');           // sell: asset on-chain + BTC over LN (submarine)
+  // Rail-agnostic matching (Stage 3): a rail is a SETTLEMENT PREFERENCE, not a matching gate.
+  // Any mixed combo is selectable whenever Lightning is deployed; the settlement router decides
+  // the settlement + bridges on Place-order, and fails closed CLEANLY (refundable) if a leg can't
+  // be honored. We no longer pre-block on a live maker (subassetCapable/sellCapable) — the unified
+  // book already shows the liquidity, and gating the rail on it re-introduced the very
+  // rail distinction the merged book erases. (p === r is always fine: pure-LN / pure-on-chain.)
+  return (p === r) || lnDeployed();
 }
 function wireRailSeg(id, leg){
   const seg = C.$(id); if (!seg || seg._wired) return; seg._wired = true;
@@ -1691,7 +1678,7 @@ function renderXBook(seqAsset, payIsBtc, forward, reverse, unified){
     asks: asks.slice(0, 8), bids: bids.slice(0, 8), mid, spread,
     priceLabel: `(BTC/${am.ticker})`, sizeLabel: am.ticker,
     refMidStr: oneUnitRefStr(seqAsset),
-    headTitle: 'Order book', headSub: `${n} offer${n === 1 ? '' : 's'}${useUnified ? ' · all rails' : ''}`,
+    headTitle: 'Order book', headSub: `${n} offer${n === 1 ? '' : 's'}`,
     emptyMsg: 'No resting offers yet - a market maker with BTC reserves needs to post one.',
   });
   renderPairBar();
@@ -1716,9 +1703,8 @@ function renderLadder(host, o){
   const rowHtml = (cls, r, i) => {
     const clk = typeof r.onClick === 'function';
     const w = Math.max(2, Math.min(100, Math.round((r.frac || 0) * 100)));
-    const railBadge = r.rail ? `<i class="swlrail swlrail-${esc(r.rail)}" title="${r.rail === 'ln' ? 'Lightning' : 'on-chain'}">${r.rail === 'ln' ? '⚡' : '⛓'}</i>` : '';
     return `<button type="button" class="swlrow ${cls}${clk ? '' : ' noclick'}${r.mine ? ' mine' : ''}" data-side="${cls}" data-i="${i}"${r.mine ? ' title="Your resting order"' : ''}${clk ? '' : ' tabindex="-1"'}>
-      <span>${railBadge}${r.mine ? '<i class="swlyou">you</i>' : ''}${esc(trim(r.price))}</span><span>${esc(trim(r.size))}</span><span>${esc(trim(r.cum != null ? r.cum : r.size))}</span>
+      <span>${r.mine ? '<i class="swlyou">you</i>' : ''}${esc(trim(r.price))}</span><span>${esc(trim(r.size))}</span><span>${esc(trim(r.cum != null ? r.cum : r.size))}</span>
       <i class="swldepth" style="width:${w}%"></i></button>`;
   };
   const asks = o.asks || [], bids = o.bids || [];
@@ -2390,10 +2376,12 @@ async function reviewMixed(q){
   // claims with the maker-revealed preimage. Gated on live sell-side book liquidity.
   const isSubAssetSell = (side === 'sell' && assetLeg === 'ln' && btcLeg === 'chain');
   const isSubmarine = (assetLeg === 'chain' && btcLeg === 'ln');
-  if (!(isSubmarine || (isSubAsset && subassetCapable(q.seqAsset)) || (isSubAssetSell && sellCapable(q.seqAsset)))){
-    $('swErr').textContent = `This mixed combination (${am.ticker} over Lightning + BTC on-chain) has no resting liquidity for this pair yet. `
-      + `Put ${am.ticker} on-chain and BTC on Lightning, or set both legs the same way.`;
-    try { C.toast('No resting liquidity for that mixed direction yet.'); } catch {}
+  // Rail-agnostic (Stage 3): don't pre-block on a live maker (subassetCapable/sellCapable) — the
+  // rail is a settlement preference. Any recognized mixed shape proceeds; the settlement router
+  // decides + bridges on Place-order and fails closed CLEANLY (refundable) if there's no
+  // counterparty. Only a genuinely unrecognized combo (should not reach here) is refused.
+  if (!(isSubmarine || isSubAsset || isSubAssetSell)){
+    $('swErr').textContent = `This rail combination isn't a recognized swap shape. Set both legs the same way, or one leg on-chain and one on Lightning.`;
     return;
   }
   // Inline channel provisioning (mirrors reviewLn): if the user PAYS a leg over Lightning
