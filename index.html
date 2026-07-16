@@ -2754,13 +2754,13 @@ function renderBalance(){
   try{ populateFeeAssets(); populateIssueFeeAssets(); }catch{}   // keep the fee pickers in sync as balances load
   let live = {}; try{ live = balObj(); }catch{}   // wollet.balance() can throw before the first scan
   let b = live, btcBal = btcBalance;
-  // Whole-wallet caching: cache the live balances, and BEFORE the first scan finishes render the
-  // cached snapshot so the list/total are populated instantly instead of empty. Guarded by
-  // _scannedOnce so a genuinely-empty scanned wallet is never masked by a stale snapshot.
-  if(Object.keys(live).length){
+  // Whole-wallet caching, gated STRICTLY on _scannedOnce (an unscanned wollet can report an empty or
+  // all-zero balance map — never treat that as authoritative). Before the first scan, ALWAYS show the
+  // cached snapshot; only after a real scan do we cache the live balances and render them.
+  if(_scannedOnce){
     try{ localStorage.setItem('swk.balCache', JSON.stringify({seq:live, btc:(btcBalance||0n).toString()})); }catch{}
-  } else if(!_scannedOnce){
-    try{ const c=JSON.parse(localStorage.getItem('swk.balCache')||'null'); if(c){ if(c.seq&&Object.keys(c.seq).length) b=c.seq; if(c.btc!=null) btcBal=BigInt(c.btc); } }catch{}
+  } else {
+    try{ const c=JSON.parse(localStorage.getItem('swk.balCache')||'null'); if(c){ if(c.seq) b=c.seq; if(c.btc!=null) btcBal=BigInt(c.btc); } }catch{}
   }
   const list=$('assetList'); list.innerHTML='';
   // Equal-standing + dual-chain: a headline portfolio total across BTC (parent chain) and
