@@ -1139,9 +1139,40 @@ function readBody(req) {
   });
 }
 
+// Read-only JSON-RPC to the Sequentia node (CFG.seqRpc = http://user:pass@host:port).
+// Used only by the public /anchor read below.
+async function seqRpcCall(method, params = []) {
+  if (!CFG.seqRpc) throw new Error('SEQ_RPC not configured');
+  const u = new URL(CFG.seqRpc);
+  const auth = 'Basic ' + Buffer.from(`${decodeURIComponent(u.username)}:${decodeURIComponent(u.password)}`).toString('base64');
+  const endpoint = `${u.protocol}//${u.host}${u.pathname === '/' ? '' : u.pathname}`;
+  const r = await fetch(endpoint, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', authorization: auth },
+    body: JSON.stringify({ jsonrpc: '1.0', id: 'lsp-anchor', method, params }),
+    signal: AbortSignal.timeout(8000),
+  });
+  const j = await r.json();
+  if (j.error) throw new Error((j.error && j.error.message) || `seq rpc ${method} error`);
+  return j.result;
+}
+
 const server = http.createServer(async (req, res) => {
   const url = new URL(req.url, 'http://x');
   if (req.method === 'GET' && url.pathname === '/health') return send(res, 200, { ok: true, service: 'seqln-lsp' });
+  // GET /anchor -> the Sequentia tip's CURRENT Bitcoin-anchor height. The cross-chain anchor
+  // gate polls this so a lagging/contested anchor is a WAIT, not a stale-snapshot dead-end.
+  // Public chain data, so it sits before the token check like /health.
+  if (req.method === 'GET' && url.pathname === '/anchor') {
+    try {
+      const info = await seqRpcCall('getblockchaininfo');
+      const blk = await seqRpcCall('getblock', [info.bestblockhash]);
+      return send(res, 200, { ok: true, height: info.blocks,
+        anchor_height: (blk.anchorheight ?? null), anchor_hash: (blk.anchorhash ?? null) });
+    } catch (e) {
+      return send(res, 200, { ok: false, error: String((e && e.message) || e) });
+    }
+  }
   if (!authed(req)) return send(res, 401, { ok: false, error: 'unauthorized (Bearer token required)' });
   try {
     // ----- ORDER BOOK (sub-asset rail): the wallet gates its BUY/SELL toggles on live
