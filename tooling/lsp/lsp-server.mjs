@@ -93,6 +93,7 @@ import { execFile } from 'node:child_process';
 import { makeProvisioner } from './provision.mjs';
 import { acceptUpgrade, bridgeWsToTcp } from './ws-bridge.mjs';
 import { settlementPlanForSide, planExecutionName } from './settlement-router.mjs';
+import { buildUnifiedBook } from './unified-book.mjs';
 
 function reqEnv(name) {
   const v = process.env[name];
@@ -1199,6 +1200,33 @@ const server = http.createServer(async (req, res) => {
     //   GET /book?asset=<id> -> { sell_available, buy_available, sell_offers[], buy_offers[] }
     //   ln_direction 5 = resting BUY-asset-with-BTC (a party locks BTC on-chain) => user can SELL.
     //   ln_direction 4 = resting SELL-asset-for-BTC (a party pays asset over LN, INTERACTIVE) => user can BUY.
+    // GET /book/unified?asset=<id> -> ONE price-sorted book merging the on-chain cross relay AND
+    // the sub-asset LN relays, rail as metadata (Stage 2, rail-agnostic matching). Taker selection
+    // is best-price rail-blind; the settlement router bridges the rails on take. The wallet reads
+    // this instead of the two separate books. Each entry carries its raw offer so the wallet can
+    // construct the take (cross HTLC or sub-asset LN) from the same payload.
+    if (req.method === 'GET' && url.pathname === '/book/unified') {
+      const assetId = resolveAsset(url.searchParams.get('asset'));
+      if (!assetId || assetId === CFG.btcx) return send(res, 400, { ok: false, error: '?asset=<sequentia asset id> is required (not BTC)' });
+      const relays = [...new Set([CFG.relay, CFG.subasRelay, CFG.subasSellRelay].filter(Boolean))];
+      const seen = new Set(), raw = [];
+      for (const relay of relays) {
+        try {
+          const rr = await fetch(`${relay}/v1/market/${assetId}/BTC/orderbook`, { signal: AbortSignal.timeout(5000) });
+          if (!rr.ok) continue;
+          for (const o of ((await rr.json()).offers || [])) {
+            const key = (o.maker_pubkey || '') + ':' + (o.offer_id || '');
+            if (seen.has(key)) continue; seen.add(key);
+            raw.push(o);
+          }
+        } catch { /* a down relay just contributes no liquidity */ }
+      }
+      const book = buildUnifiedBook(raw);
+      return send(res, 200, { ok: true, asset: assetId,
+        asks: book.asks, bids: book.bids,
+        best_ask: book.asks[0] || null, best_bid: book.bids[0] || null,
+        counts: { asks: book.asks.length, bids: book.bids.length } });
+    }
     if (req.method === 'GET' && url.pathname === '/book') {
       const assetId = resolveAsset(url.searchParams.get('asset'));
       if (!assetId || assetId === CFG.btcx) return send(res, 400, { ok: false, error: '?asset=<sequentia asset id> is required (not BTC)' });
