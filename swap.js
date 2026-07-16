@@ -1359,9 +1359,10 @@ async function loadBtcBook(route){
   const seqAsset = route.seqAsset;
   let book = { forward: [], reverse: [], unreachable: false };
   if (X && X.book) book = await X.book(seqAsset).catch(() => ({ forward: [], reverse: [], unreachable: true }));
-  const offers = route.payIsBtc ? (book.forward || []) : (book.reverse || []);
-  XBOOK = { seqAsset, payIsBtc: route.payIsBtc, offers };
-  renderXBook(seqAsset, route.payIsBtc, offers);
+  const forward = book.forward || [], reverse = book.reverse || [];
+  const offers = route.payIsBtc ? forward : reverse;   // the takeable side for this direction (quote + fill)
+  XBOOK = { seqAsset, payIsBtc: route.payIsBtc, offers, forward, reverse };
+  renderXBook(seqAsset, route.payIsBtc, forward, reverse);   // render BOTH sides, like the same-chain book
   return { offers, unreachable: book.unreachable };
 }
 function numVal(el){ return parseFloat((((el && el.value) || '')).replace(/,/g, '')) || 0; }
@@ -1615,34 +1616,39 @@ function xOfferAmts(o, payIsBtc){
 // rendered as the SAME ladder as the same-chain book — no rail distinction, orders
 // look identical. Buying asset with BTC => the offers are ASKS you can take; selling
 // asset for BTC => they are BIDS you can take. Prices are BTC per asset unit.
-function renderXBook(seqAsset, payIsBtc, offers){
+function renderXBook(seqAsset, payIsBtc, forward, reverse){
   const host = C.$('swBook'); if (!host) return;
   const am = C.assetMeta(seqAsset);
-  offers = offers || [];
-  const rows = offers.map((o, i) => {
-    const { asset, btc } = xOfferAmts(o, payIsBtc);
+  forward = forward || []; reverse = reverse || [];
+  // Two-sided, exactly like the same-chain book: asks = forward offers (someone SELLS the asset
+  // for BTC, so a BTC-payer BUYS at that price), bids = reverse offers (someone BUYS the asset with
+  // BTC). Both priced BTC/asset; map each offer's amounts by its OWN direction, not the user's side.
+  const toRow = (o, i, dirIsBtc) => {
+    const { asset, btc } = xOfferAmts(o, dirIsBtc);
     const assetU = Number(big(asset)) / Math.pow(10, am.precision || 0), btcU = Number(big(btc)) / 1e8;
     return { price: assetU > 0 ? btcU / assetU : 0, size: assetU, _i: i };
-  }).filter(r => r.price > 0 && r.size > 0);
-  let asks = [], bids = [];
-  const total = rows.reduce((s, r) => s + r.size, 0) || 1;
-  if (payIsBtc){                       // takeable asks (give BTC, get asset)
-    rows.sort((a, b) => a.price - b.price);
-    let c = 0; rows.forEach(r => { c += r.size; r.cum = c; r.frac = c / total; });
-    asks = rows.slice().reverse();
-  } else {                             // takeable bids (give asset, get BTC)
-    rows.sort((a, b) => b.price - a.price);
-    let c = 0; rows.forEach(r => { c += r.size; r.cum = c; r.frac = c / total; });
-    bids = rows;
-  }
+  };
+  let asks = forward.map((o, i) => toRow(o, i, true)).filter(r => r.price > 0 && r.size > 0);
+  let bids = reverse.map((o, i) => toRow(o, i, false)).filter(r => r.price > 0 && r.size > 0);
+  asks.sort((a, b) => a.price - b.price);
+  { let c = 0; const t = asks.reduce((s, r) => s + r.size, 0) || 1; asks.forEach(r => { c += r.size; r.cum = c; r.frac = c / t; }); }
+  asks.reverse();
+  bids.sort((a, b) => b.price - a.price);
+  { let c = 0; const t = bids.reduce((s, r) => s + r.size, 0) || 1; bids.forEach(r => { c += r.size; r.cum = c; r.frac = c / t; }); }
+  // Only the side takeable in the user's current direction is clickable (its _i indexes XBOOK.offers,
+  // which loadBtcBook set to that same side); the other side is display-only depth.
   (payIsBtc ? asks : bids).forEach(r => r.onClick = () => fillFromXOffer(r._i));
-  const best = rows.length ? (payIsBtc ? Math.min(...rows.map(r => r.price)) : Math.max(...rows.map(r => r.price))) : null;
-  LAST_MID = { price: best, cross: true };
+  const bestAsk = asks.length ? Math.min(...asks.map(a => a.price)) : null;
+  const bestBid = bids.length ? Math.max(...bids.map(b => b.price)) : null;
+  const mid = (bestAsk != null && bestBid != null) ? (bestAsk + bestBid) / 2 : (bestAsk != null ? bestAsk : bestBid);
+  const spread = (bestAsk != null && bestBid != null) ? (bestAsk - bestBid) : null;
+  LAST_MID = { price: mid, cross: true };
+  const n = forward.length + reverse.length;
   renderLadder(host, {
-    asks: asks.slice(0, 8), bids: bids.slice(0, 8), mid: best, spread: null,
+    asks: asks.slice(0, 8), bids: bids.slice(0, 8), mid, spread,
     priceLabel: `(BTC/${am.ticker})`, sizeLabel: am.ticker,
     refMidStr: oneUnitRefStr(seqAsset),
-    headTitle: 'Order book', headSub: `${offers.length} offer${offers.length === 1 ? '' : 's'}`,
+    headTitle: 'Order book', headSub: `${n} offer${n === 1 ? '' : 's'}`,
     emptyMsg: 'No resting offers yet - a market maker with BTC reserves needs to post one.',
   });
   renderPairBar();

@@ -289,12 +289,12 @@
   /* order-book ladder (asks / mid / bids, depth bars, click a level to price) */
   .swladder{border:1px solid var(--line);border-radius:12px;background:var(--panel2);padding:10px 10px 12px;margin-top:14px}
   .swladder-head{display:flex;align-items:baseline;justify-content:space-between;gap:10px;margin:0 2px 6px}
-  .swladder-cols,.swlrow{display:grid;grid-template-columns:1fr 1fr 1fr;font:12.5px/1.5 ui-monospace,Menlo,Consolas,monospace}
+  .swladder-cols,.swlrow{display:grid;grid-template-columns:1fr 1fr 1fr;column-gap:16px;font:12.5px/1.5 ui-monospace,Menlo,Consolas,monospace}
   .swladder-cols{color:var(--dim);font-size:10.5px;letter-spacing:.04em;text-transform:uppercase;padding:2px 8px 4px}
   .swladder-cols span:nth-child(2),.swlrow span:nth-child(2){text-align:right}
   .swladder-cols span:last-child,.swlrow span:last-child{text-align:right;color:var(--dim)}
   .swlrow{position:relative;padding:3px 8px;border:0;border-radius:6px;background:transparent;width:100%;text-align:left;cursor:pointer}
-  .swlrow>span{position:relative;z-index:1}
+  .swladder-cols>span,.swlrow>span{position:relative;z-index:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
   .swldepth{position:absolute;top:0;bottom:0;right:0;border-radius:6px;z-index:0}
   .swlrow.ask span:first-child{color:var(--red)} .swlrow.ask .swldepth{background:rgba(224,86,75,.13)}
   .swlrow.bid span:first-child{color:var(--green)} .swlrow.bid .swldepth{background:rgba(39,174,96,.13)}
