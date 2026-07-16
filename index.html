@@ -3374,17 +3374,26 @@ function buildIssuePset(){
 // the issuance tx is visible to the registry's chain index; until then we say so honestly rather
 // than claim it's listed. Chain-verified is automatic; domain-verified needs the .well-known proof.
 const REGISTRY_SUBMIT_URL = (typeof window!=='undefined' && window.SEQ_REGISTRY_SUBMIT_URL) || '/registry/';
-async function registerIssuedAsset(assetId, contract){
+async function registerIssuedAsset(assetId, contract, attempt=0){
+  // The registry re-derives the id from the on-chain issuance, so it can only accept the entry
+  // once that tx is confirmed and indexed. A fresh issuance is 0-conf, so the first POST is
+  // expected to bounce with a not-found/chain error; retry quietly until it confirms (~1 block).
+  const RETRY_MS=20000, MAX_TRIES=18;   // ~6 minutes
   try{
     const r = await fetch(REGISTRY_SUBMIT_URL, { method:'POST', headers:{'Content-Type':'application/json'},
       body: JSON.stringify({ asset_id: assetId, contract }) });
     const j = await r.json().catch(()=>({}));
     if(r.ok){ toast(j && j.verified_domain ? 'Listed in the asset registry (domain-verified).'
-                                            : 'Listed in the asset registry (chain-verified).'); loadRegistry(); }
-    else if(/not.*found|issuance|chain|prevout|unconfirmed/i.test((j&&j.error)||'')){
-      toast('Issued. It lists in the public registry once the issuance confirms on-chain.'); }
-    else { toast('Issued. Registry listing was declined: '+((j&&j.error)||('HTTP '+r.status))); }
-  }catch(e){ toast('Issued. Could not reach the asset registry ('+(e?.message??e)+').'); }
+                                            : 'Listed in the asset registry (chain-verified).'); loadRegistry(); return; }
+    const pending = /not.*found|issuance|chain|prevout|unconfirmed|derive/i.test((j&&j.error)||'');
+    if(pending && attempt<MAX_TRIES){
+      if(attempt===0) toast('Issued. It lists in the public registry once the issuance confirms on-chain.');
+      setTimeout(()=>registerIssuedAsset(assetId, contract, attempt+1), RETRY_MS); return; }
+    if(pending) toast('Issued. Registry listing is still pending; it will appear once the issuance confirms.');
+    else toast('Issued. Registry listing was declined: '+((j&&j.error)||('HTTP '+r.status)));
+  }catch(e){
+    if(attempt<MAX_TRIES){ setTimeout(()=>registerIssuedAsset(assetId, contract, attempt+1), RETRY_MS); return; }
+    toast('Issued. Could not reach the asset registry ('+(e?.message??e)+').'); }
 }
 
 // ---------- wiring ----------
