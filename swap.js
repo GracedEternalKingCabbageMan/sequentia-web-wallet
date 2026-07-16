@@ -1369,12 +1369,17 @@ function numVal(el){ return parseFloat((((el && el.value) || '')).replace(/,/g, 
 // user did NOT edit from the best resting offer's price, so the composer is never
 // half-empty. The authoritative amounts still come from the settle response (LN) or
 // the daemon quote (cross); this is display only, and never stomps an active field.
+// Format a UNIT amount to a string rounded to the asset's own precision (MED-4): a value
+// written back into an amount field must never carry more decimals than the asset supports,
+// or parseAtoms() throws on submit and the trade becomes un-postable. Mirrors fmtAtoms.
+function fmtUnits(units, prec){ return C.fmtAtoms(BigInt(Math.round(units * Math.pow(10, prec))), prec); }
 function deriveXOpposite(route){
   try {
     const o = (XBOOK.offers || [])[0]; if (!o) return;
     const am = C.assetMeta(route.seqAsset);
+    const aprec = am.precision || 0;
     const { asset, btc } = xOfferAmts(o, route.payIsBtc);
-    const assetU = Number(big(asset)) / Math.pow(10, am.precision || 0), btcU = Number(big(btc)) / 1e8;
+    const assetU = Number(big(asset)) / Math.pow(10, aprec), btcU = Number(big(btc)) / 1e8;
     if (!(assetU > 0 && btcU > 0)) return;
     const btcPerAsset = btcU / assetU;
     const pa = C.$('swPayAmt'), ra = C.$('swRecvAmt');
@@ -1382,11 +1387,13 @@ function deriveXOpposite(route){
     if (S.edited === 'pay'){
       const v = numVal(pa); if (!(v > 0)) return;
       const other = btcIsPay ? (v / btcPerAsset) : (v * btcPerAsset);
-      if (document.activeElement !== ra) ra.value = trim(other);
+      // derived leg is the RECEIVE side: the asset when BTC is paid, otherwise BTC (8dp).
+      if (document.activeElement !== ra) ra.value = fmtUnits(other, btcIsPay ? aprec : 8);
     } else {
       const v = numVal(ra); if (!(v > 0)) return;
       const other = btcIsPay ? (v * btcPerAsset) : (v / btcPerAsset);
-      if (document.activeElement !== pa) pa.value = trim(other);
+      // derived leg is the PAY side: BTC when BTC is paid, otherwise the asset.
+      if (document.activeElement !== pa) pa.value = fmtUnits(other, btcIsPay ? 8 : aprec);
     }
     paintRefHints();
   } catch {}
@@ -1426,11 +1433,13 @@ async function requoteMixed(route, amtStr){
       $('swRoute').textContent = 'Mixed rails · sell over Lightning, receive BTC on-chain';
       setReviewEnabled(false); renderTiming(route); return;
     }
-    const assetU = Number(offer.asset_amount) / Math.pow(10, am.precision || 0);
-    const btcU = Number(offer.btc_sats) / 1e8;
-    $('swPayAmt').value = trim(assetU);
-    $('swRecvAmt').value = trim(btcU);
-    $('swRate').textContent = `${trim(assetU)} ${am.ticker} → ${trim(btcU)} BTC · best resting offer`;
+    // MED-4: format each leg at its own precision (asset at am.precision, BTC at 8), not the
+    // generic 8dp trim(), so a sub-8-decimal asset writes a re-parseable value into the field.
+    const assetStr = C.fmtAtoms(BigInt(offer.asset_amount), am.precision || 0);
+    const btcStr = C.fmtAtoms(BigInt(offer.btc_sats), 8);
+    $('swPayAmt').value = assetStr;
+    $('swRecvAmt').value = btcStr;
+    $('swRate').textContent = `${assetStr} ${am.ticker} → ${btcStr} BTC · best resting offer`;
     $('swRoute').textContent = 'Mixed rails · sell over Lightning, receive BTC on-chain';
     paintFee('BTC', null, 'You pay the ' + am.ticker + ' over Lightning; your device claims the BTC from its on-chain HTLC.');
     LAST_QUOTE = { kind: 'mixed', route, seqAsset: route.seqAsset, payIsBtc: false,
