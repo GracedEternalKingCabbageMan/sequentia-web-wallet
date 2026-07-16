@@ -27,23 +27,22 @@ function mk(side, rail, assetAtoms, btcSats, raw, meta) {
 
 // Classify ONE relay offer (the shared /v1/market/<asset>/BTC/orderbook shape) into a normalized
 // entry, or null if unrecognized / signature-unverified. LN offers carry lightning.ln_direction
-// (4 = SELL-asset-for-BTC = ask; 5 = BUY-asset-with-BTC = bid); on-chain cross offers carry
-// cross_chain.direction (0 = BTC_TO_ASSET = ask; 1 = ASSET_TO_BTC = bid), amounts in
-// base_amount (asset) / want_amount (BTC).
+// (4 = SELL-asset-for-BTC = ask; 5 = BUY-asset-with-BTC = bid). On-chain cross offers are PLAIN
+// INTENTS — the courier mints the HTLC terms per-lift, so they carry NO cross_chain metadata;
+// recognize them by the parent-BTC leg: want_asset==='BTC' (maker sells the asset for BTC = a taker
+// BUYS = ask) or offer_asset==='BTC' (maker offers BTC for the asset = a taker SELLS = bid). The
+// literal string 'BTC' = the parent chain; a hex asset id = a same-chain pair (dropped here).
+// base_amount is always the asset; the BTC amount is want_amount (ask) or offer_amount (bid).
 export function classifyRelayOffer(o) {
   if (!o || o._verified === false) return null;
   const lt = o.lightning || o.Lightning || {};
   const dir = Number(lt.ln_direction);
   if (dir === 4) return mk('ask', 'ln', num(o.offer_amount), num(o.want_amount), o, { ln_direction: 4, interactive: true });
   if (dir === 5) return mk('bid', 'ln', num(o.want_amount), num(o.offer_amount), o, { ln_direction: 5, interactive: false });
-  const cc = o.cross_chain || o.crossChain;
-  if (cc) {
-    const d = Number(cc.direction ?? 0);
-    const assetAtoms = num(o.base_amount ?? o.baseAmount);
-    const btcSats = num(o.want_amount ?? o.wantAmount);
-    if (d === 0) return mk('ask', 'onchain', assetAtoms, btcSats, o, { direction: 0 });
-    if (d === 1) return mk('bid', 'onchain', assetAtoms, btcSats, o, { direction: 1 });
-  }
+  const oa = o.offer_asset ?? o.offerAsset, wa = o.want_asset ?? o.wantAsset;
+  const assetAtoms = num(o.base_amount ?? o.baseAmount);
+  if (wa === 'BTC') return mk('ask', 'onchain', assetAtoms || num(o.offer_amount), num(o.want_amount), o, { trade_dir: 'sell' });
+  if (oa === 'BTC') return mk('bid', 'onchain', assetAtoms || num(o.want_amount), num(o.offer_amount), o, { trade_dir: 'buy' });
   return null;
 }
 

@@ -111,6 +111,9 @@ const CFG = {
   hostedBtcRpc: process.env.HOSTED_BTC_RPC || hostedRpcFallback,
   seqobCli: reqEnv('SEQOB_CLI'),
   relay: process.env.RELAY || 'http://127.0.0.1:9955',
+  // The on-chain cross-chain order-book relay (seqobd) for the unified book. Distinct from RELAY,
+  // which the box points at the pure-LN maker relay (:9965). Defaults to seqobd :9955.
+  crossRelay: process.env.SEQOB_RELAY_URL || 'http://127.0.0.1:9955',
   gold: reqEnv('GOLD'),
   btcx: process.env.BTCX || '', // empty => real BTC-LN (seqob-cli -btc-asset "")
   swapTimeoutMs: Number(process.env.LSP_SWAP_TIMEOUT_MS || 150000),
@@ -1208,7 +1211,7 @@ const server = http.createServer(async (req, res) => {
     if (req.method === 'GET' && url.pathname === '/book/unified') {
       const assetId = resolveAsset(url.searchParams.get('asset'));
       if (!assetId || assetId === CFG.btcx) return send(res, 400, { ok: false, error: '?asset=<sequentia asset id> is required (not BTC)' });
-      const relays = [...new Set([CFG.relay, CFG.subasRelay, CFG.subasSellRelay].filter(Boolean))];
+      const relays = [...new Set([CFG.crossRelay, CFG.subasRelay, CFG.subasSellRelay].filter(Boolean))];
       const seen = new Set(), raw = [];
       for (const relay of relays) {
         try {

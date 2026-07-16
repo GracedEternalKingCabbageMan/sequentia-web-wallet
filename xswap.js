@@ -215,13 +215,18 @@ async function fetchXmarketsRFQ(){
 // asset for BTC (direction BTC_TO_ASSET = 0; protojson omits the field at 0).
 // The taker of such an offer pays BTC and receives the asset — this wizard's job.
 function xcSettlement(o){ return o.cross_chain || o.crossChain; }
+// A resting cross offer is a PLAIN INTENT: the courier mints the HTLC terms (maker keys,
+// locktimes, exact fee) PER-LIFT via the session (openCourierSession -> Terms/SeqLegLocked), so the
+// resting offer carries NO cross_chain metadata (that field is only populated on a live leg). We
+// therefore recognize a cross offer by its parent-BTC leg, NOT by cross_chain: offer_asset/
+// want_asset === 'BTC' (the literal string = the parent chain; a hex id = a same-chain asset pair).
+// want_asset==='BTC' -> the maker sells the asset for BTC = a taker BUYS (forward). offer_asset===
+// 'BTC' -> the maker offers BTC for the asset = a taker SELLS (reverse). Legacy offers that DID carry
+// cross_chain still resolve — that leg's asset is 'BTC' too. Signature (_verified) still gates: the
+// courier key derives from maker_pubkey, so an unverified offer could let a relay MITM the channel.
 function isForwardCrossOffer(o){
-  // Reject offers that fail the maker signature: the E2E courier key is derived
-  // from the offer's maker_pubkey, so an unverified offer could let a malicious
-  // relay MITM the channel. (seqob.js now verifies CrossChainTerms offers too.)
-  if (o._verified === false) return false;
-  const cc = xcSettlement(o); if (!cc) return false;
-  return Number(pick(cc, 'direction') ?? 0) === 0;   // 0 = BTC_TO_ASSET
+  if (!o || o._verified === false) return false;
+  return pick(o, 'want_asset', 'wantAsset') === 'BTC';
 }
 async function seqobGet(path){
   const r = await fetch(seqob.seqobBase() + path, { cache: 'no-store' });
@@ -272,9 +277,8 @@ function bestForwardOffer(fwd, wantAtoms){
 }
 // A cross offer whose direction is ASSET_TO_BTC (taker SELLS the asset for BTC).
 function isReverseCrossOffer(o){
-  if (o._verified === false) return false;
-  const cc = xcSettlement(o); if (!cc) return false;
-  return Number(pick(cc, 'direction') ?? 0) === 1;   // 1 = ASSET_TO_BTC
+  if (!o || o._verified === false) return false;
+  return pick(o, 'offer_asset', 'offerAsset') === 'BTC';   // maker offers BTC for the asset = taker SELLS
 }
 
 // The cross-chain ORDER BOOK for one BTC<->seqAsset pair, split by taker direction
