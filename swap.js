@@ -53,6 +53,10 @@ let BOOK = { offers: [], pair: null };   // the resting offers for the selected 
 let XBOOK = { offers: [], seqAsset: null, payIsBtc: true };   // resting cross offers for the selected BTC<->asset pair
 let UBOOK = null;   // the UNIFIED book (on-chain + LN merged, rail-tagged) for the pair, from the LSP /book/unified
 let XMAKE = null;   // the wallet's OWN live resting cross offer (maker) + its settlement state, if any
+// D2 (T13): per-order fill progress from the relay's order_status stream — { offer_id: {active, status} }
+// where `active` is the remaining base atoms after any partial fills. Populated live via onCovOrderStatus
+// while the wallet is open; renderMyOrders shows "~N% filled" when active < the order's base amount.
+const _ordStatus = {};
 // Trades the user DISMISSED this session (kept live + resumable, just not force-shown). Gated in
 // renderSwap so a dismissed swap returns to the composer instead of bouncing straight back to its
 // stepper; the "Active trades" card (renderInFlightCard) reopens any of them. Session-only: a reload
@@ -2620,8 +2624,13 @@ async function onCovMatched(m){
   } catch (e){ try { C.toast && C.toast('Fill could not settle: ' + C.prettyErr(e)); } catch {} }
 }
 async function onCovOrderStatus(s){
-  // A resting order of ours moved (likely filled by a taker/settler): rescan the
-  // companion wollet (which holds the credit) + the primary, and refresh the UI.
+  // A resting order of ours moved (likely filled by a taker/settler): record the remaining size so
+  // renderMyOrders can show per-order fill progress (D2/T13), rescan the companion wollet (which holds
+  // the credit) + the primary, and refresh the UI.
+  try {
+    const id = s.offer_id || s.offerId;
+    if (id) _ordStatus[id] = { active: big(s.active_amount || s.activeAmount || 0), status: s.status || '' };
+  } catch {}
   await scanCompanion(); try { await C.sync(); } catch {}
   try { renderSwap(); } catch {}
 }
@@ -3964,9 +3973,19 @@ async function renderMyOrders(){
   const rows = orders.map(o => {
     const give = C.assetMeta(o.offer_asset||o.offerAsset), want = C.assetMeta(o.want_asset||o.wantAsset);
     const isCov = !!(o.covenant || o.Covenant);
+    // D2/T13: per-order fill progress. active_amount (remaining base atoms) < base_amount ⇒ partially
+    // filled; show ~N% done. Only when we've seen an order_status for it (live, this session).
+    const id = o.offer_id||o.offerId;
+    const base = big(o.base_amount||o.baseAmount||0);
+    const stat = _ordStatus[id];
+    let fillHint = '';
+    if (stat && base > 0n && stat.active >= 0n && stat.active < base){
+      const pct = Number((base - stat.active) * 100n / base);
+      fillHint = pct >= 100 ? ' · <span style="color:#3ddc84">filled</span>' : ` · <span style="color:#3ddc84">~${pct}% filled</span>`;
+    }
     return `<div class="swbook-row myorder">
-      <span class="mono">give ${esc(C.fmtAtoms(big(o.offer_amount||o.offerAmount), give.precision))} ${esc(give.ticker)} · want ${esc(C.fmtAtoms(big(o.want_amount||o.wantAmount), want.precision))} ${esc(want.ticker)}${isCov ? ' · resting on-chain' : ''}</span>
-      <button type="button" class="ghost swcancel" data-id="${esc(o.offer_id||o.offerId)}">Cancel</button></div>`;
+      <span class="mono">give ${esc(C.fmtAtoms(big(o.offer_amount||o.offerAmount), give.precision))} ${esc(give.ticker)} · want ${esc(C.fmtAtoms(big(o.want_amount||o.wantAmount), want.precision))} ${esc(want.ticker)}${isCov ? ' · resting on-chain' : ''}${fillHint}</span>
+      <button type="button" class="ghost swcancel" data-id="${esc(id)}">Cancel</button></div>`;
   }).join('');
   host.innerHTML = credits + `<div class="swbook"><div class="swbook-head"><span class="lbl">Your resting orders</span>
       <span class="sub">funded on-chain · fill whenever matched, even offline</span></div>${rows}</div>`;
