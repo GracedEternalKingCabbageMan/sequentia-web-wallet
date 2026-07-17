@@ -571,7 +571,7 @@ async function refreshInstant(){
       // "2a515539…" for USDX), so keying by asset_label put the balance under a key nothing reads,
       // and the composer showed "0 Lightning" for a funded channel. Resolve the full asset hex →
       // metaOf().ticker to match, exactly like the Balance card matches on c.asset.
-      const isBtc = (c.leg === 'btc' || c.asset_label === 'BTC');
+      const isBtc = (c.leg === 'btc' || c.asset_label === 'BTC' || c.chain === 'btc');   // mirror channelMatches' 3-way BTC test
       let t;
       if (isBtc) t = 'BTC';
       else {
@@ -2597,7 +2597,8 @@ async function startSell(params){
     const H = resp.btc_htlc;
     // Persist BEFORE the on-chain claim: the asset is now paid, so the BTC claim is the fund step
     // and MUST survive a reload — resumeSell() re-attempts it from here.
-    SELL = { state: 'claiming', asset, ticker: am.ticker, preimage: resp.preimage, hash_h: resp.hash_h, btc_htlc: H, ts: mixedTip() }; saveSell();
+    SELL = { state: 'claiming', asset, ticker: am.ticker, preimage: resp.preimage, hash_h: resp.hash_h, btc_htlc: H,
+      expected_btc: Number((offer && offer.btc_sats) || 0), ts: mixedTip() }; saveSell();
     say('Preimage revealed — verifying and claiming your BTC on-chain…');
     await claimSell();   // verify + claim; updates SELL + st
     say('Done. You paid ' + am.ticker + ' over Lightning and claimed BTC on-chain (' + String(SELL.claim_txid || '').slice(0,16) + '…).', 'ok');
@@ -2614,6 +2615,19 @@ async function startSell(params){
 // Idempotent-ish: a duplicate claim of an already-spent HTLC just errors, which we surface.
 async function claimSell(){
   const H = SELL.btc_htlc;
+  // ECONOMIC gate: the maker's returned BTC HTLC must be worth at least what we were QUOTED (offer.btc_sats).
+  // verifyClaimable only checks the HTLC's on-chain value equals what the LSP reported — NOT that it meets
+  // the quote — so a shortchanging/buggy counterparty could hand back a dust HTLC after we already paid the
+  // asset over LN. We STILL claim (recovering the dust beats letting the maker refund it), but surface the
+  // shortfall loudly instead of reporting a clean success. (Proper prevention needs verifying the BTC HTLC
+  // BEFORE paying the asset — an LSP/flow change tracked separately.)
+  try {
+    const got = BigInt(String(H.amount || 0)), want = BigInt(String(SELL.expected_btc || 0));
+    if (want > 0n && got < want) {
+      SELL.shortfall = { got: String(got), want: String(want) }; saveSell();
+      C.toast && C.toast(`Warning: the BTC HTLC is only ${C.fmtAtoms(got, 8)} BTC, less than the quoted ${C.fmtAtoms(want, 8)} BTC — claiming it anyway.`, { level: 'warn' });
+    }
+  } catch {}
   await C.btcLeg.verifyClaimable({ redeem_script: H.redeem_script, hash_h: SELL.hash_h,
     claim_pub: H.taker_claim_pubkey, maker_refund_pub: H.maker_refund_pubkey, t_btc: H.t_btc,
     preimage: SELL.preimage, txid: H.txid, vout: H.vout, amount: H.amount });

@@ -864,6 +864,19 @@ function verifyLeg(){
     if (SWAP.seq_amount != null && BigInt(String(SWAP.seq_leg.amount)) < BigInt(String(SWAP.seq_amount)))
       return { ok:false, reason:'maker locked less than agreed - do not claim; refund your BTC' };
   } catch { return { ok:false, reason:'unreadable leg amount - do not claim' }; }
+  // SCRIPT-BINDING gate (as critical as the asset/amount gate): recompute the EXPECTED Sequentia HTLC
+  // and require the maker's leg matches it byte-for-byte. The leg MUST be hashlocked to OUR H and
+  // claimable by OUR seq_claim_pub (refund to the maker after seq_locktime). Without this a maker can
+  // lock the agreed asset+amount under a script only THEY can spend (still hashlocked to our H);
+  // asset/amount pass, but claimSeq would build+broadcast our claim tx revealing the preimage on a leg
+  // we can never spend — and the maker reads s and sweeps our BTC. Same primitive/arg order as the BTC
+  // leg (lockBtcLeg): (hash, CLAIM pubkey, REFUND pubkey, locktime); here claim=us, refund=maker.
+  try {
+    const expected = C.wasm.buildSeqHtlcRedeemScript(SWAP.hash_hex, SWAP.seq_claim_pub, SWAP.maker_seq_refund_pub, SWAP.seq_locktime);
+    const got = String(SWAP.seq_leg.redeem_script || '');
+    if (!expected || String(expected).toLowerCase() !== got.toLowerCase())
+      return { ok:false, reason:'the maker locked a Sequentia output your key cannot claim (HTLC script mismatch) - do NOT claim; refund your BTC after block ' + SWAP.btc_locktime };
+  } catch { return { ok:false, reason:'could not verify the Sequentia leg script - do not claim; refund your BTC' }; }
   return { ok:true };
 }
 // verifyAnchor(legAnchor): gate on the SWAP LEG'S OWN Bitcoin anchor — the anchor of the Sequentia
@@ -1253,7 +1266,10 @@ function stepProposeCard(){
 }
 function stepAnchorCard(){
   const have = !!(SWAP.seq_leg && SWAP.seq_leg.txid);
-  const gate = have ? verifyAnchor() : { ok:false };
+  // Display-only gate: use the maker's reported leg anchor so the card/button aren't dead (verifyAnchor
+  // now needs an explicit anchor; a no-arg call is NaN -> always "unconfirmed"). The REAL safety gate
+  // re-reads the leg's own on-chain anchor via fetchLegAnchor() at claim time (claimSeq/onClaimSeq).
+  const gate = have ? verifyAnchor(Number(SWAP && SWAP.seq_leg && SWAP.seq_leg.anchor_height)) : { ok:false };
   const done = have && gate.ok;
   const body = [
     C.el('div','sub','Mandatory anchor gate (the Sequentia value-add): the Sequentia leg must be bound to a Bitcoin block at or after your BTC lock.'),
@@ -1271,7 +1287,10 @@ function stepAnchorCard(){
 }
 function stepClaimCard(){
   const have = !!(SWAP.seq_leg && SWAP.seq_leg.txid);
-  const gate = have ? verifyAnchor() : { ok:false };
+  // Display-only gate: use the maker's reported leg anchor so the card/button aren't dead (verifyAnchor
+  // now needs an explicit anchor; a no-arg call is NaN -> always "unconfirmed"). The REAL safety gate
+  // re-reads the leg's own on-chain anchor via fetchLegAnchor() at claim time (claimSeq/onClaimSeq).
+  const gate = have ? verifyAnchor(Number(SWAP && SWAP.seq_leg && SWAP.seq_leg.anchor_height)) : { ok:false };
   const claimed = !!(SWAP.seq_claim_txid) || SWAP.state === ST.SEQ_CLAIMED || SWAP.state === ST.BTC_CLAIMED;
   const active = have && gate.ok && !claimed;
   const body = [ C.el('div','sub','Claim the Sequentia leg with your secret. This reveals the secret on-chain so the maker can claim your BTC - completing the atomic swap.') ];
