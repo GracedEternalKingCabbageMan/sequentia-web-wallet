@@ -337,6 +337,7 @@ function startLiveData(){
 export async function renderSwap(){
   if (!C.wollet) return;
   startLiveData();
+  stopLiveBook();   // drop any prior pair's live stream; requoteSame re-subscribes for the selected pair
   // Prune stale dismissals: once a kind's trade has ended, its flag must not suppress a future one.
   if (!hasMixedInFlight()) _dismissed.delete('mixed');
   if (!(X && X.hasInFlight && X.hasInFlight())) _dismissed.delete('cross');
@@ -1110,15 +1111,17 @@ async function requote(){
   // LN / mixed / no-route are take-only; keep the mode control honest before we quote.
   if (!postSupported(route)) S.mode = 'take';
   paintModeSeg();
-  if (!route){ setReviewEnabled(false); clearOpposite(); clearBook(); paintCostLine(); return; }
+  if (!route){ setReviewEnabled(false); clearOpposite(); clearBook(); paintCostLine(); stopLiveBook(); return; }
   const amtStr = typedAmount(S.edited);
   // Do NOT bail on an empty amount: the quote functions fetch and RENDER the ONE
   // order book first (so it is visible the moment a pair is chosen, on EVERY rail),
   // then quote only if an amount is present.
   try {
-    if (route.kind === 'ln')         await requoteLn(route, amtStr);
-    else if (route.kind === 'cross') await requoteCross(route, amtStr);
-    else if (route.kind === 'mixed') await requoteMixed(route, amtStr);
+    // Only the same-chain path has the live WS book; other rails render XBOOK/UBOOK, so tear the
+    // same-chain stream down when routing away (else a stale subscription keeps patching a hidden BOOK).
+    if (route.kind === 'ln')         { stopLiveBook(); await requoteLn(route, amtStr); }
+    else if (route.kind === 'cross') { stopLiveBook(); await requoteCross(route, amtStr); }
+    else if (route.kind === 'mixed') { stopLiveBook(); await requoteMixed(route, amtStr); }
     else                             await requoteSame(route, amtStr);
   } finally {
     try { paintCostLine(); } catch {}   // E2: the one cost line, after any rail quotes
@@ -1238,6 +1241,87 @@ function clearOpposite(){
 }
 function setReviewEnabled(on){ const b = C.$('swReview'); if (b) b.disabled = !on; }
 
+// Build BOOK (asks/bids split by trade direction, expiry- and signature-filtered, best-price-first)
+// from a flat offer list, then render the ladder. Shared by the REST quote path (requoteSame) and
+// the live WS book (startLiveBook) so both produce a byte-identical book from the same offers. The
+// relay keys markets by exact base/quote order, so a caller passes BOTH orientations' offers merged;
+// this dedups by maker:offer_id. Returns the liftable (ask) side for the caller's quote math.
+function applyOffersToBook(allOffers, pay, receive){
+  const now = Math.floor(Date.now()/1000);
+  const notExpired = (o) => { const exp = Number(o.expires_at_unix || o.expiresAtUnix || 0); return !(exp && exp <= now); };
+  const seen = new Set(), liftable = [], otherSide = [];
+  for (const o of (allOffers || [])){
+    const id = (o.maker_pubkey||o.makerPubkey)+':'+(o.offer_id||o.offerId);
+    if (seen.has(id)) continue; seen.add(id);
+    if (o._verified === false) continue;                       // untrusted relay: skip forged rows
+    if (!notExpired(o)) continue;
+    const oa = o.offer_asset||o.offerAsset, wa = o.want_asset||o.wantAsset;
+    if (oa === receive && wa === pay) liftable.push(o);
+    else if (oa === pay && wa === receive) otherSide.push(o);
+  }
+  liftable.sort((a,bb)=> ratioRecvPerPay(bb) - ratioRecvPerPay(a));  // best price first
+  BOOK = { pair:{ base_asset: receive, quote_asset: pay }, offers: liftable, otherOffers: otherSide };
+  renderBook(pay, receive);
+  return liftable;
+}
+
+// --- live book (D4): push, not poll ---
+// After the REST snapshot renders, subscribe to the relay's WS stream for the selected same-chain
+// pair so the ladder ticks in real time as offers appear/expire. The relay sends a `public_book`
+// snapshot on subscribe, then `public_order_created` / `public_order_removed` deltas; we hold a
+// verified offer set (both market orientations, since the relay keys by exact base/quote) and, on
+// any change, rebuild the ladder via applyOffersToBook. Display-only: it re-renders the BOOK ladder
+// but never touches the composer or re-derives amounts (B1), so a live tick can't move a field under
+// the user — the quote refreshes on the next interaction. WS failure is silent; the 15s poll remains
+// the fallback. Transparent book only (the stream doesn't carry the blinded namespace).
+let _liveBook = null;   // { relay, key, pay, receive, offers: Map<maker:offerId, offer>, timer, retryTimer }
+function _liveKey(pay, receive){ return pay + '␟' + receive; }
+function _liveOid(o){ return (o.maker_pubkey||o.makerPubkey)+':'+(o.offer_id||o.offerId); }
+function stopLiveBook(){
+  const lb = _liveBook;
+  if (!lb) return;
+  _liveBook = null;   // null FIRST, so a pending onClose sees itself superseded and does NOT reconnect
+  if (lb.timer)      { try { clearTimeout(lb.timer); } catch {} }
+  if (lb.retryTimer) { try { clearTimeout(lb.retryTimer); } catch {} }
+  try { lb.relay && lb.relay.close(); } catch {}
+}
+function startLiveBook(pay, receive){
+  if (!pay || !receive) return;
+  const key = _liveKey(pay, receive);
+  if (_liveBook && _liveBook.key === key) return;   // already streaming this pair (no reopen on keystrokes)
+  stopLiveBook();
+  const offers = new Map();
+  const lb = { relay: null, key, pay, receive, offers, timer: null, retryTimer: null };
+  // Live only while THIS pair is still the selected transparent-book pair and the tab is visible.
+  const stillLive = () => {
+    if (_liveBook !== lb || isConfBook()) return false;
+    if (S.payAsset !== pay || S.receiveAsset !== receive) return false;
+    const host = C.$('swBook'); return !!(host && host.offsetParent !== null);
+  };
+  // Coalesce bursts (a maker re-post is a remove+create pair; the covenant book has dozens of rows)
+  // into at most ~3 re-renders/sec, and only when this pair is still live.
+  const rebuild = () => { lb.timer = null; if (stillLive()) applyOffersToBook([...offers.values()], pay, receive); };
+  const schedule = () => { if (!lb.timer) lb.timer = setTimeout(rebuild, 300); };
+  const connect = () => {
+    lb.relay = seqob.openRelay(
+      [{ base_asset: receive, quote_asset: pay }, { base_asset: pay, quote_asset: receive }],
+      {
+        onOpen: () => { offers.clear(); },   // a (re)connect delivers a fresh snapshot; drop stale rows first
+        onBook: (b) => { for (const o of (b.offers||[])) offers.set(_liveOid(o), o); schedule(); },
+        onOfferCreated: (o) => { offers.set(_liveOid(o), o); schedule(); },
+        onOfferRemoved: (r) => { offers.delete(_liveOid(r)); schedule(); },
+        onError: () => {},   // silent: the REST snapshot already rendered + the 15s poll is the fallback
+        onClose: () => {     // relay restarted / dropped: reconnect while this pair is still on-screen
+          if (_liveBook !== lb || lb.retryTimer) return;
+          if (!stillLive()) return;   // hidden/changed: let renderSwap+requoteSame re-establish on return
+          lb.retryTimer = setTimeout(() => { lb.retryTimer = null; if (stillLive()) connect(); }, 3000);
+        },
+      });
+  };
+  _liveBook = lb;
+  connect();
+}
+
 // --- same-chain: the unified PLACE-ORDER path (passive-CLOB covenant) ---
 // Every same-chain order is "Place order": the two amount fields are the user's own
 // limit (their ratio IS the price), and Place funds a self-enforcing covenant that
@@ -1263,23 +1347,14 @@ async function requoteSame(route, amtStr){
                  reachErr = e; return { offers: [] }; }                            // network/5xx: unreachable
     };
     const [b1, b2] = await Promise.all([ safeBook(receive, pay), safeBook(pay, receive) ]);
-    const now = Math.floor(Date.now()/1000);
-    const notExpired = (o) => { const exp = Number(o.expires_at_unix || o.expiresAtUnix || 0); return !(exp && exp <= now); };
-    // Offers giving `receive` want `pay` (asks, crossable by our order); the opposite side (give
-    // `pay`, want `receive`) feeds the spread/mid summary and the depth display.
-    const seen = new Set(), liftable = [], otherSide = [];
-    for (const o of [...(b1.offers||[]), ...(b2.offers||[])]){
-      const id = (o.maker_pubkey||o.makerPubkey)+':'+(o.offer_id||o.offerId);
-      if (seen.has(id)) continue; seen.add(id);
-      if (o._verified === false) continue;                       // untrusted relay: skip forged rows
-      if (!notExpired(o)) continue;
-      const oa = o.offer_asset||o.offerAsset, wa = o.want_asset||o.wantAsset;
-      if (oa === receive && wa === pay) liftable.push(o);
-      else if (oa === pay && wa === receive) otherSide.push(o);
-    }
-    liftable.sort((a,bb)=> ratioRecvPerPay(bb) - ratioRecvPerPay(a));  // best price first
-    BOOK = { pair:{ base_asset: receive, quote_asset: pay }, offers: liftable, otherOffers: otherSide };
-    renderBook(pay, receive);
+    // Split into asks (liftable: give `receive`, want `pay`) + the opposite side (feeds spread/mid +
+    // the depth display), expiry- and signature-filtered, best-price-first. Shared with the live WS
+    // book so a REST snapshot and a pushed delta render an identical ladder (see applyOffersToBook).
+    const liftable = applyOffersToBook([...(b1.offers||[]), ...(b2.offers||[])], pay, receive);
+    // Keep the book live: after the REST snapshot, subscribe to the relay's push stream so the ladder
+    // ticks as offers appear/expire, not only on the 15s poll. Transparent book only (the WS stream
+    // doesn't carry the blinded namespace); the confidential book toggles the live stream off.
+    if (isConfBook()) stopLiveBook(); else startLiveBook(pay, receive);
 
     // T7: relay unreachable AND nothing to show — say so and let the user retry.
     if (reachErr && !liftable.length){

@@ -530,12 +530,17 @@ export async function lift(offer, takeAtoms, feeAsset, hooks){
   }
 }
 
-// Watch-for-fill: open a persistent relay WS, subscribe to a market, and
-// dispatch the matcher's crossings. The passive-CLOB replacement for the old
-// take/post round-trip — a covenant maker can watch its rest fill (order_status)
-// while offline-capable, and a taker settles on `matched`.
+// Watch-for-fill / live book: open a persistent relay WS, subscribe to a market,
+// and dispatch the relay's stream. Two uses: (1) a covenant maker watches its rest
+// fill (order_status) while offline-capable, and a taker settles on `matched`; (2)
+// a live order book — the relay sends a `public_book` snapshot on subscribe, then
+// `public_order_created` / `public_order_removed` deltas as the book changes, so a
+// viewer can tick individual rows without polling. Snapshot + created offers are
+// tagged `_verified` (maker signature checked locally; the relay is untrusted),
+// exactly like fetchBook — the caller filters forged rows the same way.
 //   markets : [{ base_asset, quote_asset }]  to subscribe (optional)
-//   handlers: { onMatched(m), onOrderStatus(s), onOfferRemoved(r), onError(e), onOpen(), onClose() }
+//   handlers: { onBook({pair,offers}), onOfferCreated(offer), onOfferRemoved(r),
+//               onMatched(m), onOrderStatus(s), onError(e), onOpen(), onClose() }
 // Returns { ws, subscribe(pair), close() }.
 export function openRelay(markets, handlers){
   handlers = handlers || {};
@@ -548,9 +553,16 @@ export function openRelay(markets, handlers){
   };
   ws.onmessage = (ev) => {
     let m; try { m = JSON.parse(typeof ev.data === 'string' ? ev.data : td.decode(new Uint8Array(ev.data))); } catch { return; }
+    const book = m.public_book || m.publicBook;
+    const created = m.public_order_created || m.publicOrderCreated;
     const matched = m.matched || m.Matched;
     const status = m.order_status || m.orderStatus;
     const removed = m.public_order_removed || m.publicOrderRemoved;
+    if (book && handlers.onBook){
+      const offers = (book.offers || book.Offers || []).map(o => ({ ...o, _verified: verifyOffer(o) }));
+      try { handlers.onBook({ pair: book.pair || book.Pair || null, offers }); } catch {}
+    }
+    if (created && handlers.onOfferCreated){ try { handlers.onOfferCreated({ ...created, _verified: verifyOffer(created) }); } catch {} }
     if (matched && handlers.onMatched)         { try { handlers.onMatched(matched); } catch {} }
     if (status && handlers.onOrderStatus)      { try { handlers.onOrderStatus(status); } catch {} }
     if (removed && handlers.onOfferRemoved)    { try { handlers.onOfferRemoved(removed); } catch {} }
