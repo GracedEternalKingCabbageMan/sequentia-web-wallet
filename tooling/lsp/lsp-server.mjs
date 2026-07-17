@@ -1895,6 +1895,22 @@ server.on('upgrade', (req, socket) => {
 
 server.listen(CFG.port, '127.0.0.1', () => {
   console.error(`[lsp] listening http://127.0.0.1:${CFG.port}  asset-rpc ${CFG.hostedAssetRpc}  btc-rpc ${CFG.hostedBtcRpc}  relay ${CFG.relay}`);
+  // T10 restart-invisibility: the per-user lightningd nodes are spawned DETACHED, so they SURVIVE an
+  // LSP restart — only our in-process view of them is lost. Proactively re-attach on boot (getinfo is a
+  // read, no signer needed) so /status + /node/list report them `running` immediately, and a wallet
+  // reconnecting after the restart hits the cheap re-attach path (rec exists + running) instead of a
+  // re-boot. Best-effort + non-blocking: a node still booting/awaiting-signer just stays as-is and is
+  // picked up by the next refresh. Never fail the boot on it.
+  if (PROV) {
+    (async () => {
+      let up = 0, seen = 0;
+      for (const rec of PROV.list()) {
+        seen++;
+        try { const r = await PROV.refresh(rec.key); if (r && r.status === 'running') up++; } catch { /* down/booting; leave it */ }
+      }
+      if (seen) console.error(`[lsp] boot re-attach: ${up}/${seen} hosted node(s) already running (survived the restart)`);
+    })().catch(() => {});
+  }
 });
 process.on('SIGTERM', () => process.exit(0));
 process.on('SIGINT', () => process.exit(0));
