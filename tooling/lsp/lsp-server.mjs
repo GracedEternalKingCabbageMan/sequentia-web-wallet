@@ -288,11 +288,16 @@ function lnrpc(method, args = [], rpc, timeoutMs = 0) {
   });
 }
 
+// Bound EVERY per-node RPC used to build /status. Without it a down/unresponsive hosted node's
+// socket hangs the whole /status forever, so ONE dead provisioned node poisoned ALL Lightning
+// status in the wallet (L.status never resolves -> no channels -> false "No Lightning channel" +
+// a flapping badge). A timed-out node rejects here and its caller skips it via .catch(()=>null).
+const STATUS_RPC_TIMEOUT_MS = 5000;
 async function nodeStatus(rpc, leg) {
-  const info = await lnrpc('getinfo', [], rpc);
+  const info = await lnrpc('getinfo', [], rpc, STATUS_RPC_TIMEOUT_MS);
   let channels = [];
   try {
-    const pc = await lnrpc('listpeerchannels', [], rpc);
+    const pc = await lnrpc('listpeerchannels', [], rpc, STATUS_RPC_TIMEOUT_MS);
     channels = (pc.channels || [])
       .filter((c) => String(c.state).startsWith('CHANNELD'))
       .map((c) => {
@@ -329,15 +334,29 @@ async function status(deviceKeys = []) {
   // with the node key + the node's asset id (the wallet matches by asset id).
   const provChannels = [];
   const provNodes = [];
-  if (PROV) for (const key of deviceKeys) {
-    const rec = PROV.getByKey(key);
-    if (!rec) continue;
-    const ns = await nodeStatus(rec.rpc, rec.chain === 'btc' ? 'btc' : 'prov').catch(() => null);
-    if (!ns) continue;
-    const on = await onchainForReport(rec.rpc, rec.chain === 'btc' ? 'btc' : 'seq', rec.chain === 'btc' ? null : rec.asset_id).catch(() => ({ onchain_msat: 0 }));
-    provNodes.push({ key: rec.key, asset_id: rec.asset_id, node_id: ns.id, channels: ns.channels.length,
-      onchain_msat: on.onchain_msat, stranded: on.onchain_msat > 0 && ns.channels.length === 0 });
-    for (const c of ns.channels) provChannels.push({ ...c, node_key: rec.key });
+  if (PROV) {
+    // Query the device's nodes CONCURRENTLY and bound each: a dead node must neither hang /status
+    // (see STATUS_RPC_TIMEOUT_MS) nor add its timeout to every other node's latency (a serial loop
+    // over N stale nodes made /status take N*STATUS_RPC_TIMEOUT_MS). Each node's whole report is also
+    // raced against a hard cap, so a hang in ANY of its RPCs (getinfo/listpeerchannels/listfunds)
+    // drops just that node instead of poisoning the entire response.
+    const recs = deviceKeys.map((key) => PROV.getByKey(key)).filter(Boolean);
+    const results = await Promise.all(recs.map((rec) => Promise.race([
+      (async () => {
+        const ns = await nodeStatus(rec.rpc, rec.chain === 'btc' ? 'btc' : 'prov').catch(() => null);
+        if (!ns) return null;
+        const on = await onchainForReport(rec.rpc, rec.chain === 'btc' ? 'btc' : 'seq', rec.chain === 'btc' ? null : rec.asset_id).catch(() => ({ onchain_msat: 0 }));
+        return { rec, ns, on };
+      })(),
+      new Promise((res) => setTimeout(() => res(null), STATUS_RPC_TIMEOUT_MS + 1500)),
+    ])));
+    for (const r of results) {
+      if (!r) continue;
+      const { rec, ns, on } = r;
+      provNodes.push({ key: rec.key, asset_id: rec.asset_id, node_id: ns.id, channels: ns.channels.length,
+        onchain_msat: on.onchain_msat, stranded: on.onchain_msat > 0 && ns.channels.length === 0 });
+      for (const c of ns.channels) provChannels.push({ ...c, node_key: rec.key });
+    }
   }
   return {
     ok: true,
