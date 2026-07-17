@@ -2686,6 +2686,13 @@ async function placeCovenantReview(q){
 async function reviewMixed(q){
   const { $ } = C;
   if (!L || !L.swap){ $('swErr').textContent = 'The mixed (Lightning + on-chain) route needs the Lightning service, which is unavailable in this build.'; return; }
+  // FUND-SAFETY (see reviewCross): one mixed/submarine swap at a time. Its on-chain HTLC leg is
+  // persisted under a single key and recoverable only via Refund; starting another would overwrite and
+  // strand it. Require finishing or refunding the current one first.
+  if (hasMixedInFlight()){
+    $('swErr').textContent = 'You already have a Lightning + on-chain swap in progress. Finish or refund it first (open it under Active trades) before starting another.';
+    return;
+  }
   const am = C.assetMeta(q.seqAsset);
   const side = q.payIsBtc ? 'buy' : 'sell';            // buy the asset (pay BTC) / sell it (pay the asset)
   // Which leg is the ASSET, which is BTC.
@@ -3392,6 +3399,16 @@ async function reviewSame(q){
 async function reviewCross(q){
   const { $ } = C;
   if (!X){ $('swErr').textContent = 'Cross-chain route unavailable in this build.'; return; }
+  // FUND-SAFETY: one cross swap per direction at a time. An in-flight swap — even one dismissed to the
+  // Active-trades tray — holds a locked BTC leg / HTLC persisted under a single localStorage key;
+  // starting another would OVERWRITE it and strand those funds (no way left to claim or refund). Require
+  // finishing or refunding the current one first. (Concurrent same-rail swaps would need a keyed-per-swap
+  // persistence store + independent resume — a separate, carefully-verified change; this guard closes
+  // the strand hole safely in the meantime.)
+  if (q.reverse ? (X.hasReverseInFlight && X.hasReverseInFlight()) : (X.hasInFlight && X.hasInFlight())){
+    $('swErr').textContent = 'You already have a cross-chain swap in progress. Finish or refund it first (open it under Active trades) before starting another.';
+    return;
+  }
   // Market order bigger than the best maker's depth: fill what's available now (the HTLC wizard,
   // below) AND rest the remainder as a limit order at the same price. Post the remainder FIRST —
   // it's quick and non-interactive, so it rests even if the user closes the fill wizard — then open
