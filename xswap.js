@@ -460,11 +460,12 @@ async function runForwardCourier(q){
       if ($('xswapErr')) $('xswapErr').textContent = 'Stopped before revealing your secret: ' + lg.reason + ' Your BTC is refundable after block ' + SWAP.btc_locktime + '.';
       return;
     }
-    setStepStatus('anchor', 'Checking the asset is anchored to a Bitcoin block at or above your lock…', true);
-    let gate = verifyAnchor(await fetchLiveAnchor());
-    if (!gate.ok && gate.lag){
-      // Transient lag: wait for the committee to anchor forward past your BTC lock rather than
-      // dead-ending to refund. Bails out only near T_btc. The secret stays unrevealed throughout.
+    setStepStatus('anchor', 'Checking the asset leg is anchored to a Bitcoin block at or above your lock…', true);
+    let gate = verifyAnchor(await fetchLegAnchor());
+    if (!gate.ok && gate.unconfirmed){
+      // The leg's block hasn't confirmed/anchored yet — wait for it to confirm (NOT for the tip).
+      // Bails to refund near T_btc, or immediately if the leg confirms anchored-before-your-lock.
+      // The secret stays unrevealed throughout.
       gate = await awaitAnchor();
     }
     if (!gate.ok){ SWAP.detail = gate.reason; saveSwap(); renderStepper();
@@ -585,9 +586,9 @@ async function resumeAnchorClaim(){
   const lg = verifyLeg(); if (!lg.ok) return;
   _resumeClaiming = true;
   try {
-    let gate = verifyAnchor(await fetchLiveAnchor());
-    if (!gate.ok && gate.lag) gate = await awaitAnchor();
-    if (!gate.ok) { renderStepper(); return; }   // timed out near T_btc; stepper shows refund guidance
+    let gate = verifyAnchor(await fetchLegAnchor());
+    if (!gate.ok && gate.unconfirmed) gate = await awaitAnchor();
+    if (!gate.ok) { renderStepper(); return; }   // unsafe (anchored before lock) or timed out near T_btc; stepper shows refund guidance
     const txid = await claimSeq();
     renderStepper();
     C.toast && C.toast('Swap complete - asset claimed (anchor-bound to Bitcoin).',
@@ -845,12 +846,12 @@ async function onPropose(){
 }
 
 // ---- step 4: anchor-ordering verification (FIRST-CLASS, MANDATORY GATE) ----
-// The Sequentia value-add. We REQUIRE seq_leg.anchor_height >= btc_leg.height
+// The Sequentia value-add. We REQUIRE the asset leg's OWN Bitcoin anchor >= btc_leg.height
 // before allowing the SEQ claim: the Sequentia leg is bound to a Bitcoin block at or
 // after the one your BTC lock confirmed in, so it can't outlive your BTC — if
-// Bitcoin reorgs your lock away, the Sequentia leg reorgs with it. We verify the
-// maker-returned anchor_height against our own btc_leg.height, and (when a SEQ
-// anchor-status reader is wired) surface the node's live anchorstatus too.
+// Bitcoin reorgs your lock away, the Sequentia leg reorgs with it. We read the anchor of
+// the leg's OWN block (seq_leg.block_hash) from a full node (fetchLegAnchor) — the FIXED
+// safety quantity, not the rising chain tip and not the maker's self-reported number.
 // Value-binding gate: the maker's locked Sequentia leg must match what we agreed to
 // buy (asset + at least the agreed amount). Without it, a malicious maker locks dust
 // or a substituted asset; we claim it, leak the preimage, and they sweep our full BTC.
@@ -865,38 +866,49 @@ function verifyLeg(){
   } catch { return { ok:false, reason:'unreadable leg amount - do not claim' }; }
   return { ok:true };
 }
-// verifyAnchor(liveAnchor?): the gate compares the FRESHEST anchor we know to the BTC-leg
-// height. The maker's anchor_height is a lock-time SNAPSHOT that never rises on its own; the
-// live value (the Sequentia tip's current Bitcoin-anchor, from fetchLiveAnchor) climbs as the
-// committee anchors forward. Passing it lets a lagging anchor CLEAR instead of dead-ending on
-// a stale number. A failure here is always a transient LAG (a wrong-asset/short-amount leg is
-// rejected earlier and terminally by verifyLeg), so callers may WAIT on it.
-function verifyAnchor(liveAnchor){
+// verifyAnchor(legAnchor): gate on the SWAP LEG'S OWN Bitcoin anchor — the anchor of the Sequentia
+// block that CONTAINS the maker's HTLC (seq_leg.block_hash), read from a full node — NOT the chain
+// tip. A block's anchor is FIXED: it never rises as the chain advances, so the tip climbing past
+// your lock does NOT make the leg safe. Per doc/sequentia/03-bitcoin-anchoring.md, "a Sequentia leg
+// can never outlive the Bitcoin block it anchors" and must confirm "with an anchor height at or
+// above the Bitcoin leg's height". So the ONLY safe condition is a_seg >= bh:
+//   legAnchor < 0        -> the leg's block isn't confirmed/anchored yet (transient — WAIT for it).
+//   0 <= legAnchor < bh  -> the leg is anchored BEFORE your lock and is FIXED there: it can outlive
+//                           your BTC in a reorg, so DO NOT claim — refund. Waiting cannot fix this.
+//   legAnchor >= bh      -> safe to reveal the secret and claim.
+// (A wrong-asset/short-amount leg is rejected earlier and terminally by verifyLeg.)
+function verifyAnchor(legAnchor){
   if (!SWAP || !SWAP.seq_leg) return { ok: false, reason: 'no Sequentia leg yet' };
-  const snap = Number(SWAP.seq_leg.anchor_height);
-  const live = Number.isFinite(Number(liveAnchor)) ? Number(liveAnchor) : -1;
-  const ah = Math.max(Number.isFinite(snap) ? snap : -1, live);
+  const a = Number(legAnchor);
   const bh = Number(SWAP.btc_leg.height);
-  if (ah < 0)
-    return { ok: false, anchor_height: ah, btc_height: bh, lag: true, reason: 'the Sequentia block is not anchored to Bitcoin yet' };
-  if (!(ah >= bh))
-    return { ok: false, anchor_height: ah, btc_height: bh, lag: true, reason: `anchor_height ${ah} < BTC-leg height ${bh}: Sequentia leg is NOT yet bound to a Bitcoin block at/after your lock` };
-  return { ok: true, anchor_height: ah, btc_height: bh };
+  if (!Number.isFinite(a) || a < 0)
+    return { ok: false, anchor_height: a, btc_height: bh, unconfirmed: true, reason: 'the maker’s Sequentia leg is not yet confirmed and anchored to Bitcoin' };
+  if (!(a >= bh))
+    return { ok: false, anchor_height: a, btc_height: bh, unsafe: true, reason: `the asset leg is anchored at Bitcoin height ${a}, BEFORE your BTC lock (${bh}); it could outlive your BTC in a reorg, so it is NOT safe to claim — refund your BTC after block ${SWAP.btc_locktime}` };
+  return { ok: true, anchor_height: a, btc_height: bh };
 }
 
 const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 
-// The Sequentia tip's LIVE Bitcoin-anchor height, read from the LSP's public /anchor endpoint
-// (the LSP runs a full txindex Sequentia node). Returns -1 on any error, so callers fall back
-// to the maker snapshot rather than blocking.
-async function fetchLiveAnchor(){
+// The SWAP LEG'S own Bitcoin-anchor height: the anchor of the Sequentia block that holds the maker's
+// HTLC (seq_leg.block_hash), read from a full node via the LSP's /anchor?block=<hash>. This is the
+// FIXED safety quantity (a block's anchor never rises) and it is keyed to the leg's OWN block, so the
+// maker cannot inflate it by self-reporting a higher number. Returns -1 while the leg's block is not
+// yet confirmed (or on any read error), so the caller WAITS for confirmation rather than proceeding.
+async function fetchLegAnchor(){
   try {
+    const leg = SWAP && SWAP.seq_leg;
+    // Prefer the leg's own txid (always present) so the lookup works even if the maker sent the leg
+    // before it confirmed into a block; fall back to a known block_hash.
+    const q = leg && leg.txid ? ('tx=' + encodeURIComponent(leg.txid))
+            : (leg && leg.block_hash ? ('block=' + encodeURIComponent(leg.block_hash)) : null);
+    if (!q) return -1;
     const base = (typeof location !== 'undefined' ? location.origin : '') + '/lsp';
-    const r = await fetch(base + '/anchor', { signal: AbortSignal.timeout(6000) });
+    const r = await fetch(base + '/anchor?' + q, { signal: AbortSignal.timeout(6000) });
     const j = await r.json();
     if (j && j.ok && Number.isFinite(Number(j.anchor_height))) return Number(j.anchor_height);
   } catch {}
-  return -1;
+  return -1;   // unconfirmed or unreadable -> caller waits (never proceeds on an unknown anchor)
 }
 
 // The Bitcoin (testnet4) tip height — used only to decide when the refund window is close.
@@ -910,27 +922,26 @@ async function btcTipHeight(){
   return -1;
 }
 
-// The anchor gate is a WAIT, not a dead-end. A lagging anchor (the parent-chain tip can be
-// contested — e.g. testnet4's min-difficulty churn — so the committee correctly holds at the
-// last uncontested height) clears as Bitcoin stabilizes and the committee anchors forward.
-// Poll the live Sequentia anchor until it reaches the BTC-lock height (then claim), or bail to
-// a refund only once the BTC refund window (T_btc) is close. Nothing is at risk while waiting:
-// the preimage is never revealed until the gate passes.
+// The anchor gate WAITS only for the maker's asset block to CONFIRM and expose its own Bitcoin
+// anchor — NOT for the chain tip to advance. A block's anchor is fixed, so the tip is irrelevant to
+// it: once the leg confirms, its fate is decided. a_seg >= bh -> claim. a_seg < bh -> the leg is
+// anchored before your lock and can outlive your BTC in a reorg, so it is TERMINALLY unsafe (waiting
+// cannot help) -> refund. Bail to a refund near T_btc if the block never confirms. The secret is
+// never revealed while waiting. (Does NOT persist a claim-enabling value — claimSeq re-reads the
+// leg's live anchor from the node at claim time, so a stale/spoofed number can't pre-authorize it.)
 async function awaitAnchor(){
   const MARGIN = 6;   // stop waiting when the BTC tip is within this many blocks of T_btc
   for (;;){
     if (!SWAP || SWAP.state === ST.FAILED || SWAP.state === ST.REFUNDED)
       return { ok: false, reason: 'swap no longer active' };
-    const gate = verifyAnchor(await fetchLiveAnchor());
-    if (gate.ok){
-      SWAP.seq_leg.anchor_height = gate.anchor_height; saveSwap();   // persist the cleared anchor
-      return gate;
-    }
+    const gate = verifyAnchor(await fetchLegAnchor());
+    if (gate.ok) return gate;
+    if (gate.unsafe) return gate;   // confirmed but anchored BEFORE your lock — fixed; refund, don't wait
     const btcTip = await btcTipHeight();
     if (btcTip >= 0 && SWAP.btc_locktime && btcTip >= (Number(SWAP.btc_locktime) - MARGIN))
       return { ok: false, timedout: true, anchor_height: gate.anchor_height, btc_height: gate.btc_height,
-        reason: `the parent-chain anchor did not reach your BTC-lock height (${gate.btc_height}) before your refund window; refund the BTC leg after block ${SWAP.btc_locktime}` };
-    setStepStatus('anchor', `Waiting for the Bitcoin anchor to bury your lock (Sequentia tip anchored at ${gate.anchor_height} < your BTC height ${gate.btc_height}; the parent-chain tip is contested — this clears as Bitcoin stabilizes)…`, true);
+        reason: `the maker's asset block did not confirm and anchor at/above your BTC-lock height (${gate.btc_height}) before your refund window; refund the BTC leg after block ${SWAP.btc_locktime}` };
+    setStepStatus('anchor', `Waiting for the maker's asset block to confirm and anchor to Bitcoin (needs anchor ≥ your BTC height ${gate.btc_height})…`, true);
     await sleep(20000);
   }
 }
@@ -943,7 +954,7 @@ async function awaitAnchor(){
 // ClaimSEQLeg fee).
 async function claimSeq(){
   if (!SWAP || !SWAP.seq_leg) throw new Error('no Sequentia leg to claim');
-  const gate = verifyAnchor(await fetchLiveAnchor());   // confirm against the LIVE anchor at the moment of claim
+  const gate = verifyAnchor(await fetchLegAnchor());   // re-read the LEG'S OWN anchor from the node at the moment of claim
   if (!gate.ok) throw new Error('anchor gate not satisfied: ' + gate.reason);   // belt-and-suspenders; the UI also gates the button
   const lg = verifyLeg();
   if (!lg.ok) throw new Error('leg mismatch: ' + lg.reason);   // never reveal the preimage on a mismatched leg
@@ -1007,9 +1018,9 @@ async function broadcastSeqTx(rawHex){
 async function onClaimSeq(){
   const { $ } = C;
   $('xswapErr').textContent = '';
-  const gate = verifyAnchor(await fetchLiveAnchor());
-  if (!gate.ok){ $('xswapErr').textContent = gate.lag
-    ? 'not yet claimable: ' + gate.reason + ' (this clears as the Bitcoin anchor advances — the wallet retries automatically).'
+  const gate = verifyAnchor(await fetchLegAnchor());
+  if (!gate.ok){ $('xswapErr').textContent = gate.unconfirmed
+    ? 'not yet claimable: ' + gate.reason + ' (this clears once the maker’s asset block confirms — the wallet retries automatically).'
     : 'cannot claim: ' + gate.reason; return; }
   const leg = verifyLeg();
   if (!leg.ok){ $('xswapErr').textContent = 'cannot claim: ' + leg.reason; return; }

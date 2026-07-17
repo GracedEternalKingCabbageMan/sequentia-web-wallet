@@ -1182,17 +1182,43 @@ async function seqRpcCall(method, params = []) {
 const server = http.createServer(async (req, res) => {
   const url = new URL(req.url, 'http://x');
   if (req.method === 'GET' && url.pathname === '/health') return send(res, 200, { ok: true, service: 'seqln-lsp' });
-  // GET /anchor -> the Sequentia tip's CURRENT Bitcoin-anchor height. The cross-chain anchor
-  // gate polls this so a lagging/contested anchor is a WAIT, not a stale-snapshot dead-end.
-  // Public chain data, so it sits before the token check like /health.
+  // GET /anchor            -> the Sequentia tip's CURRENT Bitcoin-anchor height.
+  // GET /anchor?block=<hash> -> the Bitcoin-anchor height of THAT specific block.
+  // GET /anchor?tx=<txid>    -> the Bitcoin-anchor height of the block that CONFIRMED that tx.
+  // The cross-chain claim gate needs the anchor of the SWAP LEG'S OWN block (the block that holds the
+  // maker's HTLC output), NOT the tip: a block's anchor is FIXED (it never rises as the chain
+  // advances), and per the anchoring theorem the leg's anchor must be >= the BTC-lock height or the
+  // leg could outlive the BTC. Serving it here (node-sourced, keyed to the leg's own tx/block) lets
+  // the wallet verify the leg's real anchor instead of trusting the maker's self-reported number.
+  // A null anchor_height means "not confirmed yet" (the caller WAITS). Public chain data, so it sits
+  // before the token check like /health.
   if (req.method === 'GET' && url.pathname === '/anchor') {
     try {
+      const txParam = url.searchParams.get('tx');
+      const blockParam = txParam ? null : url.searchParams.get('block');
+      const anchorOfBlock = async (hash) => {
+        let blk; try { blk = await seqRpcCall('getblock', [hash]); }
+        catch { return { ok: true, anchor_height: null }; }   // not yet confirmed/known
+        return { ok: true, block: hash, height: (blk.height ?? null),
+          anchor_height: (blk.anchorheight ?? null), anchor_hash: (blk.anchorhash ?? null) };
+      };
+      if (txParam) {
+        if (!/^[0-9a-fA-F]{64}$/.test(txParam)) return send(res, 400, { ok: false, error: 'bad txid' });
+        let tx; try { tx = await seqRpcCall('getrawtransaction', [txParam, true]); }
+        catch { return send(res, 200, { ok: true, tx: txParam, anchor_height: null }); }   // unknown/unconfirmed
+        if (!tx || !tx.blockhash) return send(res, 200, { ok: true, tx: txParam, anchor_height: null });   // in mempool, no block yet
+        return send(res, 200, { ...(await anchorOfBlock(tx.blockhash)), tx: txParam });
+      }
+      if (blockParam) {
+        if (!/^[0-9a-fA-F]{64}$/.test(blockParam)) return send(res, 400, { ok: false, error: 'bad block hash' });
+        return send(res, 200, await anchorOfBlock(blockParam));
+      }
       const info = await seqRpcCall('getblockchaininfo');
       const blk = await seqRpcCall('getblock', [info.bestblockhash]);
       return send(res, 200, { ok: true, height: info.blocks,
         anchor_height: (blk.anchorheight ?? null), anchor_hash: (blk.anchorhash ?? null) });
-    } catch (e) {
-      return send(res, 200, { ok: false, error: String((e && e.message) || e) });
+    } catch {
+      return send(res, 502, { ok: false, error: 'anchor unavailable' });   // generic — never surface the internal RPC endpoint
     }
   }
   if (!authed(req)) return send(res, 401, { ok: false, error: 'unauthorized (Bearer token required)' });
