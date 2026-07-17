@@ -318,8 +318,25 @@ function applyComposeDerivation(pay, receive, price){
 }
 
 // Re-render the whole composer for the current wallet/markets/state.
+// B3/D4 (live market data): while the Swap tab is visible, periodically refresh the READ-ONLY market
+// surfaces — recent trades + 24h stats when a pair is chosen, else the markets overview — so the desk
+// feels live. Deliberately does NOT auto-requote the composer (that would risk disrupting a quote or
+// input the user is reading); the terms-verify abort already guards a stale price at execution time.
+let _liveTimer = null;
+function startLiveData(){
+  if (_liveTimer) return;
+  _liveTimer = setInterval(() => {
+    try {
+      const sw = C.$('swBook'); if (!sw || sw.offsetParent === null) return;   // Swap tab not visible
+      if (S.payAsset && S.receiveAsset){ renderRecentTrades().catch(()=>{}); renderPairStats().catch(()=>{}); }
+      else { renderMarkets(sw).catch(()=>{}); }
+    } catch {}
+  }, 15000);
+}
+
 export async function renderSwap(){
   if (!C.wollet) return;
+  startLiveData();
   // Prune stale dismissals: once a kind's trade has ended, its flag must not suppress a future one.
   if (!hasMixedInFlight()) _dismissed.delete('mixed');
   if (!(X && X.hasInFlight && X.hasInFlight())) _dismissed.delete('cross');
