@@ -180,7 +180,7 @@ async function findReverseOffer(seqAsset){
     return { o, btc, asset, ratio: asset > 0n ? Number(btc) / Number(asset) : 0 };
   };
   const ranked = offers.map(norm).filter(x => x.btc > 0n && x.asset > 0n).sort((a, b) => b.ratio - a.ratio);
-  return ranked.length ? ranked[0] : null;
+  return ranked.length ? ranked : null;   // best-first (highest BTC per asset); [0] is best
 }
 
 // Read the maker's revealed preimage OFF-CHAIN: find the tx that spent our funded
@@ -250,8 +250,20 @@ export async function fetchRQuote(seqAsset, seqAtoms){
       throw new Error(`maker returned a bad ordering: T_btc(${q.btc_locktime}) must exceed T_seq(${q.seq_locktime})`);
     return q;
   }
-  const best = await findReverseOffer(seqAsset);
-  if (!best) throw new Error('No one is buying this asset for BTC right now. Try again later, or place a same-chain order.');
+  const ranked = await findReverseOffer(seqAsset);
+  if (!ranked) throw new Error('No one is buying this asset for BTC right now. Try again later, or place a same-chain order.');
+  const best = ranked[0];
+  // T4 retry-down-book (reverse): the other reverse offers as fallbacks if the best maker doesn't
+  // respond BEFORE it locks any BTC. Reverse price is BTC-per-asset (ratio), so HIGHER is better for
+  // the seller; keep only offers within 2% of best's ratio (never route to a materially worse sale).
+  // Each is whole-HTLC (its own size), so onOpen re-shows the confirm for the chosen fallback's terms.
+  const RETRY_MAX = 3, PRICE_TOL = 0.02;
+  const candidates = ranked.slice(1)
+    .filter(x => best.ratio > 0 && x.ratio >= best.ratio * (1 - PRICE_TOL))
+    .slice(0, RETRY_MAX)
+    .map(x => ({ offer: x.o, seq_amount: x.asset, btc_amount: x.btc,
+      price_seq_per_btc: x.ratio > 0 ? (Number(x.asset) / Number(x.btc)) : 0,
+      expires_at_unix: Number(offerField(x.o, 'expires_at_unix', 'expiresAtUnix') || 0) }));
   return {
     reverse: true,
     offer: best.o,
@@ -260,6 +272,7 @@ export async function fetchRQuote(seqAsset, seqAtoms){
     btc_amount: best.btc,             // and receive its BTC
     price_seq_per_btc: best.ratio > 0 ? (Number(best.asset) / Number(best.btc)) : 0,
     fee_btc: 0n,                       // the maker's fee is disclosed in its per-lift terms
+    candidates,
     expires_at_unix: Number(offerField(best.o, 'expires_at_unix', 'expiresAtUnix') || 0),
   };
 }
@@ -360,32 +373,53 @@ async function openSwap(q){
 async function onOpen(){
   const { $ } = C;
   if ($('xrswapErr')) $('xrswapErr').textContent = '';
-  const q = LAST_RQUOTE;
-  if (!q){ if ($('xrswapErr')) $('xrswapErr').textContent = 'get a quote first'; return; }
-  const sm = C.assetMeta(q.market.seq_asset);
-  const kv = USE_COURIER ? [
-    ['You sell', C.fmtAtoms(q.seq_amount, sm.precision) + ' ' + sm.ticker],
-    ['You receive', C.fmtAtoms(q.btc_amount, 8) + ' BTC'],
-    ['How it works', 'The maker locks the BTC first. Once it confirms, your wallet locks the asset, the maker takes it by revealing a secret, and your wallet uses that secret to claim the BTC - automatically. You only confirm here.'],
-    ['You commit', 'your ' + sm.ticker + ' once the maker’s BTC lock confirms - until then nothing is spent'],
-    ['If the maker stalls', 'your asset is refundable after Sequentia block T_seq (the wizard offers it)'],
-    ['Settlement', 'the BTC you receive is anchor-bound to Bitcoin; it can revert only if Bitcoin itself reverts'],
-  ] : [
-    ['Network', 'Cross-chain: you SELL a Sequentia asset and receive BTC on the parent chain'],
-    ['You sell', C.fmtAtoms(q.seq_amount, sm.precision) + ' ' + sm.ticker],
-    ['You receive', C.fmtAtoms(q.btc_amount, 8) + ' BTC'],
-    ['Maker fee', C.fmtAtoms(q.fee_btc, 8) + ' BTC'],
-    ['How it works', 'The maker locks the BTC first; you then fund the asset, the maker reveals a secret to take the asset, and you use that secret to claim the BTC.'],
-    ['Sequentia refund after', 'block ' + q.seq_locktime + ' (if the maker stalls, you reclaim your asset)'],
-  ];
-  const { m: modal, ok, st } = C.modalRows({ title: 'Sell ' + sm.ticker + ' for BTC', kv });
-  ok.onclick = async () => {
-    ok.disabled = true; st.className = 'status'; st.innerHTML = '<span class="spin"></span>Starting the swap…';
+  const q0 = LAST_RQUOTE;
+  if (!q0){ if ($('xrswapErr')) $('xrswapErr').textContent = 'get a quote first'; return; }
+  // T4 (reverse): the quoted offer, then the price-bounded fallbacks (courier only). If the best maker
+  // never locks any BTC, offer the next resting offer — each with its OWN confirm (a fallback is a
+  // different whole-HTLC size, so consent is re-taken, never silently switched under the seller).
+  const mkQuote = (c) => ({ reverse:true, offer:c.offer, market:q0.market, seq_amount:c.seq_amount,
+    btc_amount:c.btc_amount, price_seq_per_btc:c.price_seq_per_btc, fee_btc:0n, expires_at_unix:c.expires_at_unix });
+  const attempts = USE_COURIER ? [q0, ...((q0.candidates || []).map(mkQuote))] : [q0];
+
+  for (let i = 0; i < attempts.length; i++){
+    const q = attempts[i];
+    const sm = C.assetMeta(q.market.seq_asset);
+    const kv = USE_COURIER ? [
+      ...(i > 0 ? [['Heads up', `the previous maker didn’t respond; this is the next best resting offer (${i} of ${attempts.length - 1})`]] : []),
+      ['You sell', C.fmtAtoms(q.seq_amount, sm.precision) + ' ' + sm.ticker],
+      ['You receive', C.fmtAtoms(q.btc_amount, 8) + ' BTC'],
+      ['How it works', 'The maker locks the BTC first. Once it confirms, your wallet locks the asset, the maker takes it by revealing a secret, and your wallet uses that secret to claim the BTC - automatically. You only confirm here.'],
+      ['You commit', 'your ' + sm.ticker + ' once the maker’s BTC lock confirms - until then nothing is spent'],
+      ['If the maker stalls', 'your asset is refundable after Sequentia block T_seq (the wizard offers it)'],
+      ['Settlement', 'the BTC you receive is anchor-bound to Bitcoin; it can revert only if Bitcoin itself reverts'],
+    ] : [
+      ['Network', 'Cross-chain: you SELL a Sequentia asset and receive BTC on the parent chain'],
+      ['You sell', C.fmtAtoms(q.seq_amount, sm.precision) + ' ' + sm.ticker],
+      ['You receive', C.fmtAtoms(q.btc_amount, 8) + ' BTC'],
+      ['Maker fee', C.fmtAtoms(q.fee_btc, 8) + ' BTC'],
+      ['How it works', 'The maker locks the BTC first; you then fund the asset, the maker reveals a secret to take the asset, and you use that secret to claim the BTC.'],
+      ['Sequentia refund after', 'block ' + q.seq_locktime + ' (if the maker stalls, you reclaim your asset)'],
+    ];
+    const { m: modal, ok, st } = C.modalRows({ title: 'Sell ' + sm.ticker + ' for BTC', kv });
+
+    // Wait for the user's Confirm or Cancel on THIS attempt.
+    const go = await new Promise((resolve) => {
+      ok.onclick = () => { ok.disabled = true; st.className = 'status'; st.innerHTML = '<span class="spin"></span>Starting the swap…'; resolve(true); };
+      const no = modal.querySelector('.ghost'); if (no) no.onclick = () => { modal.remove(); resolve(false); };
+    });
+    if (!go) return;   // user cancelled — stop the whole flow
+
     try {
       if (USE_COURIER){
         modal.remove();
         LAST_RQUOTE = null;
-        await driveReverse(q);           // auto-drives to completion, rendering as it goes
+        const r = await driveReverse(q);   // auto-drives; returns 'retry' iff no maker locked (pre-lock)
+        if (r === 'retry'){
+          if (i < attempts.length - 1){ C.toast && C.toast('That maker didn’t respond - showing the next best offer.'); continue; }
+          if (C.$('xrswapErr')) C.$('xrswapErr').textContent = `No maker responded${attempts.length > 1 ? ` (tried ${attempts.length} offers)` : ''}. Nothing was spent - try again shortly.`;
+        }
+        return;   // committed / settled / terminal — done
       } else {
         await openSwap(q);
         modal.remove();
@@ -393,12 +427,14 @@ async function onOpen(){
         renderStepper();
         startPoll();
         C.toast && C.toast('Maker locked the BTC leg - waiting for it to confirm.');
+        return;
       }
     } catch (e){
       if (modal.isConnected){ st.className = 'status err'; st.textContent = 'Failed: ' + C.prettyErr(e); ok.disabled = false; }
       else { renderStepper(); if (C.$('xrswapErr')) C.$('xrswapErr').textContent = 'Swap failed: ' + C.prettyErr(e); }
+      return;   // a thrown error is terminal (post-lock, or RFQ path) — never auto-retry after a lock
     }
-  };
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -414,18 +450,27 @@ async function driveReverse(q){
   const btcClaim = C.btcLeg.claimKey();     // taker claims the maker BTC leg with the preimage
   const seqRefund = C.seqLeg.refundKey();   // taker refunds the asset leg after T_seq
 
-  // 1. Open the courier session on the resting offer and request per-lift terms.
-  //    The E2E key binds to the SIGNED offer's maker pubkey (MITM-guarded inside).
-  const session = await xcourier.openCourierSession(q.offer, q.seq_amount, '', {});
+  // 1. Open the courier session + get the maker's BTC lock. A failure HERE — the session won't open, or
+  //    the maker never sends its BtcLegLocked within the fail-fast window — means NO maker committed any
+  //    BTC, so return 'retry': onOpen can offer the next resting offer (T4). Once a leg IS received we
+  //    are past this point and every later failure is terminal for THIS swap (the maker locked BTC; we
+  //    never silently retry and strand it), handled by failAbort/return below exactly as before.
+  let session;
+  try { session = await xcourier.openCourierSession(q.offer, q.seq_amount, '', {}); }
+  catch { return 'retry'; }
+  let locked;
   try {
     await session.send({
       type: xcourier.XcType.TermsRequest,
       taker_seq_refund_pub: seqRefund.public_key,
       taker_btc_claim_pub: btcClaim.public_key,
     });
+    // 2. The maker locks BTC first and sends terms + the BTC leg. Fail-fast (was 60s): a live maker
+    //    locks within seconds, so 30s => move to the next resting offer instead of a long stall.
+    locked = await session.recv(xcourier.XcType.BtcLegLocked, 30000);
+  } catch { try { session.close(); } catch {} return 'retry'; }
 
-    // 2. The maker locks BTC first and sends terms + the BTC leg.
-    const locked = await session.recv(xcourier.XcType.BtcLegLocked, 60000);
+  try {
     const leg = locked.leg || {};
     const tBtc = num(leg.locktime) || num(locked.btc_locktime);
     const tSeq = num(locked.seq_locktime);
