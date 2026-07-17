@@ -262,6 +262,15 @@ function wireAmount(input, side){
   input.addEventListener('input', () => {
     S.edited = side;
     input._userTyped = true;   // this side now holds USER input — never overwrite it
+    // TAKE mode: the two amounts are LINKED (one price), so editing this side makes the OTHER
+    // side a derived value again — clear its user-typed flag so a requote can refresh it. POST/
+    // limit mode: both amounts are independent user input (their ratio IS the limit price), so
+    // leave the other side's flag alone. This is what lets a fresh keystroke on one side win
+    // AND still re-derive the other, without ever stomping a value the user actually typed.
+    if (S.mode !== 'post'){
+      const other = side === 'pay' ? C.$('swRecvAmt') : C.$('swPayAmt');
+      if (other) other._userTyped = false;
+    }
     LAST_QUOTE = null;
     setReviewEnabled(false);
     clearTimeout(_quoteTimer);
@@ -271,6 +280,23 @@ function wireAmount(input, side){
 // Programmatically set a field's value and mark it NOT user-typed (so the other
 // side's derivation may overwrite this one; the user's own input is protected).
 function setDerived(input, value){ if (!input) return; input.value = value; input._userTyped = false; }
+// THE anti-clobber invariant (user keystrokes always beat derived values): write a DERIVED value
+// into a field ONLY if the user has not typed there and is not editing it right now. Every seed/
+// quote/derivation write across ALL rails (same-chain, cross, LN, mixed) MUST go through this — a
+// raw `el.value = …` guarded on document.activeElement alone silently overwrote a value the user
+// typed the instant the field lost focus (the observed "my typed amount didn't stick" bug).
+function writeDerived(el, value){
+  if (!el) return;
+  if (el._userTyped) return;                   // user's own input — never overwrite
+  if (document.activeElement === el) return;   // don't fight the field being edited right now
+  el.value = value;                            // remains _userTyped=false: still a derived value
+}
+// Clear a DERIVED field (same invariant): never wipe a value the user typed or is editing.
+function clearDerived(el){
+  if (!el) return;
+  if (el._userTyped || document.activeElement === el) return;
+  el.value = '';
+}
 // Apply the anti-clobber compose rule: derive the field the user did NOT edit from
 // the book's best price, WITHOUT clearing or overwriting anything the user typed.
 // The empty-market case (no price) leaves both fields exactly as typed — this is
@@ -1089,8 +1115,7 @@ function renderBookPlaceholder(){
 
 function clearOpposite(){
   const other = S.edited === 'pay' ? C.$('swRecvAmt') : C.$('swPayAmt');
-  // Don't stomp a value the user is actively typing on the OTHER side.
-  if (document.activeElement !== other) other.value = '';
+  clearDerived(other);   // never stomp a value the user typed or is editing on the OTHER side
 }
 function setReviewEnabled(on){ const b = C.$('swReview'); if (b) b.disabled = !on; }
 
@@ -1383,11 +1408,11 @@ function paintQuoteSame(){
   const { $ } = C; const q = LAST_QUOTE; if (!q) return;
   // assetP/amountP is what we PAY; assetR/amountR is what we RECEIVE.
   const pm = C.assetMeta(q.assetP), rm = C.assetMeta(q.assetR);
-  // Write the side we did NOT edit (so the user's typed field is never stomped).
+  // Write the side we did NOT edit (writeDerived guarantees the user's typed field is never stomped).
   if (S.edited === 'pay'){
-    if (document.activeElement !== $('swRecvAmt')) $('swRecvAmt').value = C.fmtAtoms(q.amountR, rm.precision);
+    writeDerived($('swRecvAmt'), C.fmtAtoms(q.amountR, rm.precision));
   } else {
-    if (document.activeElement !== $('swPayAmt')) $('swPayAmt').value = C.fmtAtoms(q.amountP, pm.precision);
+    writeDerived($('swPayAmt'), C.fmtAtoms(q.amountP, pm.precision));
   }
   paintRefHints();
   // Rate line: 1 PAY = X RECEIVE (derived from the two legs; direction-agnostic).
@@ -1458,12 +1483,12 @@ function deriveXOpposite(route){
       const v = numVal(pa); if (!(v > 0)) return;
       const other = btcIsPay ? (v / btcPerAsset) : (v * btcPerAsset);
       // derived leg is the RECEIVE side: the asset when BTC is paid, otherwise BTC (8dp).
-      if (document.activeElement !== ra) ra.value = fmtUnits(other, btcIsPay ? aprec : 8);
+      writeDerived(ra, fmtUnits(other, btcIsPay ? aprec : 8));
     } else {
       const v = numVal(ra); if (!(v > 0)) return;
       const other = btcIsPay ? (v * btcPerAsset) : (v / btcPerAsset);
       // derived leg is the PAY side: BTC when BTC is paid, otherwise the asset.
-      if (document.activeElement !== pa) pa.value = fmtUnits(other, btcIsPay ? 8 : aprec);
+      writeDerived(pa, fmtUnits(other, btcIsPay ? 8 : aprec));
     }
     paintRefHints();
   } catch {}
@@ -1778,8 +1803,10 @@ function fillFromXOffer(i){
   const o = (XBOOK.offers || [])[i]; if (!o) return;
   const am = C.assetMeta(XBOOK.seqAsset);
   const { asset } = xOfferAmts(o, XBOOK.payIsBtc);
-  if (XBOOK.payIsBtc){ S.edited = 'receive'; C.$('swRecvAmt').value = C.fmtAtoms(asset, am.precision || 0); }
-  else               { S.edited = 'pay';     C.$('swPayAmt').value  = C.fmtAtoms(asset, am.precision || 0); }
+  // Clicking a book level is an EXPLICIT user amount — mark it _userTyped so the requote's
+  // derivation fills the OTHER leg and never overwrites this chosen size.
+  if (XBOOK.payIsBtc){ S.edited = 'receive'; const el = C.$('swRecvAmt'); el.value = C.fmtAtoms(asset, am.precision || 0); el._userTyped = true; const o = C.$('swPayAmt'); if (o) o._userTyped = false; }
+  else               { S.edited = 'pay';     const el = C.$('swPayAmt');  el.value = C.fmtAtoms(asset, am.precision || 0); el._userTyped = true; const o = C.$('swRecvAmt'); if (o) o._userTyped = false; }
   LAST_QUOTE = null; setReviewEnabled(false);
   requote().catch(()=>{});
 }
@@ -1829,11 +1856,11 @@ function paintQuoteCross(){
   // Map BTC<->asset onto pay/receive panes (whichever the user has on each side).
   const btcIsPay = (S.payAsset === 'BTC');
   if (btcIsPay){
-    if (document.activeElement !== $('swPayAmt'))  $('swPayAmt').value  = btcStr;
-    if (document.activeElement !== $('swRecvAmt')) $('swRecvAmt').value = seqStr;
+    writeDerived($('swPayAmt'),  btcStr);
+    writeDerived($('swRecvAmt'), seqStr);
   } else {
-    if (document.activeElement !== $('swPayAmt'))  $('swPayAmt').value  = seqStr;
-    if (document.activeElement !== $('swRecvAmt')) $('swRecvAmt').value = btcStr;
+    writeDerived($('swPayAmt'),  seqStr);
+    writeDerived($('swRecvAmt'), btcStr);
   }
   paintRefHints();
   const seqUnits = Number(reqSeq) / Math.pow(10, sm.precision || 0);
