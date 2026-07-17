@@ -1105,10 +1105,14 @@ async function requote(){
     else                             await requoteSame(route, amtStr);
   } finally {
     try { paintCostLine(); } catch {}   // E2: the one cost line, after any rail quotes
-    // D5: refresh the recent-trades feed only when the PAIR changes (not on every keystroke).
+    // D5/D3: refresh the recent-trades feed + 24h stats only when the PAIR changes (not per keystroke).
     try {
       const pk = (S.payAsset && S.receiveAsset) ? (S.payAsset + '|' + S.receiveAsset) : null;
-      if (pk !== _tradesPair){ _tradesPair = pk; if (pk) renderRecentTrades().catch(()=>{}); else { const h = C.$('swTrades'); if (h) h.innerHTML = ''; } }
+      if (pk !== _tradesPair){
+        _tradesPair = pk;
+        if (pk){ renderRecentTrades().catch(()=>{}); renderPairStats().catch(()=>{}); }
+        else { const h = C.$('swTrades'); if (h) h.innerHTML = ''; const s = C.$('swPairStats'); if (s) s.innerHTML = ''; }
+      }
     } catch {}
   }
 }
@@ -3621,6 +3625,50 @@ async function renderRecentTrades(){
     + '<span class="sub" style="color:var(--txt);font-weight:650">Recent trades</span>'
     + '<span class="sub">price ' + esc(qm.ticker) + '/' + esc(bm.ticker) + '</span></div>'
     + trades.slice(0, 30).map(row).join('') + '</div>';
+}
+
+// D3: 24h stats + a mini sparkline for the active pair, from seqobd /candles (T1). Same
+// one-canonical-direction handling as the trades feed. Sparse on testnet (renders whatever exists);
+// richer as trades accumulate. Cleared when no pair / no candle data.
+let _statsPair = null, _statsReq = 0;
+async function renderPairStats(){
+  const host = C.$('swPairStats'); if (!host) return;
+  const pay = S.payAsset, recv = S.receiveAsset;
+  if (!pay || !recv){ host.innerHTML = ''; return; }
+  const req = ++_statsReq;
+  const fetchDir = async (base, quote) => {
+    try {
+      const r = await fetch(seqob.seqobBase() + '/v1/market/' + encodeURIComponent(base) + '/' + encodeURIComponent(quote) + '/candles?interval=3600&limit=48', { cache: 'no-store' });
+      if (!r.ok) return []; const j = await r.json(); return Array.isArray(j.candles) ? j.candles : [];
+    } catch { return []; }
+  };
+  let base = recv, quote = pay, candles = await fetchDir(base, quote);
+  if (!candles.length){ const alt = await fetchDir(pay, recv); if (alt.length){ base = pay; quote = recv; candles = alt; } }
+  if (req !== _statsReq) return;
+  if (!candles.length){ host.innerHTML = ''; return; }
+  const cutoff = Math.floor(Date.now() / 1000) - 86400;
+  const win = candles.filter(c => (c.t || 0) >= cutoff);
+  const use = win.length ? win : candles.slice(-1);   // nothing in 24h → show the latest as a flat point
+  let hi = -Infinity, lo = Infinity, vol = 0n;
+  for (const c of use){ if (Number(c.h) > hi) hi = Number(c.h); if (Number(c.l) < lo) lo = Number(c.l); vol += big(String(c.v || 0)); }
+  const first = use[0], lastc = use[use.length - 1];
+  const changePct = (first && Number(first.o) > 0) ? ((Number(lastc.c) - Number(first.o)) / Number(first.o) * 100) : 0;
+  const bm = C.assetMeta(base);
+  const pts = use.map(c => Number(c.c)).filter(isFinite);
+  const up = changePct >= 0, col = up ? '#3ddc84' : 'var(--amber2)';
+  let spark = '';
+  if (pts.length >= 2){
+    const min = Math.min(...pts), max = Math.max(...pts), rng = (max - min) || 1, W = 84, H = 20;
+    const d = pts.map((p, i) => (i / (pts.length - 1) * W).toFixed(1) + ',' + (H - (p - min) / rng * H).toFixed(1)).join(' ');
+    spark = '<svg width="' + W + '" height="' + H + '" viewBox="0 0 ' + W + ' ' + H + '" style="vertical-align:middle"><polyline points="' + d + '" fill="none" stroke="' + col + '" stroke-width="1.5"/></svg>';
+  }
+  const chg = (up ? '+' : '') + changePct.toFixed(2) + '%';
+  host.innerHTML = '<div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap;padding:4px 2px;font-size:12px" class="sub">'
+    + spark
+    + '<span>24h <b style="color:' + col + '">' + chg + '</b></span>'
+    + (hi > -Infinity ? '<span>H <span class="mono">' + trim(hi) + '</span></span><span>L <span class="mono">' + trim(lo) + '</span></span>' : '')
+    + '<span>vol <span class="mono">' + esc(C.fmtAtoms(vol, bm.precision || 0)) + '</span> ' + esc(bm.ticker) + '</span>'
+    + '</div>';
 }
 
 function renderBook(pay, receive){
