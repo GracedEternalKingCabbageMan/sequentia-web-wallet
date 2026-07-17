@@ -3190,14 +3190,35 @@ async function requoteLn(route, amtStr){
   await loadBtcBook(route);
   deriveXOpposite(route);
   const side = route.payIsBtc ? 'buy' : 'sell';
-  LAST_QUOTE = { kind: 'ln', side, seqAsset: route.seqAsset, payIsBtc: route.payIsBtc,
-    amount: amtStr ? parseFloat(amtStr) : null };
-  paintFee('BTC', null, 'The rate includes the LP spread; there is no separate network fee on the Lightning leg.');
   const am = C.assetMeta(route.seqAsset);
-  $('swRate').textContent = `Instant ${am.ticker}/BTC over Lightning · rate includes the LP spread`;
+  const aprec = am.precision || 0;
   $('swRoute').textContent = route.payIsBtc ? 'Lightning · buy with BTC' : 'Lightning · sell for BTC';
   $('swStatus').textContent = ''; $('swErr').textContent = '';
   renderTiming(route);
+  // The pure-LN CLI (xpln) has NO partial fill: it lifts the best resting offer IN FULL, so the size
+  // that actually executes is the OFFER'S size, not the typed amount. Read the best takeable offer and
+  // carry its true amounts on the quote so Review can show what will really move (and warn on mismatch).
+  // Never present the typed amount as if it were the executed size.
+  const best = (XBOOK && XBOOK.offers || [])[0];
+  let lnOffer = null;
+  if (best){
+    try {
+      const { asset: offAsset, btc: offBtc } = xOfferAmts(best, route.payIsBtc);
+      if (big(offAsset) > 0n && big(offBtc) > 0n)
+        lnOffer = { assetAtoms: String(big(offAsset)), btcAtoms: String(big(offBtc)) };
+    } catch {}
+  }
+  if (!lnOffer){
+    LAST_QUOTE = null; setReviewEnabled(false);
+    paintFee('BTC', null, null);
+    $('swRate').textContent = `No resting Lightning offer for ${am.ticker}/BTC yet.`;
+    return;
+  }
+  LAST_QUOTE = { kind: 'ln', side, seqAsset: route.seqAsset, payIsBtc: route.payIsBtc,
+    amount: amtStr ? parseFloat(amtStr) : null, lnOffer };
+  paintFee('BTC', null, 'This rail lifts the best resting offer in full · the rate includes the LP spread (no separate network fee).');
+  const assetStr = C.fmtAtoms(big(lnOffer.assetAtoms), aprec), btcStr = C.fmtAtoms(big(lnOffer.btcAtoms), 8);
+  $('swRate').innerHTML = `Instant over Lightning · lifts the best offer <b>in full</b>: ${assetStr} ${am.ticker} for ${btcStr} BTC`;
   setReviewEnabled(true);   // LP fixed terms (proven path) — Review is offerable
 }
 
@@ -3239,14 +3260,32 @@ async function reviewLn(q){
     if (!ra.pureLnOk){ $('swErr').textContent = 'Your Lightning channel opened but is not ready to trade yet — please try again in a moment.'; return; }
   }
   const am = C.assetMeta(q.seqAsset);
+  const aprec = am.precision || 0;
   const dir = q.side === 'buy' ? `Buy ${am.ticker} with BTC` : `Sell ${am.ticker} for BTC`;
+  // xpln lifts the whole offer, so the amounts that actually move come from the offer, NOT q.amount.
+  // Show them explicitly and warn if they differ materially from what the user typed.
+  const off = q.lnOffer || null;
+  const assetStr = off ? (C.fmtAtoms(big(off.assetAtoms), aprec) + ' ' + am.ticker) : null;
+  const btcStr = off ? (C.fmtAtoms(big(off.btcAtoms), 8) + ' BTC') : null;
+  const payStr = off ? (q.side === 'buy' ? btcStr : assetStr) : null;
+  const recvStr = off ? (q.side === 'buy' ? assetStr : btcStr) : null;
   const kv = [
     ['Route', 'Instant Lightning (pure-LN) · non-custodial, your keys stay on this device'],
     ['Direction', dir],
-    ['Pricing', 'Best resting Lightning offer · rate includes the LP spread (no separate network fee)'],
+  ];
+  if (payStr){ kv.push(['You pay', payStr], ['You receive', recvStr]); }
+  kv.push(
+    ['Pricing', 'Lifts the best resting Lightning offer IN FULL · rate includes the LP spread (no separate network fee)'],
     ['Finality', L.finalityCopy ? L.finalityCopy() : 'Instant and final · pure Lightning, nothing on-chain, no Bitcoin-reorg risk.'],
     ['If it stalls', 'Nothing moves · the swap unwinds atomically via the Lightning hold timeout.'],
-  ];
+  );
+  // Loud mismatch warning: the executed size is the offer's, so if the user typed something ~different,
+  // say so before they commit (this rail cannot fill a partial amount).
+  if (off && q.amount > 0){
+    const execUnits = q.side === 'buy' ? (Number(big(off.btcAtoms)) / 1e8) : (Number(big(off.assetAtoms)) / Math.pow(10, aprec));
+    if (execUnits > 0 && Math.abs(execUnits - q.amount) / execUnits > 0.05)
+      kv.push(['⚠ Note', `This lifts the whole offer (${q.side === 'buy' ? btcStr : assetStr}), which differs from the ${C.fmtAtoms(BigInt(Math.round(q.amount * Math.pow(10, q.side === 'buy' ? 8 : aprec))), q.side === 'buy' ? 8 : aprec)} ${q.side === 'buy' ? 'BTC' : am.ticker} you entered. Partial fills are not possible on this rail.`]);
+  }
   const { m: modal, ok, st } = C.modalRows({ title: 'Review Lightning swap', kv });
   ok.onclick = async () => {
     ok.disabled = true; st.className = 'status'; st.innerHTML = '<span class="spin"></span>Settling over Lightning…';

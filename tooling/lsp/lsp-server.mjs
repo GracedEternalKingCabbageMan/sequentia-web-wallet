@@ -1208,6 +1208,14 @@ async function seqRpcCall(method, params = []) {
   return j.result;
 }
 
+// Short-TTL cache for the no-param /anchor tip. That path is unauthenticated (the wallet needs it
+// before login and the taker's T_seq guard polls it during a swap) and each miss costs two Sequentia
+// RPCs, so a hot loop or a burst of clients would amplify into RPC load. The tip only moves once per
+// block (~seconds apart at most), and it is fully public, so a couple of seconds of staleness is
+// harmless. Only the no-param tip is cached; tx/block lookups are per-swap and keyed, not hot.
+let _anchorTip = { at: 0, body: null };
+const ANCHOR_TIP_TTL_MS = 3000;
+
 const server = http.createServer(async (req, res) => {
   const url = new URL(req.url, 'http://x');
   if (req.method === 'GET' && url.pathname === '/health') return send(res, 200, { ok: true, service: 'seqln-lsp' });
@@ -1242,10 +1250,15 @@ const server = http.createServer(async (req, res) => {
         if (!/^[0-9a-fA-F]{64}$/.test(blockParam)) return send(res, 400, { ok: false, error: 'bad block hash' });
         return send(res, 200, await anchorOfBlock(blockParam));
       }
+      const now = Date.now();
+      if (_anchorTip.body && (now - _anchorTip.at) < ANCHOR_TIP_TTL_MS)
+        return send(res, 200, _anchorTip.body);
       const info = await seqRpcCall('getblockchaininfo');
       const blk = await seqRpcCall('getblock', [info.bestblockhash]);
-      return send(res, 200, { ok: true, height: info.blocks,
-        anchor_height: (blk.anchorheight ?? null), anchor_hash: (blk.anchorhash ?? null) });
+      const body = { ok: true, height: info.blocks,
+        anchor_height: (blk.anchorheight ?? null), anchor_hash: (blk.anchorhash ?? null) };
+      _anchorTip = { at: now, body };
+      return send(res, 200, body);
     } catch {
       return send(res, 502, { ok: false, error: 'anchor unavailable' });   // generic — never surface the internal RPC endpoint
     }
