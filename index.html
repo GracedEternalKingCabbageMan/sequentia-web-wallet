@@ -949,9 +949,9 @@ let REGISTRY_ASSETS = (()=>{ try{ return JSON.parse(localStorage.getItem('swk.re
 async function loadRegistry(){
   try {
     const r = await fetch(REGISTRY_URL, {cache:'no-store'}); if(!r.ok) return;
-    const idx = await r.json(); const m = {};            // { id: [domain, ticker, name, precision] }
+    const idx = await r.json(); const m = {};            // { id: [domain, ticker, name, precision, verified] }
     const clean=(s,n)=> (typeof s==='string') ? s.replace(/[<>]/g,'').slice(0,n) : s;   // defense-in-depth: registry strings are display text
-    for(const [id,v] of Object.entries(idx)) if(Array.isArray(v)) m[id]={ticker:clean(v[1],16), name:clean(v[2],48), precision:v[3], domain:v[0]};
+    for(const [id,v] of Object.entries(idx)) if(Array.isArray(v)) m[id]={ticker:clean(v[1],16), name:clean(v[2],48), precision:v[3], domain:v[0], verified:!!v[4]};
     REGISTRY_ASSETS = m;
     try { localStorage.setItem('swk.registryCache', JSON.stringify(m)); } catch {}   // cache for instant resolution next load
     try { if(typeof renderBalance==='function') renderBalance(); } catch {}   // refresh labels if the UI is already up
@@ -963,6 +963,39 @@ function assetMeta(hex){ if(!hex) return {ticker:'—', name:'Asset', precision:
   if(hex.startsWith('oamp:')){ const m=oampAssets[hex.slice(5)]; return m ? {ticker:m.ticker||'?', name:m.name||'Restricted asset', precision:m.precision||0} : {ticker:'?', name:'Restricted asset', precision:0}; }
   if(hex===POLICY_HEX) return {ticker:'tSEQ', name:'Sequence', precision:8};
   return labels()[hex] || REGISTRY_ASSETS[hex] || DEFAULT_ASSETS[hex] || {ticker:hex.slice(0,8)+'…', name:'Asset', precision:0}; }
+// Asset TRUST signals (E1): distinguish a registry-verified asset, a merely-known one, and an
+// unknown id the wallet just happens to hold (a potential impostor). tSEQ (policy asset) and BTC
+// (parent chain) are inherently known. A user's OWN label does NOT confer verification — it only
+// names an id the user chose to trust. "registered" = present in the asset registry at all.
+function assetRegistered(hex){ return !!(hex===POLICY_HEX || hex==='BTC' || (hex&&hex.startsWith('oamp:')) || REGISTRY_ASSETS[hex]); }
+function assetVerified(hex){
+  if(hex===POLICY_HEX || hex==='BTC') return true;
+  const r = REGISTRY_ASSETS[hex]; return !!(r && r.verified);
+}
+// The registry domain that vouches for this asset (for a "verified by <domain>" tooltip), or ''.
+function assetDomain(hex){ const r = REGISTRY_ASSETS[hex]; return (r && r.domain) || ''; }
+// A small trust indicator to render next to a ticker (E1): a green ✓ for registry-verified assets
+// (tooltip names the vouching domain), an amber ⚠ for an id NOT in the registry (anyone can mint an
+// asset with any ticker, so an unregistered id is a potential impostor — warn before trusting it),
+// or null for a registered-but-unverified asset (neutral). Returns a DOM node or null.
+function trustBadge(hex){
+  if(!hex || hex.startsWith('oamp:')) return null;   // restricted assets carry their own enclave trust model
+  if(assetVerified(hex)){
+    const b=el('span'); b.textContent='✓';
+    b.title = hex==='BTC' ? 'Bitcoin — the parent chain'
+            : hex===POLICY_HEX ? 'Sequentia native asset'
+            : ('Verified in the Sequentia asset registry'+(assetDomain(hex)?(' · '+assetDomain(hex)):''));
+    b.setAttribute('aria-label','verified'); b.style.cssText='color:#3ddc84;margin-left:5px;font-weight:700;cursor:help';
+    return b;
+  }
+  if(!assetRegistered(hex)){
+    const b=el('span'); b.textContent='⚠';
+    b.title='Not in the asset registry. Anyone can issue an asset with any ticker — verify the issuer before trusting or trading it.';
+    b.setAttribute('aria-label','unregistered'); b.style.cssText='color:var(--amber2);margin-left:5px;font-size:11px;cursor:help';
+    return b;
+  }
+  return null;
+}
 let POLICY_HEX='';
 // True when we have NO authoritative precision for this asset — assetMeta() only
 // falls back to precision:0 (the generic ticker:hex…/name:'Asset' placeholder).
@@ -2613,6 +2646,7 @@ function initSwapTab(){
     get mnemonic(){ return localStorage.getItem(KEY) || ''; },
     esploraFetch: (path, opts) => fetch(ESPLORA + path, opts),
     el, $, assetMeta, balObj, fmtAtoms, parseAtoms,
+    assetVerified, assetRegistered, assetDomain, trustBadge,   // E1: asset trust signals in the picker
     refValueStr, attachRefHint, assetAmountOf, feeRateFor, prettyErr,
     DEFAULT_FEERATE, EXCHANGE_RATE_SCALE,   // for the order-book swap's open-fee-market fee estimate
     get feeRates(){ return feeRates; },   // reassigned by fetchFeeRates — read fresh
@@ -2833,6 +2867,7 @@ function renderBalance(){
     // Header line: ticker · name/id · combined total (on-chain + Lightning) + ref value.
     const head=el('div','arow-head');
     head.appendChild(el('span','tk', ticker));
+    const tb=trustBadge(kind); if(tb) head.appendChild(tb);   // E1: verified ✓ / unregistered ⚠
     const mid=el('div','grow');
     if(nameNode){ const nd=el('div'); nd.appendChild(nameNode); mid.appendChild(nd); }
     head.appendChild(mid);

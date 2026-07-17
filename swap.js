@@ -2149,6 +2149,8 @@ function popover(anchorEl, items, onPick){
     const b = el('button','swopt'); b.type = 'button'; b.setAttribute('role','option');
     if (!it.enabled){ b.disabled = true; }
     const t = el('span','swopt-tk', it.ticker);
+    // E1: verified ✓ / unregistered ⚠ trust badge next to the ticker (same signal as the Balance list).
+    try { const tb = C.trustBadge && C.trustBadge(it.hex); if (tb) t.appendChild(tb); } catch {}
     const mid = el('div','swopt-mid'); mid.appendChild(el('div','swopt-name', it.name || ''));
     if (it.split){ const sp = el('div','swopt-split'); sp.innerHTML = it.split; mid.appendChild(sp); }
     const bal = el('div','swopt-bal');
