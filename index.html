@@ -1291,7 +1291,7 @@ function refHintFor(amountStr, hex){
 const _trimNum = n => { const s=(Math.round(n*1e8)/1e8).toFixed(8); return s.replace(/0+$/,'').replace(/\.$/,''); };
 // Same, but rounded/clamped to `dp` decimals — used to write an ASSET amount back at its own precision.
 const _trimNumDp = (n, dp) => { dp=Math.max(0,Math.min(8,dp|0)); const s=n.toFixed(dp); return dp>0 ? s.replace(/\.?0+$/,'') : s; };
-function _assetUsd(hex){ return PRICES[priceTicker(hex)]; }  // asset's USD base price
+function _assetUsd(hex){ return priceFor(priceTicker(hex)); }  // asset's USD base price (BTC-key-aware, case-robust)
 function _bothPriced(hex, ref){ return _assetUsd(hex)>0 && priceOf(ref||REF)>0; }
 const _NUMRE = /^\d+(\.\d+)?$/;   // exactly what parseAtoms accepts; reject anything else (e.g. '1,5') — fail safe
 // The human ASSET amount a tx must use. In reference-input mode (⇄) the user typed a REFERENCE
