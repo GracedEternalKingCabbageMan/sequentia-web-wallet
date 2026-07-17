@@ -2761,7 +2761,18 @@ async function startBuy(params){
 async function driveBuy(say){
   say = say || (() => {});
   const H = BUY.hash_h, node_key = BUY.node_key;
-  // Resume-after-crash-before-swap: if we funded the BTC but never commanded the LSP, (re)issue it.
+  // Reconcile a dropped LSP job. The LSP keeps jobs in memory, so a restart drops ours (GET /swap/<id>
+  // -> 404) and the maker's pay-by-hash is never re-driven — the buy would then just wait out the clock
+  // and refund. If our recorded job is gone or failed, drop the stale id so the re-issue below
+  // re-commands the maker. Safe to repeat: the on-chain HTLC is already funded and the hosted node's
+  // hold invoice on H can only be paid once, so a duplicate command is idempotent. (Skipped on a fresh
+  // startBuy, whose job_id points at a live job.)
+  if (BUY.job_id && L.jobStatus){
+    const alive = await L.jobStatus(BUY.poll || ('/swap/' + BUY.job_id))
+      .then(j => !!(j && j.ok !== false && j.status !== 'failed'), () => false);
+    if (!alive){ BUY.job_id = null; BUY.poll = null; saveBuy(); }
+  }
+  // Resume-after-crash-before-swap (or after the reconcile above): funded the BTC but no live LSP job.
   if (!BUY.job_id && BUY.btc_htlc){
     try {
       const job = await L.swap({ side: 'buy', hodl: true, asset: BUY.asset, node_key, payment_hash: H,
