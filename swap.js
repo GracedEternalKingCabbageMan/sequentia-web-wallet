@@ -651,9 +651,14 @@ function renderPairBar(){
   const pm = metaOf(S.payAsset), rm = metaOf(S.receiveAsset);
   let lastStr = '—';
   if (LAST_MID && LAST_MID.price != null && isFinite(LAST_MID.price) && LAST_MID.price > 0){
-    lastStr = LAST_MID.cross
-      ? `${trim(LAST_MID.price)} BTC/${rm.ticker}`
-      : `${trim(LAST_MID.price)} ${pm.ticker}/${rm.ticker}`;
+    if (LAST_MID.cross){
+      // Cross pairs are always priced in BTC per ASSET. The asset is whichever leg isn't BTC, so on a
+      // SELL (receive = BTC) the denominator is the PAY asset — never "BTC/BTC".
+      const assetTk = rm.ticker === 'BTC' ? pm.ticker : rm.ticker;
+      lastStr = `${trim(LAST_MID.price)} BTC/${assetTk}`;
+    } else {
+      lastStr = `${trim(LAST_MID.price)} ${pm.ticker}/${rm.ticker}`;
+    }
   }
   host.innerHTML = `<div class="swpairsel">${esc(rm.ticker)} <span class="swpair-car">/</span> ${esc(pm.ticker)}</div>
     <div class="swpair-last">last <b class="mono">${esc(lastStr)}</b></div>`;
@@ -3313,7 +3318,17 @@ function resetComposer(){
 
 function amtRow(hex, atoms){ const m = C.assetMeta(hex); return C.fmtAtoms(atoms, m.precision) + ' ' + m.ticker; }
 function refSuffix(hex, atoms){ const r = C.refValueStr(hex, atoms); return r ? ('  ('+r+')') : ''; }
-function trim(n){ if (!isFinite(n)) return '-'; const s = (Math.round(n*1e8)/1e8).toString(); return s; }
+function trim(n){
+  if (!isFinite(n)) return '-';
+  const r = Math.round(n * 1e8) / 1e8;
+  if (r === 0) return '0';
+  // Never emit scientific notation: Number.toString() switches to "1e-7" below 1e-6, which reads wrong
+  // in the UI and, if written into an amount field, makes parseAtoms() throw. Render fixed to 8dp (BTC
+  // precision, the finest we quote) and strip trailing zeros.
+  let s = r.toFixed(8);
+  if (s.indexOf('.') >= 0) s = s.replace(/0+$/, '').replace(/\.$/, '');
+  return s;
+}
 
 // ---------------------------------------------------------------------------
 // build -> propose -> sign (add_details + strip bip32) -> complete  (UNCHANGED)

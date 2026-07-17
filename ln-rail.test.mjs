@@ -13,12 +13,16 @@ const USDX = 'bc'.repeat(32);
 const goldT = { hex: GOLD, ticker: 'GOLD' };
 const usdxT = { hex: USDX, ticker: 'USDX' };
 
-// A representative LSP /status channel set: a live BTC channel (both-sided), a live
-// GOLD channel that is RECEIVE-only (no spendable), and a USDX channel still OPENING.
+// A representative LSP /status channel set. The wallet's OWN channels carry a node_key (only those
+// count toward rail liquidity): a live BTC channel (both-sided), a live GOLD channel that is
+// RECEIVE-only (no spendable), and a USDX channel still OPENING. Plus a shared/demo-topology BTC
+// channel with NO node_key that /status also returns but the wallet does not control — it must be
+// excluded, or the Swap tab would offer to pay over a channel the user can't actually spend from.
 const CHANNELS = [
-  { peer_id: 'ln-btc', asset_label: 'BTC', spendable_units: 1_000_000, receivable_units: 500_000, state: 'CHANNELD_NORMAL' },
-  { peer_id: 'ln-gold', asset_label: 'GOLD', asset: GOLD, spendable_units: 0, receivable_units: 2_000_000, state: 'CHANNELD_NORMAL' },
-  { peer_id: 'ln-usdx', asset_label: 'USDX', asset: USDX, spendable_units: 9_000, receivable_units: 9_000, state: 'OPENINGD' },
+  { peer_id: 'ln-btc', asset_label: 'BTC', node_key: 'own-btc', spendable_units: 1_000_000, receivable_units: 500_000, state: 'CHANNELD_NORMAL' },
+  { peer_id: 'ln-gold', asset_label: 'GOLD', asset: GOLD, node_key: 'own-gold', spendable_units: 0, receivable_units: 2_000_000, state: 'CHANNELD_NORMAL' },
+  { peer_id: 'ln-usdx', asset_label: 'USDX', asset: USDX, node_key: 'own-usdx', spendable_units: 9_000, receivable_units: 9_000, state: 'OPENINGD' },
+  { peer_id: 'ln-shared', asset_label: 'BTC', spendable_units: 5_000_000, receivable_units: 5_000_000, state: 'CHANNELD_NORMAL' },
 ];
 
 // --- channel matching + active-state gating --------------------------------------
@@ -32,7 +36,8 @@ console.log('ok: channelMatches keys by BTC-tag / asset hex / ticker; only CHANN
 
 // --- liquidity aggregation --------------------------------------------------------
 const btcL = legLiquidity(CHANNELS, 'BTC');
-assert.deepEqual([btcL.active, btcL.spendable, btcL.receivable, btcL.count], [true, 1_000_000n, 500_000n, 1n], 'BTC leg liquidity');
+// count is 1, not 2: the shared node_key-less BTC channel is excluded despite matching + being active.
+assert.deepEqual([btcL.active, btcL.spendable, btcL.receivable, btcL.count], [true, 1_000_000n, 500_000n, 1], 'BTC leg liquidity (own channel only; shared excluded)');
 const goldL = legLiquidity(CHANNELS, goldT);
 assert.deepEqual([goldL.active, goldL.spendable, goldL.receivable], [true, 0n, 2_000_000n], 'GOLD leg is receive-only');
 const usdxL = legLiquidity(CHANNELS, usdxT);

@@ -60,6 +60,18 @@ const T = { poll: 5000, termsReqWait: 120000, btcFundWait: 2*60*60*1000, seqLock
             anchorWait: 20*60*1000, minBtcConf: 1, seqClaimMargin: 10 };
 
 const ANCHOR_BASE = () => (typeof location !== 'undefined' ? location.origin : '');
+
+// The xcourier wire carries amounts as JSON numbers (the Go peer's struct is `uint64`, no `,string`
+// tag, so it rejects a JSON string). That caps a JS-sent amount at 2^53-1 atoms without silent
+// precision loss. Rather than emit a lossy number that the taker later rejects with a confusing
+// "quoted X, not Y" mismatch, refuse LOUDLY up front. (>2^53 atoms is ~90M units of an 8-dp asset —
+// far beyond any testnet leg; lifting this ceiling needs a coordinated `,string`-tag wire change.)
+function wireAmt(x, label){
+  const b = (typeof x === 'bigint') ? x : BigInt(x);
+  if (b > BigInt(Number.MAX_SAFE_INTEGER))
+    throw new Error(`${label} (${b} atoms) exceeds the cross-chain rail's safe amount limit (2^53-1); split the trade into smaller lifts`);
+  return Number(b);
+}
 // A Sequentia block's Bitcoin-anchor height + the node's anchor status, SELF-DERIVED
 // via the explorer's read-only /anchor endpoints (context-overridable for tests).
 async function anchorHeightOf(blockHash){
@@ -230,7 +242,7 @@ export async function RunMakerForward(session, lift, offer, onState){
     maker_btc_claim_pub: makerBtcClaim.public_key,
     maker_refund_pub:    makerSeqRefund.public_key,   // forward: maker_refund_pub is the SEQ refund
     btc_locktime: btcLocktime, seq_locktime: seqLocktime,
-    btc_amount: Number(btcAmount), seq_amount: Number(seqAmount), fee_btc: 0,
+    btc_amount: wireAmt(btcAmount, 'BTC leg amount'), seq_amount: wireAmt(seqAmount, 'asset leg amount'), fee_btc: 0,
   });
 
   // 4. recv btc_leg_funded (taker funded BTC first)
@@ -410,8 +422,8 @@ export async function RunMakerReverse(session, lift, offer, onState){
   try {
     await session.send({ type: XcType.BtcLegLocked, hash_h: sec.hash_hex,
       maker_seq_claim_pub: makerSeqClaim.public_key, maker_refund_pub: makerBtcRefund.public_key,
-      seq_locktime: seqLocktime, btc_amount: Number(btcAmount), seq_amount: Number(seqAmount), fee_btc: 0,
-      leg: { txid: funded.txid, vout: funded.vout, amount: Number(btcAmount), redeem_script: btcRedeem, locktime: btcLocktime } });
+      seq_locktime: seqLocktime, btc_amount: wireAmt(btcAmount, 'BTC leg amount'), seq_amount: wireAmt(seqAmount, 'asset leg amount'), fee_btc: 0,
+      leg: { txid: funded.txid, vout: funded.vout, amount: wireAmt(btcAmount, 'BTC leg amount'), redeem_script: btcRedeem, locktime: btcLocktime } });
   } catch (e){ return await refundReverseBtc(st, onState, 'could not announce btc_leg_locked: ' + (e.message||e)); }
 
   // 5. recv seq_leg_funded (the taker funds the asset leg against our BTC lock).
