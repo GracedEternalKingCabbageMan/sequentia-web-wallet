@@ -293,6 +293,16 @@ function lnrpc(method, args = [], rpc, timeoutMs = 0) {
 // status in the wallet (L.status never resolves -> no channels -> false "No Lightning channel" +
 // a flapping badge). A timed-out node rejects here and its caller skips it via .catch(()=>null).
 const STATUS_RPC_TIMEOUT_MS = 5000;
+// Bound RPCs that round-trip to the DEVICE signer (invoice/hold-invoice minting) or are otherwise
+// heavier than a plain read. Same rationale as STATUS_RPC_TIMEOUT_MS: lnrpc defaults timeoutMs=0 (no
+// timeout), so an offline signer or a wedged node would hang the request handler forever otherwise.
+const SIGNER_RPC_TIMEOUT_MS = 20000;
+// Redact secrets/internal paths from CLI output before returning it to a client: SEQ_RPC is a
+// http://user:pass@host:port URL and seqob-cli/lightning-cli errors can echo it (or internal
+// --rpc-file=/root/... paths). Keep the last 6 non-empty lines but strip credentials + fs paths.
+const scrubDetail = (out) => String(out || '').split('\n').filter(Boolean).slice(-6).join(' | ')
+  .replace(/(https?:\/\/)[^@\s/]+@/gi, '$1<redacted>@')
+  .replace(/\/root\/[^\s'"|]+/g, '<path>');
 async function nodeStatus(rpc, leg) {
   const info = await lnrpc('getinfo', [], rpc, STATUS_RPC_TIMEOUT_MS);
   let channels = [];
@@ -501,7 +511,7 @@ async function ensurePeer(rpc, peerId, peerAddr, job) {
 // wallet can auto-detect "deposit landed on my node but no channel" and (re)call /channel/open.
 // msat convention matches CLN: for an asset output amount_msat = atoms * 1000 (5 USDX -> 500000000000).
 async function onchainForReport(rpc, chain, assetId) {
-  const lf = await lnrpc('listfunds', [], rpc).catch(() => ({ outputs: [] }));
+  const lf = await lnrpc('listfunds', [], rpc, STATUS_RPC_TIMEOUT_MS).catch(() => ({ outputs: [] }));
   let msat = 0; const outputs = [];
   for (const o of (lf.outputs || [])) {
     if (o.status !== 'confirmed' && o.status !== 'unconfirmed') continue;   // count 0-conf too
@@ -531,7 +541,7 @@ async function waitGetinfo(rpc, timeoutMs = 45000) {
   if (!rpc) throw new Error('internal: no rpc path for node (cannot wait for readiness)');
   const deadline = Date.now() + timeoutMs;
   for (;;) {
-    try { return await lnrpc('getinfo', [], rpc); }
+    try { return await lnrpc('getinfo', [], rpc, STATUS_RPC_TIMEOUT_MS); }
     catch (e) {
       if (Date.now() > deadline) throw new Error(`your Lightning node is still preparing (booting + syncing) — try again in a moment (${e.message})`);
       await sleep(1500);
@@ -548,7 +558,7 @@ async function waitGetinfo(rpc, timeoutMs = 45000) {
 // getinfo), so this also catches a soft-wedge as a timeout rather than a silent hang.
 async function waitSynced(rpc, deadline) {
   for (;;) {
-    const info = await lnrpc('getinfo', [], rpc).catch(() => null);
+    const info = await lnrpc('getinfo', [], rpc, STATUS_RPC_TIMEOUT_MS).catch(() => null);
     if (info && info.warning_lightningd_sync == null && info.warning_bitcoind_sync == null) return info;
     if (Date.now() > deadline) throw new Error('your Lightning node did not finish syncing to the chain tip in time (still rescanning) — its funds are safe on-chain; retry once it is caught up');
     await sleep(3000);
@@ -559,7 +569,7 @@ async function channelDeposit(chain, assetId, nodeKey) {
   const { rpc } = targetFor(chain, chain === 'seq' ? (assetId || CFG.gold) : null, nodeKey);
   if (!rpc) throw new Error('no hosted node for that asset (provision it first)');
   const info = await waitGetinfo(rpc);            // tolerate a just-booted node's missing socket
-  const na = await lnrpc('newaddr', ['bech32'], rpc);
+  const na = await lnrpc('newaddr', ['bech32'], rpc, STATUS_RPC_TIMEOUT_MS);
   return { ok: true, chain, node_id: info.id, network: info.network,
     address: na.bech32 || na.address || na.p2tr };
 }
@@ -775,7 +785,7 @@ async function runSubasBuyHodl(job, body) {
     watching = false;
     job.status = 'failed';
     job.error = `sub-asset buy failed before held: ${err.message}`;
-    job.detail = out.split('\n').filter(Boolean).slice(-6).join(' | ');
+    job.detail = scrubDetail(out);
     job.note = 'the BTC HTLC is refundable after T_btc via btcLeg.refund (the device holds the refund key).';
     job.done_ms = Date.now();
     return job;
@@ -897,7 +907,7 @@ function runSwap({ side, asset, amount }) {
         preimage: m[5], finality: 'final', settled_ms: Date.now() - t0, requested_amount: amount ?? null,
       });
       resolve({ ok: false, error: err ? `swap failed: ${err.message}` : 'swap did not settle',
-        detail: out.split('\n').filter(Boolean).slice(-6).join(' | '), settled_ms: Date.now() - t0 });
+        detail: scrubDetail(out), settled_ms: Date.now() - t0 });
     });
   });
 }
@@ -937,12 +947,12 @@ async function provisionInbound({ nodeKey, assetId, amount }) {
   const already = (pc.channels || []).find(c => c.peer_id === lpId && c.state === 'CHANNELD_NORMAL' && Number(c.receivable_msat || 0) >= need);
   if (already) return { ok: true, already_had_inbound: true, channel_id: already.channel_id || null, receivable_msat: already.receivable_msat ?? null, fee_msat: 0 };
   // The user node's listen address, so the LP can dial it.
-  const uinfo = await lnrpc('getinfo', [], userRpc);
+  const uinfo = await lnrpc('getinfo', [], userRpc, STATUS_RPC_TIMEOUT_MS);
   const userId = uinfo.id;
   const bind = (uinfo.binding || []).find(b => b.port) || {};
   if (!bind.port) throw new Error('user node has no listen binding for the LP to connect to');
   const host = bind.address || '127.0.0.1';
-  await lnrpc('connect', [`id=${userId}`, `host=${host}`, `port=${bind.port}`], CFG.subasLpRpc)
+  await lnrpc('connect', [`id=${userId}`, `host=${host}`, `port=${bind.port}`], CFG.subasLpRpc, SIGNER_RPC_TIMEOUT_MS)
     .catch(e => { throw new Error(`LP could not connect to the user node: ${e.message}`); });
   // LP funds a 0-conf asset channel TOWARD the user (all liquidity on the LP side =
   // the user's inbound). Fails closed if the LP lacks the asset on-chain.
@@ -1041,7 +1051,7 @@ function runMixed({ side, asset, amount, payRail, recvRail, node_key, asset_bolt
         }
         return resolve({ ok: false,
           error: (j && j.error) ? `sub-asset sell failed: ${j.error}` : (err ? `sub-asset sell failed: ${err.message}` : 'sub-asset sell did not settle'),
-          detail: out.split('\n').filter(Boolean).slice(-6).join(' | '), settled_ms: dt });
+          detail: scrubDetail(out), settled_ms: dt });
       });
     }
     if (execName === 'xsubas') {
@@ -1162,7 +1172,7 @@ function runMixed({ side, asset, amount, payRail, recvRail, node_key, asset_bolt
         settled_ms: dt, requested_amount: amount ?? null,
       });
       resolve({ ok: false, error: err ? `mixed swap failed: ${err.message}` : 'mixed swap did not settle',
-        detail: out.split('\n').filter(Boolean).slice(-6).join(' | '), settled_ms: dt });
+        detail: scrubDetail(out), settled_ms: dt });
     });
   });
 }
@@ -1431,7 +1441,7 @@ const server = http.createServer(async (req, res) => {
           // positional padding: lightning-cli -k invoice amount_msat=.. label=.. preimage=..
           const kv = [`amount_msat=${amtMsat}`, `label=${label}`, 'description=asset buy'];
           if (P) kv.push(`preimage=${P}`);
-          inv = await lnrpcKw('invoice', kv, rec.rpc);
+          inv = await lnrpcKw('invoice', kv, rec.rpc, SIGNER_RPC_TIMEOUT_MS);
         }
         return send(res, 200, { ok: true, bolt11: inv.bolt11, payment_hash: inv.payment_hash, hodl: !!H });
       } catch (e) {
@@ -1493,7 +1503,7 @@ const server = http.createServer(async (req, res) => {
       const label = 'recv-' + crypto.randomUUID();
       const desc = (body && body.description) ? String(body.description).slice(0, 128) : 'Lightning receive';
       try {
-        const inv = await lnrpcKw('invoice', [`amount_msat=${amtMsat}`, `label=${label}`, `description=${desc}`], rec.rpc);
+        const inv = await lnrpcKw('invoice', [`amount_msat=${amtMsat}`, `label=${label}`, `description=${desc}`], rec.rpc, SIGNER_RPC_TIMEOUT_MS);
         return send(res, 200, { ok: true, bolt11: inv.bolt11, payment_hash: inv.payment_hash, amount_msat: Number(amtMsat) });
       } catch (e) { return send(res, 502, { ok: false, error: `invoice: ${e.message}` }); }
     }
