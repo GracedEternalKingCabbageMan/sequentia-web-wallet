@@ -1184,9 +1184,10 @@ async function renderMarkets(host){
     if (!b || !q) continue;
     const bid = Number(m.best_bid)||0, ask = Number(m.best_ask)||0, n = Number(m.n_orders)||0;
     const mid = (bid>0 && ask>0) ? (bid+ask)/2 : (ask||bid||0);
+    const last = Number(m.last_price)||0;   // T1: last traded price (0 until a cross)
     const key = [b,q].sort().join('|');
     const prev = byPair.get(key);
-    if (!prev || n > prev.n) byPair.set(key, { b, q, mid, n, bt: tkOf(b), qt: tkOf(q) });
+    if (!prev || n > prev.n) byPair.set(key, { b, q, mid, last, n, bt: tkOf(b), qt: tkOf(q) });
   }
   const rows = [...byPair.values()].filter(r => r.n > 0).sort((a,b)=> b.n - a.n || a.bt.localeCompare(b.bt));
   if (!rows.length) return;
@@ -1194,7 +1195,7 @@ async function renderMarkets(host){
     + `style="display:flex;justify-content:space-between;align-items:center;gap:10px;width:100%;padding:7px 10px;`
     + `background:none;border:0;border-top:1px solid rgba(255,255,255,.06);cursor:pointer;text-align:left;color:inherit;font:inherit">`
     + `<span style="font-weight:600;white-space:nowrap">${esc(r.bt)}<span class="sub"> / </span>${esc(r.qt)}</span>`
-    + `<span class="mono sub" style="flex:1;text-align:right;overflow:hidden;text-overflow:ellipsis">${r.mid>0 ? trim(r.mid) : '—'}</span>`
+    + `<span class="mono sub" style="flex:1;text-align:right;overflow:hidden;text-overflow:ellipsis" title="${r.last>0?'last traded price':'mid price (no trades yet)'}">${(r.last>0?r.last:r.mid)>0 ? trim(r.last>0?r.last:r.mid) : '—'}${r.last>0?'':'<span class="sub" style="font-size:9px"> mid</span>'}</span>`
     + `<span class="sub" style="min-width:58px;text-align:right;white-space:nowrap">${r.n} order${r.n===1?'':'s'}</span></button>`;
   host.innerHTML = `<div class="swladder"><div class="swladder-head">`
     + `<span class="sub" style="color:var(--txt);font-weight:650">Markets</span>`
