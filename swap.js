@@ -1145,13 +1145,62 @@ function paintCostLine(){
     el.title = `You take at ~${trim(eff)} vs the ${trim(mid)} mid — the cost of filling now instead of resting at the mid price.`;
   }
 }
-// A muted stand-in so the desk's LEFT (book) column is never a blank void before a pair
-// is chosen. Replaced by the live ladder the moment a pair + book load.
+// Before a pair is chosen the LEFT (book) column shows the MARKETS OVERVIEW (D1): a live, clickable
+// list of every market so you never pick two assets blind. Render the static stand-in instantly, then
+// upgrade to the markets list when it loads.
 function renderBookPlaceholder(){
   const host = C.$('swBook'); if (!host) return;
+  renderBookPlaceholderStatic(host);
+  renderMarkets(host).catch(()=>{});
+}
+function renderBookPlaceholderStatic(host){
   host.innerHTML = `<div class="swladder"><div class="swladder-head">`
-    + `<span class="sub" style="color:var(--txt);font-weight:650">Order book</span><span class="sub"></span></div>`
-    + `<div class="swladder-empty">Pick two assets to see the order book.</div></div>`;
+    + `<span class="sub" style="color:var(--txt);font-weight:650">Markets</span><span class="sub">loading…</span></div>`
+    + `<div class="swladder-empty">Pick two assets, or choose a market.</div></div>`;
+}
+// D1: markets overview — the discovery surface. ONE /v1/markets call carries best_bid/ask + n_orders
+// for EVERY pair (same-chain AND BTC cross), so we list them all with a mid + depth, clickable to load
+// the composer. Directed duplicates (A/B and B/A) are collapsed to one row (the deeper side).
+let _marketsCache = null;
+async function renderMarkets(host){
+  let markets = _marketsCache;
+  try {
+    const j = await fetch(seqob.seqobBase() + '/v1/markets', { cache: 'no-store' }).then(r => r.ok ? r.json() : null);
+    if (j && Array.isArray(j.markets)) markets = _marketsCache = j.markets;
+  } catch {}
+  if (S.payAsset && S.receiveAsset) return;   // a pair got chosen while we were fetching — the ladder owns it now
+  if (!markets || !markets.length) return;    // keep the static stand-in
+  const tkOf = (a) => a === 'BTC' ? 'BTC' : (C.assetMeta(a).ticker || (a.slice(0,6)+'…'));
+  const byPair = new Map();
+  for (const m of markets){
+    const b = m.pair && (m.pair.base_asset || m.pair.baseAsset), q = m.pair && (m.pair.quote_asset || m.pair.quoteAsset);
+    if (!b || !q) continue;
+    const bid = Number(m.best_bid)||0, ask = Number(m.best_ask)||0, n = Number(m.n_orders)||0;
+    const mid = (bid>0 && ask>0) ? (bid+ask)/2 : (ask||bid||0);
+    const key = [b,q].sort().join('|');
+    const prev = byPair.get(key);
+    if (!prev || n > prev.n) byPair.set(key, { b, q, mid, n, bt: tkOf(b), qt: tkOf(q) });
+  }
+  const rows = [...byPair.values()].filter(r => r.n > 0).sort((a,b)=> b.n - a.n || a.bt.localeCompare(b.bt));
+  if (!rows.length) return;
+  const rowHtml = (r) => `<button type="button" class="swmkt-row" data-b="${esc(r.b)}" data-q="${esc(r.q)}" `
+    + `style="display:flex;justify-content:space-between;align-items:center;gap:10px;width:100%;padding:7px 10px;`
+    + `background:none;border:0;border-top:1px solid rgba(255,255,255,.06);cursor:pointer;text-align:left;color:inherit;font:inherit">`
+    + `<span style="font-weight:600;white-space:nowrap">${esc(r.bt)}<span class="sub"> / </span>${esc(r.qt)}</span>`
+    + `<span class="mono sub" style="flex:1;text-align:right;overflow:hidden;text-overflow:ellipsis">${r.mid>0 ? trim(r.mid) : '—'}</span>`
+    + `<span class="sub" style="min-width:58px;text-align:right;white-space:nowrap">${r.n} order${r.n===1?'':'s'}</span></button>`;
+  host.innerHTML = `<div class="swladder"><div class="swladder-head">`
+    + `<span class="sub" style="color:var(--txt);font-weight:650">Markets</span>`
+    + `<span class="sub">${rows.length} pair${rows.length===1?'':'s'} · tap to trade</span></div>`
+    + `<div class="swmkt-list" style="max-height:340px;overflow-y:auto">${rows.map(rowHtml).join('')}</div></div>`;
+  host.querySelectorAll('.swmkt-row').forEach(el => el.onclick = () => {
+    // Clicking BASE/QUOTE starts a BUY of the base: pay the quote, receive the base.
+    const b = el.dataset.b, q = el.dataset.q;
+    if (b === q) return;
+    S.payAsset = q; S.receiveAsset = b;
+    S.railsTouched = false; S.modeTouched = false; LAST_QUOTE = null; setReviewEnabled(false);
+    paintPanes(); requote().catch(()=>{});
+  });
 }
 
 function clearOpposite(){
