@@ -563,6 +563,7 @@ async function refreshInstant(){
     const st = await L.status();
     const chans = (st && (st.channels || st.channel_balances)) || [];
     LNSTATUS = { channels: chans, funding: (st && st.funding) || null };   // ground truth for rail gating
+    try { console.log('[dbg-btc]', JSON.stringify((chans||[]).map(c=>({leg:c.leg,state:c.state,node_key:!!c.node_key,asset_label:c.asset_label,asset:c.asset,spend:c.spendable_units,recv:c.receivable_units})))); } catch(e){} // TEMP
     for (const c of chans){
       if (!c.node_key) continue;   // ONLY the wallet's own channels count as its Lightning balance
                                    // (never shared/demo) — consistent with the Balance tab + railAvail
