@@ -343,7 +343,7 @@ async function status(deviceKeys = []) {
     const recs = deviceKeys.map((key) => PROV.getByKey(key)).filter(Boolean);
     const results = await Promise.all(recs.map((rec) => Promise.race([
       (async () => {
-        const ns = await nodeStatus(rec.rpc, rec.chain === 'btc' ? 'btc' : 'prov').catch((e) => { try { console.error('[status-dbg]', String(rec.key).slice(0,26), 'rpc=', rec.rpc, 'err=', e && e.message); } catch {} return null; });
+        const ns = await nodeStatus(rec.rpc, rec.chain === 'btc' ? 'btc' : 'prov').catch(() => null);
         if (!ns) return null;
         const on = await onchainForReport(rec.rpc, rec.chain === 'btc' ? 'btc' : 'seq', rec.chain === 'btc' ? null : rec.asset_id).catch(() => ({ onchain_msat: 0 }));
         return { rec, ns, on };
