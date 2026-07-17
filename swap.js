@@ -1983,7 +1983,6 @@ function renderXBook(seqAsset, payIsBtc, forward, reverse, unified){
   }
   asks.sort((a, b) => a.price - b.price);
   { let c = 0; const t = asks.reduce((s, r) => s + r.size, 0) || 1; asks.forEach(r => { c += r.size; r.cum = c; r.frac = c / t; }); }
-  asks.reverse();
   bids.sort((a, b) => b.price - a.price);
   { let c = 0; const t = bids.reduce((s, r) => s + r.size, 0) || 1; bids.forEach(r => { c += r.size; r.cum = c; r.frac = c / t; }); }
   // (onClick was assigned per-branch above: seed-amount for the merged book, fillFromXOffer for the
@@ -1994,7 +1993,7 @@ function renderXBook(seqAsset, payIsBtc, forward, reverse, unified){
   const spread = (bestAsk != null && bestBid != null) ? (bestAsk - bestBid) : null;
   LAST_MID = { price: mid, cross: true };
   renderLadder(host, {
-    asks: asks.slice(0, 8), bids: bids.slice(0, 8), mid, spread,
+    asks: asks.slice(0, 8).reverse(), bids: bids.slice(0, 8), mid, spread,   // 8 BEST (lowest) asks, shown high->low near the mid
     priceLabel: `(BTC/${am.ticker})`, sizeLabel: am.ticker,
     refMidStr: oneUnitRefStr(seqAsset),
     headTitle: 'Order book', headSub: `${n} offer${n === 1 ? '' : 's'}`,
@@ -3797,10 +3796,13 @@ function renderBook(pay, receive){
   // cumulate from the mid outward; display asks high->low, bids high->low
   asks.sort((a, b) => a.price - b.price);
   { let c = 0; const t = asks.reduce((s, r) => s + r.size, 0) || 1; asks.forEach(r => { c += r.size; r.cum = c; r.frac = c / t; }); }
-  asks.reverse();
   bids.sort((a, b) => b.price - a.price);
   { let c = 0; const t = bids.reduce((s, r) => s + r.size, 0) || 1; bids.forEach(r => { c += r.size; r.cum = c; r.frac = c / t; }); }
-  asks = asks.slice(0, 8); bids = bids.slice(0, 8);
+  // Show the 8 offers NEAREST the mid (the BEST asks + BEST bids), never the farthest: asks is sorted
+  // ascending, so slice the 8 LOWEST then reverse for the high->low display (best ask sits right above
+  // the mid); bids are already best-first (descending). Previously the ask side reversed BEFORE slicing,
+  // so it showed the 8 HIGHEST asks and hid the best ones — visibly inconsistent with the spread/mid.
+  asks = asks.slice(0, 8); asks.reverse(); bids = bids.slice(0, 8);
   asks.forEach(r => r.onClick = () => fillFromOffer(r.id, r.maker, pay, receive));   // takeable
   LAST_MID = { price: mid, cross: false };
   renderLadder(host, {
