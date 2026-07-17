@@ -460,7 +460,15 @@ function findRoute(pay, receive){
     // Rail-agnostic (Stage 3): HONOR a chosen LN pay-leg even without a channel yet — review opens +
     // funds it inline on Place-order (reviewMixed/reviewLn provisioning), so "pay from Lightning" is a
     // preference, not gated on pre-existing liquidity. (No longer downgraded to 'chain' on !payLn.ok.)
-    const p = (ln && S.payRail === 'ln') ? 'ln' : 'chain';
+    // Pay-over-LN: a BTC pay-leg (a BUY) is funded inline on Place-order, so honor it unconditionally.
+    // Paying the ASSET over LN (a sub-asset SELL) instead LIFTS a resting sub-asset sell offer — there
+    // is no inline funding — so honor it only when such an offer exists (sellCapable) or the user has a
+    // real pay channel; otherwise degrade to the on-chain cross rail (which supports POSTING). Without
+    // this, an LN best-bid the auto-select picked but that has no takeable sub-asset offer (source
+    // mismatch, or the fire-and-forget sub-asset book not yet loaded) strands the user: requoteMixed
+    // disables Review and a mixed route isn't postable, so BOTH Review and Post are off.
+    const paySellServiceable = payIsBtc || (ra && ra.payLn.ok) || sellCapable(seqAsset);
+    const p = (ln && S.payRail === 'ln' && paySellServiceable) ? 'ln' : 'chain';
     // Receiving over LN normally needs a real inbound channel on that asset — EXCEPT the
     // sub-asset BUY (pay BTC on-chain, receive the asset over LN). There the LSP JIT-provisions
     // the user's inbound asset liquidity as part of the buy (provisionInbound), so recv=ln is
@@ -1027,7 +1035,10 @@ async function requote(){
       if (best && best.rail){
         if (best.rail === 'onchain'){ S.payRail = 'chain'; S.recvRail = 'chain'; }
         else if (side === 'buy'){ S.payRail = 'chain'; S.recvRail = 'ln'; }
-        else                    { S.payRail = 'ln';    S.recvRail = 'chain'; }
+        // Sell over LN only if a sub-asset sell offer is actually takeable; else keep the pay leg on
+        // chain (postable cross rail) so the LN best-bid doesn't strand the user. Upgrades to LN on a
+        // later requote once the sub-asset book loads.
+        else                    { S.payRail = sellCapable(seqAsset) ? 'ln' : 'chain'; S.recvRail = 'chain'; }
         try { paintRailSegs(); } catch {}
       }
     } catch {}
@@ -1488,6 +1499,31 @@ async function requoteMixed(route, amtStr){
     setReviewEnabled(true);
     return;
   }
+  // Sub-asset BUY (pay BTC on-chain, receive the asset over Lightning): like the sell, reviewMixed
+  // lifts the WHOLE resting sub-asset BUY offer at the maker's fixed terms (startBuy uses
+  // offer.asset_amount and ignores the typed amount). So quote off THAT offer — not the on-chain
+  // cross book — attach it, and show its exact BTC↔asset terms, so the displayed rate is what
+  // actually executes (fixes the price-honesty gap where the cross book and the lifted offer differ).
+  if (route.payRail === 'chain' && route.recvRail === 'ln' && route.payIsBtc && subassetCapable(route.seqAsset)){
+    const offer = subassetOffers(route.seqAsset, 'buy')[0] || null;
+    if (!offer){
+      $('swRate').textContent = `No resting BTC→${am.ticker} buy offer right now — try again shortly.`;
+      $('swRoute').textContent = 'Mixed rails · buy over Lightning, pay BTC on-chain';
+      setReviewEnabled(false); renderTiming(route); return;
+    }
+    const assetStr = C.fmtAtoms(BigInt(offer.asset_amount), am.precision || 0);
+    const btcStr = C.fmtAtoms(BigInt(offer.btc_sats), 8);
+    $('swRecvAmt').value = assetStr;
+    $('swPayAmt').value = btcStr;
+    $('swRate').textContent = `${btcStr} BTC → ${assetStr} ${am.ticker} · best resting offer`;
+    $('swRoute').textContent = 'Mixed rails · buy over Lightning, pay BTC on-chain';
+    paintFee('BTC', null, 'You pay BTC on-chain; the maker pays the ' + am.ticker + ' to your device over Lightning.');
+    LAST_QUOTE = { kind: 'mixed', route, seqAsset: route.seqAsset, payIsBtc: true,
+      payRail: 'chain', recvRail: 'ln', buyOffer: offer };
+    renderTiming(route);
+    setReviewEnabled(true);
+    return;
+  }
   await loadBtcBook(route);
   deriveXOpposite(route);
   const o = (XBOOK.offers || [])[0];
@@ -1666,16 +1702,20 @@ function renderXBook(seqAsset, payIsBtc, forward, reverse, unified){
     // whole units and sorted like the on-chain book. Clicking a level seeds the asset size
     // (rail-agnostic); the composer requotes on the user's chosen rail (the LSP bridges on take).
     const uRow = (o) => {
-      const assetU = Number(big(o.assetAtoms)) / Math.pow(10, am.precision || 0);
+      const atoms = big(o.assetAtoms);
+      const assetU = Number(atoms) / Math.pow(10, am.precision || 0);
       const btcU = Number(big(o.btcSats)) / 1e8;
-      return { price: assetU > 0 ? btcU / assetU : 0, size: assetU, rail: o.rail };
+      return { price: assetU > 0 ? btcU / assetU : 0, size: assetU, assetAtoms: atoms, rail: o.rail };
     };
     asks = (unified.asks || []).map(uRow).filter(r => r.price > 0 && r.size > 0);
     bids = (unified.bids || []).map(uRow).filter(r => r.price > 0 && r.size > 0);
     n = (unified.asks || []).length + (unified.bids || []).length;
     const seed = (r) => () => {
       const el = payIsBtc ? C.$('swRecvAmt') : C.$('swPayAmt');
-      if (el){ S.edited = payIsBtc ? 'receive' : 'pay'; el.value = trim(r.size); }
+      // Seed the EXACT atoms at the asset's own precision (like fillFromXOffer / commit 7d85b396's
+      // MED-4 fix), not an 8dp float trim() that can lose precision or emit more decimals than the
+      // asset supports.
+      if (el){ S.edited = payIsBtc ? 'receive' : 'pay'; el.value = C.fmtAtoms(r.assetAtoms, am.precision || 0); }
       LAST_QUOTE = null; setReviewEnabled(false); requote().catch(()=>{});
     };
     (payIsBtc ? asks : bids).forEach(r => r.onClick = seed(r));

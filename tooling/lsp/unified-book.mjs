@@ -15,7 +15,10 @@ const num = (v) => { const n = Number(v); return Number.isFinite(n) ? n : 0; };
 // side: 'ask' = an offer SELLING the asset (a taker BUYS it); 'bid' = an offer BUYING the asset (a
 // taker SELLS into it). rail: 'ln' | 'onchain'. price is BTC sats per asset atom (null if sizeless).
 function mk(side, rail, assetAtoms, btcSats, raw, meta) {
-  const price = assetAtoms > 0 ? btcSats / assetAtoms : null;
+  // Require BOTH legs positive: a zero/negative btcSats yields price <= 0, which would survive the
+  // `price == null` drop in mergeBook, sort to the TOP of asks, and get auto-selected by bestFor as
+  // "the best price". Null it so mergeBook discards the garbage offer.
+  const price = (assetAtoms > 0 && btcSats > 0) ? btcSats / assetAtoms : null;
   return {
     side, rail, assetAtoms, btcSats, price,
     id: (raw && (raw.offer_id || raw.offerId)) || null,
