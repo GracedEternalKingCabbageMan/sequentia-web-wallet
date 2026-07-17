@@ -1118,16 +1118,32 @@ function paintCostLine(){
   if (!LAST_QUOTE || !LAST_MID || !(LAST_MID.price > 0)) return;
   const payV = numVal(C.$('swPayAmt')), recvV = numVal(C.$('swRecvAmt'));
   if (!(payV > 0 && recvV > 0)) return;
+  const cross = !!LAST_MID.cross, payIsBtc = S.payAsset === 'BTC';
   // Effective price in the SAME units as the mid — same-chain mid is PAY per RECEIVE (renderBook),
   // cross mid is BTC per ASSET (paintQuoteCross); invert the field ratio for a cross sell.
-  const eff = LAST_MID.cross ? (S.payAsset === 'BTC' ? payV / recvV : recvV / payV) : (payV / recvV);
+  const eff = cross ? (payIsBtc ? payV / recvV : recvV / payV) : (payV / recvV);
   const mid = LAST_MID.price;
   if (!(eff > 0 && mid > 0) || !isFinite(eff)) return;
-  const pct = Math.abs(eff / mid - 1) * 100;
-  if (pct < 0.05){ el.textContent = 'at the mid price'; return; }
-  el.style.color = pct > 3 ? 'var(--amber2)' : '';
-  el.textContent = `≈ ${pct.toFixed(pct < 1 ? 2 : 1)}% spread cost vs mid`;
-  el.title = `You take at ~${trim(eff)} vs the ${trim(mid)} mid — the cost of filling now instead of resting an order at the mid price.`;
+  // DIRECTION matters: a lower effective price is better for the taker EXCEPT on a cross SELL, where
+  // you want MORE BTC per asset. betterWhenLower encodes that so we never mislabel a favorable price
+  // as a "cost". improvePct > 0 ⇒ better than mid; < 0 ⇒ you pay a premium (the real spread cost).
+  const betterWhenLower = cross ? payIsBtc : true;
+  const rawPct = (eff / mid - 1) * 100;                    // + ⇒ effective above mid
+  const improvePct = betterWhenLower ? -rawPct : rawPct;   // + ⇒ better for the taker
+  const mag = Math.abs(improvePct);
+  if (mag < 0.05){ el.textContent = 'at the mid price'; return; }
+  // A taker crossing the spread beats mid by at most the half-spread; a big deviation means the mid
+  // is unreliable (thin/wide book on testnet), so a vs-mid comparison would mislead — suppress it.
+  if (mag > 12) return;
+  if (improvePct > 0){
+    el.style.color = '#3ddc84';
+    el.textContent = `≈ ${mag.toFixed(mag < 1 ? 2 : 1)}% better than mid`;
+    el.title = `You take at ~${trim(eff)} vs the ${trim(mid)} mid — better than resting at the mid price.`;
+  } else {
+    el.style.color = 'var(--amber2)';
+    el.textContent = `≈ ${mag.toFixed(mag < 1 ? 2 : 1)}% spread cost vs mid`;
+    el.title = `You take at ~${trim(eff)} vs the ${trim(mid)} mid — the cost of filling now instead of resting at the mid price.`;
+  }
 }
 // A muted stand-in so the desk's LEFT (book) column is never a blank void before a pair
 // is chosen. Replaced by the live ladder the moment a pair + book load.
