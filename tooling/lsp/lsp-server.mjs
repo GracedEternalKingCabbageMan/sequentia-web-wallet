@@ -227,15 +227,70 @@ if (!CFG.hostedAssetRpc || !CFG.hostedBtcRpc) {
 }
 
 // In-memory async job store for over-cap mixed swaps (anchor-gated, minutes-long).
-// A restart drops in-flight jobs; the underlying swap is crash-safe via its own state
-// file (the taker persists P after paying), so recovery is by re-driving the CLI.
-const jobs = new Map();
+// Job store. A restart kills the in-process driver of every in-flight job, so the job
+// state is persisted to disk and reloaded on boot — but the DRIVER cannot be resurrected,
+// so on boot a still-running ('pending'/'held'/'accepted') job is marked 'interrupted'
+// rather than left looking live. That is the honest signal the wallet's client-side
+// reconcile needs: a poll returns 'interrupted' (re-drive / recover) instead of a bare 404
+// (which the client cannot distinguish from "never existed") OR a stale 'pending' that would
+// poll forever against a driver that is gone. The underlying swap stays crash-safe via its
+// own state file (the taker persists P after paying); this only fixes the STATUS surface.
 const JOB_TTL_MS = 6 * 60 * 60 * 1000; // reap finished jobs after 6h
+// Persist to the same durable dir as the hosted-fund registry (provDir). If provisioning is
+// disabled (no provDir) jobs stay in-memory only — exactly today's behavior, so no regression.
+const JOBS_FILE = CFG.provDir ? path.join(CFG.provDir, 'jobs.json') : '';
+const NON_TERMINAL = new Set(['pending', 'held', 'accepted', 'pending_deposit', 'confirming']);
+
+function loadJobs() {
+  const m = new Map();
+  if (!JOBS_FILE) return m;
+  let raw;
+  try { raw = fs.readFileSync(JOBS_FILE, 'utf8'); }
+  catch (e) { if (e && e.code === 'ENOENT') return m; console.error('[lsp] jobs.json unreadable, starting empty:', e && e.message); return m; }
+  let obj;
+  try { obj = JSON.parse(raw); } catch { console.error('[lsp] jobs.json corrupt, starting empty'); return m; }
+  const now = Date.now();
+  for (const [id, j] of Object.entries(obj && obj.jobs ? obj.jobs : {})) {
+    if (!j || typeof j !== 'object') continue;
+    if (j.done_ms && now - j.done_ms > JOB_TTL_MS) continue;   // don't resurrect long-finished jobs
+    if (NON_TERMINAL.has(j.status)) {
+      // The driver that would have advanced this job died with the old process.
+      j.status = 'interrupted';
+      j.interrupted = true;
+      j.error = j.error || 'the LSP restarted while this swap was in flight; its status could not be confirmed — recover via the wallet';
+      j.done_ms = j.done_ms || now;
+    }
+    m.set(id, j);
+  }
+  return m;
+}
+const jobs = loadJobs();
+if (JOBS_FILE) {
+  const n = jobs.size, intr = [...jobs.values()].filter((j) => j.interrupted).length;
+  if (n) console.error(`[lsp] loaded ${n} persisted job(s) from ${JOBS_FILE}${intr ? ` (${intr} marked interrupted after restart)` : ''}`);
+}
+
+function persistJobs() {
+  if (!JOBS_FILE) return;
+  // Synchronous atomic write (temp + rename). Jobs are low-frequency (a few per swap), the file is a
+  // few KB, and this is a durability feature — so we flush inline rather than debounce, leaving no
+  // window where a hard restart loses a just-created job (which is exactly what we must NOT lose).
+  try {
+    const tmp = JOBS_FILE + '.tmp';
+    fs.writeFileSync(tmp, JSON.stringify({ jobs: Object.fromEntries(jobs) }));
+    fs.renameSync(tmp, JOBS_FILE);
+  } catch (e) { console.error('[lsp] failed to persist jobs.json:', e && e.message); }
+}
+// Every mutation of `jobs` must go through these so the on-disk copy stays current.
+function setJob(id, job) { jobs.set(id, job); persistJobs(); return job; }
+
 function reapJobs() {
   const now = Date.now();
+  let changed = false;
   for (const [id, j] of jobs) {
-    if (j.done_ms && now - j.done_ms > JOB_TTL_MS) jobs.delete(id);
+    if (j.done_ms && now - j.done_ms > JOB_TTL_MS) { jobs.delete(id); changed = true; }
   }
+  if (changed) persistJobs();
 }
 
 const ASSET_ALIAS = { GOLD: CFG.gold, gold: CFG.gold, BTC: CFG.btcx };
@@ -843,10 +898,10 @@ function startSubasBuyHodl(body) {
     offer_id: body.offer_id || null, maker_pubkey: body.maker_pubkey || null,
     status: 'pending', held: false, settled: false,
     finality: 'confirming', anchor_bound: true, inbound: null, started_ms: Date.now() };
-  jobs.set(jobId, job);
-  runSubasBuyHodl(job, body).catch((e) => {
-    job.status = 'failed'; job.error = String((e && e.message) || e); job.done_ms = Date.now();
-  });
+  setJob(jobId, job);   // persist on creation so a restart sees it (as 'interrupted'), not a 404
+  runSubasBuyHodl(job, body)
+    .catch((e) => { job.status = 'failed'; job.error = String((e && e.message) || e); job.done_ms = Date.now(); })
+    .finally(() => persistJobs());   // capture the terminal state (settled/failed) on disk
   return { ...job, ok: true, held: false, poll: `/swap/${jobId}`,
     note: 'Sub-asset HODL buy: poll GET /swap/<job_id>; when held:true, settle via /node/settle to release P and let the maker claim your BTC.' };
 }
@@ -1720,10 +1775,10 @@ const server = http.createServer(async (req, res) => {
       const job = { job_id: jobId, status: 'confirming', side, asset: body.asset,
         rail: 'mixed', pay_rail: payRail, recv_rail: recvRail, finality: 'confirming',
         requested_amount: body.amount ?? null, started_ms: Date.now() };
-      jobs.set(jobId, job);
+      setJob(jobId, job);   // persist on creation (a restart sees 'interrupted', not a 404)
       runMixed({ ...body, payRail, recvRail })
-        .then((r) => jobs.set(jobId, { ...job, ...r, status: r.ok ? 'settled' : 'failed', done_ms: Date.now() }))
-        .catch((e) => jobs.set(jobId, { ...job, status: 'failed', error: String((e && e.message) || e), done_ms: Date.now() }));
+        .then((r) => setJob(jobId, { ...job, ...r, status: r.ok ? 'settled' : 'failed', done_ms: Date.now() }))
+        .catch((e) => setJob(jobId, { ...job, status: 'failed', error: String((e && e.message) || e), done_ms: Date.now() }));
       return send(res, 202, { ...job, ok: true,
         poll: `/swap/${jobId}`,
         note: 'over the 0-conf cap: the on-chain leg is anchor-gated to Bitcoin (several blocks). '
