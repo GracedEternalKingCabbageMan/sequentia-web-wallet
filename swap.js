@@ -318,10 +318,13 @@ function applyComposeDerivation(pay, receive, price){
 }
 
 // Re-render the whole composer for the current wallet/markets/state.
-// B3/D4 (live market data): while the Swap tab is visible, periodically refresh the READ-ONLY market
-// surfaces — recent trades + 24h stats when a pair is chosen, else the markets overview — so the desk
-// feels live. Deliberately does NOT auto-requote the composer (that would risk disrupting a quote or
-// input the user is reading); the terms-verify abort already guards a stale price at execution time.
+// B3/D4 (live market data): the order book itself now streams over a WS (startLiveBook) — the ladder
+// and the cost-vs-mid line tick in real time as offers appear/expire, and the header shows "· live".
+// This 15s timer is the fallback + the READ-ONLY surfaces the stream doesn't carry: recent trades +
+// 24h stats when a pair is chosen, else the markets overview. It (and the live stream) DELIBERATELY do
+// NOT auto-requote the composer — that would risk moving an amount the user is reading or about to
+// place; the terms-verify abort already guards a stale price at execution time (B3), so the composer
+// stays put while everything around it stays live.
 let _liveTimer = null;
 function startLiveData(){
   if (_liveTimer) return;
@@ -1277,6 +1280,9 @@ function applyOffersToBook(allOffers, pay, receive){
 let _liveBook = null;   // { relay, key, pay, receive, offers: Map<maker:offerId, offer>, timer, retryTimer }
 function _liveKey(pay, receive){ return pay + '␟' + receive; }
 function _liveOid(o){ return (o.maker_pubkey||o.makerPubkey)+':'+(o.offer_id||o.offerId); }
+// True when the live WS book is currently connected for the pair on screen — drives the "· live"
+// header hint so a user can tell the ladder is streaming, not a stale poll snapshot.
+function liveBookOn(){ return !!(_liveBook && _liveBook.connected && _liveBook.pay === S.payAsset && _liveBook.receive === S.receiveAsset); }
 function stopLiveBook(){
   const lb = _liveBook;
   if (!lb) return;
@@ -1291,7 +1297,7 @@ function startLiveBook(pay, receive){
   if (_liveBook && _liveBook.key === key) return;   // already streaming this pair (no reopen on keystrokes)
   stopLiveBook();
   const offers = new Map();
-  const lb = { relay: null, key, pay, receive, offers, timer: null, retryTimer: null };
+  const lb = { relay: null, key, pay, receive, offers, timer: null, retryTimer: null, connected: false };
   // Live only while THIS pair is still the selected transparent-book pair and the tab is visible.
   const stillLive = () => {
     if (_liveBook !== lb || isConfBook()) return false;
@@ -1299,19 +1305,23 @@ function startLiveBook(pay, receive){
     const host = C.$('swBook'); return !!(host && host.offsetParent !== null);
   };
   // Coalesce bursts (a maker re-post is a remove+create pair; the covenant book has dozens of rows)
-  // into at most ~3 re-renders/sec, and only when this pair is still live.
-  const rebuild = () => { lb.timer = null; if (stillLive()) applyOffersToBook([...offers.values()], pay, receive); };
+  // into at most ~3 re-renders/sec, and only when this pair is still live. After the ladder re-renders
+  // (which recomputes LAST_MID), repaint the cost-vs-mid line (T6 freshness) so the "N% vs mid" figure
+  // tracks the moving book. Display-only: paintCostLine reads the composer's amounts + the fresh mid
+  // and writes one label — it never re-derives or moves an amount field (B1).
+  const rebuild = () => { lb.timer = null; if (!stillLive()) return; applyOffersToBook([...offers.values()], pay, receive); try { paintCostLine(); } catch {} };
   const schedule = () => { if (!lb.timer) lb.timer = setTimeout(rebuild, 300); };
   const connect = () => {
     lb.relay = seqob.openRelay(
       [{ base_asset: receive, quote_asset: pay }, { base_asset: pay, quote_asset: receive }],
       {
-        onOpen: () => { offers.clear(); },   // a (re)connect delivers a fresh snapshot; drop stale rows first
+        onOpen: () => { offers.clear(); lb.connected = true; schedule(); },   // fresh snapshot incoming; drop stale rows, mark live
         onBook: (b) => { for (const o of (b.offers||[])) offers.set(_liveOid(o), o); schedule(); },
         onOfferCreated: (o) => { offers.set(_liveOid(o), o); schedule(); },
         onOfferRemoved: (r) => { offers.delete(_liveOid(r)); schedule(); },
         onError: () => {},   // silent: the REST snapshot already rendered + the 15s poll is the fallback
         onClose: () => {     // relay restarted / dropped: reconnect while this pair is still on-screen
+          lb.connected = false;
           if (_liveBook !== lb || lb.retryTimer) return;
           if (!stillLive()) return;   // hidden/changed: let renderSwap+requoteSame re-establish on return
           lb.retryTimer = setTimeout(() => { lb.retryTimer = null; if (stillLive()) connect(); }, 3000);
@@ -3797,7 +3807,7 @@ function renderBook(pay, receive){
     asks, bids, mid, spread,
     priceLabel: `(${pm.ticker}/${rm.ticker})`, sizeLabel: rm.ticker,
     refMidStr: oneUnitRefStr(receive),
-    headTitle: 'Order book', headSub: `${(BOOK.offers || []).length} offer${(BOOK.offers || []).length === 1 ? '' : 's'}`,
+    headTitle: 'Order book', headSub: `${(BOOK.offers || []).length} offer${(BOOK.offers || []).length === 1 ? '' : 's'}${liveBookOn() ? ' · live' : ''}`,
     emptyMsg: 'No resting offers - enter an amount and Review to start this market.',
   });
   renderPairBar();
