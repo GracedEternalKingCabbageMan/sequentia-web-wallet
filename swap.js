@@ -1093,17 +1093,42 @@ async function requote(){
   // LN / mixed / no-route are take-only; keep the mode control honest before we quote.
   if (!postSupported(route)) S.mode = 'take';
   paintModeSeg();
-  if (!route){ setReviewEnabled(false); clearOpposite(); clearBook(); return; }
+  if (!route){ setReviewEnabled(false); clearOpposite(); clearBook(); paintCostLine(); return; }
   const amtStr = typedAmount(S.edited);
   // Do NOT bail on an empty amount: the quote functions fetch and RENDER the ONE
   // order book first (so it is visible the moment a pair is chosen, on EVERY rail),
   // then quote only if an amount is present.
-  if (route.kind === 'ln')    return requoteLn(route, amtStr);
-  if (route.kind === 'cross') return requoteCross(route, amtStr);
-  if (route.kind === 'mixed') return requoteMixed(route, amtStr);
-  return requoteSame(route, amtStr);
+  try {
+    if (route.kind === 'ln')         await requoteLn(route, amtStr);
+    else if (route.kind === 'cross') await requoteCross(route, amtStr);
+    else if (route.kind === 'mixed') await requoteMixed(route, amtStr);
+    else                             await requoteSame(route, amtStr);
+  } finally { try { paintCostLine(); } catch {} }   // E2: the one cost line, after any rail quotes
 }
 function clearBook(){ renderBookPlaceholder(); renderPairBar(); }
+// E2: ONE honest cost line. A taker always crosses the spread, so surface that as a positive
+// magnitude vs the book mid (direction-safe — avoids a confusing "above/below" that flips between
+// buy and sell): the price you take NOW vs resting an order at mid. Only in take mode with a live
+// mid + both amounts; cleared otherwise. The network fee (in the reference currency) is already
+// shown on the fee row, so this line is specifically the spread/immediacy cost the rate line hides.
+function paintCostLine(){
+  const el = C.$('swCost'); if (!el) return;
+  el.textContent = ''; el.title = ''; el.style.color = '';
+  if (S.mode === 'post') return;                              // limit order: you set the price
+  if (!LAST_QUOTE || !LAST_MID || !(LAST_MID.price > 0)) return;
+  const payV = numVal(C.$('swPayAmt')), recvV = numVal(C.$('swRecvAmt'));
+  if (!(payV > 0 && recvV > 0)) return;
+  // Effective price in the SAME units as the mid — same-chain mid is PAY per RECEIVE (renderBook),
+  // cross mid is BTC per ASSET (paintQuoteCross); invert the field ratio for a cross sell.
+  const eff = LAST_MID.cross ? (S.payAsset === 'BTC' ? payV / recvV : recvV / payV) : (payV / recvV);
+  const mid = LAST_MID.price;
+  if (!(eff > 0 && mid > 0) || !isFinite(eff)) return;
+  const pct = Math.abs(eff / mid - 1) * 100;
+  if (pct < 0.05){ el.textContent = 'at the mid price'; return; }
+  el.style.color = pct > 3 ? 'var(--amber2)' : '';
+  el.textContent = `≈ ${pct.toFixed(pct < 1 ? 2 : 1)}% spread cost vs mid`;
+  el.title = `You take at ~${trim(eff)} vs the ${trim(mid)} mid — the cost of filling now instead of resting an order at the mid price.`;
+}
 // A muted stand-in so the desk's LEFT (book) column is never a blank void before a pair
 // is chosen. Replaced by the live ladder the moment a pair + book load.
 function renderBookPlaceholder(){
