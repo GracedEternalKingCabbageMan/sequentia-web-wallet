@@ -1315,21 +1315,25 @@ function startLiveBook(pay, receive){
   // and writes one label — it never re-derives or moves an amount field (B1).
   const rebuild = () => { lb.timer = null; if (!stillLive()) return; applyOffersToBook([...offers.values()], pay, receive); try { paintCostLine(); } catch {} };
   const schedule = () => { if (!lb.timer) lb.timer = setTimeout(rebuild, 300); };
+  // Retry a failed/dropped connection with a bounded 3s backoff, but only while this pair is still on
+  // screen. Used by BOTH onError (the WS never opened) and onClose (it dropped) — the retryTimer guard
+  // dedups the two. Without the onError retry, a WS that never connects would leave the ladder frozen at
+  // the initial REST snapshot with no live updates (there is no separate book poll fallback).
+  const scheduleReconnect = () => {
+    lb.connected = false;
+    if (_liveBook !== lb || lb.retryTimer || !stillLive()) return;
+    lb.retryTimer = setTimeout(() => { lb.retryTimer = null; if (stillLive()) connect(); }, 3000);
+  };
   const connect = () => {
     lb.relay = seqob.openRelay(
       [{ base_asset: receive, quote_asset: pay }, { base_asset: pay, quote_asset: receive }],
       {
-        onOpen: () => { offers.clear(); lb.connected = true; schedule(); },   // fresh snapshot incoming; drop stale rows, mark live
+        onOpen: () => { offers.clear(); lb.connected = true; },   // fresh snapshot incoming; onBook schedules the render (a schedule() here could rebuild a blank map)
         onBook: (b) => { for (const o of (b.offers||[])) offers.set(_liveOid(o), o); schedule(); },
         onOfferCreated: (o) => { offers.set(_liveOid(o), o); schedule(); },
         onOfferRemoved: (r) => { offers.delete(_liveOid(r)); schedule(); },
-        onError: () => {},   // silent: the REST snapshot already rendered + the 15s poll is the fallback
-        onClose: () => {     // relay restarted / dropped: reconnect while this pair is still on-screen
-          lb.connected = false;
-          if (_liveBook !== lb || lb.retryTimer) return;
-          if (!stillLive()) return;   // hidden/changed: let renderSwap+requoteSame re-establish on return
-          lb.retryTimer = setTimeout(() => { lb.retryTimer = null; if (stillLive()) connect(); }, 3000);
-        },
+        onError: scheduleReconnect,
+        onClose: scheduleReconnect,   // relay restarted / dropped: reconnect while this pair is still on-screen
       });
   };
   _liveBook = lb;
@@ -1342,9 +1346,11 @@ function startLiveBook(pay, receive){
 // rests on-chain and fills whenever it is crossed — even while the wallet is closed.
 // The book still renders on the left (any resting orders); clicking a level seeds
 // the fields. There is NO take-vs-post distinction — the matcher crosses the order.
+let _reqSameGen = 0;   // supersession guard: a newer requoteSame invalidates an older one's in-flight book fetch
 async function requoteSame(route, amtStr){
   const { $ } = C;
   const pay = route.pay, receive = route.receive;
+  const myGen = ++_reqSameGen;
   const status = $('swStatus');
   status.className = 'status'; status.innerHTML = '<span class="spin"></span>Loading the order book…';
   $('swErr').textContent = '';
@@ -1361,6 +1367,10 @@ async function requoteSame(route, amtStr){
                  reachErr = e; return { offers: [] }; }                            // network/5xx: unreachable
     };
     const [b1, b2] = await Promise.all([ safeBook(receive, pay), safeBook(pay, receive) ]);
+    // Supersession: if a newer requoteSame started (user switched pair) while our two fetches were in
+    // flight, bail — rendering now would paint this stale pair's ladder over the new one AND point the
+    // live WS subscription at the wrong pair (out-of-order resolution). The newer call owns the render.
+    if (myGen !== _reqSameGen) return;
     // Split into asks (liftable: give `receive`, want `pay`) + the opposite side (feeds spread/mid +
     // the depth display), expiry- and signature-filtered, best-price-first. Shared with the live WS
     // book so a REST snapshot and a pushed delta render an identical ladder (see applyOffersToBook).
@@ -2695,13 +2705,10 @@ async function placeCovenantReview(q){
 async function reviewMixed(q){
   const { $ } = C;
   if (!L || !L.swap){ $('swErr').textContent = 'The mixed (Lightning + on-chain) route needs the Lightning service, which is unavailable in this build.'; return; }
-  // FUND-SAFETY (see reviewCross): one mixed/submarine swap at a time. Its on-chain HTLC leg is
-  // persisted under a single key and recoverable only via Refund; starting another would overwrite and
-  // strand it. Require finishing or refunding the current one first.
-  if (hasMixedInFlight()){
-    $('swErr').textContent = 'You already have a Lightning + on-chain swap in progress. Finish or refund it first (open it under Active trades) before starting another.';
-    return;
-  }
+  // FUND-SAFETY (see reviewCross): the submarine (MIXED), the sub-asset BUY (BUY) and the sub-asset
+  // SELL (SELL) each persist their on-chain HTLC leg under a SINGLE localStorage key, recoverable only
+  // via Refund — so starting a second of the SAME kind overwrites and strands it. The per-kind guard is
+  // below, once we know which shape this is (the earlier mixed-only guard missed buy + sell).
   const am = C.assetMeta(q.seqAsset);
   const side = q.payIsBtc ? 'buy' : 'sell';            // buy the asset (pay BTC) / sell it (pay the asset)
   // Which leg is the ASSET, which is BTC.
@@ -2714,6 +2721,12 @@ async function reviewMixed(q){
   // claims with the maker-revealed preimage. Gated on live sell-side book liquidity.
   const isSubAssetSell = (side === 'sell' && assetLeg === 'ln' && btcLeg === 'chain');
   const isSubmarine = (assetLeg === 'chain' && btcLeg === 'ln');
+  // Per-kind in-flight guard (fund-safety): refuse a second swap of the SAME kind (its single-key
+  // recovery handle would be overwritten). startMixed/startBuy/startSell also self-guard below.
+  if ((isSubmarine && hasMixedInFlight()) || (isSubAsset && hasBuyInFlight()) || (isSubAssetSell && hasSellInFlight())){
+    $('swErr').textContent = 'You already have a swap of this kind in progress. Finish or refund it first (open it under Active trades) before starting another.';
+    return;
+  }
   // Rail-agnostic (Stage 3): don't pre-block on a live maker (subassetCapable/sellCapable) — the
   // rail is a settlement preference. Any recognized mixed shape proceeds; the settlement router
   // decides + bridges on Place-order and fails closed CLEANLY (refundable) if there's no
@@ -2828,6 +2841,8 @@ export function hasSellInFlight(){ return !!(SELL && SELL.state === 'claiming');
 async function startSell(params){
   const { $ } = C;
   const asset = params.asset, am = C.assetMeta(asset);
+  // FUND-SAFETY self-guard: a second sell would overwrite SELL (the single-key handle to the BTC claim).
+  if (hasSellInFlight()){ if (C.toast) C.toast('You already have a sub-asset sell in progress (claiming your BTC) — finish or refund it first under Active trades.'); return; }
   const modal = C.el('div','modal'); const card = C.el('div','card');
   card.appendChild(C.el('label','lbl','Selling ' + am.ticker + ' over Lightning'));
   const st = C.el('div','status'); card.appendChild(st);
@@ -2936,6 +2951,8 @@ async function startBuy(params){
   const { $ } = C;
   const asset = params.asset, am = C.assetMeta(asset);
   const offer = params.offer || null;
+  // FUND-SAFETY self-guard: a second buy would overwrite BUY (the single-key handle to the locked BTC).
+  if (hasBuyInFlight()){ if (C.toast) C.toast('You already have a sub-asset buy in progress (Bitcoin locked) — finish or refund it first under Active trades.'); return; }
   const modal = C.el('div','modal'); const card = C.el('div','card');
   card.appendChild(C.el('label','lbl','Buying ' + am.ticker + ' over Lightning'));
   const st = C.el('div','status'); card.appendChild(st);
@@ -2964,8 +2981,15 @@ async function startBuy(params){
     let assetAtoms = wholeAsset, btcSats = wholeBtc;
     const reqBtcSats = (params.amount != null && Number(params.amount) > 0) ? Math.round(Number(params.amount) * 1e8) : 0;
     if (reqBtcSats > 0 && reqBtcSats < wholeBtc){
-      assetAtoms = Math.max(1, Math.floor(wholeAsset * reqBtcSats / wholeBtc));
-      btcSats = Math.ceil(wholeBtc * assetAtoms / wholeAsset);   // proportional, rounded up (== maker's requirement)
+      // BigInt, NOT float: the price must EXACTLY equal the maker's integer ProportionalBtc(ceil). A
+      // float multiply overflows 2^53 for large offers and diverged by +1 in ~0.6% of cases, so the
+      // maker would reject AFTER the BTC HTLC is funded → stranded until the CLTV refund. assetAtoms =
+      // floor slice of the entered BTC; btcSats = ceil(wholeBtc*assetAtoms/wholeAsset) = the maker's need.
+      const bW = BigInt(wholeAsset), bB = BigInt(wholeBtc);
+      let a = (bW * BigInt(reqBtcSats)) / bB;   // floor
+      if (a < 1n) a = 1n;
+      assetAtoms = Number(a);
+      btcSats = Number(ceilDiv(bB * a, bW));
     }
     // Bring our asset LN node's device signer ONLINE so it can register + settle the HODL invoice.
     if (L.connectNode){
@@ -3978,6 +4002,9 @@ async function renderMyOrders(){
   // On a fetch error, leave whatever is already rendered rather than blanking the panel (a transient
   // relay blip should not make your resting orders vanish from the UI).
   try { orders = await seqob.fetchMyOrders(makerPubHex()); } catch { if (credits) host.innerHTML = credits; return; }
+  // D2/T13: prune fill-progress for orders no longer resting, so a stale entry can't paint a wrong
+  // "~N% filled" if the relay ever re-uses an offer_id.
+  { const live = new Set(orders.map(o => o.offer_id || o.offerId)); for (const k of Object.keys(_ordStatus)) if (!live.has(k)) delete _ordStatus[k]; }
   if (!orders.length){ host.innerHTML = credits; return; }
   const rows = orders.map(o => {
     const give = C.assetMeta(o.offer_asset||o.offerAsset), want = C.assetMeta(o.want_asset||o.wantAsset);

@@ -164,29 +164,36 @@ export async function openCourierSession(offer, takeAtoms, feeAsset, opts){
     ws.onerror = () => reject(new Error('could not reach the order-book relay'));
   });
 
-  t.send({ start_lift: {
-    offer_id: offerId,
-    maker_pubkey: makerPubHex,
-    take_amount: String(takeAtoms),
-    taker_fee_asset: feeAsset || '',
-    taker_session_pubkey: b64encode(sessPub),
-  }});
+  // Once the socket is open, close it on ANY error path — a rejected/mismatched lift used to leak the
+  // WebSocket, and the retry-down-the-book loop multiplies that by the candidate count per take.
+  try {
+    t.send({ start_lift: {
+      offer_id: offerId,
+      maker_pubkey: makerPubHex,
+      take_amount: String(takeAtoms),
+      taker_fee_asset: feeAsset || '',
+      taker_session_pubkey: b64encode(sessPub),
+    }});
 
-  let la = null;
-  for (let n = 0; n < 8 && !la; n++){
-    const m = await t.recv(20000);
-    if (m && m.error) throw new Error('relay: ' + (m.error.message || JSON.stringify(m.error)));
-    if (m && (m.lift_accepted || m.liftAccepted)) la = m.lift_accepted || m.liftAccepted;
+    let la = null;
+    for (let n = 0; n < 8 && !la; n++){
+      const m = await t.recv(20000);
+      if (m && m.error) throw new Error('relay: ' + (m.error.message || JSON.stringify(m.error)));
+      if (m && (m.lift_accepted || m.liftAccepted)) la = m.lift_accepted || m.liftAccepted;
+    }
+    if (!la) throw new Error('relay did not accept the lift');
+
+    const echo = la.maker_session_pubkey || la.makerSessionPubkey;
+    if (echo && b64encode(hexToBytes(makerPubHex)) !== echo)
+      throw new Error('relay returned a mismatched maker key (possible MITM); aborting');
+
+    const crypter = await Crypter.fromECDH(sessPriv, hexToBytes(makerPubHex));
+    const sessionId = la.session_id || la.sessionId;
+    return new CourierSession(crypter, sessionId, t);
+  } catch (e){
+    try { ws.close(); } catch {}
+    throw e;
   }
-  if (!la) throw new Error('relay did not accept the lift');
-
-  const echo = la.maker_session_pubkey || la.makerSessionPubkey;
-  if (echo && b64encode(hexToBytes(makerPubHex)) !== echo)
-    throw new Error('relay returned a mismatched maker key (possible MITM); aborting');
-
-  const crypter = await Crypter.fromECDH(sessPriv, hexToBytes(makerPubHex));
-  const sessionId = la.session_id || la.sessionId;
-  return new CourierSession(crypter, sessionId, t);
 }
 
 // ---------------------------------------------------------------------------
