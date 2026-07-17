@@ -308,10 +308,29 @@ async function fetchXquoteCourier(seqAsset, seqAtoms){
   const price = best.wa > 0n ? Number(best.ba) / Number(best.wa) : 0;
   const market = XMARKETS.find(m => m.seq_asset === seqAsset) ||
     { btc_asset: '', seq_asset: seqAsset, name: 'BTC / ' + C.assetMeta(seqAsset).ticker, price_seq_per_btc: price };
+  // T4 retry-down-the-book: rank the OTHER forward offers (same whole-HTLC preference) as PRE-LOCK
+  // fallbacks, so if best's maker is unreachable the wizard tries the next resting offer instead of
+  // dead-ending. Bounded to a few, and to offers no more than PRICE_TOL worse than best in BTC-per-asset
+  // (want/base) — never silently route the taker to a materially worse price. The confirm-lock modal
+  // still shows the actual terms before anything is spent, and each is taken whole (its own size).
+  const oid = (o) => pick(o, 'offer_id', 'offerId');
+  const bestBtcPerAsset = best.ba > 0n ? Number(best.wa) / Number(best.ba) : Infinity;
+  const RETRY_MAX = 3, PRICE_TOL = 0.02;
+  const candidates = [];
+  let pool = fwd.filter(o => oid(o) !== oid(best.o));
+  while (candidates.length < RETRY_MAX && pool.length){
+    const c = bestForwardOffer(pool, seqAtoms);
+    if (!c) break;
+    pool = pool.filter(o => oid(o) !== oid(c.o));
+    const cBtcPerAsset = c.ba > 0n ? Number(c.wa) / Number(c.ba) : Infinity;
+    if (bestBtcPerAsset > 0 && isFinite(bestBtcPerAsset) && cBtcPerAsset > bestBtcPerAsset * (1 + PRICE_TOL)) continue;   // too pricey; skip, keep scanning
+    candidates.push({ offer: c.o, seq_amount: c.ba, btc_amount: c.wa,
+      price_seq_per_btc: c.wa > 0n ? Number(c.ba) / Number(c.wa) : 0 });
+  }
   return {
     market, offer: best.o, courier: true, quote_id: 'courier',
     seq_amount: best.ba, btc_amount: best.wa, fee_btc: 0n,
-    price_seq_per_btc: price,
+    price_seq_per_btc: price, candidates,
     maker_btc_claim_pub: '', maker_seq_refund_pub: '', btc_locktime: 0, seq_locktime: 0, expires_at_unix: 0,
   };
 }
@@ -366,9 +385,8 @@ async function runForwardCourier(q){
   const { $ } = C;
   if ($('xswapErr')) $('xswapErr').textContent = '';
   if (!C.btcLeg){ if ($('xswapErr')) $('xswapErr').textContent = 'BTC leg unavailable in this build.'; return; }
-  const offer = q.offer;
+  let offer = q.offer;              // rebound to the actually-taken offer if a fallback wins (T4)
   const sm = C.assetMeta(q.market.seq_asset);
-  const takeAtoms = q.seq_amount;   // whole-HTLC: the resting offer's full size
 
   // In-memory progress SWAP so the stepper renders during the pre-lock phase; it
   // is NOT persisted until real BTC is committed (so a reload before lock just
@@ -385,40 +403,72 @@ async function runForwardCourier(q){
 
   let session = null;
   try {
-    session = await xc.openCourierSession(offer, takeAtoms, '');
-    XSESSION = session;
-    await session.send({ type: xc.XcType.TermsRequest });
-    setStepStatus('terms', 'Waiting for the maker’s terms…', true);
-    const terms = await session.recv(xc.XcType.Terms, 120000);
+    // PRE-LOCK retry (T4 retry-down-the-book): try the quoted offer, then the price-bounded fallbacks —
+    // each is open-a-courier-session + confirm-the-maker's-terms, FAIL-FAST so a dead maker can't hang
+    // the taker. The first offer whose terms verify wins and proceeds to the single lock below. This
+    // ENTIRE loop commits NO funds: nothing is spent until lockBtcLeg, which is reached exactly once,
+    // AFTER the loop — so trying the next resting offer on an unreachable/misquoting maker is always
+    // fund-safe (there is no path that retries after a lock). Each fallback is taken whole (its own size),
+    // and confirmLockModal below shows the ACTUAL chosen terms before any BTC moves.
+    const PRELOCK_TERMS_MS = 30000;   // a co-sign-ready maker answers in seconds; 30s ⇒ move on, don't hang 2 min
+    const attempts = [{ offer, seq_amount: big(q.seq_amount), btc_amount: big(q.btc_amount) }].concat(
+      (q.candidates || []).map(c => ({ offer: c.offer, seq_amount: big(c.seq_amount), btc_amount: big(c.btc_amount) })));
+    let fq = null, lastErr = null;
+    for (let i = 0; i < attempts.length; i++){
+      const at = attempts[i], atOffer = at.offer, atSeq = at.seq_amount, atBtc = at.btc_amount;
+      let s = null;
+      try {
+        if (i > 0) setStepStatus('terms', `That maker didn’t respond; trying the next resting offer (${i}/${attempts.length - 1})…`, true);
+        s = await xc.openCourierSession(atOffer, atSeq, '');
+        XSESSION = s;
+        await s.send({ type: xc.XcType.TermsRequest });
+        setStepStatus('terms', i > 0 ? 'Waiting for the next maker’s terms…' : 'Waiting for the maker’s terms…', true);
+        const terms = await s.recv(xc.XcType.Terms, PRELOCK_TERMS_MS);
 
-    // Bind the maker's terms to the offer we chose (never fund on a mismatch).
-    const tSeq = big(pick(terms, 'seq_amount', 'seqAmount'));
-    const tBtc = big(pick(terms, 'btc_amount', 'btcAmount'));
-    const tFee = big(pick(terms, 'fee_btc', 'feeBtc') || 0);
-    const bl = Number(pick(terms, 'btc_locktime', 'btcLocktime'));
-    const sl = Number(pick(terms, 'seq_locktime', 'seqLocktime'));
-    const makerBtcClaimPub = pick(terms, 'maker_btc_claim_pub', 'makerBtcClaimPub');
-    const makerSeqRefundPub = pick(terms, 'maker_refund_pub', 'makerRefundPub');
-    if (tBtc !== q.btc_amount)
-      throw abortTerms(session, `the maker quoted ${C.fmtAtoms(tBtc,8)} BTC, not the offered ${C.fmtAtoms(q.btc_amount,8)} BTC`);
-    if (tSeq !== q.seq_amount)
-      throw abortTerms(session, `the maker quoted ${C.fmtAtoms(tSeq, sm.precision)} ${sm.ticker}, not the offered ${C.fmtAtoms(q.seq_amount, sm.precision)} ${sm.ticker}`);
-    if (!makerBtcClaimPub || !makerSeqRefundPub)
-      throw abortTerms(session, 'the maker’s terms were missing a key');
-    if (!(bl > sl))
-      throw abortTerms(session, `bad locktime ordering (T_btc ${bl} must exceed T_seq ${sl})`);
-    // Fee sanity: never accept a maker fee above ~1% of the trade (defends against
-    // a maker quoting a punitive fee once the session is open).
-    if (tFee > (q.btc_amount / 100n) + 1000n)
-      throw abortTerms(session, `the maker fee ${C.fmtAtoms(tFee,8)} BTC is too high`);
+        // Bind the maker's terms to THIS attempt's offer + amounts (never fund on a mismatch).
+        const tSeq = big(pick(terms, 'seq_amount', 'seqAmount'));
+        const tBtc = big(pick(terms, 'btc_amount', 'btcAmount'));
+        const tFee = big(pick(terms, 'fee_btc', 'feeBtc') || 0);
+        const bl = Number(pick(terms, 'btc_locktime', 'btcLocktime'));
+        const sl = Number(pick(terms, 'seq_locktime', 'seqLocktime'));
+        const makerBtcClaimPub = pick(terms, 'maker_btc_claim_pub', 'makerBtcClaimPub');
+        const makerSeqRefundPub = pick(terms, 'maker_refund_pub', 'makerRefundPub');
+        if (tBtc !== atBtc)
+          throw abortTerms(s, `the maker quoted ${C.fmtAtoms(tBtc,8)} BTC, not the offered ${C.fmtAtoms(atBtc,8)} BTC`);
+        if (tSeq !== atSeq)
+          throw abortTerms(s, `the maker quoted ${C.fmtAtoms(tSeq, sm.precision)} ${sm.ticker}, not the offered ${C.fmtAtoms(atSeq, sm.precision)} ${sm.ticker}`);
+        if (!makerBtcClaimPub || !makerSeqRefundPub)
+          throw abortTerms(s, 'the maker’s terms were missing a key');
+        if (!(bl > sl))
+          throw abortTerms(s, `bad locktime ordering (T_btc ${bl} must exceed T_seq ${sl})`);
+        // Fee sanity: never accept a maker fee above ~1% of the trade (defends against
+        // a maker quoting a punitive fee once the session is open).
+        if (tFee > (atBtc / 100n) + 1000n)
+          throw abortTerms(s, `the maker fee ${C.fmtAtoms(tFee,8)} BTC is too high`);
 
-    const fq = {
-      market: q.market, quote_id: 'courier',
-      seq_amount: q.seq_amount, btc_amount: q.btc_amount, fee_btc: tFee,
-      maker_btc_claim_pub: makerBtcClaimPub, maker_seq_refund_pub: makerSeqRefundPub,
-      btc_locktime: bl, seq_locktime: sl,
-    };
-    SWAP.fee_btc = tFee; SWAP.btc_locktime = bl; SWAP.seq_locktime = sl; renderStepper();
+        // Pre-lock handshake succeeded: bind the wizard to THIS offer + amounts and proceed to the lock.
+        session = s; offer = atOffer;
+        SWAP.offer_id = atOffer.offer_id || atOffer.offerId;
+        SWAP.maker_pubkey = atOffer.maker_pubkey || atOffer.makerPubkey;
+        SWAP.seq_amount = atSeq; SWAP.btc_amount = atBtc;
+        fq = {
+          market: q.market, quote_id: 'courier',
+          seq_amount: atSeq, btc_amount: atBtc, fee_btc: tFee,
+          maker_btc_claim_pub: makerBtcClaimPub, maker_seq_refund_pub: makerSeqRefundPub,
+          btc_locktime: bl, seq_locktime: sl,
+        };
+        SWAP.fee_btc = tFee; SWAP.btc_locktime = bl; SWAP.seq_locktime = sl; renderStepper();
+        break;
+      } catch (e){
+        lastErr = e; try { s && s.close(); } catch {}   // pre-lock only — nothing spent; fall to the next offer
+      }
+    }
+    if (!fq){
+      const tried = attempts.length > 1 ? ` (tried ${attempts.length} resting offers)` : '';
+      if ($('xswapErr')) $('xswapErr').textContent = 'No maker completed the handshake' + tried + ': ' + ((lastErr && lastErr.message) || 'no response') + ' Nothing was spent - try again in a moment.';
+      SWAP = null; renderStepper(); if (C.onExit) C.onExit();
+      return;
+    }
 
     // One confirmation before real BTC moves (never blind-lock), then auto-drive.
     const okConfirm = await confirmLockModal(fq, sm);
