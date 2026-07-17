@@ -1103,7 +1103,14 @@ async function requote(){
     else if (route.kind === 'cross') await requoteCross(route, amtStr);
     else if (route.kind === 'mixed') await requoteMixed(route, amtStr);
     else                             await requoteSame(route, amtStr);
-  } finally { try { paintCostLine(); } catch {} }   // E2: the one cost line, after any rail quotes
+  } finally {
+    try { paintCostLine(); } catch {}   // E2: the one cost line, after any rail quotes
+    // D5: refresh the recent-trades feed only when the PAIR changes (not on every keystroke).
+    try {
+      const pk = (S.payAsset && S.receiveAsset) ? (S.payAsset + '|' + S.receiveAsset) : null;
+      if (pk !== _tradesPair){ _tradesPair = pk; if (pk) renderRecentTrades().catch(()=>{}); else { const h = C.$('swTrades'); if (h) h.innerHTML = ''; } }
+    } catch {}
+  }
 }
 function clearBook(){ renderBookPlaceholder(); renderPairBar(); }
 // E2: ONE honest cost line. A taker always crosses the spread, so surface that as a positive
@@ -3580,6 +3587,41 @@ function esc(s){ return String(s == null ? '' : s).replace(/[&<>"]/g, c => ({'&'
 // (the conventional quote, matching the mid). ASKS are the offers we can take (give
 // pay, get receive) — clickable to lift; BIDS are the opposite side (display-only
 // depth, since the taker can't lift them).
+// D5: recent-trades feed for the active pair, backed by seqobd's /trades (T1). Resting offers use ONE
+// canonical base/quote per market, so exactly one direction has data — query the composer's direction
+// first, fall back to the inverse, and display whichever has trades (never merge — the two are
+// inverse-priced). Compact: price (quote/base) · size (base) · time-ago. Empty ⇒ no section (honest).
+let _tradesPair = null, _tradesReq = 0;
+async function renderRecentTrades(){
+  const host = C.$('swTrades'); if (!host) return;
+  const pay = S.payAsset, recv = S.receiveAsset;
+  if (!pay || !recv){ host.innerHTML = ''; return; }
+  const req = ++_tradesReq;
+  const fetchDir = async (base, quote) => {
+    try {
+      const r = await fetch(seqob.seqobBase() + '/v1/market/' + encodeURIComponent(base) + '/' + encodeURIComponent(quote) + '/trades?limit=30', { cache: 'no-store' });
+      if (!r.ok) return []; const j = await r.json(); return Array.isArray(j.trades) ? j.trades : [];
+    } catch { return []; }
+  };
+  // composer maps pay/receive → the same-chain book's base=receive, quote=pay; try that, else inverse.
+  let base = recv, quote = pay, trades = await fetchDir(base, quote);
+  if (!trades.length){ const alt = await fetchDir(pay, recv); if (alt.length){ base = pay; quote = recv; trades = alt; } }
+  if (req !== _tradesReq) return;                 // superseded by a newer pair
+  if (!trades.length){ host.innerHTML = ''; return; }
+  trades.sort((a, b) => (b.ts || 0) - (a.ts || 0));
+  const bm = C.assetMeta(base), qm = C.assetMeta(quote);
+  const nowS = Math.floor(Date.now() / 1000);
+  const ago = (ts) => { const s = Math.max(0, nowS - (ts || 0)); return s < 60 ? s + 's' : s < 3600 ? Math.floor(s/60) + 'm' : s < 86400 ? Math.floor(s/3600) + 'h' : Math.floor(s/86400) + 'd'; };
+  const row = (t) => '<div style="display:flex;justify-content:space-between;gap:8px;padding:3px 10px;font-size:12px">'
+    + '<span class="mono">' + trim(Number(t.price)) + '</span>'
+    + '<span class="mono sub">' + esc(C.fmtAtoms(big(String(t.size || 0)), bm.precision || 0)) + ' ' + esc(bm.ticker) + '</span>'
+    + '<span class="sub" style="min-width:30px;text-align:right">' + ago(t.ts) + '</span></div>';
+  host.innerHTML = '<div class="swladder" style="margin-top:8px"><div class="swladder-head">'
+    + '<span class="sub" style="color:var(--txt);font-weight:650">Recent trades</span>'
+    + '<span class="sub">price ' + esc(qm.ticker) + '/' + esc(bm.ticker) + '</span></div>'
+    + trades.slice(0, 30).map(row).join('') + '</div>';
+}
+
 function renderBook(pay, receive){
   const host = C.$('swBook'); if (!host) return;
   const pm = C.assetMeta(pay), rm = C.assetMeta(receive);
