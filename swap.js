@@ -2956,8 +2956,17 @@ async function startBuy(params){
     const sec = C.wasm.generateSwapSecret();            // { secret_hex, hash_hex }
     const H = sec.hash_hex, P = sec.secret_hex;
     const node_key = await L.assetNodeKey(asset);       // our OWN hosted asset node RECEIVES the asset over LN
-    const assetAtoms = Number(offer.asset_amount);      // whole-offer lift at the maker's fixed terms
-    const btcSats = Number(offer.btc_sats);
+    // T8 partial fill: default to the whole offer, but if the user entered LESS BTC than the offer's
+    // full price, take a proportional slice — assetAtoms scaled by the BTC fraction, then btcSats
+    // recomputed as the ceil-proportional price (matching the maker's ProportionalBtc, so it never
+    // rejects us). The maker re-rests the remainder. params.amount is the pay (BTC) field, in BTC.
+    const wholeAsset = Number(offer.asset_amount), wholeBtc = Number(offer.btc_sats);
+    let assetAtoms = wholeAsset, btcSats = wholeBtc;
+    const reqBtcSats = (params.amount != null && Number(params.amount) > 0) ? Math.round(Number(params.amount) * 1e8) : 0;
+    if (reqBtcSats > 0 && reqBtcSats < wholeBtc){
+      assetAtoms = Math.max(1, Math.floor(wholeAsset * reqBtcSats / wholeBtc));
+      btcSats = Math.ceil(wholeBtc * assetAtoms / wholeAsset);   // proportional, rounded up (== maker's requirement)
+    }
     // Bring our asset LN node's device signer ONLINE so it can register + settle the HODL invoice.
     if (L.connectNode){
       say('Bringing your ' + am.ticker + ' Lightning node online…');

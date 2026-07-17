@@ -810,6 +810,9 @@ async function runSubasBuyHodl(job, body) {
     '-asset-ln-socket', userRpc, '-taker-ln-node-id', String(userNodeId),
     '-payment-hash', job.payment_hash, '-state-file', `/tmp/xsubas-${job.job_id}.json`,
     '-min-btc-conf', String(CFG.subasMinBtcConf)];
+  // T8 partial fill: take exactly the asset amount the wallet asked for (<= the offer). xsubas
+  // locks the proportional BTC and the maker re-rests the remainder; 0/absent = the whole offer.
+  if (job.asset_amount) args.push('-amount', String(job.asset_amount));
   if (job.offer_id) args.push('-offer-id', String(job.offer_id));
   if (job.maker_pubkey) args.push('-maker-pubkey', String(job.maker_pubkey));
   // (d) READ-ONLY held/settled watcher — the SAME holdinvoicelookup /node/invoice-status uses.
