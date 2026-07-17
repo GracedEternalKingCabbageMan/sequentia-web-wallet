@@ -3659,6 +3659,26 @@ function creditsHtml(){
   return `<div class="swbook"><div class="swbook-head"><span class="lbl">Order credits received</span>
       <span class="sub">paid into a payout only this wallet controls</span></div>${rows}</div>`;
 }
+// E3: notify when a RESTING order fills — including one that filled while the wallet was CLOSED.
+// The maker-credit balance is the fill signal (a covenant fill pays a payout only this wallet
+// controls). Persist the last-seen balance across sessions; any per-asset INCREASE is a fill, so
+// toast the delta. The very first observation just baselines (no toast). Cheap + idempotent, so it's
+// safe to call on every renderMyOrders (live fills via onCovOrderStatus, and on reopen via resume).
+let _seenCredits = undefined;
+function notifyNewCredits(){
+  let bal; try { bal = covenantCreditBalance(); } catch { return; }
+  const cur = {}; for (const h of Object.keys(bal || {})){ const v = big(bal[h]); if (v > 0n) cur[h] = v.toString(); }
+  if (_seenCredits === undefined){ try { _seenCredits = JSON.parse(localStorage.getItem('swk.seenCredits.v1') || 'null'); } catch { _seenCredits = null; } }
+  if (_seenCredits == null){ _seenCredits = cur; try { localStorage.setItem('swk.seenCredits.v1', JSON.stringify(cur)); } catch {} return; }
+  for (const h of Object.keys(cur)){
+    const now = big(cur[h]), was = big(_seenCredits[h] || '0');
+    if (now > was){
+      const m = C.assetMeta(h);
+      try { C.toast && C.toast(`Your resting order filled — received ${C.fmtAtoms(now - was, m.precision)} ${m.ticker}.`); } catch {}
+    }
+  }
+  _seenCredits = cur; try { localStorage.setItem('swk.seenCredits.v1', JSON.stringify(cur)); } catch {}
+}
 
 // The unified "Active trades" card: every in-flight swap (submarine, sub-asset sell, cross-chain),
 // so a DISMISSED one is never lost — each row reopens its process view (clearing the dismiss). A
@@ -3722,6 +3742,7 @@ async function renderMyOrders(){
   if (XMAKE) return renderXMake();   // a live wallet cross offer owns this panel
 
   const credits = creditsHtml();     // maker proceeds from filled resting orders
+  notifyNewCredits();                // E3: toast any newly-filled resting order (incl. filled-while-away)
 
   let orders = [];
   // On a fetch error, leave whatever is already rendered rather than blanking the panel (a transient
