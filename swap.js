@@ -467,7 +467,12 @@ function findRoute(pay, receive){
     // this, an LN best-bid the auto-select picked but that has no takeable sub-asset offer (source
     // mismatch, or the fire-and-forget sub-asset book not yet loaded) strands the user: requoteMixed
     // disables Review and a mixed route isn't postable, so BOTH Review and Post are off.
-    const paySellServiceable = payIsBtc || (ra && ra.payLn.ok) || sellCapable(seqAsset);
+    // A sub-asset SELL (pay asset over LN, receive BTC on-chain) LIFTS a resting sell offer, so it needs
+    // one to exist (sellCapable) — an outbound channel alone is necessary but NOT sufficient. Only the
+    // pure-LN sell (recv=ln too) is serviceable by the pay channel itself. Without this split, having a
+    // funded pay-channel but no resting offer left the mixed sell on 'ln' -> requoteMixed disables Review
+    // and mixed isn't postable = dead-end. Degrade to the postable cross rail instead.
+    const paySellServiceable = payIsBtc || sellCapable(seqAsset) || (ra && ra.payLn.ok && S.recvRail === 'ln');
     const p = (ln && S.payRail === 'ln' && paySellServiceable) ? 'ln' : 'chain';
     // Receiving over LN normally needs a real inbound channel on that asset — EXCEPT the
     // sub-asset BUY (pay BTC on-chain, receive the asset over LN). There the LSP JIT-provisions
@@ -1044,6 +1049,15 @@ async function requote(){
     } catch {}
   }
   const route = findRoute(S.payAsset, S.receiveAsset);
+  // Keep the DISPLAYED rails in sync with what findRoute actually routes: the auto-select above is a
+  // heuristic from the best offer, but findRoute downgrades an unserviceable LN leg (no channel / no
+  // sub-asset maker) to on-chain. Without this the toggle could show "Lightning" while the trade settles
+  // on-chain (a cross HTLC) — a false rail display. Only sync when the user hasn't touched the rails.
+  if (route && !S.railsTouched && (route.payRail || route.recvRail)){
+    if (route.payRail) S.payRail = route.payRail;
+    if (route.recvRail) S.recvRail = route.recvRail;
+    try { paintRailSegs(); } catch {}
+  }
   renderTiming(route);   // timing banner reflects the rails immediately, before amounts
   // LN / mixed / no-route are take-only; keep the mode control honest before we quote.
   if (!postSupported(route)) S.mode = 'take';

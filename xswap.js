@@ -935,6 +935,22 @@ async function btcTipHeight(){
   return -1;
 }
 
+// The Sequentia tip height, from the LSP's /anchor (no params) -> {height: info.blocks}. Used to refuse
+// revealing the preimage once the Sequentia chain is within SEQ_REFUND_MARGIN of the maker's SEQ refund
+// height (seq_locktime): beyond that the maker can refund the SEQ leg, so claiming would RACE that refund
+// — if the maker's refund confirms first, our claim is orphaned but s is already public, and the maker
+// claims our BTC with s. Refusing to claim (routing to refund) is the only safe move there.
+const SEQ_REFUND_MARGIN = 3;   // Sequentia blocks of safety before T_seq
+async function seqTipHeight(){
+  try {
+    const base = (typeof location !== 'undefined' ? location.origin : '') + '/lsp';
+    const r = await fetch(base + '/anchor', { signal: AbortSignal.timeout(6000) });
+    const j = await r.json();
+    if (j && j.ok && Number.isFinite(Number(j.height))) return Number(j.height);
+  } catch {}
+  return -1;
+}
+
 // The anchor gate WAITS only for the maker's asset block to CONFIRM and expose its own Bitcoin
 // anchor — NOT for the chain tip to advance. A block's anchor is fixed, so the tip is irrelevant to
 // it: once the leg confirms, its fate is decided. a_seg >= bh -> claim. a_seg < bh -> the leg is
@@ -954,6 +970,14 @@ async function awaitAnchor(){
     if (btcTip >= 0 && SWAP.btc_locktime && btcTip >= (Number(SWAP.btc_locktime) - MARGIN))
       return { ok: false, timedout: true, anchor_height: gate.anchor_height, btc_height: gate.btc_height,
         reason: `the maker's asset block did not confirm and anchor at/above your BTC-lock height (${gate.btc_height}) before your refund window; refund the BTC leg after block ${SWAP.btc_locktime}` };
+    // Don't keep waiting once the Sequentia tip nears the maker's SEQ refund window: even if the leg
+    // later anchors, claiming past this point races the maker's refund. Stop and route to a BTC refund.
+    if (SWAP.seq_locktime){
+      const seqTip = await seqTipHeight();
+      if (seqTip >= 0 && seqTip >= (Number(SWAP.seq_locktime) - SEQ_REFUND_MARGIN))
+        return { ok: false, timedout: true, anchor_height: gate.anchor_height, btc_height: gate.btc_height,
+          reason: `the maker's asset leg did not become claimable before its own Sequentia refund window (tip ${seqTip} ≥ T_seq ${SWAP.seq_locktime} − ${SEQ_REFUND_MARGIN}); refund the BTC leg after block ${SWAP.btc_locktime}` };
+    }
     setStepStatus('anchor', `Waiting for the maker's asset block to confirm and anchor to Bitcoin (needs anchor ≥ your BTC height ${gate.btc_height})…`, true);
     await sleep(20000);
   }
@@ -971,6 +995,14 @@ async function claimSeq(){
   if (!gate.ok) throw new Error('anchor gate not satisfied: ' + gate.reason);   // belt-and-suspenders; the UI also gates the button
   const lg = verifyLeg();
   if (!lg.ok) throw new Error('leg mismatch: ' + lg.reason);   // never reveal the preimage on a mismatched leg
+  // T_seq guard: once the Sequentia tip nears the maker's SEQ refund height, claiming RACES that refund
+  // (if the refund confirms first, s is public but our claim is orphaned and the maker takes our BTC).
+  // Refuse — the safe move is to let the BTC leg refund. Re-read live, at the moment of claim.
+  if (SWAP.seq_locktime){
+    const seqTip = await seqTipHeight();
+    if (seqTip >= 0 && seqTip >= (Number(SWAP.seq_locktime) - SEQ_REFUND_MARGIN))
+      throw new Error(`too close to the maker's Sequentia refund window (tip ${seqTip} ≥ T_seq ${SWAP.seq_locktime} − ${SEQ_REFUND_MARGIN}); do NOT reveal the secret — let your BTC refund after block ${SWAP.btc_locktime}`);
+  }
   const { wasm } = C;
   // Destination SPK: a fresh wallet address, unconfidential (explicit output).
   const destSpk = takerDestSpkHex();

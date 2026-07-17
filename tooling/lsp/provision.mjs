@@ -81,8 +81,20 @@ export function makeProvisioner(opts) {
   const bootedAt = new Map();
   const BOOT_DEBOUNCE_MS = 20000;
 
-  const load = () => { try { return JSON.parse(fs.readFileSync(REG, 'utf8')); } catch { return { nodes: {}, seq: 0 }; } };
-  const save = (r) => fs.writeFileSync(REG, JSON.stringify(r, null, 2));
+  // A MISSING registry means a fresh install (default to empty). A CORRUPT registry must NOT silently
+  // default to empty: this is the single source of truth for all hosted user funds, and an empty
+  // default would orphan every provisioned node (unreachable/unfundable) AND reset `seq` so new
+  // provisions reuse idx 0 and collide ports with still-running nodes. Fail loud so it's restored.
+  const load = () => {
+    let raw;
+    try { raw = fs.readFileSync(REG, 'utf8'); }
+    catch (e) { if (e && e.code === 'ENOENT') return { nodes: {}, seq: 0 }; throw e; }
+    try { return JSON.parse(raw); }
+    catch { throw new Error(`registry.json is corrupt (${REG}) — refusing to continue with an empty registry, which would orphan all hosted nodes. Restore it (a .tmp may exist from an interrupted write).`); }
+  };
+  // Atomic write: a crash mid-write must never leave a half-written registry. Write a temp file then
+  // rename (atomic on POSIX) so a reader always sees the whole old OR the whole new file.
+  const save = (r) => { const tmp = REG + '.tmp'; fs.writeFileSync(tmp, JSON.stringify(r, null, 2)); fs.renameSync(tmp, REG); };
 
   // Registry key. BOTH chains are keyed by (asset, DEVICE) so each user gets their OWN
   // non-custodial hosted node with their own funds/channels — two different devices
