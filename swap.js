@@ -2569,15 +2569,20 @@ async function placeCovenant(pay, receive, payAtoms, recvAtoms, onStatus){
     covenant, makerPubkey: makerPubHex(), recvAddress: payout.address, offerId: seqob.randHex(16),
     allowPartial: true, minLot,                           // fill what crosses now; the covenant's remainder rests on
   });
-  onStatus && onStatus('Posting your resting order…');
-  await seqob.postCovenantOffer(offer, makerPriv());
+  // FUND-SAFETY: the covenant is now funded ON-CHAIN, so persist its refund material (covTxid/vout/spkHex
+  // + the order params to re-derive the taptree) BEFORE attempting the post. If the post fails (a relay
+  // reject, a dropped connection), the funds would otherwise be stranded in a covenant with no local
+  // record to reclaim them after expiry. posted:false until the relay accepts it.
   const rec = {
     offerId: offer.offer_id, pay, receive,
     sellAtoms: String(payAtoms), recvAtoms: String(recvAtoms),
     makerIndex: idx, covTxid: txid, covVout: vout, spkHex: plan.spkHex,
-    expiry: params.expiryLocktime, created: Date.now(),
+    expiry: params.expiryLocktime, created: Date.now(), posted: false,
   };
   PLACED.push(rec); savePlaced();
+  onStatus && onStatus('Posting your resting order…');
+  await seqob.postCovenantOffer(offer, makerPriv());
+  rec.posted = true; savePlaced();   // the relay accepted it; it is now a live resting order
   ensureCovenantRelay();   // watch for a match so we can settle / reflect a fill
   return rec;
 }
