@@ -418,7 +418,6 @@ export async function renderSwap(){
   ensureDefaults();
   renderFeePicker();
   paintPanes();
-  renderChips();
   renderPairBar();
   refreshInstant();   // best-effort instant/on-chain split from the LSP /status (non-blocking)
   await requote().catch(()=>{});
@@ -679,7 +678,7 @@ async function refreshInstant(){
       };
     }
   } catch { INSTANT = {}; LNSTATUS = { channels: [], funding: null }; }
-  try { renderChips(); paintPanes(); } catch {}
+  try { paintPanes(); } catch {}
 }
 
 // --- per-asset Lightning-rail gating (ln-rail.js) ---------------------------------
@@ -701,36 +700,10 @@ function iconGlyph(hex, m){
   if (hex === 'BTC') return '₿';
   return (m.ticker || '?').slice(0, 1).toUpperCase();
 }
-function chipHtml(hex){
-  const m = metaOf(hex);
-  const onchain = balAtoms(hex), instant = instantAtomsFor(hex);
-  const total = onchain + instant;
-  return `<button type="button" class="swchip" data-h="${esc(hex)}">
-    <span class="swchip-ic ${iconClass(hex)}">${esc(iconGlyph(hex, m))}</span>
-    <span class="swchip-body">
-      <span class="swchip-amt mono">${esc(C.fmtAtoms(total, m.precision))} ${esc(m.ticker)}</span>
-      <span class="swchip-split"><span class="z">${esc(C.fmtAtoms(instant, m.precision))} Lightning</span> · ${esc(C.fmtAtoms(onchain, m.precision))} on-chain</span>
-    </span></button>`;
-}
-function renderChips(){
-  const host = C.$('swChips'); if (!host) return;
-  const bal = C.balObj() || {};
-  const held = Object.keys(bal).filter(h => big(bal[h]) > 0n && h !== 'BTC');
-  // BTC is first-class (dual-chain) — always a chip, even at 0.
-  const list = []; const seen = new Set();
-  for (const h of ['BTC', ...held]){ if (!seen.has(h)){ seen.add(h); list.push(h); } }
-  host.innerHTML = list.map(chipHtml).join('');
-  host.querySelectorAll('.swchip[data-h]').forEach(c => c.onclick = () => onChipPick(c.dataset.h));
-}
-// Clicking a chip sets it as the PAY side (a quick way to start a trade from a holding).
-function onChipPick(hex){
-  if (!hex || hex === S.payAsset) return;
-  S.payAsset = hex;
-  if (S.receiveAsset && (S.receiveAsset === hex || !counterpartsOf(hex).includes(S.receiveAsset))) S.receiveAsset = null;
-  S.railsTouched = false; S.modeTouched = false;
-  LAST_QUOTE = null; setReviewEnabled(false);
-  paintPanes(); requote().catch(()=>{});
-}
+// (The old "holdings chips" strip was removed: its host #swChips never existed in the DOM, so
+// renderChips/chipHtml/onChipPick were dead code — and chipHtml's icon styling gave the policy asset a
+// privileged look, a latent equal-standing violation. The asset dropdown's "Your assets" group is the
+// holdings surface now, and it treats every asset the same.)
 
 // --- pair bar: the selected market + last price (derived from the book mid) ---
 function renderPairBar(){
@@ -1388,7 +1361,7 @@ async function requoteSame(route, amtStr){
       LAST_QUOTE = null; setReviewEnabled(false);
       $('swRate').textContent = 'Order book unreachable - retry.';
       $('swRoute').textContent = '';
-      $('swErr').textContent = 'Could not reach the order-book relay (' + (reachErr.message || reachErr) + '). Check your connection and press Refresh.';
+      $('swErr').textContent = 'Could not reach the order-book relay (' + (reachErr.message || reachErr) + '). Check your connection and try again (re-enter the amount to retry).';
       return;
     }
     status.textContent = '';
@@ -1866,7 +1839,7 @@ async function requoteCross(route, amtStr){
       status.textContent = ''; clearOpposite(); LAST_QUOTE = null; setReviewEnabled(false);
       $('swRate').textContent = 'Cross-chain order book unreachable - retry.';
       $('swRoute').textContent = '';
-      $('swErr').textContent = 'Could not reach the cross-chain order book (' + (unreachable === true ? 'relay unreachable' : unreachable) + '). Check your connection and press Refresh.';
+      $('swErr').textContent = 'Could not reach the cross-chain order book (' + (unreachable === true ? 'relay unreachable' : unreachable) + '). Check your connection and try again (re-enter the amount to retry).';
       return;
     }
 
