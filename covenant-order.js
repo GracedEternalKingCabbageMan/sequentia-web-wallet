@@ -209,7 +209,7 @@ export async function settleFill(matched, hooks){
   const built = await hooks.buildCovenantFillTx(recipe);
   status('Broadcasting…');
   const txid = await hooks.broadcast(built.rawHex);
-  status('Settling — anchor-bound to Bitcoin.');
+  status('Settling. Anchor-bound to Bitcoin.');
   return { txid, recipe };
 }
 

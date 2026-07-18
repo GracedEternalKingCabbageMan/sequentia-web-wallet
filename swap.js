@@ -764,13 +764,16 @@ function paintPanes(){
   const cta = $('swReview'); if (cta) cta.textContent = 'Place order';   // one CTA, always
 }
 
-// The opt-in confidential-RECEIVE control (transparent book only) is meaningless when
-// the received leg is BTC — the parent chain has no confidential transactions — so it
-// is HIDDEN whenever S.receiveAsset === 'BTC'. It is also hidden on the Blinded book,
-// where both legs already blind by construction (a per-swap opt-in would be redundant).
+// The opt-in confidential-RECEIVE control shows ONLY when you are receiving a Sequentia-issued asset
+// ON-CHAIN — a blinded (confidential) address is a Sequentia on-chain concept. So it is HIDDEN when:
+// no receive asset is chosen yet; the received leg is BTC (the parent chain has no confidential
+// transactions); the received leg is over LIGHTNING (there is no on-chain address to blind); or the
+// Blinded book is active (both legs already blind by construction, so a per-swap opt-in is redundant).
 function paintConfControl(){
   const wrap = C.$('swConfWrap'); if (!wrap) return;
-  const hide = S.receiveAsset === 'BTC' || isConfBook();
+  const route = (S.payAsset && S.receiveAsset) ? findRoute(S.payAsset, S.receiveAsset) : null;
+  const recvOverLn = !!(route && route.recvRail === 'ln');
+  const hide = !S.receiveAsset || S.receiveAsset === 'BTC' || isConfBook() || recvOverLn;
   wrap.style.display = hide ? 'none' : 'flex';
 }
 
@@ -1032,6 +1035,7 @@ function setRail(leg, r){
   paintRailSegs(ra);
   try { renderRailNote(ra); } catch {}   // refresh/clear the LN-channel note for the newly-selected rail
   try { renderFeePicker(); } catch {}   // reflect the pay-from-Lightning fee freeze immediately
+  try { paintConfControl(); } catch {}  // the confidential-receive toggle depends on the receive rail (on-chain only)
   requote().catch(()=>{});
 }
 function paintRefHints(){
@@ -4052,11 +4056,15 @@ function renderInFlightCard(){
       title: (MIXED.side === 'buy' ? 'Buy ' : 'Sell ') + esc(am.ticker) + ' · submarine',
       status: need ? 'on-chain HTLC refundable now' : String(MIXED.state) });
   }
-  if (hasSellInFlight()){
+  // Gate on the OBJECT, not just the predicate: hasSell/BuyInFlight() also returns true off the
+  // synchronous _sellStarting/_buyStarting sentinel DURING the pre-fund prologue, before SELL/BUY is
+  // assigned — a bare predicate check here would deref null. The prologue has nothing to show in this
+  // card anyway (the progress modal covers it); the row appears once the record exists.
+  if (SELL && hasSellInFlight()){
     rows.push({ view: null, need: true, title: 'Sell ' + esc(SELL.ticker) + ' for BTC',
       status: 'claiming your BTC on-chain (automatic)' });
   }
-  if (hasBuyInFlight()){
+  if (BUY && hasBuyInFlight()){
     rows.push({ view: null, need: true, title: 'Buy ' + esc(BUY.ticker || 'asset') + ' with BTC',
       status: BUY.state === 'holding' ? 'held · settle from your wallet to receive' : 'BTC HTLC funded; awaiting the asset over Lightning' });
   }

@@ -658,12 +658,9 @@
           </div><!-- /.swdesk-compose -->
         </div><!-- /.swdesk -->
 
-        <!-- trust line: one book, no labels; funding lives in the Balance tab -->
-        <div class="swtrust">
-          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><path d="M12 3l7 3v5c0 4.5-3 7.6-7 9-4-1.4-7-4.5-7-9V6l7-3z"/><path d="M9 12l2 2 4-4"/></svg>
-          <span><b>One book, no labels.</b> Every order looks identical, so no one can tell if it was funded on-chain or on Lightning. Move BTC or an asset into a Lightning channel any time from the <b>Balance</b> tab; here you just choose how you pay and how you receive.</span>
-        </div>
-        <label class="swconf" id="swConfWrap" style="display:flex;align-items:center;gap:9px;margin-top:12px;font-size:12.5px;color:var(--dim);cursor:pointer">
+        <!-- Confidential-receive toggle: shown ONLY when receiving a Sequentia-issued asset ON-CHAIN
+             (blinded addresses don't apply to BTC or to a Lightning receive). Gated by updateConfToggle(). -->
+        <label class="swconf hide" id="swConfWrap" style="align-items:center;gap:9px;margin-top:12px;font-size:12.5px;color:var(--dim);cursor:pointer">
           <input type="checkbox" id="swConfChk" style="width:16px;height:16px;flex:0 0 auto">
           <span>Receive this swap <b style="color:var(--txt);font-weight:650">confidentially</b> (a blinded address). Off by default: swaps receive to your transparent tb1 address, like the Receive tab.</span>
         </label>

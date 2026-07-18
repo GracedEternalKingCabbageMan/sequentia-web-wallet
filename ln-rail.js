@@ -92,7 +92,7 @@ export function legOption(channels, target, direction, provisioned) {
       ok: false, reason: `No Lightning channel for ${name} yet.`,
       cta: 'move', ctaLabel: `Move ${name} to Lightning`,
       hint: nodeUp
-        ? `Your ${name} Lightning node is ready — open a channel from the Balance tab to trade it instantly.`
+        ? `Your ${name} Lightning node is ready. Open a channel from the Balance tab to trade it instantly.`
         : `Move ${name} into a Lightning channel from the Balance tab first, then this rail turns on.`,
       liquidity: l,
     };

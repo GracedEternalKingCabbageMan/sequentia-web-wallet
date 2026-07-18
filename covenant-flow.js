@@ -104,7 +104,11 @@ export function fillRestSplit(requestedAtoms, fillableAtoms, dustDen = 200n){
 //   recvAtoms      atoms of B wanted for a full fill (== requiredBForFull)
 //   covenant       the CovenantTerms (from buildCovenantTerms)
 //   makerPubkey    the maker identity pubkey hex (seqob makerPubHex)
-//   recvAddress    the maker's same-chain receive address (informational)
+//   recvAddress    accepted for back-compat but NOT emitted: `covenant` and `same_chain` are BOTH
+//                  members of the settlement oneof (field 23), so setting both makes protojson reject
+//                  the offer ("oneof settlement is already set"). The covenant self-describes its
+//                  payout (CovenantTerms.maker_prog = the taproot output a FILL credits), so a separate
+//                  same-chain recv address is redundant; a covenant offer carries ONLY `covenant`.
 //   nowUnix/ttl    created/expires timestamps
 export function buildCovenantOffer({ assetA, assetB, sellAtoms, recvAtoms, covenant,
                                      makerPubkey, recvAddress, offerId, nowUnix, ttlSecs,
@@ -128,7 +132,8 @@ export function buildCovenantOffer({ assetA, assetB, sellAtoms, recvAtoms, coven
     expires_at_unix: String(now + ttl),
     maker_pubkey: makerPubkey,
     fee_asset_hint: assetB,
-    ...(recvAddress ? { same_chain: { maker_recv_address: recvAddress } } : {}),
+    // ONLY `covenant` in the settlement oneof — see the recvAddress note above. Emitting `same_chain`
+    // here too made every browser covenant post fail to decode ("oneof settlement is already set").
     covenant,
   };
 }
