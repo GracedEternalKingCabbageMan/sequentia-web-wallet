@@ -846,6 +846,15 @@ function paintModeSeg(){
   const show = !!(S.payAsset && S.receiveAsset && postSupported(route));
   if (wrap) wrap.classList.toggle('hide', !show);
   if (seg) seg.querySelectorAll('button[data-m]').forEach(b => b.classList.toggle('on', b.dataset.m === S.mode));
+  // Keep the mode hint in lockstep: it references "Switch to Limit", which is wrong when there's no Limit
+  // control (LN/mixed/no pair) — hide it there; when shown, phrase it for the current mode (C-8).
+  const hint = C.$('swModeHint');
+  if (hint){
+    hint.classList.toggle('hide', !show);
+    if (show) hint.textContent = S.mode === 'post'
+      ? 'Set both amounts; their ratio is your price. Switch to Market to fill at the best price now.'
+      : 'Type an amount; the other fills at the best price. Switch to Limit to set your own.';
+  }
 }
 // Switch mode by hand (marks it touched so the auto-default stops). Take re-links the
 // fields (requote re-derives the opposite); Post leaves both fields independent.
@@ -1437,7 +1446,7 @@ async function requoteSame(route, amtStr){
     setReviewEnabled(true);
   } catch (e){
     status.textContent = '';
-    $('swErr').textContent = 'Order book: ' + (e.message || e);
+    $('swErr').textContent = 'Order book: ' + C.prettyErr(e);
     setReviewEnabled(false);
   }
 }
@@ -1950,7 +1959,7 @@ async function requoteCross(route, amtStr){
     setReviewEnabled(true);
   } catch (e){
     status.textContent = '';
-    $('swErr').textContent = 'Cross-chain order book: ' + (e.message || e);
+    $('swErr').textContent = 'Cross-chain order book: ' + C.prettyErr(e);
     setReviewEnabled(false);
   }
 }
@@ -2775,7 +2784,7 @@ async function reviewMixed(q){
         $('swStatus').textContent = '';
       } catch (e){
         $('swStatus').textContent = '';
-        $('swErr').textContent = 'Could not open your Lightning channel: ' + (e && e.message || e);
+        $('swErr').textContent = 'Could not open your Lightning channel: ' + C.prettyErr(e);
         return;
       }
       if (!railAvail(S.payAsset, S.receiveAsset).payLn.ok){
@@ -2793,25 +2802,25 @@ async function reviewMixed(q){
       ? `Buy ${am.ticker} with Bitcoin over Lightning · receive ${am.ticker} on-chain`
       : `Sell ${am.ticker} on-chain · receive Bitcoin over Lightning`);
   const kv = isSubAssetSell ? [
-    ['Route', 'Mixed rails · you pay ' + am.ticker + ' over Lightning and receive Bitcoin in an on-chain HTLC your device claims, bound by one preimage'],
+    ['Route', 'Mixed rails · you pay ' + am.ticker + ' over Lightning and receive Bitcoin into an on-chain lock your device claims. Both legs share one secret, so they settle together or not at all.'],
     ['Direction', dir],
     ['Pricing', 'Best resting offer · you take a party who locks BTC on-chain for your ' + am.ticker + ' (a maker or any posted offer)'],
-    ['Timing', 'You pay ' + am.ticker + ' over Lightning; the taker reveals the preimage on settle; your device claims the BTC on-chain with it.'],
-    ['Finality', 'The BTC arrives in a Bitcoin on-chain HTLC your device claims (final to Bitcoin); the ' + am.ticker + ' leg is over Lightning.'],
+    ['Timing', 'You pay ' + am.ticker + ' over Lightning; the counterparty reveals the shared secret to settle, and your device uses it to claim the BTC on-chain.'],
+    ['Finality', 'The BTC arrives in an on-chain Bitcoin lock your device claims (final to Bitcoin); the ' + am.ticker + ' leg is over Lightning.'],
     ['If it stalls', 'Nothing is lost · if the counterparty never settles, your Lightning payment auto-returns.'],
   ] : isSubAsset ? [
-    ['Route', 'Mixed rails · you pay Bitcoin in an on-chain HTLC and receive the asset over Lightning, bound by one preimage'],
+    ['Route', 'Mixed rails · you pay Bitcoin into an on-chain lock and receive the asset over Lightning. Both legs share one secret, so they settle together or not at all.'],
     ['Direction', dir],
     ['Pricing', 'Best resting sub-asset offer · whole-swap lift (the LP\'s fixed terms)'],
-    ['Timing', 'The asset arrives over Lightning the moment the maker is paid; your BTC is claimed from its on-chain HTLC with the revealed preimage.'],
-    ['Finality', 'The BTC leg is a Bitcoin on-chain HTLC (final to Bitcoin); the asset leg settles over Lightning.'],
-    ['If it stalls', 'Nothing is lost · you reclaim the BTC HTLC after its on-chain timeout if the asset never arrives.'],
+    ['Timing', 'The asset arrives over Lightning the moment the maker is paid; your BTC is released from its on-chain lock by the same shared secret.'],
+    ['Finality', 'The BTC leg is an on-chain Bitcoin lock (final to Bitcoin); the asset leg settles over Lightning.'],
+    ['If it stalls', 'Nothing is lost · you reclaim the BTC from its lock after the on-chain timeout if the asset never arrives.'],
   ] : [
-    ['Route', 'Mixed rails · one leg on Lightning, one anchored on-chain (a submarine swap, bound by one preimage)'],
+    ['Route', 'Mixed rails · one leg on Lightning, one anchored on-chain (a submarine swap, with both legs sharing one secret)'],
     ['Direction', dir],
-    ['Pricing', 'Best resting submarine offer · whole-HTLC lift (the LP\'s fixed terms)'],
-    ['Timing', 'Anchor-gated: the on-chain HTLC must bury under Bitcoin before the Lightning leg settles — a few minutes, not instant.'],
-    ['Finality', 'Anchor-bound to Bitcoin (reverts only if Bitcoin reverts) — not the instant-final of the pure-Lightning rail.'],
+    ['Pricing', 'Best resting submarine offer · whole-swap lift (the LP\'s fixed terms)'],
+    ['Timing', 'Anchor-gated: the on-chain leg must bury under Bitcoin before the Lightning leg settles. A few minutes, not instant.'],
+    ['Finality', 'Anchored to Bitcoin (reverts only if Bitcoin reverts), so not the instant finality of the pure-Lightning rail.'],
     ['If it stalls', 'Nothing is lost · each leg refunds after its own timeout.'],
   ];
   const { m: modal, ok, st } = C.modalRows({ title: 'Review mixed-rail swap', kv });
@@ -3198,7 +3207,7 @@ function renderMixedSwap(){
   const phase = {
     [sub.ST.SETTLING]:  'Settling — the on-chain HTLC leg is burying under Bitcoin (anchor-gated).',
     [sub.ST.REFUNDING]: 'Refunding the on-chain HTLC leg…',
-    [sub.ST.REFUNDED]:  'Refunded — the on-chain HTLC leg was reclaimed; your funds are back.',
+    [sub.ST.REFUNDED]:  'Refund broadcast · the on-chain leg is being reclaimed; your funds return once it confirms.',
     [sub.ST.SETTLED]:   'Settled — anchor-bound to Bitcoin (reverts only if Bitcoin reverts).',
     [sub.ST.FAILED]:    'Failed — nothing further to reclaim on-chain.',
   }[MIXED.state] || MIXED.state;
