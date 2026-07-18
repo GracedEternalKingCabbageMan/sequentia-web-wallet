@@ -190,8 +190,11 @@ let LAST_MID = null; // { price, cross, base, quote } for the current pair — f
 function _quoteRank(hex){
   if (hex === 'BTC') return 1000;
   const t = String((C.assetMeta(hex) || {}).ticker || '').toUpperCase();
-  const r = { USDX:900, EURX:890, FEEUSD:880, USDT:870, USDC:865, USD:860, TSEQ:500, SEQ:500, GOLD:300, SILVR:200, OILX:100 };
-  return (t in r) ? r[t] : 400;   // unknown issued asset: below the stables/Sequence, above the commodities
+  // ONLY genuine units of account are numeraires (quotes): BTC + the fiat stablecoins. The Sequence
+  // token (SEQ/tSEQ) is NOT a numeraire — it's just another issued asset with EQUAL standing (Principle 3),
+  // so it sits in the same generic "base" tier as the commodities and any unknown asset, tiebroken by id.
+  const r = { USDX:900, EURX:890, FEEUSD:880, USDT:870, USDC:865, USD:860 };
+  return (t in r) ? r[t] : 400;
 }
 // {base, quote} for an UNORDERED pair — the higher-rank asset is the QUOTE (numeraire). Deterministic
 // (a rank tie falls back to the asset id) so a pair's direction never flips with the buy/sell side.
@@ -710,6 +713,11 @@ function renderPairBar(){
   const host = C.$('swPairBar'); if (!host) return;
   if (!S.payAsset || !S.receiveAsset){ host.innerHTML = ''; host.classList.add('hide'); return; }
   host.classList.remove('hide');
+  // The flip toggle inverts the SAME-CHAIN ladder's frame; the cross ladder (renderXBook) is fixed to
+  // "1 asset = N BTC" and can't honour it — so hide the toggle on cross pairs and never leave a stale
+  // flip applied there (C-3).
+  const isCross = S.payAsset === 'BTC' || S.receiveAsset === 'BTC';
+  if (isCross) S.priceFlip = false;
   const { base, quote } = pairDir(S.payAsset, S.receiveAsset);
   const bm = metaOf(base), qm = metaOf(quote);
   // LAST_MID.price is quote-per-base in the SAME frame the book just rendered (pairDir already applied),
@@ -720,8 +728,9 @@ function renderPairBar(){
     midStr = `${fmtPrice(LAST_MID.price)} ${qm.ticker}`;
   }
   host.innerHTML = `<div class="swpairsel">${esc(bm.ticker)} <span class="swpair-car">/</span> ${esc(qm.ticker)}`
-    + ` <button type="button" class="swpairflip" id="swPairFlip" title="Flip price direction" aria-label="Flip price direction"`
-    + ` style="background:none;border:0;color:var(--dim);cursor:pointer;font-size:13px;line-height:1;padding:2px 5px;margin-left:5px;border-radius:5px">&#8645;</button></div>`
+    + (isCross ? '' : ` <button type="button" class="swpairflip" id="swPairFlip" title="Flip price direction" aria-label="Flip price direction"`
+      + ` style="background:none;border:0;color:var(--dim);cursor:pointer;font-size:13px;line-height:1;padding:2px 5px;margin-left:5px;border-radius:5px">&#8645;</button>`)
+    + `</div>`
     + `<div class="swpair-last">mid <b class="mono">${esc(midStr)}</b></div>`;
   const fb = C.$('swPairFlip');
   if (fb) fb.onclick = (e) => {
@@ -1067,7 +1076,7 @@ function onFlip(){
   [pa._userTyped, ra._userTyped] = [ra._userTyped, pa._userTyped];   // keep the anti-clobber flags with their values
   S.edited = S.edited === 'pay' ? 'receive' : 'pay';
   S.modeTouched = false;   // re-arm the Take/Post default for the flipped pair
-  if (!S.feeAssetTouched) S.feeAsset = null;   // let the fee default follow the flipped pay asset (D2)
+  S.feeAsset = null; S.feeAssetTouched = false;   // fee default re-follows the flipped pay asset (D2/C-11)
   LAST_QUOTE = null; setReviewEnabled(false);
   paintPanes();
   requote().catch(()=>{});
@@ -1178,6 +1187,7 @@ function paintCostLine(){
   el.textContent = ''; el.title = ''; el.style.color = '';
   if (S.mode === 'post') return;                              // limit order: you set the price
   if (!LAST_QUOTE || !LAST_MID || !(LAST_MID.price > 0)) return;
+  if (LAST_MID.oneSided) return;   // only one side of the book exists: "mid" is just top-of-book, so a "% vs mid" would be fake (C-4)
   const payV = numVal(C.$('swPayAmt')), recvV = numVal(C.$('swRecvAmt'));
   if (!(payV > 0 && recvV > 0)) return;
   const cross = !!LAST_MID.cross, payIsBtc = S.payAsset === 'BTC';
@@ -1382,9 +1392,22 @@ async function requoteSame(route, amtStr){
     const payAtoms  = safeAtoms($('swPayAmt').value,  pm.precision || 0);
     const recvAtoms = safeAtoms($('swRecvAmt').value, rm.precision || 0);
     if (payAtoms <= 0n || recvAtoms <= 0n){ LAST_QUOTE = null; setReviewEnabled(false); return; }
-    if (payAtoms > balAtoms(pay)){
+    // Affordability: the pay leg AND the funding fee must both be covered. The covenant funding fee is
+    // paid in the chosen fee asset (C-1), so when that's the pay asset the balance must cover BOTH; when
+    // it's a different asset, that asset must separately cover the fee (C-2).
+    const _feeAsset = S.feeAsset || defaultFeeAsset();
+    const _feeAtoms = covFeeAtoms(_feeAsset);
+    if (payAtoms + (_feeAsset === pay ? _feeAtoms : 0n) > balAtoms(pay)){
       LAST_QUOTE = null; setReviewEnabled(false);
-      $('swErr').textContent = `You only hold ${C.fmtAtoms(balAtoms(pay), pm.precision)} ${pm.ticker}.`;
+      $('swErr').textContent = _feeAsset === pay
+        ? `You only hold ${C.fmtAtoms(balAtoms(pay), pm.precision)} ${pm.ticker} — not enough for the amount plus the fee.`
+        : `You only hold ${C.fmtAtoms(balAtoms(pay), pm.precision)} ${pm.ticker}.`;
+      return;
+    }
+    if (_feeAsset !== pay && _feeAtoms > balAtoms(_feeAsset)){
+      LAST_QUOTE = null; setReviewEnabled(false);
+      const _fm = C.assetMeta(_feeAsset);
+      $('swErr').textContent = `You need about ${C.fmtAtoms(_feeAtoms, _fm.precision)} ${_fm.ticker} for the fee, but hold ${C.fmtAtoms(balAtoms(_feeAsset), _fm.precision)}.`;
       return;
     }
     if (isConfBook()){
@@ -1996,7 +2019,7 @@ function renderXBook(seqAsset, payIsBtc, forward, reverse, unified){
   const bestBid = bids.length ? Math.max(...bids.map(b => b.price)) : null;
   const mid = (bestAsk != null && bestBid != null) ? (bestAsk + bestBid) / 2 : (bestAsk != null ? bestAsk : bestBid);
   const spread = (bestAsk != null && bestBid != null) ? (bestAsk - bestBid) : null;
-  LAST_MID = { price: mid, cross: true, base: seqAsset, quote: 'BTC' };
+  LAST_MID = { price: mid, cross: true, base: seqAsset, quote: 'BTC', oneSided: !(bestAsk != null && bestBid != null) };
   renderLadder(host, {
     asks: asks.slice(0, 8).reverse(), bids: bids.slice(0, 8), mid, spread,   // 8 BEST (lowest) asks, shown high->low near the mid
     priceLabel: `(${am.ticker}/BTC)`, sizeLabel: am.ticker,
@@ -2038,7 +2061,7 @@ function renderLadder(host, o){
   const hasRows = asks.length || bids.length;
   const cols = `<div class="swladder-cols"><span>Price ${esc(o.priceLabel || '')}</span><span>Size${o.sizeLabel ? ' (' + esc(o.sizeLabel) + ')' : ''}</span><span>Sum</span></div>`;
   const midHtml = hasRows
-    ? `<div class="swlmid"><b>${o.mid != null ? esc(fmtPrice(o.mid)) : '—'}</b> <span class="sp">${o.spread != null ? 'spread ' + esc(fmtPrice(o.spread)) + ' · mid' : 'mid'}</span> <span>${esc(o.refMidStr || '')}</span></div>`
+    ? `<div class="swlmid"><b>${o.mid != null ? esc(fmtPrice(o.mid)) : '—'}</b> <span class="sp">${o.spread != null ? 'spread ' + esc(fmtPrice(o.spread)) + ' · mid' : 'best price'}</span> <span>${esc(o.refMidStr || '')}</span></div>`
     : '';
   const empty = hasRows ? '' : `<div class="swladder-empty">${esc(o.emptyMsg || 'No resting offers yet.')}</div>`;
   host.innerHTML = `<div class="swladder">
@@ -2321,7 +2344,7 @@ function openPicker(side){
     const o = side === 'pay' ? S.receiveAsset : S.payAsset;
     if (o && !counterpartsOf(hex).includes(o)){ if (side === 'pay') S.receiveAsset = null; else S.payAsset = null; }
     S.railsTouched = false; S.modeTouched = false;   // re-arm rail + Take/Post defaults for the new pair
-    if (!S.feeAssetTouched) S.feeAsset = null;        // let the fee default follow the new pay asset (D2)
+    S.feeAsset = null; S.feeAssetTouched = false; S.priceFlip = false;   // fee default re-follows the new pay asset; a manual pick + display flip are per-pair, not global (D2/C-11)
     LAST_QUOTE = null; setReviewEnabled(false);
     paintPanes();
     requote().catch(()=>{});
@@ -2469,12 +2492,13 @@ async function esplora(path, opts){ return C.esploraFetch(path, opts); }
 // Fund a covenant spk: send `atoms` of asset A to the covenant address as an
 // explicit output (the proven TxBuilder -> sign -> finalize -> broadcast path),
 // then resolve the covenant vout by matching the spk on the broadcast tx.
-async function fundCovenant(covAddr, spkHex, assetHex, atoms){
+async function fundCovenant(covAddr, spkHex, assetHex, atoms, feeAsset){
   const addr = new C.wasm.Address(covAddr);
-  const pset = C.network.txBuilder()
-    .addExplicitRecipient(addr, BigInt(atoms), new C.wasm.AssetId(assetHex))
-    .feeRate(C.DEFAULT_FEERATE)
-    .finish(C.wollet);
+  // C-1: pay the funding fee in the CHOSEN fee asset (open fee market), not silently in tSEQ. applyFee
+  // prices any asset — tSEQ included — from the feed, so the fee the user is shown ("Fee paid in: X") is
+  // the fee actually charged. Falls back to the pay asset if no fee asset was resolved.
+  const b = C.network.txBuilder().addExplicitRecipient(addr, BigInt(atoms), new C.wasm.AssetId(assetHex));
+  const pset = C.applyFee(b, feeAsset || assetHex).finish(C.wollet);
   const signed = C.signer.sign(pset);
   const finalized = C.wollet.finalize(signed);
   const t = await C.client.broadcast(finalized);
@@ -2520,7 +2544,7 @@ async function placeCovenant(pay, receive, payAtoms, recvAtoms, onStatus){
   const plan = planPlaceOrder(params);
   const covAddr = C.wasm.scriptToAddress(plan.spkHex, C.network);
   onStatus && onStatus('Funding the order on-chain…');
-  const { txid, vout } = await fundCovenant(covAddr, plan.spkHex, pay, payAtoms);
+  const { txid, vout } = await fundCovenant(covAddr, plan.spkHex, pay, payAtoms, S.feeAsset || defaultFeeAsset());
   const covenant = buildCovenantTerms(plan.order, txid, vout, plan.tap);
   const offer = buildCovenantOffer({
     assetA: pay, assetB: receive, sellAtoms: BigInt(payAtoms), recvAtoms: BigInt(recvAtoms),
@@ -3636,7 +3660,9 @@ function fmtGroup(n){ return _group(trim(n)); }
 function fmtPrice(n){
   if (!isFinite(n)) return '-';
   if (n === 0) return '0';
-  const a = Math.abs(n), dp = a >= 1000 ? 2 : a >= 1 ? 4 : a >= 0.01 ? 6 : 8;
+  const a = Math.abs(n);
+  if (a < 1e-8) return (n < 0 ? '-' : '') + '<0.00000001';   // nonzero but below 8dp resolution — never show a real price as "0" (e.g. a cheap asset priced in BTC)
+  const dp = a >= 1000 ? 2 : a >= 1 ? 4 : a >= 0.01 ? 6 : 8;
   let s = (Math.round(n * Math.pow(10, dp)) / Math.pow(10, dp)).toFixed(dp);
   if (s.indexOf('.') >= 0) s = s.replace(/0+$/, '').replace(/\.$/, '');
   return _group(s);
@@ -3891,7 +3917,7 @@ function renderBook(pay, receive){
   // Only the liftable rows (from BOOK.offers) are clickable — seed the composer at that level's price.
   const wire = (r) => { if (r.take) r.onClick = () => fillFromOffer(r.id, r.maker, pay, receive); };
   asks.forEach(wire); bids.forEach(wire);
-  LAST_MID = { price: mid, cross: false, base, quote };
+  LAST_MID = { price: mid, cross: false, base, quote, oneSided: !(bestAsk != null && bestBid != null) };
   renderLadder(host, {
     asks, bids, mid, spread,
     priceLabel: `(${bm.ticker}/${qm.ticker})`, sizeLabel: bm.ticker,
