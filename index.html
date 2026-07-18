@@ -450,7 +450,7 @@
         <label class="lbl">⚡ Pay a Lightning invoice</label>
         <p class="sub" style="margin:0 0 10px">Your hosted node pays the invoice and your device co-signs. Pick the asset to pay from.</p>
         <select id="lnSendAsset" style="width:100%"></select>
-        <textarea id="lnSendBolt11" class="mono" placeholder="lnbc… — paste a BOLT11 invoice" style="width:100%;margin-top:8px;min-height:64px;resize:vertical"></textarea>
+        <textarea id="lnSendBolt11" class="mono" placeholder="Paste a BOLT11 invoice (lnbc…)" style="width:100%;margin-top:8px;min-height:64px;resize:vertical"></textarea>
         <button class="primary" id="lnSendBtn" style="margin-top:10px">Pay invoice</button>
         <div class="status" id="lnSendStatus" style="margin-top:8px"></div>
       </div>
@@ -986,15 +986,15 @@ function trustBadge(hex){
   if(!hex || hex.startsWith('oamp:')) return null;   // restricted assets carry their own enclave trust model
   if(assetVerified(hex)){
     const b=el('span'); b.textContent='✓';
-    b.title = hex==='BTC' ? 'Bitcoin — the parent chain'
-            : hex===POLICY_HEX ? 'Sequentia native asset'
+    b.title = hex==='BTC' ? 'Bitcoin, the parent chain'
+            : hex===POLICY_HEX ? 'The Sequence token'
             : ('Verified in the Sequentia asset registry'+(assetDomain(hex)?(' · '+assetDomain(hex)):''));
     b.setAttribute('aria-label','verified'); b.style.cssText='color:#3ddc84;margin-left:5px;font-weight:700;cursor:help';
     return b;
   }
   if(!assetRegistered(hex)){
     const b=el('span'); b.textContent='⚠';
-    b.title='Not in the asset registry. Anyone can issue an asset with any ticker — verify the issuer before trusting or trading it.';
+    b.title='Not in the asset registry. Anyone can issue an asset with any ticker. Verify the issuer before trusting or trading it.';
     b.setAttribute('aria-label','unregistered'); b.style.cssText='color:var(--amber2);margin-left:5px;font-size:11px;cursor:help';
     return b;
   }
@@ -2047,7 +2047,7 @@ function lnStatusPill(){
   }
   const legs = ['asset','btc'].filter(n=>st.nodes[n].enabled)
     .map(n=>`${n}: ${st.nodes[n].connected?'serving':(st.nodes[n].phase||'…')}${st.nodes[n].detail?(' ('+st.nodes[n].detail+')'):''}`);
-  el.title = 'Lightning device signers — ' + legs.join(' · ');
+  el.title = 'Lightning device signers: ' + legs.join(' · ');
   // Re-quote the composer ONLY when LN availability actually TRANSITIONS (a serving leg or the channel
   // count changed → the "Instant (Lightning)" rail appears/disappears), and only while the Swap tab is
   // visible. A full renderSwap on EVERY status tick tore down + rebuilt the whole tab, so the page
@@ -2380,7 +2380,7 @@ function initLnSendReceive(){
       const inv = await L.nodeReceive({ node_key, amount: amt, description: 'Receive ' + meta.ticker });
       if (!inv || !inv.bolt11) throw new Error((inv && inv.error) || 'no invoice returned');
       out.textContent = inv.bolt11; $('lnRecvCopy').classList.remove('hide');
-      st.className = 'status'; st.textContent = 'Invoice ready — share it to receive ' + esc($('lnRecvAmt').value) + ' ' + esc(meta.ticker) + '.';
+      st.className = 'status'; st.textContent = 'Invoice ready. Share it to receive ' + esc($('lnRecvAmt').value) + ' ' + esc(meta.ticker) + '.';
     } catch(e){ st.className = 'status err'; st.textContent = 'Could not create the invoice: ' + prettyErr(e); }
     finally { recvBtn.disabled = false; }
   };
@@ -2543,7 +2543,7 @@ function moveToLightningDialog(leg){
             // survives a reload via resumeMove). The user gets a toast when the channel is ready.
             no.disabled=false; no.textContent='Continue in background';
             no.onclick=()=>{ backgrounded=true; m.remove();
-              try{ toast('Deposit sent — your '+leg.ticker+' Lightning channel is opening in the background. Keep using the wallet; we’ll let you know when it’s ready.'); }catch{} };
+              try{ toast('Deposit sent. Your '+leg.ticker+' Lightning channel is opening in the background. Keep using the wallet; we’ll let you know when it’s ready.'); }catch{} };
           }
           if(e.phase==='reconnecting'){ say('Connection hiccup — reconnecting (your deposit is safe; this will finish)…'); return; }
           if(phaseCopy[e.phase]) say(phaseCopy[e.phase]);

@@ -168,9 +168,13 @@ async function findReverseOffer(seqAsset){
   const book = await seqob.fetchBook(seqAsset, 'BTC');
   const offers = (book.offers || book.Offers || []).filter(o => {
     if (o._verified === false) return false;
-    const cc = offerField(o, 'cross_chain', 'crossChain');
-    if (!cc) return false;
-    return Number(offerField(cc, 'direction') || 0) === DIR_ASSET_TO_BTC;
+    // Mirror the composer's book predicate (isReverseCrossOffer in xswap.js): a reverse offer is simply
+    // one whose offer_asset is BTC (the maker gives BTC for the asset = a taker SELL). Daemon/relay-seeded
+    // reverse offers carry NO cross_chain field (the maker keys/locktimes are minted per-lift), so the old
+    // cross_chain.direction requirement returned null for exactly the seeded liquidity the ladder showed,
+    // throwing "No one is buying this asset for BTC right now". Forward offers have want_asset==='BTC'
+    // instead, so this never picks one up.
+    return offerField(o, 'offer_asset', 'offerAsset') === 'BTC';
   });
   if (!offers.length) return null;
   const norm = (o) => {

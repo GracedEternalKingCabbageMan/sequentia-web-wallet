@@ -1951,8 +1951,13 @@ async function requoteCross(route, amtStr){
     // letting the user start a swap they can't fund.
     const _payAtoms = route.payIsBtc ? reqBtcAtoms : reqSeqAtoms;
     const _payBal   = balAtoms(route.payIsBtc ? 'BTC' : seqAsset);
-    if (_payAtoms > _payBal){
-      $('swErr').textContent = `You only hold ${C.fmtAtoms(_payBal, route.payIsBtc ? 8 : seqPrec)} ${route.payIsBtc ? 'BTC' : am.ticker} · reduce the amount.`;
+    // Paying BTC funds an on-chain HTLC whose funding tx also needs a Bitcoin miner fee on top of the
+    // locked amount, so reserve a little headroom (the exact fee is computed at btcBuildTx). Without it a
+    // near-max BTC buy passes Review and then fails when the funding tx is built. Same class as onMax's
+    // same-asset fee headroom; BTC side only.
+    const _payNeed = route.payIsBtc ? (_payAtoms + 1000n) : _payAtoms;
+    if (_payNeed > _payBal){
+      $('swErr').textContent = `You only hold ${C.fmtAtoms(_payBal, route.payIsBtc ? 8 : seqPrec)} ${route.payIsBtc ? 'BTC' : am.ticker}${route.payIsBtc ? ' (an on-chain fee is also needed)' : ''} · reduce the amount.`;
       setReviewEnabled(false);
       return;
     }
@@ -2861,11 +2866,17 @@ async function reviewMixed(q){
 //  the rail is gated honestly and never half-executes a real BTC claim.]
 const SELL_KEY = 'swk.subasset.sell';
 let SELL = null;
+// Synchronous in-flight sentinel. SELL.state only becomes 'claiming' AFTER the LN-pay prologue
+// (assetNodeKey / connectNode / L.swap), so hasSellInFlight is blind during it. With the progress
+// modal now dismissable, a user could start a SECOND sell in that window and overwrite SELL (the
+// single-key handle to the BTC claim). Set true synchronously at the top of startSell, cleared in
+// its finally, so the guard covers the whole pre-claim prologue too.
+let _sellStarting = false;
 function saveSell(){ try { localStorage.setItem(SELL_KEY, JSON.stringify(SELL)); } catch {} }
 function clearSell(){ SELL = null; try { localStorage.removeItem(SELL_KEY); } catch {} }
-// True while a sell is persisted with the preimage but its BTC claim is not yet confirmed —
-// the claim is the FUND step, so it must survive a reload (resumeSell re-attempts it).
-export function hasSellInFlight(){ return !!(SELL && SELL.state === 'claiming'); }
+// True while a sell is starting or is persisted with the preimage but its BTC claim is not yet
+// confirmed — the claim is the FUND step, so it must survive a reload (resumeSell re-attempts it).
+export function hasSellInFlight(){ return !!(_sellStarting || (SELL && SELL.state === 'claiming')); }
 
 async function startSell(params){
   const { $ } = C;
@@ -2887,6 +2898,7 @@ async function startSell(params){
   const say = (t, cls) => { st.className = 'status' + (cls ? ' ' + cls : ''); st.innerHTML = (cls ? '' : '<span class="spin"></span>') + esc(t); };
   const done = () => { closeBtn.textContent = 'Close'; };
   try {
+    _sellStarting = true;   // block a concurrent second sell through the whole pre-claim prologue (TOCTOU)
     if (!(L && L.swap && L.assetNodeKey)) throw new Error('The Lightning service is unavailable in this build.');
     if (!(C.btcLeg && C.btcLeg.claim && C.btcLeg.claimKey && C.btcLeg.verifyClaimable)) throw new Error('The BTC claim service is unavailable in this build.');
     say('Preparing your sell…');
@@ -2925,6 +2937,8 @@ async function startSell(params){
     // If the asset was already paid (SELL persisted), keep it for re-claim on reload — never lose it.
     say('Failed: ' + C.prettyErr(e) + (SELL && SELL.state === 'claiming' ? ' · your BTC is still claimable; reopen the wallet to retry the claim.' : ''), 'err');
     done();
+  } finally {
+    _sellStarting = false;   // hand off to the SELL.state guard (or clear if the prologue never funded)
   }
 }
 // Verify the maker's BTC HTLC binds our claim key + H, then claim it on-chain with the preimage.
@@ -2972,11 +2986,16 @@ export async function resumeSell(){
 // with its identity key (seqdex 2152f33). BUY and SELL stay on SEPARATE books (ln_direction 5 vs 4).
 const BUY_KEY = 'swk.subasset.buy';
 let BUY = null;
+// Synchronous in-flight sentinel (mirror of _sellStarting). BUY.state only becomes 'funded' AFTER the
+// pre-fund prologue, so without this a dismissed modal lets a second buy fund a SECOND BTC HTLC and
+// overwrite BUY (the single-key handle to the locked BTC). Set at the top of startBuy, cleared in its
+// finally, so the guard covers the whole pre-fund prologue too.
+let _buyStarting = false;
 function saveBuy(){ try { localStorage.setItem(BUY_KEY, JSON.stringify(BUY)); } catch {} }
 function clearBuy(){ BUY = null; try { localStorage.removeItem(BUY_KEY); } catch {} }
-// True while a buy has FUNDED its BTC HTLC but is not yet settled/refunded — the BTC is locked, so
-// the record must survive a reload (resumeBuy settles on hold, or refunds after T_btc).
-export function hasBuyInFlight(){ return !!(BUY && (BUY.state === 'funded' || BUY.state === 'holding')); }
+// True while a buy is starting or has FUNDED its BTC HTLC but is not yet settled/refunded — the BTC is
+// locked, so the record must survive a reload (resumeBuy settles on hold, or refunds after T_btc).
+export function hasBuyInFlight(){ return !!(_buyStarting || (BUY && (BUY.state === 'funded' || BUY.state === 'holding'))); }
 // T_btc safety delta over the current BTC tip (parent-chain blocks), matching the maker's
 // BtcLocktimeDelta so the refund branch matures well after the swap should have settled.
 const BUY_CLTV_DELTA = 100;
@@ -3001,6 +3020,7 @@ async function startBuy(params){
   const say = (t, cls) => { st.className = 'status' + (cls ? ' ' + cls : ''); st.innerHTML = (cls ? '' : '<span class="spin"></span>') + esc(t); };
   const done = () => { closeBtn.textContent = 'Close'; };
   try {
+    _buyStarting = true;   // block a concurrent second buy through the whole pre-fund prologue (TOCTOU)
     if (!(L && L.swap && L.assetNodeKey && L.nodeInvoice && L.invoiceStatus && L.nodeSettle)) throw new Error('The Lightning service is unavailable in this build.');
     if (!(C.btcLeg && C.btcLeg.fund && C.btcLeg.refund && C.btcLeg.refundKey && C.btcLeg.tipHeight)) throw new Error('The BTC HTLC service is unavailable in this build.');
     if (!(C.wasm && C.wasm.generateSwapSecret && C.wasm.buildSeqHtlcRedeemScript)) throw new Error('The HTLC builder is unavailable in this build.');
@@ -3071,6 +3091,8 @@ async function startBuy(params){
     // If the BTC HTLC was already funded (BUY persisted), keep it for settle/refund on reload — never lose it.
     say('Failed: ' + C.prettyErr(e) + (BUY && (BUY.state === 'funded' || BUY.state === 'holding') ? ' · your Bitcoin is still locked; reopen the wallet to finish or refund it.' : ''), 'err');
     done();
+  } finally {
+    _buyStarting = false;   // hand off to the BUY.state guard (or clear if the prologue never funded)
   }
 }
 // Poll the HODL invoice on our node until the maker's asset payment is HELD, then device-settle with
