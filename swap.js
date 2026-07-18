@@ -1067,6 +1067,7 @@ function onFlip(){
   [pa._userTyped, ra._userTyped] = [ra._userTyped, pa._userTyped];   // keep the anti-clobber flags with their values
   S.edited = S.edited === 'pay' ? 'receive' : 'pay';
   S.modeTouched = false;   // re-arm the Take/Post default for the flipped pair
+  if (!S.feeAssetTouched) S.feeAsset = null;   // let the fee default follow the flipped pay asset (D2)
   LAST_QUOTE = null; setReviewEnabled(false);
   paintPanes();
   requote().catch(()=>{});
@@ -2170,7 +2171,7 @@ function openFeePicker(){
   popover(C.$('swFeePick'), opts.map(o => ({
     hex: o.hex, ticker: o.ticker, name: feeAssetSubline(o.hex), bal: balLine(o.hex), enabled: true,
   })), (hex) => {
-    S.feeAsset = hex; renderFeePicker();
+    S.feeAsset = hex; S.feeAssetTouched = true; renderFeePicker();
     LAST_QUOTE = null; setReviewEnabled(false);
     requote().catch(()=>{});
   });
@@ -2320,6 +2321,7 @@ function openPicker(side){
     const o = side === 'pay' ? S.receiveAsset : S.payAsset;
     if (o && !counterpartsOf(hex).includes(o)){ if (side === 'pay') S.receiveAsset = null; else S.payAsset = null; }
     S.railsTouched = false; S.modeTouched = false;   // re-arm rail + Take/Post defaults for the new pair
+    if (!S.feeAssetTouched) S.feeAsset = null;        // let the fee default follow the new pay asset (D2)
     LAST_QUOTE = null; setReviewEnabled(false);
     paintPanes();
     requote().catch(()=>{});
