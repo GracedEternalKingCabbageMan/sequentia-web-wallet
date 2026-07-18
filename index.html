@@ -107,7 +107,7 @@
   .modal{position:fixed;inset:0;background:#000a;display:flex;align-items:center;justify-content:center;padding:18px;z-index:50}
   .modal .card{margin:0;max-width:480px;width:100%;max-height:88vh;overflow:auto}
   .kv{display:flex;justify-content:space-between;gap:14px;padding:7px 0;border-top:1px solid var(--line);font-size:14px}
-  .kv:first-child{border-top:none} .kv .k{color:var(--dim)} .kv .v{text-align:right;word-break:break-all;font:13px ui-monospace,monospace}
+  .kv:first-child{border-top:none} .kv .k{color:var(--dim);flex:0 0 auto;white-space:nowrap} .kv .v{text-align:right;overflow-wrap:anywhere;min-width:0;font:13px ui-monospace,monospace}
   /* toast */
   .toast{position:fixed;left:50%;bottom:24px;transform:translateX(-50%);background:#1d242d;border:1px solid var(--line);
          border-radius:10px;padding:12px 16px;font-size:13.5px;max-width:92vw;box-shadow:0 8px 30px #0008;z-index:60}

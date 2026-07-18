@@ -1394,7 +1394,8 @@ async function requoteSame(route, amtStr){
     const best = bestReceivePerPay(liftable, pay, receive);
     if (S.mode === 'take') applyComposeDerivation(pay, receive, best);
     paintPlaceRate(pay, receive, best, liftable.length);
-    paintFee(S.feeAsset, null);
+    if (!S.feeAsset) S.feeAsset = defaultFeeAsset();
+    paintFee(S.feeAsset, covFeeAtoms(S.feeAsset));   // compose-time estimate in the chosen fee asset, not "-"
     setFinality('same');
 
     // Enable Place order once BOTH amounts are set and the pay leg is affordable.
@@ -1537,7 +1538,7 @@ function postModeSame(pay, receive){
       : `No resting offers yet — set both amounts (their ratio is your price) to post the first order.`;
   }
   $('swRoute').textContent = hasBook ? 'Order book · post a limit order' : 'Order book · be the first';
-  paintFee(S.feeAsset, null);
+  paintFee(S.feeAsset, covFeeAtoms(S.feeAsset));   // compose-time estimate in the chosen fee asset, not "-"
   setFinality('same');
   setReviewEnabled(pv > 0 && rv > 0);
 }
@@ -2662,10 +2663,14 @@ async function placeCovenantReview(q){
   const pm = C.assetMeta(pay), rm = C.assetMeta(receive);
   const payU = Number(payAtoms)/Math.pow(10, pm.precision||0), recvU = Number(recvAtoms)/Math.pow(10, rm.precision||0);
   const isMarket = S.mode !== 'post';
+  const feeAsset = S.feeAsset || defaultFeeAsset();
+  const feeAtoms = covFeeAtoms(feeAsset);
   const kv = [
     ['You pay', amtRow(pay, payAtoms) + refSuffix(pay, payAtoms)],
     ['You receive', amtRow(receive, recvAtoms) + refSuffix(receive, recvAtoms)],
     ['Price', payU>0 ? `${isMarket ? 'Market · ' : 'Limit · '}${ratePerPayToLine(pay, receive, recvU/payU).str}` : '-'],
+    ['Network fee', amtRow(feeAsset, feeAtoms) + refSuffix(feeAsset, feeAtoms) + '  (estimate)'],
+    ['Fee paid in', C.assetMeta(feeAsset).ticker],
     ['How it fills', isMarket
       ? `Fills against the order book now at your price or better. If your order is larger than what's resting, the filled part settles on-chain and the unfilled remainder keeps resting at the same price until it's crossed — even while this wallet is closed. Consensus rejects any underpay or redirect.`
       : `Rests on-chain at your price and fills — fully or partially — whenever someone crosses it, even while this wallet is closed. A partial fill settles that part and leaves the rest resting. Consensus rejects any underpay or redirect.`],
