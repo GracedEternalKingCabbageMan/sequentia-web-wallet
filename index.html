@@ -886,7 +886,7 @@ import init, { Mnemonic, Network, Signer, Wollet, EsploraClient, Address, AssetI
   openampComputeAid, enclaveSighash, decodeEnclaveSpend, stringToQr }
   from './pkg/lwk_wasm.js';
 import { HDKey, mnemonicToSeedSync, btc, schnorr } from './btc.js';
-import { initSwap, renderSwap, resumeCrossMakers, resumeCovenantOrders, resumeMixedSwap, resumeSell, resumeBuy, hasBuyInFlight, scanCovenantCompanion, setConfidentialReceive, confidentialReceive } from './swap.js';
+import { initSwap, renderSwap, resumeCrossMakers, resumeCovenantOrders, resumeMixedSwap, resumeSell, resumeBuy, hasBuyInFlight, scanCovenantCompanion, setConfidentialReceive, confidentialReceive, logTrade } from './swap.js';
 import { initXswap, renderXswap, fetchXmarkets, fetchXquote, fetchXbook, openFromComposer, hasInFlight } from './xswap.js';
 import { initXrswap, fetchRQuote, openReverseFromComposer, hasInFlight as hasReverseInFlight, renderReverse } from './xrswap.js';
 import { initXmaker, startForwardMaker, startReverseMaker, liveMakerOffers, resumeMakerSwaps } from './xmaker.js';
@@ -2616,6 +2616,7 @@ function initSwapTab(){
     get addrIndex(){ return addrIndex; },
     el, $, assetMeta, balObj, fmtAtoms, parseAtoms,
     refValueStr, attachRefHint, prettyErr, modalRows, toast, sync,
+    logTrade,                                 // shared completed-trade history log (W6)
     feeRateFor, DEFAULT_FEERATE, EXCHANGE_RATE_SCALE,   // open-fee-market SEQ-leg claim fee
     btcLeg,                                   // the BTC-leg bridge (testnet4)
     SEQ_ESPLORA: ESPLORA,                     // Sequentia esplora for the claim broadcast
@@ -2633,6 +2634,7 @@ function initSwapTab(){
     get network(){ return network; }, get client(){ return client; },
     get addrIndex(){ return addrIndex; },
     el, $, assetMeta, fmtAtoms, refValueStr, prettyErr, modalRows, toast, sync,
+    logTrade,                                 // shared completed-trade history log (W6)
     feeRateFor, DEFAULT_FEERATE, EXCHANGE_RATE_SCALE, get POLICY_HEX(){ return POLICY_HEX; }, // open-fee-market refund fee
     btcLeg, seqLeg,                            // the BTC-leg + SEQ-leg bridges
     SEQ_ESPLORA: ESPLORA,

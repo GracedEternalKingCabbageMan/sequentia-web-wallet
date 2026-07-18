@@ -831,6 +831,14 @@ function renderStepper(){
   const sm = C.assetMeta(SWAP.market.seq_asset);
   const [blabel, bcls] = badge(SWAP.state);
 
+  // W6: once the sell finishes (BTC claimed), record a receipt in the shared completed-trade history
+  // so it shows in the Active-trades card. logTrade dedups by id, so a re-render logs exactly once.
+  if (SWAP.state === ST.BTC_CLAIMED && C.logTrade){
+    C.logTrade({ id: 'xsell:' + (SWAP.session_id || SWAP.hash_hex || SWAP.btc_claim_txid || ''),
+      title: 'Sold ' + C.fmtAtoms(SWAP.seq_amount || 0, sm.precision) + ' ' + sm.ticker + ' for BTC (cross-chain)',
+      status: 'complete', txid: SWAP.btc_claim_txid || null });
+  }
+
   const head = el('div','card');
   const hr = el('div','row');
   hr.appendChild(el('label','lbl', 'Cross-chain sell (asset → BTC)'));

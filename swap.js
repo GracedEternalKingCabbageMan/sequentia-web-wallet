@@ -67,7 +67,7 @@ const _dismissed = new Set();
 // re-renders logs once. Summaries only (no keys/secrets) — safe to persist.
 const HIST_KEY = 'swk.dex.history';
 function loadHist(){ try { return JSON.parse(localStorage.getItem(HIST_KEY) || '[]') || []; } catch { return []; } }
-function logTrade(e){
+export function logTrade(e){
   if (!e || !e.id) return;
   try {
     const h = loadHist();
@@ -2876,11 +2876,16 @@ async function startSell(params){
   card.appendChild(C.el('label','lbl','Selling ' + am.ticker + ' over Lightning'));
   const st = C.el('div','status'); card.appendChild(st);
   const act = C.el('div','row'); act.style.marginTop = '12px';
-  const closeBtn = C.el('button','ghost','Close'); closeBtn.style.display = 'none'; closeBtn.onclick = () => modal.remove();
+  // The sell is persisted + resumable (resumeSell re-attempts on reload), so this modal is a
+  // progress view, not a lock: closing it never cancels the swap, and a second sell stays blocked
+  // by hasSellInFlight. Dismissable from the start via the button and a backdrop click; the label
+  // firms to "Close" once it settles (W5).
+  const closeBtn = C.el('button','ghost','Run in background'); closeBtn.onclick = () => modal.remove();
   act.appendChild(closeBtn); card.appendChild(act);
   modal.appendChild(card); document.body.appendChild(modal);
+  modal.onclick = (e) => { if (e.target === modal) modal.remove(); };
   const say = (t, cls) => { st.className = 'status' + (cls ? ' ' + cls : ''); st.innerHTML = (cls ? '' : '<span class="spin"></span>') + esc(t); };
-  const done = () => { closeBtn.style.display = ''; };
+  const done = () => { closeBtn.textContent = 'Close'; };
   try {
     if (!(L && L.swap && L.assetNodeKey)) throw new Error('The Lightning service is unavailable in this build.');
     if (!(C.btcLeg && C.btcLeg.claim && C.btcLeg.claimKey && C.btcLeg.verifyClaimable)) throw new Error('The BTC claim service is unavailable in this build.');
@@ -2986,11 +2991,15 @@ async function startBuy(params){
   card.appendChild(C.el('label','lbl','Buying ' + am.ticker + ' over Lightning'));
   const st = C.el('div','status'); card.appendChild(st);
   const act = C.el('div','row'); act.style.marginTop = '12px';
-  const closeBtn = C.el('button','ghost','Close'); closeBtn.style.display = 'none'; closeBtn.onclick = () => modal.remove();
+  // Persisted + resumable (resumeBuy settles on hold / refunds the BTC after its timeout on reload),
+  // so this modal is a progress view, not a lock: closing it never cancels the buy, and a second buy
+  // stays blocked by hasBuyInFlight. Dismissable from the start; label firms to "Close" on settle (W5).
+  const closeBtn = C.el('button','ghost','Run in background'); closeBtn.onclick = () => modal.remove();
   act.appendChild(closeBtn); card.appendChild(act);
   modal.appendChild(card); document.body.appendChild(modal);
+  modal.onclick = (e) => { if (e.target === modal) modal.remove(); };
   const say = (t, cls) => { st.className = 'status' + (cls ? ' ' + cls : ''); st.innerHTML = (cls ? '' : '<span class="spin"></span>') + esc(t); };
-  const done = () => { closeBtn.style.display = ''; };
+  const done = () => { closeBtn.textContent = 'Close'; };
   try {
     if (!(L && L.swap && L.assetNodeKey && L.nodeInvoice && L.invoiceStatus && L.nodeSettle)) throw new Error('The Lightning service is unavailable in this build.');
     if (!(C.btcLeg && C.btcLeg.fund && C.btcLeg.refund && C.btcLeg.refundKey && C.btcLeg.tipHeight)) throw new Error('The BTC HTLC service is unavailable in this build.');
@@ -3456,6 +3465,11 @@ async function reviewSame(q){
     try {
       const txid = await liftOffer(q, st);
       modal.remove();
+      // Receipt into the persistent history so the Active-trades card is a record, not just live
+      // status — same-chain taker lifts were the one completed flow that never logged one (W6).
+      logTrade({ id: 'lift:' + txid,
+        title: 'Swapped ' + C.assetMeta(q.assetP).ticker + ' for ' + C.assetMeta(q.assetR).ticker,
+        status: 'settled', txid });
       C.toast('Swap settled (anchor-bound; reverts only if Bitcoin reverts):', {href:'/explorer/tx/'+txid, label:String(txid).slice(0,18)+'…'});
       resetComposer();
       await C.sync();
@@ -3632,7 +3646,12 @@ async function reviewLn(q){
       const got = (r.direction === 'sold') ? `${r.quote_amount} BTC`
         : `${r.base_amount} ${bm.ticker}`;
       modal.remove();
-      C.toast(`Lightning swap settled (final): received ${got} · preimage ${String(r.preimage || '').slice(0, 16)}…`);
+      // Receipt into the persistent history (W6); no on-chain txid on this rail, so key by the
+      // payment hash. Drop the raw preimage from the toast — it is protocol jargon, not user info (C-7).
+      logTrade({ id: 'ln:' + (r.hash_h || r.preimage || Date.now()),
+        title: (r.direction === 'sold' ? 'Sold ' + bm.ticker + ' for BTC' : 'Bought ' + bm.ticker + ' with BTC') + ' over Lightning',
+        status: 'settled' });
+      C.toast(`Lightning swap settled and final: received ${got}.`);
       resetComposer();
       await C.sync();
       renderSwap();

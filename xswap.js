@@ -1313,6 +1313,15 @@ function renderStepper(){
   const sm = C.assetMeta(SWAP.market.seq_asset);
   const [blabel, bcls] = badge(SWAP.state);
 
+  // W6: once the buy finishes, drop a receipt into the shared completed-trade history so it shows in
+  // the Active-trades card as a record, not just live status. logTrade dedups by id, so re-renders of
+  // the terminal view log exactly once.
+  if (isForwardComplete() && C.logTrade){
+    C.logTrade({ id: 'xbuy:' + (SWAP.offer_id || SWAP.session_id || SWAP.seq_claim_txid || ''),
+      title: 'Bought ' + C.fmtAtoms(SWAP.seq_amount || 0, sm.precision) + ' ' + sm.ticker + ' with BTC (cross-chain)',
+      status: 'complete', txid: SWAP.seq_claim_txid || null });
+  }
+
   // Header card: market + overall badge + amounts + the secret/timeouts.
   const head = el('div','card');
   const hr = el('div','row');
