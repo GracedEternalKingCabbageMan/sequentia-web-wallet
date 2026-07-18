@@ -1101,7 +1101,12 @@ function onFlip(){
 function onMax(){
   if (!S.payAsset || S.payAsset === 'BTC') return;
   const m = C.assetMeta(S.payAsset);
-  C.$('swPayAmt').value = C.fmtAtoms(balAtoms(S.payAsset), m.precision);
+  let maxAtoms = balAtoms(S.payAsset);
+  // Leave headroom for the network fee when it's paid in the SAME asset you're spending — otherwise
+  // "Max" spends the whole balance and leaves nothing to cover the fee, so the order fails (C4).
+  const feeAsset = S.feeAsset || defaultFeeAsset();
+  if (feeAsset === S.payAsset){ const fee = covFeeAtoms(feeAsset); if (maxAtoms > fee) maxAtoms -= fee; }
+  C.$('swPayAmt').value = C.fmtAtoms(maxAtoms, m.precision);
   C.$('swPayAmt')._userTyped = true;   // Max is an explicit user amount
   // exit ⇄ ref-input mode if active so the literal asset amount is used
   if (C.$('swPayAmt')._refMode) C.$('swPayAmt')._refMode = false;
@@ -1215,17 +1220,17 @@ function paintCostLine(){
   const improvePct = betterWhenLower ? -rawPct : rawPct;   // + ⇒ better for the taker
   const mag = Math.abs(improvePct);
   if (mag < 0.05){ el.textContent = 'at the mid price'; return; }
-  // A taker crossing the spread beats mid by at most the half-spread; a big deviation means the mid
-  // is unreliable (thin/wide book on testnet), so a vs-mid comparison would mislead — suppress it.
-  if (mag > 12) return;
+  // Never HIDE a large deviation (C4): a big number is real price impact from your size walking a thin
+  // book — exactly when the taker most needs to see it. Escalate the wording instead of suppressing.
   if (improvePct > 0){
     el.style.color = '#3ddc84';
     el.textContent = `≈ ${mag.toFixed(mag < 1 ? 2 : 1)}% better than mid`;
     el.title = `You take at ~${trim(eff)} vs the ${trim(mid)} mid — better than resting at the mid price.`;
   } else {
     el.style.color = 'var(--amber2)';
-    el.textContent = `≈ ${mag.toFixed(mag < 1 ? 2 : 1)}% spread cost vs mid`;
-    el.title = `You take at ~${trim(eff)} vs the ${trim(mid)} mid — the cost of filling now instead of resting at the mid price.`;
+    const label = mag > 8 ? 'price impact (thin book) vs mid' : 'spread cost vs mid';
+    el.textContent = `≈ ${mag.toFixed(mag < 1 ? 2 : 1)}% ${label}`;
+    el.title = `You take at ~${trim(eff)} vs the ${trim(mid)} mid — the cost of filling now (your size walks the book past the best price) instead of resting at the mid.`;
   }
 }
 // Before a pair is chosen the composer (the pay/receive selectors) IS the surface: the book area stays
@@ -1935,6 +1940,16 @@ async function requoteCross(route, amtStr){
       remainderSeqAtoms: hasRemainder ? remSeq : 0n, remainderBtcAtoms: remBtc };
     status.textContent = '';
     paintQuoteCross();
+    // AFFORDABILITY (C4): the cross take funds the fill now AND rests the remainder, so the FULL
+    // requested pay amount is committed — gate Review on it, like the same-chain path, instead of
+    // letting the user start a swap they can't fund.
+    const _payAtoms = route.payIsBtc ? reqBtcAtoms : reqSeqAtoms;
+    const _payBal   = balAtoms(route.payIsBtc ? 'BTC' : seqAsset);
+    if (_payAtoms > _payBal){
+      $('swErr').textContent = `You only hold ${C.fmtAtoms(_payBal, route.payIsBtc ? 8 : seqPrec)} ${route.payIsBtc ? 'BTC' : am.ticker} — reduce the amount.`;
+      setReviewEnabled(false);
+      return;
+    }
     setReviewEnabled(true);
   } catch (e){
     status.textContent = '';
