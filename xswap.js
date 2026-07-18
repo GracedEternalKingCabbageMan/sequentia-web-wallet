@@ -979,7 +979,7 @@ function verifyAnchor(legAnchor){
   if (!Number.isFinite(a) || a < 0)
     return { ok: false, anchor_height: a, btc_height: bh, unconfirmed: true, reason: 'the maker’s Sequentia leg is not yet confirmed and anchored to Bitcoin' };
   if (!(a >= bh))
-    return { ok: false, anchor_height: a, btc_height: bh, unsafe: true, reason: `the asset leg is anchored at Bitcoin height ${a}, BEFORE your BTC lock (${bh}); it could outlive your BTC in a reorg, so it is NOT safe to claim — refund your BTC after block ${SWAP.btc_locktime}` };
+    return { ok: false, anchor_height: a, btc_height: bh, unsafe: true, reason: `the asset leg is anchored at Bitcoin height ${a}, BEFORE your BTC lock (${bh}); it could outlive your BTC in a reorg, so it is NOT safe to claim · refund your BTC after block ${SWAP.btc_locktime}` };
   return { ok: true, anchor_height: a, btc_height: bh };
 }
 
@@ -1083,7 +1083,7 @@ async function claimSeq(){
   if (SWAP.seq_locktime){
     const seqTip = await seqTipHeight();
     if (seqTip >= 0 && seqTip >= (Number(SWAP.seq_locktime) - SEQ_REFUND_MARGIN))
-      throw new Error(`too close to the maker's Sequentia refund window (tip ${seqTip} ≥ T_seq ${SWAP.seq_locktime} − ${SEQ_REFUND_MARGIN}); do NOT reveal the secret — let your BTC refund after block ${SWAP.btc_locktime}`);
+      throw new Error(`too close to the maker's Sequentia refund window (tip ${seqTip} ≥ T_seq ${SWAP.seq_locktime} − ${SEQ_REFUND_MARGIN}); do NOT reveal the secret · let your BTC refund after block ${SWAP.btc_locktime}`);
   }
   const { wasm } = C;
   // Destination SPK: a fresh wallet address, unconfidential (explicit output).
@@ -1147,7 +1147,7 @@ async function onClaimSeq(){
   $('xswapErr').textContent = '';
   const gate = verifyAnchor(await fetchLegAnchor());
   if (!gate.ok){ $('xswapErr').textContent = gate.unconfirmed
-    ? 'not yet claimable: ' + gate.reason + ' (this clears once the maker’s asset block confirms — the wallet retries automatically).'
+    ? 'not yet claimable: ' + gate.reason + ' (this clears once the maker’s asset block confirms · the wallet retries automatically).'
     : 'cannot claim: ' + gate.reason; return; }
   const leg = verifyLeg();
   if (!leg.ok){ $('xswapErr').textContent = 'cannot claim: ' + leg.reason; return; }
@@ -1202,7 +1202,7 @@ function stopPoll(){ if (POLL){ clearInterval(POLL); POLL = null; } }
 async function onRefundBtc(){
   const { $ } = C;
   $('xswapErr').textContent = '';
-  if (!SWAP || !SWAP.btc_leg || SWAP.btc_leg.vout == null){ $('xswapErr').textContent = 'The BTC funding is still confirming — refund is available once it confirms.'; return; }
+  if (!SWAP || !SWAP.btc_leg || SWAP.btc_leg.vout == null){ $('xswapErr').textContent = 'The BTC funding is still confirming · refund is available once it confirms.'; return; }
   if (!C.btcLeg || !C.btcLeg.refund){ $('xswapErr').textContent = 'BTC refund unavailable in this build'; return; }
   const kv = [
     ['Network', '⚠ Bitcoin: refunding YOUR locked BTC leg (parent chain) via the CLTV branch'],
@@ -1219,7 +1219,7 @@ async function onRefundBtc(){
       const tip = Number(await btcTipHeight().catch(() => 0)) || 0;
       if (tip && tip < Number(SWAP.btc_locktime)){
         st.className = 'status err';
-        st.textContent = `Not yet — the refund unlocks at Bitcoin block ${SWAP.btc_locktime}, about ${Number(SWAP.btc_locktime) - tip} block(s) away.`;
+        st.textContent = `Not yet · the refund unlocks at Bitcoin block ${SWAP.btc_locktime}, about ${Number(SWAP.btc_locktime) - tip} block(s) away.`;
         ok.disabled = false; return;
       }
       const txid = await C.btcLeg.refund({

@@ -766,7 +766,7 @@ async function onRefundSeq(){
       let _tip = 0; try { _tip = C.wollet ? Number(C.wollet.tip().height()) : 0; } catch {}
       if (_tip && _tip < Number(SWAP.seq_locktime)){
         st.className = 'status err';
-        st.textContent = `Not yet — the refund unlocks at Sequentia block ${SWAP.seq_locktime}, about ${Number(SWAP.seq_locktime) - _tip} block(s) away.`;
+        st.textContent = `Not yet · the refund unlocks at Sequentia block ${SWAP.seq_locktime}, about ${Number(SWAP.seq_locktime) - _tip} block(s) away.`;
         ok.disabled = false; return;
       }
       // The refund tx pays its fee IN THE LOCKED ASSET (the HTLC holds only that asset — which could be

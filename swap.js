@@ -723,7 +723,7 @@ function renderPairBar(){
   // LAST_MID.price is quote-per-base in the SAME frame the book just rendered (pairDir already applied),
   // so use it only when its base matches the current display base. Labelled "mid" — it IS the book mid,
   // not a last trade (a real last price needs the durable trade log; until then, don't call it "last").
-  let midStr = '—';
+  let midStr = '-';
   if (LAST_MID && LAST_MID.price != null && isFinite(LAST_MID.price) && LAST_MID.price > 0 && LAST_MID.base === base){
     midStr = `${fmtPrice(LAST_MID.price)} ${qm.ticker}`;
   }
@@ -923,7 +923,7 @@ function renderRailNote(ra){
   if (bad.cta === 'move'){
     // No channel yet is NOT a blocker any more — a channel is opened for you INLINE when you place
     // the order. Say so honestly; offer an optional "set it up now" shortcut to the Balance tab.
-    note.innerHTML = `<span>No Lightning channel for this leg yet — one is opened for you when you place the order (this can take a couple of minutes).</span>`
+    note.innerHTML = `<span>No Lightning channel for this leg yet · one is opened for you when you place the order (this can take a couple of minutes).</span>`
       + ` <button type="button" class="swfix" id="swRailMove">Set it up now</button>`;
   } else {
     // Channel exists but this side lacks liquidity (cta 'add') — the honest add-liquidity note stays.
@@ -985,7 +985,7 @@ function wireRailSeg(id, leg){
 }
 function paintRailSegs(ra){
   ra = ra || railAvail(S.payAsset, S.receiveAsset);
-  const badTip = 'Coming soon — this asset-over-Lightning with BTC on-chain shape has no maker yet. '
+  const badTip = 'Coming soon · this asset-over-Lightning with BTC on-chain shape has no maker yet. '
     + 'Keep the asset on-chain and BTC on Lightning, or set both legs the same way.';
   const paint = (id, leg) => { const seg = C.$(id); if (!seg) return;
     const cur = leg === 'pay' ? S.payRail : S.recvRail;
@@ -1012,7 +1012,7 @@ function paintRailSegs(ra){
       }
       else if (r === 'ln' && !legLn.ok){ tip = legLn.cta === 'add'
         ? (legLn.reason + (legLn.hint ? ' ' + legLn.hint : ''))
-        : 'No channel yet — one is opened for you when you place the order.'; }
+        : 'No channel yet · one is opened for you when you place the order.'; }
       b.disabled = bad;
       if (tip) b.title = tip; else b.removeAttribute('title');   // informative title even when selectable
     }); };
@@ -1218,12 +1218,12 @@ function paintCostLine(){
   if (improvePct > 0){
     el.style.color = '#3ddc84';
     el.textContent = `≈ ${mag.toFixed(mag < 1 ? 2 : 1)}% better than mid`;
-    el.title = `You take at ~${trim(eff)} vs the ${trim(mid)} mid — better than resting at the mid price.`;
+    el.title = `You take at ~${trim(eff)} vs the ${trim(mid)} mid · better than resting at the mid price.`;
   } else {
     el.style.color = 'var(--amber2)';
     const label = mag > 8 ? 'price impact (thin book) vs mid' : 'spread cost vs mid';
     el.textContent = `≈ ${mag.toFixed(mag < 1 ? 2 : 1)}% ${label}`;
-    el.title = `You take at ~${trim(eff)} vs the ${trim(mid)} mid — the cost of filling now (your size walks the book past the best price) instead of resting at the mid.`;
+    el.title = `You take at ~${trim(eff)} vs the ${trim(mid)} mid · the cost of filling now (your size walks the book past the best price) instead of resting at the mid.`;
   }
 }
 // Before a pair is chosen the composer (the pay/receive selectors) IS the surface: the book area stays
@@ -1409,7 +1409,7 @@ async function requoteSame(route, amtStr){
     if (payAtoms + (_feeAsset === pay ? _feeAtoms : 0n) > balAtoms(pay)){
       LAST_QUOTE = null; setReviewEnabled(false);
       $('swErr').textContent = _feeAsset === pay
-        ? `You only hold ${C.fmtAtoms(balAtoms(pay), pm.precision)} ${pm.ticker} — not enough for the amount plus the fee.`
+        ? `You only hold ${C.fmtAtoms(balAtoms(pay), pm.precision)} ${pm.ticker} · not enough for the amount plus the fee.`
         : `You only hold ${C.fmtAtoms(balAtoms(pay), pm.precision)} ${pm.ticker}.`;
       return;
     }
@@ -1464,10 +1464,10 @@ function paintPlaceRate(pay, receive, best, bookLen){
     // LIMIT: the user's own price. Compare to the book so they know if/when it crosses.
     if (yourPrice > 0){
       let s = `Limit · ${yourLine}`;
-      if (best) s += yourPrice <= best ? ` — crosses now (best ${fmtPrice(bestQ)})` : ` — rests until crossed (best ${fmtPrice(bestQ)})`;
+      if (best) s += yourPrice <= best ? ` · crosses now (best ${fmtPrice(bestQ)})` : ` · rests until crossed (best ${fmtPrice(bestQ)})`;
       $('swRate').textContent = s;
     } else {
-      $('swRate').textContent = 'Limit — set both amounts; their ratio is your price.';
+      $('swRate').textContent = 'Limit · set both amounts; their ratio is your price.';
     }
   } else {
     // MARKET: fill at the best executable offer.
@@ -1479,11 +1479,11 @@ function paintPlaceRate(pay, receive, best, bookLen){
       if (split) s += ` · fills ~${trim(Number(split.fill)/Math.pow(10, pm.precision||0))} ${pm.ticker} now, ~${trim(Number(split.rest)/Math.pow(10, pm.precision||0))} rests`;
       $('swRate').textContent = s;
     } else if (best){
-      $('swRate').textContent = `Market · fills at ${ratePerPayToLine(pay, receive, best).str} — set an amount.`;
+      $('swRate').textContent = `Market · fills at ${ratePerPayToLine(pay, receive, best).str} · set an amount.`;
     } else {
       $('swRate').textContent = bookLen
-        ? 'No crossable offers yet — set both amounts to rest an order (their ratio is your price).'
-        : 'No resting orders yet — set both amounts to place the first order.';
+        ? 'No crossable offers yet · set both amounts to rest an order (their ratio is your price).'
+        : 'No resting orders yet · set both amounts to place the first order.';
     }
   }
   $('swRoute').textContent = bookLen ? 'Order book · place a resting order' : 'Order book · be the first';
@@ -1542,11 +1542,11 @@ function postModeSame(pay, receive){
   const hasBook = !!(BOOK.offers && BOOK.offers.length);
   LAST_QUOTE = { kind:'same', startMarket:true, post:true, pay, receive };
   if (pv > 0 && rv > 0){
-    $('swRate').textContent = `Your price · ${ratePerPayToLine(pay, receive, rv/pv).str} — Post to rest this offer.`;
+    $('swRate').textContent = `Your price · ${ratePerPayToLine(pay, receive, rv/pv).str} · Post to rest this offer.`;
   } else {
     $('swRate').textContent = hasBook
-      ? `Set both amounts — their ratio is your limit price — then Post a resting offer.`
-      : `No resting offers yet — set both amounts (their ratio is your price) to post the first order.`;
+      ? `Set both amounts · their ratio is your limit price · then Post a resting offer.`
+      : `No resting offers yet · set both amounts (their ratio is your price) to post the first order.`;
   }
   $('swRoute').textContent = hasBook ? 'Order book · post a limit order' : 'Order book · be the first';
   paintFee(S.feeAsset, covFeeAtoms(S.feeAsset));   // compose-time estimate in the chosen fee asset, not "-"
@@ -1755,7 +1755,7 @@ async function requoteMixed(route, amtStr){
   if (route.payRail === 'ln' && route.recvRail === 'chain' && !route.payIsBtc){
     const offer = subassetOffers(route.seqAsset, 'sell')[0] || null;
     if (!offer){
-      $('swRate').textContent = `No resting ${am.ticker}→BTC sell offer right now — try again shortly.`;
+      $('swRate').textContent = `No resting ${am.ticker}→BTC sell offer right now · try again shortly.`;
       $('swRoute').textContent = 'Mixed rails · sell over Lightning, receive BTC on-chain';
       setReviewEnabled(false); renderTiming(route); return;
     }
@@ -1782,7 +1782,7 @@ async function requoteMixed(route, amtStr){
   if (route.payRail === 'chain' && route.recvRail === 'ln' && route.payIsBtc && subassetCapable(route.seqAsset)){
     const offer = subassetOffers(route.seqAsset, 'buy')[0] || null;
     if (!offer){
-      $('swRate').textContent = `No resting BTC→${am.ticker} buy offer right now — try again shortly.`;
+      $('swRate').textContent = `No resting BTC→${am.ticker} buy offer right now · try again shortly.`;
       $('swRoute').textContent = 'Mixed rails · buy over Lightning, pay BTC on-chain';
       setReviewEnabled(false); renderTiming(route); return;
     }
@@ -1844,8 +1844,8 @@ function postModeCross(route){
   LAST_QUOTE = { kind:'cross-make', reverse, assetHex: route.seqAsset };
   const both = numVal($('swPayAmt')) > 0 && numVal($('swRecvAmt')) > 0;
   $('swRate').textContent = both
-    ? `Your price · ${reverse ? `buy ${am.ticker} with BTC` : `sell ${am.ticker} for BTC`} — Post to rest this offer.`
-    : `Set both amounts (the ${am.ticker} and the BTC) — their ratio is your price — then Post.`;
+    ? `Your price · ${reverse ? `buy ${am.ticker} with BTC` : `sell ${am.ticker} for BTC`} · Post to rest this offer.`
+    : `Set both amounts (the ${am.ticker} and the BTC) · their ratio is your price · then Post.`;
   $('swRoute').textContent = reverse ? 'Cross-chain · post a bid (buy with BTC)' : 'Cross-chain · post an offer (sell for BTC)';
   setFinality('cross');
   setReviewEnabled(both);
@@ -1952,7 +1952,7 @@ async function requoteCross(route, amtStr){
     const _payAtoms = route.payIsBtc ? reqBtcAtoms : reqSeqAtoms;
     const _payBal   = balAtoms(route.payIsBtc ? 'BTC' : seqAsset);
     if (_payAtoms > _payBal){
-      $('swErr').textContent = `You only hold ${C.fmtAtoms(_payBal, route.payIsBtc ? 8 : seqPrec)} ${route.payIsBtc ? 'BTC' : am.ticker} — reduce the amount.`;
+      $('swErr').textContent = `You only hold ${C.fmtAtoms(_payBal, route.payIsBtc ? 8 : seqPrec)} ${route.payIsBtc ? 'BTC' : am.ticker} · reduce the amount.`;
       setReviewEnabled(false);
       return;
     }
@@ -2070,7 +2070,7 @@ function renderLadder(host, o){
   const hasRows = asks.length || bids.length;
   const cols = `<div class="swladder-cols"><span>Price ${esc(o.priceLabel || '')}</span><span>Size${o.sizeLabel ? ' (' + esc(o.sizeLabel) + ')' : ''}</span><span>Sum</span></div>`;
   const midHtml = hasRows
-    ? `<div class="swlmid"><b>${o.mid != null ? esc(fmtPrice(o.mid)) : '—'}</b> <span class="sp">${o.spread != null ? 'spread ' + esc(fmtPrice(o.spread)) + ' · mid' : 'best price'}</span> <span>${esc(o.refMidStr || '')}</span></div>`
+    ? `<div class="swlmid"><b>${o.mid != null ? esc(fmtPrice(o.mid)) : '-'}</b> <span class="sp">${o.spread != null ? 'spread ' + esc(fmtPrice(o.spread)) + ' · mid' : 'best price'}</span> <span>${esc(o.refMidStr || '')}</span></div>`
     : '';
   const empty = hasRows ? '' : `<div class="swladder-empty">${esc(o.emptyMsg || 'No resting offers yet.')}</div>`;
   host.innerHTML = `<div class="swladder">
@@ -2140,9 +2140,9 @@ function paintFee(feeAssetHex, feeAtoms, noteOverride){
   const ref = (feeAtoms != null) ? (C.refValueStr(feeAssetHex, feeAtoms) || '') : '';
   $('swFeeRef').textContent = ref;
   $('swFeeNote').textContent = noteOverride || (payFromLn
-    ? `In ${fm.ticker} — the asset you pay over Lightning.`
+    ? `In ${fm.ticker} · the asset you pay over Lightning.`
     : payIsBtc
-    ? 'In BTC — the Bitcoin network fee for the parent-chain leg (sat/vB).'
+    ? 'In BTC · the Bitcoin network fee for the parent-chain leg (sat/vB).'
     : 'Pay the fee in any asset the network prices.');
   // The fee picker is disabled when paying from Lightning (fee frozen to the pay asset), and for
   // the cross-chain (BTC-only) leg / LN leg / mixed rail (their cost is the LP spread / BTC-leg fee
@@ -2150,7 +2150,7 @@ function paintFee(feeAssetHex, feeAtoms, noteOverride){
   const noFee = payFromLn || (LAST_QUOTE && (LAST_QUOTE.kind === 'cross' || LAST_QUOTE.kind === 'ln' || LAST_QUOTE.kind === 'mixed'));
   $('swFeePick').disabled = !!noFee;
   $('swFeePick').style.opacity = noFee ? '.5' : '';
-  if (payFromLn) $('swFeePick').title = `Paying over Lightning — the fee is in ${fm.ticker}, the asset you pay.`;
+  if (payFromLn) $('swFeePick').title = `Paying over Lightning · the fee is in ${fm.ticker}, the asset you pay.`;
   else $('swFeePick').removeAttribute('title');
 }
 
@@ -2292,7 +2292,7 @@ function renderTiming(route){
   const tk = esc(C.assetMeta(route.seqAsset).ticker);
   if (rr === 'ln' && pr === 'ln'){
     el.className = 'swtiming ok'; if (ic) ic.textContent = '✓';
-    tx.innerHTML = '<b>Instant &amp; final</b> — both legs on Lightning, nothing on-chain, no reorg risk.';
+    tx.innerHTML = '<b>Instant &amp; final</b> · both legs on Lightning, nothing on-chain, no reorg risk.';
   } else if (rr === 'ln' && pr === 'chain' && btcLegAtoms() <= frontCapAtoms()){
     el.className = 'swtiming ok'; if (ic) ic.textContent = '✓';
     tx.innerHTML = `<b>Instant.</b> Your on-chain payment is fronted; you receive final ${tk} now.`;
@@ -2421,7 +2421,7 @@ function popover(anchorEl, items, onPick){
         listEl.appendChild(b); shown.push(it); optEls.push(b);
       }
     }
-    if (capped) listEl.appendChild(el('div','swopt-more', `+${all.length - ALL_CAP} more — keep typing to find them.`));
+    if (capped) listEl.appendChild(el('div','swopt-more', `+${all.length - ALL_CAP} more · keep typing to find them.`));
   };
   const markKbd = () => {
     optEls.forEach((c,i)=>c.classList.toggle('kbd', i===kbdIdx));
@@ -2651,9 +2651,9 @@ async function onCovMatched(m){
     || m.resting_is_covenant === 'true' || m.restingIsCovenant === 'true';
   if (!isCov) return;
   try {
-    C.toast && C.toast('Order matched — settling the fill on-chain…');
+    C.toast && C.toast('Order matched · settling the fill on-chain…');
     const { txid } = await covSettleFill(m, fillHooksFor(m));
-    C.toast && C.toast('Fill settled — anchor-bound to Bitcoin.',
+    C.toast && C.toast('Fill settled · anchor-bound to Bitcoin.',
       txid ? { href:'/explorer/tx/'+txid, label:String(txid).slice(0,18)+'…' } : undefined);
     await C.sync(); await scanCompanion(); try { renderSwap(); } catch {}
   } catch (e){ try { C.toast && C.toast('Fill could not settle: ' + C.prettyErr(e)); } catch {} }
@@ -2695,8 +2695,8 @@ async function placeCovenantReview(q){
     ['Network fee', amtRow(feeAsset, feeAtoms) + refSuffix(feeAsset, feeAtoms) + '  (estimate)'],
     ['Fee paid in', C.assetMeta(feeAsset).ticker],
     ['How it fills', isMarket
-      ? `Fills against the order book now at your price or better. If your order is larger than what's resting, the filled part settles on-chain and the unfilled remainder keeps resting at the same price until it's crossed — even while this wallet is closed. Consensus rejects any underpay or redirect.`
-      : `Rests on-chain at your price and fills — fully or partially — whenever someone crosses it, even while this wallet is closed. A partial fill settles that part and leaves the rest resting. Consensus rejects any underpay or redirect.`],
+      ? `Fills against the order book now at your price or better. If your order is larger than what's resting, the filled part settles on-chain and the unfilled remainder keeps resting at the same price until it's crossed · even while this wallet is closed. Consensus rejects any underpay or redirect.`
+      : `Rests on-chain at your price and fills · fully or partially · whenever someone crosses it, even while this wallet is closed. A partial fill settles that part and leaves the rest resting. Consensus rejects any underpay or redirect.`],
     ['You can close the wallet', `The order rests on-chain; when it fills you are credited to a payout address only this wallet controls. Reopen any time to see it.`],
     ['If it does not fill', `Cancel any time to delist it. After the order expires the locked ${pm.ticker} is reclaimable on-chain.`],
     ['Finality', 'Settles in ~1 block · anchor-bound to Bitcoin (reverts only if Bitcoin reverts).'],
@@ -2713,7 +2713,7 @@ async function placeCovenantReview(q){
       const rec = await placeCovenant(pay, receive, payAtoms, recvAtoms,
         (msg) => { st.innerHTML = '<span class="spin"></span>' + esc(msg); });
       modal.remove();
-      C.toast('Order placed — resting on-chain; it fills when matched, even offline.',
+      C.toast('Order placed · resting on-chain; it fills when matched, even offline.',
         rec.covTxid ? { href:'/explorer/tx/'+rec.covTxid, label:String(rec.covTxid).slice(0,18)+'…' } : undefined);
       resetComposer();
       await C.sync();
@@ -2788,7 +2788,7 @@ async function reviewMixed(q){
         return;
       }
       if (!railAvail(S.payAsset, S.receiveAsset).payLn.ok){
-        $('swErr').textContent = 'Your Lightning channel opened but is not ready to trade yet — please try again in a moment.';
+        $('swErr').textContent = 'Your Lightning channel opened but is not ready to trade yet · please try again in a moment.';
         return;
       }
     }
@@ -2871,7 +2871,7 @@ async function startSell(params){
   const { $ } = C;
   const asset = params.asset, am = C.assetMeta(asset);
   // FUND-SAFETY self-guard: a second sell would overwrite SELL (the single-key handle to the BTC claim).
-  if (hasSellInFlight()){ if (C.toast) C.toast('You already have a sub-asset sell in progress (claiming your BTC) — finish or refund it first under Active trades.'); return; }
+  if (hasSellInFlight()){ if (C.toast) C.toast('You already have a sub-asset sell in progress (claiming your BTC) · finish or refund it first under Active trades.'); return; }
   const modal = C.el('div','modal'); const card = C.el('div','card');
   card.appendChild(C.el('label','lbl','Selling ' + am.ticker + ' over Lightning'));
   const st = C.el('div','status'); card.appendChild(st);
@@ -2898,7 +2898,7 @@ async function startSell(params){
     if (L.connectNode){
       say('Bringing your ' + am.ticker + ' Lightning node online…');
       const prov = await L.connectNode(asset);
-      if (!(prov && prov.connected)) throw new Error('Could not bring your ' + am.ticker + ' Lightning node online — reopen the wallet and try again.');
+      if (!(prov && prov.connected)) throw new Error('Could not bring your ' + am.ticker + ' Lightning node online · reopen the wallet and try again.');
     }
     // Pay the asset over Lightning (LSP drives the hold-invoice pay from our node; device co-signs).
     // On settle the maker reveals the preimage, returned here WITH the BTC HTLC terms — the LSP
@@ -2915,7 +2915,7 @@ async function startSell(params){
     // and MUST survive a reload — resumeSell() re-attempts it from here.
     SELL = { state: 'claiming', asset, ticker: am.ticker, preimage: resp.preimage, hash_h: resp.hash_h, btc_htlc: H,
       expected_btc: Number((offer && offer.btc_sats) || 0), ts: mixedTip() }; saveSell();
-    say('Preimage revealed — verifying and claiming your BTC on-chain…');
+    say('Preimage revealed · verifying and claiming your BTC on-chain…');
     await claimSell();   // verify + claim; updates SELL + st
     say('Done. You paid ' + am.ticker + ' over Lightning and claimed BTC on-chain (' + String(SELL.claim_txid || '').slice(0,16) + '…).', 'ok');
     done();
@@ -2923,7 +2923,7 @@ async function startSell(params){
     clearSell();
   } catch (e){
     // If the asset was already paid (SELL persisted), keep it for re-claim on reload — never lose it.
-    say('Failed: ' + C.prettyErr(e) + (SELL && SELL.state === 'claiming' ? ' — your BTC is still claimable; reopen the wallet to retry the claim.' : ''), 'err');
+    say('Failed: ' + C.prettyErr(e) + (SELL && SELL.state === 'claiming' ? ' · your BTC is still claimable; reopen the wallet to retry the claim.' : ''), 'err');
     done();
   }
 }
@@ -2941,7 +2941,7 @@ async function claimSell(){
     const got = BigInt(String(H.amount || 0)), want = BigInt(String(SELL.expected_btc || 0));
     if (want > 0n && got < want) {
       SELL.shortfall = { got: String(got), want: String(want) }; saveSell();
-      C.toast && C.toast(`Warning: the BTC HTLC is only ${C.fmtAtoms(got, 8)} BTC, less than the quoted ${C.fmtAtoms(want, 8)} BTC — claiming it anyway.`, { level: 'warn' });
+      C.toast && C.toast(`Warning: the BTC HTLC is only ${C.fmtAtoms(got, 8)} BTC, less than the quoted ${C.fmtAtoms(want, 8)} BTC · claiming it anyway.`, { level: 'warn' });
     }
   } catch {}
   await C.btcLeg.verifyClaimable({ redeem_script: H.redeem_script, hash_h: SELL.hash_h,
@@ -2956,7 +2956,7 @@ async function claimSell(){
 export async function resumeSell(){
   try { SELL = JSON.parse(localStorage.getItem(SELL_KEY) || 'null'); } catch { SELL = null; }
   if (!SELL || SELL.state !== 'claiming' || !SELL.preimage || !SELL.btc_htlc) return;
-  try { await claimSell(); try { C.toast && C.toast('Recovered your sell — BTC claimed on-chain (' + String(SELL.claim_txid||'').slice(0,16) + '…).'); } catch {} try { await C.sync(); } catch {} clearSell(); }
+  try { await claimSell(); try { C.toast && C.toast('Recovered your sell · BTC claimed on-chain (' + String(SELL.claim_txid||'').slice(0,16) + '…).'); } catch {} try { await C.sync(); } catch {} clearSell(); }
   catch (e){ /* leave persisted; the HTLC may already be claimed, or needs a retry — surfaced when the user re-enters Swap */ }
 }
 // ===========================================================================
@@ -2986,7 +2986,7 @@ async function startBuy(params){
   const asset = params.asset, am = C.assetMeta(asset);
   const offer = params.offer || null;
   // FUND-SAFETY self-guard: a second buy would overwrite BUY (the single-key handle to the locked BTC).
-  if (hasBuyInFlight()){ if (C.toast) C.toast('You already have a sub-asset buy in progress (Bitcoin locked) — finish or refund it first under Active trades.'); return; }
+  if (hasBuyInFlight()){ if (C.toast) C.toast('You already have a sub-asset buy in progress (Bitcoin locked) · finish or refund it first under Active trades.'); return; }
   const modal = C.el('div','modal'); const card = C.el('div','card');
   card.appendChild(C.el('label','lbl','Buying ' + am.ticker + ' over Lightning'));
   const st = C.el('div','status'); card.appendChild(st);
@@ -3005,7 +3005,7 @@ async function startBuy(params){
     if (!(C.btcLeg && C.btcLeg.fund && C.btcLeg.refund && C.btcLeg.refundKey && C.btcLeg.tipHeight)) throw new Error('The BTC HTLC service is unavailable in this build.');
     if (!(C.wasm && C.wasm.generateSwapSecret && C.wasm.buildSeqHtlcRedeemScript)) throw new Error('The HTLC builder is unavailable in this build.');
     const makerClaimPub = offer && (offer.maker_claim_pub || offer.maker_claim_pubkey);
-    if (!offer || !makerClaimPub) throw new Error('No resting ' + am.ticker + ' buy offer right now — try again shortly.');
+    if (!offer || !makerClaimPub) throw new Error('No resting ' + am.ticker + ' buy offer right now · try again shortly.');
     say('Preparing your buy…');
     // 1. DEVICE generates the secret. Only we ever hold P until WE settle.
     const sec = C.wasm.generateSwapSecret();            // { secret_hex, hash_hex }
@@ -3033,7 +3033,7 @@ async function startBuy(params){
     if (L.connectNode){
       say('Bringing your ' + am.ticker + ' Lightning node online…');
       const prov = await L.connectNode(asset);
-      if (!(prov && prov.connected)) throw new Error('Could not bring your ' + am.ticker + ' Lightning node online — reopen the wallet and try again.');
+      if (!(prov && prov.connected)) throw new Error('Could not bring your ' + am.ticker + ' Lightning node online · reopen the wallet and try again.');
     }
     // Ensure inbound asset liquidity so the maker can pay us over LN (JIT 0-conf; idempotent, best-effort).
     if (L.channelInbound){ say('Preparing inbound Lightning liquidity…'); try { await L.channelInbound({ node_key, asset, amount: assetAtoms }); } catch {} }
@@ -3064,12 +3064,12 @@ async function startBuy(params){
     // 5. Wait for the maker's asset payment to arrive HELD, then DEVICE-SETTLE with P (or refund after T_btc).
     say('Waiting for the maker’s ' + am.ticker + ' payment to arrive…');
     await driveBuy(say);
-    if (BUY && BUY.state === 'settled'){ say('Done. Your BTC bought ' + am.ticker + ' — received over Lightning.', 'ok'); done(); try { await C.sync(); } catch {} clearBuy(); }
-    else if (BUY && BUY.state === 'refunded'){ say('The maker didn’t pay in time — your Bitcoin was refunded on-chain (' + String(BUY.refund_txid||'').slice(0,16) + '…).', 'ok'); done(); try { await C.sync(); } catch {} clearBuy(); }
+    if (BUY && BUY.state === 'settled'){ say('Done. Your BTC bought ' + am.ticker + ' · received over Lightning.', 'ok'); done(); try { await C.sync(); } catch {} clearBuy(); }
+    else if (BUY && BUY.state === 'refunded'){ say('The maker didn’t pay in time · your Bitcoin was refunded on-chain (' + String(BUY.refund_txid||'').slice(0,16) + '…).', 'ok'); done(); try { await C.sync(); } catch {} clearBuy(); }
     else { done(); }
   } catch (e){
     // If the BTC HTLC was already funded (BUY persisted), keep it for settle/refund on reload — never lose it.
-    say('Failed: ' + C.prettyErr(e) + (BUY && (BUY.state === 'funded' || BUY.state === 'holding') ? ' — your Bitcoin is still locked; reopen the wallet to finish or refund it.' : ''), 'err');
+    say('Failed: ' + C.prettyErr(e) + (BUY && (BUY.state === 'funded' || BUY.state === 'holding') ? ' · your Bitcoin is still locked; reopen the wallet to finish or refund it.' : ''), 'err');
     done();
   }
 }
@@ -3107,7 +3107,7 @@ async function driveBuy(say){
     if (status && status.settled){ BUY.state = 'settled'; saveBuy(); return; }   // already settled (resume)
     if (status && status.held){
       BUY.state = 'holding'; saveBuy();
-      say('Payment received — releasing your ' + BUY.ticker + ' and revealing the preimage…');
+      say('Payment received · releasing your ' + BUY.ticker + ' and revealing the preimage…');
       await L.nodeSettle({ node_key, payment_hash: H, preimage: BUY.preimage });   // 5. device-settle
       BUY.state = 'settled'; saveBuy();
       logTrade({ id: 'buy:' + H, title: 'Bought ' + BUY.ticker + ' with BTC', status: 'asset received' });
@@ -3115,7 +3115,7 @@ async function driveBuy(say){
       if (L.jobStatus && (BUY.poll || BUY.job_id)){ try { const j = await L.jobStatus(BUY.poll || ('/swap/' + BUY.job_id)); if (j && j.status) { BUY.detail = j.status; saveBuy(); } } catch {} }
       return;
     }
-    if (tip && BUY.t_btc && tip >= BUY.t_btc){ say('The maker didn’t pay in time — refunding your Bitcoin on-chain…'); await refundBuy(); return; }   // 7. refund branch
+    if (tip && BUY.t_btc && tip >= BUY.t_btc){ say('The maker didn’t pay in time · refunding your Bitcoin on-chain…'); await refundBuy(); return; }   // 7. refund branch
     await new Promise(r => setTimeout(r, 6000));
   }
 }
@@ -3133,8 +3133,8 @@ export async function resumeBuy(){
   if (!BUY || !(BUY.state === 'funded' || BUY.state === 'holding') || !BUY.preimage || !BUY.btc_htlc) return;
   try {
     await driveBuy();
-    if (BUY.state === 'settled'){ try { C.toast && C.toast('Recovered your buy — ' + BUY.ticker + ' received over Lightning.'); } catch {} try { await C.sync(); } catch {} clearBuy(); }
-    else if (BUY.state === 'refunded'){ try { C.toast && C.toast('Your buy timed out — Bitcoin refunded on-chain (' + String(BUY.refund_txid||'').slice(0,16) + '…).'); } catch {} try { await C.sync(); } catch {} clearBuy(); }
+    if (BUY.state === 'settled'){ try { C.toast && C.toast('Recovered your buy · ' + BUY.ticker + ' received over Lightning.'); } catch {} try { await C.sync(); } catch {} clearBuy(); }
+    else if (BUY.state === 'refunded'){ try { C.toast && C.toast('Your buy timed out · Bitcoin refunded on-chain (' + String(BUY.refund_txid||'').slice(0,16) + '…).'); } catch {} try { await C.sync(); } catch {} clearBuy(); }
   } catch (e){ /* leave persisted; the BTC is still refundable at T_btc — retried when the user re-enters Swap */ }
 }
 // ===========================================================================
@@ -3214,11 +3214,11 @@ function renderMixedSwap(){
   if (terminal) logTrade({ id: 'mx:' + (MIXED.id || MIXED.ts || (MIXED.htlc && MIXED.htlc.refund_locktime) || ''),
     title: (MIXED.side === 'buy' ? 'Bought ' : 'Sold ') + metaOf(MIXED.asset).ticker + ' · submarine', status: MIXED.state });
   const phase = {
-    [sub.ST.SETTLING]:  'Settling — the on-chain HTLC leg is burying under Bitcoin (anchor-gated).',
+    [sub.ST.SETTLING]:  'Settling · the on-chain HTLC leg is burying under Bitcoin (anchor-gated).',
     [sub.ST.REFUNDING]: 'Refunding the on-chain HTLC leg…',
     [sub.ST.REFUNDED]:  'Refund broadcast · the on-chain leg is being reclaimed; your funds return once it confirms.',
-    [sub.ST.SETTLED]:   'Settled — anchor-bound to Bitcoin (reverts only if Bitcoin reverts).',
-    [sub.ST.FAILED]:    'Failed — nothing further to reclaim on-chain.',
+    [sub.ST.SETTLED]:   'Settled · anchor-bound to Bitcoin (reverts only if Bitcoin reverts).',
+    [sub.ST.FAILED]:    'Failed · nothing further to reclaim on-chain.',
   }[MIXED.state] || MIXED.state;
   const dir = MIXED.side === 'buy'
     ? `Buy ${esc(am.ticker)} with BTC over Lightning · receive ${esc(am.ticker)} on-chain`
@@ -3226,7 +3226,7 @@ function renderMixedSwap(){
   const lock = MIXED.htlc && MIXED.htlc.refund_locktime;
   const legLine = MIXED.htlc
     ? (refundable
-        ? `On-chain HTLC leg is past its refund timeout (block ${lock}) — reclaimable now.`
+        ? `On-chain HTLC leg is past its refund timeout (block ${lock}) · reclaimable now.`
         : `On-chain HTLC leg refundable after block ${lock}${tip ? ` (tip ${tip})` : ''}.`)
     : 'The LSP is driving both legs; no separate on-chain leg to reclaim.';
   host.innerHTML = `<div class="swbook"><div class="swbook-head">
@@ -3295,7 +3295,7 @@ export function resumeMixedSwap(){
   if (!MIXED) return;
   try { showMixed(true); renderMixedSwap(); } catch {}
   if (!sub.isTerminal(MIXED)) pollMixed();
-  if (C.toast) try { C.toast('Resuming an interrupted Lightning+on-chain swap — refund the on-chain leg here if it stalls.'); } catch {}
+  if (C.toast) try { C.toast('Resuming an interrupted Lightning+on-chain swap · refund the on-chain leg here if it stalls.'); } catch {}
 }
 
 // Start a CROSS market from the wallet: post a signed forward cross offer (SELL
@@ -3450,7 +3450,7 @@ async function reviewSame(q){
   const fm = C.assetMeta(q.feeAsset);
   const kv = [
     ['Network', 'Sequentia (testnet) atomic swap via the order book; not parent-chain BTC'],
-    ...(q.confidential ? [['Privacy', 'Blinded book — both legs settle confidentially; amounts and assets are hidden on-chain (Confidential Transactions).']] : []),
+    ...(q.confidential ? [['Privacy', 'Blinded book · both legs settle confidentially; amounts and assets are hidden on-chain (Confidential Transactions).']] : []),
     ['You pay', amtRow(q.assetP, q.amountP) + refSuffix(q.assetP, q.amountP)],
     ['You receive', amtRow(q.assetR, q.amountR) + refSuffix(q.assetR, q.amountR)],
     ['Network fee', amtRow(q.feeAsset, q.feeAmount) + '  (estimate)'],
@@ -3587,7 +3587,7 @@ async function reviewLn(q){
     // No usable channel on one/both legs. Instead of BLOCKING and sending the user to the Balance
     // tab, OPEN the missing channel(s) INLINE now (the same non-custodial provision+fund flow), then
     // continue the swap. Honest, bounded progress; a clear failure — never a silent hang.
-    if (!L.provisionChannel){ $('swErr').textContent = 'Opening a channel is unavailable in this build — open one from the Balance tab first.'; return; }
+    if (!L.provisionChannel){ $('swErr').textContent = 'Opening a channel is unavailable in this build · open one from the Balance tab first.'; return; }
     const provLeg = async (hexOrBtc, amtEl) => {
       const chain = hexOrBtc === 'BTC' ? 'btc' : 'seq';
       const m = metaOf(hexOrBtc);
@@ -3608,7 +3608,7 @@ async function reviewLn(q){
       return;
     }
     ra = railAvail(S.payAsset, S.receiveAsset);
-    if (!ra.pureLnOk){ $('swErr').textContent = 'Your Lightning channel opened but is not ready to trade yet — please try again in a moment.'; return; }
+    if (!ra.pureLnOk){ $('swErr').textContent = 'Your Lightning channel opened but is not ready to trade yet · please try again in a moment.'; return; }
   }
   const am = C.assetMeta(q.seqAsset);
   const aprec = am.precision || 0;
@@ -3753,7 +3753,7 @@ async function postOfferReview(q){
   const payU = Number(payAtoms)/Math.pow(10, pm.precision||0), recvU = Number(recvAtoms)/Math.pow(10, rm.precision||0);
   const kv = [
     ['Posting', 'A resting offer - you become the maker of this market'],
-    ...((q.confidential || isConfBook()) ? [['Privacy', 'Blinded book — your offer rests confidentially and fills confidentially; a blinded receive address and blinding pubkey are published so the counterparty can blind their leg too.']] : []),
+    ...((q.confidential || isConfBook()) ? [['Privacy', 'Blinded book · your offer rests confidentially and fills confidentially; a blinded receive address and blinding pubkey are published so the counterparty can blind their leg too.']] : []),
     ['You give', amtRow(pay, payAtoms) + refSuffix(pay, payAtoms)],
     ['You want', amtRow(receive, recvAtoms) + refSuffix(receive, recvAtoms)],
     ['Price', payU>0 ? ratePerPayToLine(pay, receive, recvU/payU).str : '-'],
@@ -3813,7 +3813,7 @@ function esc(s){ return String(s == null ? '' : s).replace(/[&<>"]/g, c => ({'&'
 
 // Same-chain SeqOB book, rendered as the shared ladder. Prices are PAY per 1 RECEIVE
 // (the conventional quote, matching the mid). ASKS are the offers we can take (give
-// pay, get receive) — clickable to lift; BIDS are the opposite side (display-only
+// pay, get receive) · clickable to lift; BIDS are the opposite side (display-only
 // depth, since the taker can't lift them).
 // D5: recent-trades feed for the active pair, backed by seqobd's /trades (T1). Resting offers use ONE
 // canonical base/quote per market, so exactly one direction has data — query the composer's direction
@@ -4010,7 +4010,7 @@ function notifyNewCredits(){
     const now = big(cur[h]), was = big(_seenCredits[h] || '0');
     if (now > was){
       const m = C.assetMeta(h);
-      try { C.toast && C.toast(`Your resting order filled — received ${C.fmtAtoms(now - was, m.precision)} ${m.ticker}.`); } catch {}
+      try { C.toast && C.toast(`Your resting order filled · received ${C.fmtAtoms(now - was, m.precision)} ${m.ticker}.`); } catch {}
     }
   }
   _seenCredits = cur; try { localStorage.setItem('swk.seenCredits.v1', JSON.stringify(cur)); } catch {}
@@ -4036,7 +4036,7 @@ function renderInFlightCard(){
   }
   if (hasBuyInFlight()){
     rows.push({ view: null, need: true, title: 'Buy ' + esc(BUY.ticker || 'asset') + ' with BTC',
-      status: BUY.state === 'holding' ? 'held — settle from your wallet to receive' : 'BTC HTLC funded; awaiting the asset over Lightning' });
+      status: BUY.state === 'holding' ? 'held · settle from your wallet to receive' : 'BTC HTLC funded; awaiting the asset over Lightning' });
   }
   if (X && X.hasInFlight && X.hasInFlight()){
     rows.push({ view: 'cross', need: true, title: 'Buy asset with BTC · cross-chain', status: 'in progress' });
@@ -4125,7 +4125,7 @@ async function renderMyOrders(){
         const out = await covCancel(id, { recipe, tipHeight, expiryLocktime: Number(rec.expiry) },
           { relayCancel: async (offerId) => seqob.signAndCancel(offerId, makerPriv()), ...refundHooksFor() });
         if (out.refundTxid){
-          C.toast('Order cancelled — reclaimed on-chain (' + String(out.refundTxid).slice(0,12) + '…).');
+          C.toast('Order cancelled · reclaimed on-chain (' + String(out.refundTxid).slice(0,12) + '…).');
         } else if (out.reclaimable){
           const meta = C.assetMeta(rec.pay);
           C.toast('Order delisted. The locked ' + esc(meta.ticker) + ' is reclaimable on-chain after block ' + out.reclaimable.afterHeight + '.');
