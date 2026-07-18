@@ -2023,6 +2023,7 @@ function lnEnabledNodes(){
   if (W.SEQ_LSP_WS_BTC && W.SEQ_LSP_HOST_PUBKEY_BTC) out.push('btc');
   return out;
 }
+let _lastLnSig = null;   // last LN-availability signature; re-quote the composer only when it CHANGES
 function lnStatusPill(){
   const el = $('lnStatus'); if (!el) return;
   const st = seqlnState();
@@ -2044,8 +2045,19 @@ function lnStatusPill(){
   const legs = ['asset','btc'].filter(n=>st.nodes[n].enabled)
     .map(n=>`${n}: ${st.nodes[n].connected?'serving':(st.nodes[n].phase||'…')}${st.nodes[n].detail?(' ('+st.nodes[n].detail+')'):''}`);
   el.title = 'Lightning device signers — ' + legs.join(' · ');
-  // Re-quote the composer so the "Instant (Lightning)" rail appears/disappears live.
-  try{ if(typeof renderSwap==='function' && $('swReview')) renderSwap(); }catch{}
+  // Re-quote the composer ONLY when LN availability actually TRANSITIONS (a serving leg or the channel
+  // count changed → the "Instant (Lightning)" rail appears/disappears), and only while the Swap tab is
+  // visible. A full renderSwap on EVERY status tick tore down + rebuilt the whole tab, so the page
+  // jittered constantly. seqln emits status frequently; the pill text above always updates, but the
+  // heavy re-render now fires at most once per real availability change.
+  try{
+    const sig = st.nodes.asset.connected + '|' + st.nodes.btc.connected + '|' + activeChannels;
+    if (sig !== _lastLnSig){
+      _lastLnSig = sig;
+      const sw = $('swBook');
+      if (sw && sw.offsetParent !== null && typeof renderSwap==='function' && $('swReview')) renderSwap();
+    }
+  }catch{}
 }
 function initLightning(phrase){
   initSeqln();                       // reads window.SEQ_LSP_URL/_TOKEN + per-node _WS_ASSET/_BTC + _HOST_PUBKEY_ASSET/_BTC (legacy _WS/_HOST_PUBKEY -> asset)
