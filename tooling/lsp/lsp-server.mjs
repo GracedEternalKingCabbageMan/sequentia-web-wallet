@@ -293,6 +293,80 @@ function reapJobs() {
   if (changed) persistJobs();
 }
 
+// ---------------------------------------------------------------------------
+// SUB-ASSET SELL idempotency store: swap_nonce -> the SETTLED swap result.
+//
+// A sub-asset SELL pays the asset over Lightning INSIDE the /swap call and answers
+// SYNCHRONOUSLY with {settled, preimage, btc_htlc, hash_h}. If that response is lost
+// AFTER the asset was already paid, the wallet re-calls /swap with the SAME client-
+// supplied swap_nonce; we then return the ALREADY-settled result instead of re-running
+// the swap, so the asset is NEVER paid twice and the wallet recovers everything it needs
+// to claim the BTC. Persisted the SAME atomic/synchronous way as jobs.json (temp+rename),
+// so an LSP restart between settling and the store-write is the only (tiny, unavoidable)
+// remaining window. Bounded by age AND a most-recent cap so it can't grow without limit.
+// FUND-SAFETY: EXACT-match keying ONLY — a missing/blank nonce means "no idempotency"
+// (run fresh), never a wildcard, so one swap's result can never be served for another
+// nonce; and only a genuine settle is ever recorded (a failed swap stores nothing).
+const SUBAS_SELL_NONCES_FILE = CFG.provDir ? path.join(CFG.provDir, 'subas-sell-nonces.json') : '';
+const SUBAS_SELL_NONCE_TTL_MS = 24 * 60 * 60 * 1000;   // a recovered result stays claimable for 24h
+const SUBAS_SELL_NONCE_CAP = 500;                       // hard cap on retained results (most-recent wins)
+function loadSubasSellNonces() {
+  const m = new Map();
+  if (!SUBAS_SELL_NONCES_FILE) return m;
+  let raw;
+  try { raw = fs.readFileSync(SUBAS_SELL_NONCES_FILE, 'utf8'); }
+  catch (e) { if (e && e.code === 'ENOENT') return m; console.error('[lsp] subas-sell-nonces unreadable, starting empty:', e && e.message); return m; }
+  let obj;
+  try { obj = JSON.parse(raw); } catch { console.error('[lsp] subas-sell-nonces corrupt, starting empty'); return m; }
+  const now = Date.now();
+  for (const [nonce, r] of Object.entries(obj && obj.nonces ? obj.nonces : {})) {
+    if (!r || typeof r !== 'object' || r.settled !== true) continue;   // only genuine settles are ever valid
+    if (r.ts && now - r.ts > SUBAS_SELL_NONCE_TTL_MS) continue;        // drop expired
+    m.set(nonce, r);
+  }
+  return m;
+}
+const subasSellNonces = loadSubasSellNonces();
+if (SUBAS_SELL_NONCES_FILE && subasSellNonces.size) {
+  console.error(`[lsp] loaded ${subasSellNonces.size} sub-asset SELL idempotency record(s) from ${SUBAS_SELL_NONCES_FILE}`);
+}
+function persistSubasSellNonces() {
+  if (!SUBAS_SELL_NONCES_FILE) return;   // provDir disabled: in-memory only (same posture as jobs.json)
+  try {
+    const tmp = SUBAS_SELL_NONCES_FILE + '.tmp';
+    fs.writeFileSync(tmp, JSON.stringify({ nonces: Object.fromEntries(subasSellNonces) }));
+    fs.renameSync(tmp, SUBAS_SELL_NONCES_FILE);
+  } catch (e) { console.error('[lsp] failed to persist subas-sell-nonces.json:', e && e.message); }
+}
+// EXACT-match lookup of a stored settled result (never a wildcard); expires lazily.
+function getSubasSellResult(nonce) {
+  if (!nonce || typeof nonce !== 'string') return null;
+  const r = subasSellNonces.get(nonce);
+  if (!r) return null;
+  if (r.ts && Date.now() - r.ts > SUBAS_SELL_NONCE_TTL_MS) { subasSellNonces.delete(nonce); persistSubasSellNonces(); return null; }
+  return r;
+}
+// Record a SETTLED result under the nonce, SYNCHRONOUSLY (temp+rename) BEFORE the caller returns —
+// so a hard restart between the swap settling and this write is the only remaining loss window.
+// Never records a non-settled swap. Prunes expired entries, then caps to the most-recent N.
+function putSubasSellResult(nonce, result) {
+  if (!nonce || typeof nonce !== 'string') return;
+  if (!result || result.settled !== true) return;   // FUND-SAFETY: only a genuine settle is ever recorded
+  const now = Date.now();
+  for (const [k, v] of subasSellNonces) { if (v && v.ts && now - v.ts > SUBAS_SELL_NONCE_TTL_MS) subasSellNonces.delete(k); }
+  subasSellNonces.delete(nonce);                     // re-insert last so this nonce is the most-recent (insertion-ordered)
+  subasSellNonces.set(nonce, { ...result, ts: now });
+  while (subasSellNonces.size > SUBAS_SELL_NONCE_CAP) { const oldest = subasSellNonces.keys().next().value; subasSellNonces.delete(oldest); }
+  persistSubasSellNonces();
+}
+// In-memory coalescing of CONCURRENT same-nonce runs: a retry that races the ORIGINAL /swap while
+// it is STILL executing server-side (Node keeps the handler running after the client disconnects, so
+// a reload + resumeSell re-call can arrive before the first run finishes). The second caller awaits
+// the first run's promise instead of launching a SECOND xsubas-sell — which would double-pay. Not
+// persisted: after a restart there are no in-flight runs, and the on-disk store gives cross-restart
+// idempotency.
+const subasSellInflight = new Map();   // swap_nonce -> Promise<runMixed result>
+
 const ASSET_ALIAS = { GOLD: CFG.gold, gold: CFG.gold, BTC: CFG.btcx };
 function resolveAsset(a) {
   if (!a) return null;
@@ -1759,7 +1833,25 @@ const server = http.createServer(async (req, res) => {
       // SUB-ASSET SELL always answers SYNCHRONOUSLY: the wallet needs P + the BTC HTLC
       // terms in the response to claim on-chain with its device key.
       if (execName === 'xsubas-sell') {
-        const r = await runMixed({ ...body, payRail, recvRail });
+        // Idempotency + double-pay guard, keyed by the client-supplied swap_nonce. The asset is paid
+        // INSIDE runMixed; if the wallet loses this response it re-calls with the SAME nonce, and we
+        // MUST return the already-settled result rather than pay a second time. A missing/blank nonce
+        // is an old client: no idempotency, runs fresh exactly as before (back-compat).
+        const nonce = (typeof body.swap_nonce === 'string' && body.swap_nonce.trim()) ? body.swap_nonce.trim() : '';
+        if (nonce) {
+          const hit = getSubasSellResult(nonce);          // EXACT-match only; never another swap's result
+          if (hit) { const { ts, ...payload } = hit; return send(res, 200, { ...payload, idempotent_replay: true }); }
+        }
+        let r;
+        const inflight = nonce ? subasSellInflight.get(nonce) : null;
+        if (inflight) {
+          r = await inflight;                              // a retry raced the original run -> await it, never launch a second
+        } else {
+          const run = runMixed({ ...body, payRail, recvRail });
+          if (nonce) subasSellInflight.set(nonce, run);
+          try { r = await run; if (nonce && r && r.ok && r.settled) putSubasSellResult(nonce, r); }
+          finally { if (nonce) subasSellInflight.delete(nonce); }   // store BEFORE delete: a caller arriving after the delete finds the stored result
+        }
         return send(res, r.ok ? 200 : 502, r);
       }
       reapJobs();

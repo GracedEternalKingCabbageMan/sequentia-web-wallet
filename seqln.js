@@ -421,7 +421,7 @@ export function closeChannelLsp({ chain = 'seq', asset, node, scid, destination,
 //     over Lightning). Anchor-gated; returns finality:'confirming' (anchor-bound).
 // Rails are only serialized when present, so the pure-LN call is byte-identical to
 // before (the LSP treats a missing rail as ln/ln).
-export function seqlnSwap({ side, asset, amount, payRail, recvRail, node_key, btc_claim_pub }) {
+export function seqlnSwap({ side, asset, amount, payRail, recvRail, node_key, btc_claim_pub, offer_id, maker_pubkey, swap_nonce }) {
   const body = { side, asset, amount };
   if (payRail) body.payRail = payRail;
   if (recvRail) body.recvRail = recvRail;
@@ -430,6 +430,14 @@ export function seqlnSwap({ side, asset, amount, payRail, recvRail, node_key, bt
   // claiming — the wallet then claims on-chain with the device key matching `btc_claim_pub`.
   if (node_key) body.node_key = node_key;
   if (btc_claim_pub) body.btc_claim_pub = btc_claim_pub;
+  // Forward the SPECIFIC reviewed offer so the LSP lifts THAT resting sell (its btc_sats is what
+  // claimSell's economic gate checks) rather than an arbitrary one — matching Ambra's swapSub.
+  if (offer_id) body.offer_id = offer_id;
+  if (maker_pubkey) body.maker_pubkey = maker_pubkey;
+  // Sub-asset SELL idempotency key: the wallet persists it BEFORE this call and re-sends the SAME
+  // value on a recovery re-call so the LSP returns the already-settled {preimage, btc_htlc} without
+  // re-paying the asset. Only serialized when present, so the pure-LN body is byte-identical to before.
+  if (swap_nonce) body.swap_nonce = swap_nonce;
   return lspFetch('/swap', { method: 'POST', body: JSON.stringify(body) });
 }
 

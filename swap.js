@@ -2875,6 +2875,13 @@ async function reviewMixed(q){
 //  the rail is gated honestly and never half-executes a real BTC claim.]
 const SELL_KEY = 'swk.subasset.sell';
 let SELL = null;
+// A fresh 32-byte random hex idempotency key for a sub-asset sell (same CSPRNG the maker key uses).
+// The wallet persists it in the 'paying' record BEFORE the asset-paying /swap, and re-sends the SAME
+// value on recovery so the LSP returns the already-settled result rather than re-paying the asset.
+function newSwapNonce(){ const a = new Uint8Array(32); (crypto || window.crypto).getRandomValues(a); return [...a].map(b => b.toString(16).padStart(2,'0')).join(''); }
+// After this long, a still-'paying' record can't complete (any unsettled Lightning payment has
+// auto-returned past its own timeout), so resumeSell clears it rather than re-attempting forever.
+const SELL_PAYING_TTL_MS = 24 * 60 * 60 * 1000;
 // Synchronous in-flight sentinel. SELL.state only becomes 'claiming' AFTER the LN-pay prologue
 // (assetNodeKey / connectNode / L.swap), so hasSellInFlight is blind during it. With the progress
 // modal now dismissable, a user could start a SECOND sell in that window and overwrite SELL (the
@@ -2885,7 +2892,9 @@ function saveSell(){ try { localStorage.setItem(SELL_KEY, JSON.stringify(SELL));
 function clearSell(){ SELL = null; try { localStorage.removeItem(SELL_KEY); } catch {} }
 // True while a sell is starting or is persisted with the preimage but its BTC claim is not yet
 // confirmed — the claim is the FUND step, so it must survive a reload (resumeSell re-attempts it).
-export function hasSellInFlight(){ return !!(_sellStarting || (SELL && SELL.state === 'claiming')); }
+// 'paying' is ALSO in-flight: the asset may already be paid but its response was lost, so the record
+// is the ONLY recovery handle (its nonce) — a second sell must never overwrite it (fund-safety).
+export function hasSellInFlight(){ return !!(_sellStarting || (SELL && (SELL.state === 'claiming' || SELL.state === 'paying'))); }
 
 async function startSell(params){
   const { $ } = C;
@@ -2906,6 +2915,10 @@ async function startSell(params){
   modal.onclick = (e) => { if (e.target === modal) modal.remove(); };
   const say = (t, cls) => { st.className = 'status' + (cls ? ' ' + cls : ''); st.innerHTML = (cls ? '' : '<span class="spin"></span>') + esc(t); };
   const done = () => { closeBtn.textContent = 'Close'; };
+  // Set true the instant BEFORE the asset-paying L.swap. In the catch it separates a LOST RESPONSE
+  // (network error after we may have paid -> keep the 'paying' record for recovery) from a pre-pay or
+  // definitive-rejection error (asset NOT paid -> discard it so it neither blocks nor re-runs).
+  let paidCallStarted = false;
   try {
     _sellStarting = true;   // block a concurrent second sell through the whole pre-claim prologue (TOCTOU)
     if (!(L && L.swap && L.assetNodeKey)) throw new Error('The Lightning service is unavailable in this build.');
@@ -2921,21 +2934,30 @@ async function startSell(params){
       const prov = await L.connectNode(asset);
       if (!(prov && prov.connected)) throw new Error('Could not bring your ' + am.ticker + ' Lightning node online · reopen the wallet and try again.');
     }
+    // FUND-SAFETY: the asset is paid INSIDE L.swap. Persist a PENDING ('paying') record carrying a
+    // fresh swap_nonce + everything needed to RE-CALL /swap, BEFORE that call. If the response is lost
+    // after the LSP already paid the asset, resumeSell() re-calls with this SAME nonce and the LSP
+    // returns the settled {preimage, btc_htlc} idempotently (it never re-pays for a stored nonce).
+    const swap_nonce = newSwapNonce();
+    SELL = { state: 'paying', swap_nonce, asset, ticker: am.ticker, amount: params.amount ?? null,
+      node_key, btc_claim_pub, offer, ts: Date.now() }; saveSell();
     // Pay the asset over Lightning (LSP drives the hold-invoice pay from our node; device co-signs).
     // On settle the maker reveals the preimage, returned here WITH the BTC HTLC terms — the LSP
     // never claims (no claim key) and we claim on-chain ourselves.
     say('Paying ' + am.ticker + ' over Lightning…');
+    paidCallStarted = true;   // from here a lost response means the asset MAY be paid -> keep for recovery
     const resp = await L.swap({ side: 'sell', asset, node_key, btc_claim_pub, amount: params.amount,
       // State the rails EXPLICITLY (asset over Lightning, BTC on-chain) so the LSP routes this to
       // the sub-asset sell (xsubas-sell) rather than defaulting omitted rails to pure-LN (xpln).
       payRail: 'ln', recvRail: 'chain',
-      offer_id: offer && offer.offer_id, maker_pubkey: offer && offer.maker_pubkey });
+      offer_id: offer && offer.offer_id, maker_pubkey: offer && offer.maker_pubkey,
+      swap_nonce });
     if (!(resp && resp.settled && resp.preimage && resp.btc_htlc)) throw new Error(resp && resp.error ? resp.error : 'The sell did not settle over Lightning.');
     const H = resp.btc_htlc;
     // Persist BEFORE the on-chain claim: the asset is now paid, so the BTC claim is the fund step
     // and MUST survive a reload — resumeSell() re-attempts it from here.
     SELL = { state: 'claiming', asset, ticker: am.ticker, preimage: resp.preimage, hash_h: resp.hash_h, btc_htlc: H,
-      expected_btc: Number((offer && offer.btc_sats) || 0), ts: mixedTip() }; saveSell();
+      expected_btc: Number((offer && offer.btc_sats) || 0), swap_nonce, ts: mixedTip() }; saveSell();
     say('Preimage revealed · verifying and claiming your BTC on-chain…');
     await claimSell();   // verify + claim; updates SELL + st
     say('Done. You paid ' + am.ticker + ' over Lightning and claimed BTC on-chain (' + String(SELL.claim_txid || '').slice(0,16) + '…).', 'ok');
@@ -2943,8 +2965,18 @@ async function startSell(params){
     try { await C.sync(); } catch {}
     clearSell();
   } catch (e){
-    // If the asset was already paid (SELL persisted), keep it for re-claim on reload — never lose it.
-    say('Failed: ' + C.prettyErr(e) + (SELL && SELL.state === 'claiming' ? ' · your BTC is still claimable; reopen the wallet to retry the claim.' : ''), 'err');
+    // Was the asset possibly paid? Only if we reached L.swap AND the failure was a LOST RESPONSE — a
+    // network/fetch error (surfaced as a TypeError; the LSP may already have settled). A DEFINITIVE
+    // rejection (a completed round-trip returning ok:false, thrown as a plain Error by lspFetch) means
+    // the sub-asset sell never settled, so NO asset was paid. Keep the 'paying' record only in the
+    // lost-response case (resumeSell recovers via its nonce); else discard it so it neither blocks a
+    // future sell nor triggers a surprise re-run.
+    const msg = String((e && e.message) || '');
+    const lostResponse = paidCallStarted && ((e instanceof TypeError) || (e && e.name === 'AbortError')
+      || /failed to fetch|networkerror|network error|network request failed|load failed|fetch failed|connection|timed? ?out|timeout/i.test(msg));
+    if (SELL && SELL.state === 'paying' && !lostResponse) clearSell();   // definitive failure / pre-pay error: nothing was paid
+    const recoverable = !!(SELL && (SELL.state === 'claiming' || SELL.state === 'paying'));
+    say('Failed: ' + C.prettyErr(e) + (recoverable ? ' · your funds are safe; reopen the wallet to complete this sell.' : ''), 'err');
     done();
   } finally {
     _sellStarting = false;   // hand off to the SELL.state guard (or clear if the prologue never funded)
@@ -2978,9 +3010,45 @@ async function claimSell(){
 // claim (the preimage + HTLC terms are persisted). This is the fund-recovery path.
 export async function resumeSell(){
   try { SELL = JSON.parse(localStorage.getItem(SELL_KEY) || 'null'); } catch { SELL = null; }
-  if (!SELL || SELL.state !== 'claiming' || !SELL.preimage || !SELL.btc_htlc) return;
-  try { await claimSell(); try { C.toast && C.toast('Recovered your sell · BTC claimed on-chain (' + String(SELL.claim_txid||'').slice(0,16) + '…).'); } catch {} try { await C.sync(); } catch {} clearSell(); }
-  catch (e){ /* leave persisted; the HTLC may already be claimed, or needs a retry — surfaced when the user re-enters Swap */ }
+  if (!SELL) return;
+  // (A) Asset paid + response received: SELL holds the preimage + HTLC -> re-attempt the on-chain
+  //     claim (the FUND step). The original recovery path, unchanged.
+  if (SELL.state === 'claiming' && SELL.preimage && SELL.btc_htlc){
+    try { await claimSell(); try { C.toast && C.toast('Recovered your sell · BTC claimed on-chain (' + String(SELL.claim_txid||'').slice(0,16) + '…).'); } catch {} try { await C.sync(); } catch {} clearSell(); }
+    catch (e){ /* leave persisted; the HTLC may already be claimed, or needs a retry — surfaced when the user re-enters Swap */ }
+    return;
+  }
+  // (B) Asset MAY have been paid but the /swap response was LOST (a network blip after the LSP
+  //     settled): SELL is at 'paying' with a nonce but no preimage. RE-CALL /swap with the SAME
+  //     nonce — the LSP returns the already-settled {preimage, btc_htlc} idempotently (it never
+  //     re-pays for a stored nonce), then we claim as usual. This closes the fund-loss window.
+  if (SELL.state === 'paying' && SELL.swap_nonce && !SELL.preimage){
+    // Bounded: past the Lightning leg's own timeout any unsettled asset payment has auto-returned, so a
+    // still-'paying' record this old can't complete — clear it rather than re-attempt (or re-run) forever.
+    if (SELL.ts && (Date.now() - SELL.ts) > SELL_PAYING_TTL_MS){ clearSell(); try { C.toast && C.toast('A sub-asset sell that never completed has expired; any Lightning payment has auto-returned.'); } catch {} return; }
+    if (!(L && L.swap && L.assetNodeKey)) return;                                             // service unavailable in this build; retry next load
+    if (!(C.btcLeg && C.btcLeg.claim && C.btcLeg.claimKey && C.btcLeg.verifyClaimable)) return;
+    try {
+      const asset = SELL.asset, offer = SELL.offer || null;
+      const btc_claim_pub = C.btcLeg.claimKey().public_key;     // re-derived the SAME way startSell does
+      const node_key = await L.assetNodeKey(asset);
+      if (L.connectNode){ const prov = await L.connectNode(asset); if (!(prov && prov.connected)) return; }
+      const resp = await L.swap({ side: 'sell', asset, node_key, btc_claim_pub, amount: SELL.amount,
+        payRail: 'ln', recvRail: 'chain',
+        offer_id: offer && offer.offer_id, maker_pubkey: offer && offer.maker_pubkey,
+        swap_nonce: SELL.swap_nonce });
+      if (!(resp && resp.settled && resp.preimage && resp.btc_htlc)) return;                  // not settled yet; keep the 'paying' record for a later retry
+      SELL = { state: 'claiming', asset, ticker: SELL.ticker || ((C.assetMeta(asset)||{}).ticker || ''),
+        preimage: resp.preimage, hash_h: resp.hash_h, btc_htlc: resp.btc_htlc,
+        expected_btc: Number((offer && offer.btc_sats) || SELL.expected_btc || 0),
+        swap_nonce: SELL.swap_nonce, ts: mixedTip() }; saveSell();
+      await claimSell();
+      try { C.toast && C.toast('Recovered your sell · BTC claimed on-chain (' + String(SELL.claim_txid||'').slice(0,16) + '…).'); } catch {}
+      try { await C.sync(); } catch {}
+      clearSell();
+    } catch (e){ /* leave the 'paying' record; its nonce keeps recovery idempotent on the next load */ }
+    return;
+  }
 }
 // ===========================================================================
 // Sub-asset BUY flow — the MIRROR of the sub-asset SELL, roles flipped. The taker pays BTC in an
