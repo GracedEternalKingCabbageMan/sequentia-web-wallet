@@ -3105,8 +3105,8 @@ function ownedOptions(sel){
   const prev=sel.value;
   const b=balObj(); sel.innerHTML='';
   const add=(h)=>{ const o=el('option'); o.value=h; o.textContent=assetMeta(h).ticker; sel.appendChild(o); };
-  add(POLICY_HEX);
-  add('BTC');   // parent-chain Bitcoin testnet4 — routed through the BTC layer, not lwk
+  add('BTC');   // parent-chain Bitcoin testnet4 — the first-class default pick (principle 2), routed through the BTC layer, not lwk
+  add(POLICY_HEX);   // tSEQ: one asset among equals, no longer the privileged default (principle 3)
   for(const h of Object.keys(b)) if(h!==POLICY_HEX) add(h);
   // Restricted (OpenAMP) assets the AID holds — routed through the enclave transfer API, not lwk.
   for(const id of Object.keys(oampBalances)) if((oampBalances[id]?.atoms||0n)>0n) add('oamp:'+id);
