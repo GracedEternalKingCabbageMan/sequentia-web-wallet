@@ -488,8 +488,10 @@ async function runForwardCourier(q){
     }
 
     setStepStatus('lock', `Locking your ${C.fmtAtoms(fq.btc_amount,8)} BTC and waiting for 1 confirmation (about one Bitcoin block - often ~20 min on testnet4)…`, true);
-    await lockBtcLeg(fq);                 // funds + confirms the BTC HTLC; sets SWAP (PENDING) + saveSwap
-    SWAP.courier = true;                  // lockBtcLeg rebuilt SWAP; restore courier identity
+    // Pass the courier identity so lockBtcLeg persists it in the PENDING stub, before its confirmation
+    // wait — a reload during that wait then resumes on the courier path (see the stub in lockBtcLeg).
+    await lockBtcLeg(fq, { courier: true, offer_id: offer.offer_id || offer.offerId, maker_pubkey: offer.maker_pubkey || offer.makerPubkey });
+    SWAP.courier = true;                  // re-assert in memory (lockBtcLeg already persisted these)
     SWAP.offer_id = offer.offer_id || offer.offerId;
     SWAP.maker_pubkey = offer.maker_pubkey || offer.makerPubkey;
     saveSwap(); renderStepper();
@@ -785,7 +787,7 @@ function startCountdown(){
 // (via the binding — byte-identical to the daemon's recompute), then FUND its
 // P2SH on the Bitcoin chain via btc.js (or the injected harness shim) and wait
 // for the agreed confirmations. Captures {txid,vout,height,redeem_script}.
-async function lockBtcLeg(q){
+async function lockBtcLeg(q, courierCtx){
   const { wasm } = C;
   // 1) secret s + H, and the taker's keys.
   const sec = wasm.generateSwapSecret();                 // {secret_hex, hash_hex}
@@ -819,6 +821,12 @@ async function lockBtcLeg(q){
     maker_btc_claim_pub: q.maker_btc_claim_pub,
     maker_seq_refund_pub: q.maker_seq_refund_pub,
     btc_leg: null,
+    // Stamp the courier identity into the stub itself (not just after lockBtcLeg returns), so a reload
+    // DURING the ~20min BTC confirmation wait below resumes on the courier path instead of the RFQ
+    // propose path. Funds were always refundable either way; this only fixes the resume route.
+    courier: !!(courierCtx && courierCtx.courier),
+    offer_id: courierCtx && courierCtx.offer_id,
+    maker_pubkey: courierCtx && courierCtx.maker_pubkey,
   };
   saveSwap();  // <- persisted BEFORE the broadcast, so an interrupted funding is never stranded
   const funded = await C.btcLeg.fund(redeem, q.btc_amount, (txid) => {
