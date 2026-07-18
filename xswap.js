@@ -164,6 +164,14 @@ function loadSwap(){
   } catch (e){ SWAP = null; }
 }
 function clearSwap(){ SWAP = null; saveSwap(); }
+// Bounce a terminal START failure back to the composer WITH its reason. onExit() re-renders the composer
+// and hides #xswapErr (it lives inside the cross wrap), so the explanation must also land on the
+// composer's own #swErr — set AFTER onExit so the composer re-render doesn't wipe it.
+function bounceToComposer(msg){
+  SWAP = null; renderStepper();
+  if (C.onExit) C.onExit();
+  const e = document.getElementById('swErr'); if (e && msg) e.textContent = msg;
+}
 
 export function initXswap(ctx){
   C = ctx;
@@ -465,8 +473,9 @@ async function runForwardCourier(q){
     }
     if (!fq){
       const tried = attempts.length > 1 ? ` (tried ${attempts.length} resting offers)` : '';
-      if ($('xswapErr')) $('xswapErr').textContent = 'No maker completed the handshake' + tried + ': ' + ((lastErr && lastErr.message) || 'no response') + ' Nothing was spent - try again in a moment.';
-      SWAP = null; renderStepper(); if (C.onExit) C.onExit();
+      const _m = 'No maker completed the handshake' + tried + ': ' + ((lastErr && lastErr.message) || 'no response') + ' Nothing was spent - try again in a moment.';
+      if ($('xswapErr')) $('xswapErr').textContent = _m;
+      bounceToComposer(_m);
       return;
     }
 
@@ -541,9 +550,9 @@ async function runForwardCourier(q){
       if ($('xswapErr')) $('xswapErr').textContent = describeForwardFailure(e);
     } else {
       // Nothing spent yet — back to the composer with an explanation.
-      SWAP = null; renderStepper();
-      if ($('xswapErr')) $('xswapErr').textContent = 'Could not start the swap: ' + C.prettyErr(e) + ' - nothing was spent.';
-      if (C.onExit) C.onExit();
+      const _m = 'Could not start the swap: ' + C.prettyErr(e) + ' - nothing was spent.';
+      if ($('xswapErr')) $('xswapErr').textContent = _m;
+      bounceToComposer(_m);
     }
   } finally {
     XSESSION = null;
@@ -669,6 +678,9 @@ export async function renderXswap(){
   renderStepper();
   // A reloaded forward buy stuck at the anchor gate finishes on its own (session-independent).
   resumeAnchorClaim();
+  // A BTC funding interrupted between broadcast and confirmation: recover the outpoint (or clear a stub
+  // that never broadcast) so the wizard never strands the user or lies about what was spent.
+  resumeFunding();
 }
 
 function marketLabel(m){
@@ -782,8 +794,11 @@ async function lockBtcLeg(q){
   // 2) the BTC-leg HTLC redeemScript: claim=maker (with s), refund=taker after T_btc.
   const redeem = wasm.buildSeqHtlcRedeemScript(sec.hash_hex, q.maker_btc_claim_pub, btcRefund.public_key, q.btc_locktime);
   // 3) fund the P2SH on the Bitcoin chain, wait for >= minconf, capture the outpoint.
-  const funded = await C.btcLeg.fund(redeem, q.btc_amount, q.btc_locktime, btcRefund);  // -> {txid, vout, height, amount, asset_id}
-
+  // FUND-SAFETY: persist the full refund material (secret, refund key, redeem script, locktime, amounts)
+  // BEFORE broadcasting the BTC HTLC. C.btcLeg.fund broadcasts and then BLOCKS for a confirmation; a
+  // crash/reload in that window must still leave the locked BTC recoverable + refundable. So we save a
+  // stub now (btc_leg=null), record the funding txid the instant it broadcasts (onBroadcast), then fill
+  // in the vout/height once it confirms. resumeFunding() recovers an interrupted funding on reload.
   SWAP = {
     state: ST.PENDING,
     created: Date.now(),
@@ -803,10 +818,17 @@ async function lockBtcLeg(q){
     fee_btc: q.fee_btc,
     maker_btc_claim_pub: q.maker_btc_claim_pub,
     maker_seq_refund_pub: q.maker_seq_refund_pub,
-    btc_leg: {
-      txid: funded.txid, vout: funded.vout, height: funded.height,
-      amount: big(funded.amount), asset_id: funded.asset_id || '', redeem_script: redeem,
-    },
+    btc_leg: null,
+  };
+  saveSwap();  // <- persisted BEFORE the broadcast, so an interrupted funding is never stranded
+  const funded = await C.btcLeg.fund(redeem, q.btc_amount, (txid) => {
+    // broadcast landed: capture the outpoint reference NOW, before the confirmation wait.
+    SWAP.btc_leg = { txid, vout: null, height: null, amount: big(q.btc_amount), asset_id: '', redeem_script: redeem };
+    saveSwap();
+  });  // -> {txid, vout, height, amount, asset_id}
+  SWAP.btc_leg = {
+    txid: funded.txid, vout: funded.vout, height: funded.height,
+    amount: big(funded.amount), asset_id: funded.asset_id || '', redeem_script: redeem,
   };
   saveSwap();
   return SWAP;
@@ -836,7 +858,17 @@ async function onLockBtc(){
       resetQuote();
       renderStepper();
       C.toast && C.toast('BTC leg locked - propose the swap to the maker next.');
-    } catch (e){ st.className = 'status err'; st.textContent = 'Failed: ' + C.prettyErr(e); ok.disabled = false; }
+    } catch (e){
+      if (SWAP && SWAP.btc_leg && SWAP.btc_leg.txid){
+        // The BTC leg already funded (persisted) before the error — do NOT re-enable the button: a retry
+        // would overwrite SWAP and STRAND the funded HTLC. Close to the stepper, which shows the
+        // recoverable/refundable swap under Active trades.
+        modal.remove(); renderStepper();
+        C.toast && C.toast('BTC leg funded, but the next step failed - resume or refund it under Active trades.');
+      } else {
+        st.className = 'status err'; st.textContent = 'Failed: ' + C.prettyErr(e); ok.disabled = false;
+      }
+    }
   };
 }
 
@@ -1170,7 +1202,7 @@ function stopPoll(){ if (POLL){ clearInterval(POLL); POLL = null; } }
 async function onRefundBtc(){
   const { $ } = C;
   $('xswapErr').textContent = '';
-  if (!SWAP || !SWAP.btc_leg){ $('xswapErr').textContent = 'no BTC leg to refund'; return; }
+  if (!SWAP || !SWAP.btc_leg || SWAP.btc_leg.vout == null){ $('xswapErr').textContent = 'The BTC funding is still confirming — refund is available once it confirms.'; return; }
   if (!C.btcLeg || !C.btcLeg.refund){ $('xswapErr').textContent = 'BTC refund unavailable in this build'; return; }
   const kv = [
     ['Network', '⚠ Bitcoin: refunding YOUR locked BTC leg (parent chain) via the CLTV branch'],
@@ -1182,6 +1214,14 @@ async function onRefundBtc(){
   ok.onclick = async () => {
     ok.disabled = true; st.className = 'status'; st.innerHTML = '<span class="spin"></span>Refunding BTC leg…';
     try {
+      // Defence in depth: a refund tx is non-final until the tip reaches btc_locktime — reject a premature
+      // click with a clear message instead of a raw network "non-final" broadcast error.
+      const tip = Number(await btcTipHeight().catch(() => 0)) || 0;
+      if (tip && tip < Number(SWAP.btc_locktime)){
+        st.className = 'status err';
+        st.textContent = `Not yet — the refund unlocks at Bitcoin block ${SWAP.btc_locktime}, about ${Number(SWAP.btc_locktime) - tip} block(s) away.`;
+        ok.disabled = false; return;
+      }
       const txid = await C.btcLeg.refund({
         txid: SWAP.btc_leg.txid, vout: SWAP.btc_leg.vout, amount: SWAP.btc_leg.amount,
         redeem_script: SWAP.btc_redeem_script, locktime: SWAP.btc_locktime,
@@ -1194,6 +1234,36 @@ async function onRefundBtc(){
   };
 }
 
+// FUND-SAFETY resume: a BTC funding interrupted between broadcast and confirmation. If the funding txid
+// was captured (onBroadcast), recover the vout on-chain (findFunding) so the leg is fully usable +
+// refundable. If no txid was recorded, the broadcast never completed (nothing spent) — clear the stub so
+// the user isn't stranded on a dead stepper. Never claims "nothing spent" once a txid exists.
+async function resumeFunding(){
+  if (!SWAP || SWAP.state !== ST.PENDING) return;
+  const leg = SWAP.btc_leg;
+  if (leg && leg.txid && leg.vout == null){
+    try {
+      const f = await C.btcLeg.findFunding(leg.txid, SWAP.btc_redeem_script);
+      SWAP.btc_leg = { ...leg, vout: f.vout, height: f.height || 0, amount: big(f.value || leg.amount) };
+      saveSwap(); renderStepper();
+    } catch { /* not indexed yet — the leg is still refundable after T_btc; a later reload retries */ }
+  } else if (!leg){
+    clearSwap(); renderStepper();   // pre-broadcast stub that never funded — safe to drop (no BTC locked)
+  }
+}
+// CLTV-gate a refund button: a refund tx sets nLockTime and is non-final (network-rejected) until the
+// tip reaches it. Disable with a live countdown until then; enable once mature. Fail OPEN if the tip is
+// unreadable (the on-chain spend still rejects a premature refund, so the user is never truly blocked).
+async function gateRefundByCltv(btn, locktime){
+  try {
+    const tip = Number(await btcTipHeight().catch(() => 0)) || 0;
+    if (!btn.isConnected) return;
+    const remain = Number(locktime) - tip;
+    if (!tip || remain <= 0){ btn.disabled = false; btn.title = 'Reclaim your locked BTC (the refund timelock has matured).'; }
+    else { btn.disabled = true; btn.title = `Refund unlocks at Bitcoin block ${locktime}, about ${remain} more block${remain === 1 ? '' : 's'} away (~${remain * 10} min).`; }
+  } catch { if (btn.isConnected){ btn.disabled = false; btn.title = 'Reclaim your locked BTC once the timelock (block ' + locktime + ') matures.'; } }
+}
+
 // Abandon/clear a terminal or stuck swap from local storage (after BTC_CLAIMED /
 // REFUNDED / FAILED, or to start over). Does not touch on-chain funds. With no
 // swap left, hand control back to the composer (the single swap entry point).
@@ -1203,7 +1273,12 @@ function onAbandon(){
 }
 
 // ---- stepper rendering ----
+// A forward buy is COMPLETE at BTC_CLAIMED, or — for a COURIER buy, where the maker claims the BTC
+// off-chain and there is no further taker step — at SEQ_CLAIMED. Used to render a clean terminal (no
+// stray Refund button, "Clear" not "Abandon").
+function isForwardComplete(){ return !!(SWAP && (SWAP.state === ST.BTC_CLAIMED || (SWAP.courier && SWAP.state === ST.SEQ_CLAIMED))); }
 function badge(state){
+  if (SWAP && SWAP.courier && state === ST.SEQ_CLAIMED) return ['Complete', 'b-in'];   // courier forward: SEQ claimed IS done
   // Map a state to a small badge label + class.
   const map = {
     [ST.QUOTED]:      ['Quoted', 'b-out'],
@@ -1264,10 +1339,16 @@ function renderStepper(){
   const row = el('div','row'); row.style.marginTop = '6px';
   // Refund off-ramp is offered whenever the BTC leg is locked and the swap
   // hasn't completed — the user decides; the copy notes it's only valid after T_btc.
-  if (SWAP.btc_leg && SWAP.state !== ST.BTC_CLAIMED && SWAP.state !== ST.REFUNDED){
-    const rb = el('button','danger','Refund BTC leg'); rb.id = 'btnXRefund'; rb.onclick = onRefundBtc; row.appendChild(rb);
+  // Refund off-ramp: only once the BTC leg has a CONFIRMED outpoint (txid+vout), only while the swap is
+  // NOT complete/refunded, and only ENABLED after the CLTV maturity (gateRefundByCltv). A courier
+  // forward at SEQ_CLAIMED is already complete — no refund on a finished swap.
+  if (SWAP.btc_leg && SWAP.btc_leg.vout != null && !isForwardComplete() && SWAP.state !== ST.REFUNDED){
+    const rb = el('button','danger','Refund BTC leg'); rb.id = 'btnXRefund'; rb.onclick = onRefundBtc;
+    rb.disabled = true; rb.title = 'Checking the refund timelock…';
+    row.appendChild(rb);
+    gateRefundByCltv(rb, SWAP.btc_locktime);
   }
-  const ab = el('button','ghost', (SWAP.state === ST.BTC_CLAIMED || SWAP.state === ST.REFUNDED || SWAP.state === ST.FAILED) ? 'Clear' : 'Abandon');
+  const ab = el('button','ghost', (isForwardComplete() || SWAP.state === ST.REFUNDED || SWAP.state === ST.FAILED) ? 'Clear' : 'Abandon');
   ab.id = 'btnXAbandon'; ab.onclick = onAbandon; row.appendChild(ab);
   ctl.appendChild(row);
   wrap.appendChild(ctl);
@@ -1322,7 +1403,7 @@ function stepCard(n, title, done, active, bodyNodes){
 }
 
 function stepLockCard(){
-  const done = !!(SWAP.btc_leg && SWAP.btc_leg.txid);
+  const done = !!(SWAP.btc_leg && SWAP.btc_leg.txid && SWAP.btc_leg.vout != null);
   const body = [
     C.el('div','sub','You locked BTC in an HTLC claimable by the maker with your secret, refundable by you after T_btc.'),
     SWAP.btc_leg && SWAP.btc_leg.txid ? kvRowHtml('BTC lock tx', txLink(SWAP.btc_leg.txid, true)) : null,
@@ -1332,7 +1413,7 @@ function stepLockCard(){
 }
 function stepProposeCard(){
   const done = !!(SWAP.swap_id);
-  const active = !done && !!(SWAP.btc_leg && SWAP.btc_leg.txid) && SWAP.state !== ST.FAILED;
+  const active = !done && !!(SWAP.btc_leg && SWAP.btc_leg.txid && SWAP.btc_leg.vout != null) && SWAP.state !== ST.FAILED;
   const body = [ C.el('div','sub','The maker verifies your BTC leg, then locks the Sequentia leg in an anchored Sequentia block.') ];
   if (done && SWAP.swap_id && !SWAP.courier) body.push(kvRowCopy('Swap id', SWAP.swap_id));
   if (SWAP.seq_leg && SWAP.seq_leg.txid) body.push(kvRowHtml('Sequentia lock tx', txLink(SWAP.seq_leg.txid, false)));

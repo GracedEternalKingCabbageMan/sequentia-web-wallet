@@ -1666,7 +1666,7 @@ const btcLeg = {
   },
   // Fund the HTLC P2SH (from a redeemScript hex) with `amountAtoms` BTC on
   // testnet4, then poll until it has >=1 confirmation; return the outpoint+height.
-  async fund(redeemHex, amountAtoms){
+  async fund(redeemHex, amountAtoms, onBroadcast){
     const redeem = bytesOfHex(redeemHex);
     const p2sh = btc.p2sh({ script: redeem }, btc.TEST_NETWORK);   // {address, script}
     const address = p2sh.address;
@@ -1677,6 +1677,9 @@ const btcLeg = {
     if(!/^[0-9a-fA-F]{64}$/.test(txt)) throw new Error('unexpected broadcast response: '+txt.slice(0,80));
     const txid = txt;
     if(built.changeIndex!=null) btcChangeNext = Math.max(btcChangeNext, built.changeIndex+1);
+    // Fund-safety: hand the caller the txid the INSTANT it broadcasts, before the confirmation wait, so
+    // the swap's refund material can be persisted with the outpoint reference before we block.
+    if(typeof onBroadcast==='function'){ try{ onBroadcast(txid); }catch{} }
     // Find the HTLC vout (the output paying the P2SH scriptPubKey) and wait for a conf.
     const spkHex = hexOfBytes(p2sh.script);
     const { vout, height } = await btcWaitConf(txid, spkHex);
