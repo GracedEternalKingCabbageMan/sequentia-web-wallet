@@ -1095,7 +1095,7 @@ async function claimSeq(){
   const claimAsset = SWAP.seq_leg.asset_id;
   let fee = 1;
   try {
-    const rate = (claimAsset === C.POLICY_HEX) ? C.EXCHANGE_RATE_SCALE : Number(C.feeRateFor(claimAsset));
+    const rate = Number(C.feeRateFor(claimAsset));   // tSEQ is priced from the feed like every other asset — no SEQ=1 privilege
     const nativeFeeSats = Math.ceil(C.DEFAULT_FEERATE * 350 / 1000);   // ~policy fee (tSEQ-sats), ~350-vB claim
     fee = Math.max(1, Math.ceil(nativeFeeSats * C.EXCHANGE_RATE_SCALE / rate));
   } catch {}

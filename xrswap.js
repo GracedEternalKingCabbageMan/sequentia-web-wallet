@@ -391,7 +391,7 @@ async function onOpen(){
       ['You receive', C.fmtAtoms(q.btc_amount, 8) + ' BTC'],
       ['How it works', 'The maker locks the BTC first. Once it confirms, your wallet locks the asset, the maker takes it by revealing a secret, and your wallet uses that secret to claim the BTC - automatically. You only confirm here.'],
       ['You commit', 'your ' + sm.ticker + ' once the maker’s BTC lock confirms - until then nothing is spent'],
-      ['If the maker stalls', 'your asset is refundable after Sequentia block T_seq (the wizard offers it)'],
+      ['If the maker stalls', 'your asset is refundable after the maker’s stated Sequentia timeout (the exact block is shown once the maker locks; the wizard offers the refund then, with a countdown)'],
       ['Settlement', 'the BTC you receive is anchor-bound to Bitcoin; it can revert only if Bitcoin itself reverts'],
     ] : [
       ['Network', 'Cross-chain: you SELL a Sequentia asset and receive BTC on the parent chain'],
@@ -736,6 +736,16 @@ function startPoll(){
 }
 function stopPoll(){ if (POLL){ clearInterval(POLL); POLL = null; } }
 
+// CLTV-gate the asset-leg refund by the SEQUENTIA tip: the refund tx is non-final (rejected) until the
+// tip reaches seq_locktime. Disable with a live countdown until mature; enable once mature. Fail OPEN if
+// the tip is unreadable (the on-chain spend still rejects a premature refund, so the user isn't blocked).
+async function gateSeqRefundByCltv(btn, locktime){
+  let tip = 0; try { tip = C.wollet ? Number(C.wollet.tip().height()) : 0; } catch {}
+  if (!btn.isConnected) return;
+  const remain = Number(locktime) - tip;
+  if (!tip || remain <= 0){ btn.disabled = false; btn.title = 'Reclaim your locked asset (the refund timelock has matured).'; }
+  else { btn.disabled = true; btn.title = `Refund unlocks at Sequentia block ${locktime}, about ${remain} more block${remain === 1 ? '' : 's'} away (~${remain} min).`; }
+}
 // ---- step 7: refund off-ramp (the asset leg, after T_seq) ----
 async function onRefundSeq(){
   const { $ } = C;
@@ -752,16 +762,24 @@ async function onRefundSeq(){
   ok.onclick = async () => {
     ok.disabled = true; st.className = 'status'; st.innerHTML = '<span class="spin"></span>Refunding the asset leg…';
     try {
-      // Refund fee paid IN THE ASSET (the HTLC holds only the asset, no native tSEQ):
-      // convert the native policy fee to the asset via its published rate. A flat 100000
-      // atoms of a valuable asset is a huge native-equivalent fee that the node rejects
-      // ("Fee exceeds maximum ... maxfeerate") — a valuable asset needs only ~1 atom.
+      // Defence in depth: the refund is non-final until the Sequentia tip reaches seq_locktime.
+      let _tip = 0; try { _tip = C.wollet ? Number(C.wollet.tip().height()) : 0; } catch {}
+      if (_tip && _tip < Number(SWAP.seq_locktime)){
+        st.className = 'status err';
+        st.textContent = `Not yet — the refund unlocks at Sequentia block ${SWAP.seq_locktime}, about ${Number(SWAP.seq_locktime) - _tip} block(s) away.`;
+        ok.disabled = false; return;
+      }
+      // The refund tx pays its fee IN THE LOCKED ASSET (the HTLC holds only that asset — which could be
+      // tSEQ or any other issued asset). Size it as the node's ABSTRACT REFERENCE feerate expressed in
+      // THIS asset via its published rate, so every asset (tSEQ included) is treated the same. A valuable
+      // asset needs very few atoms; a naive flat atom count would be a huge reference-value fee the node
+      // rejects ("Fee exceeds maximum ... maxfeerate").
       let fee = 1;
       try {
         const asset = SWAP.market.seq_asset;
-        const rate = (asset === C.POLICY_HEX) ? C.EXCHANGE_RATE_SCALE : Number(C.feeRateFor(asset));
-        const nativeFeeSats = Math.ceil(C.DEFAULT_FEERATE * 350 / 1000);   // ~policy fee (tSEQ-sats), ~350-vB refund
-        fee = Math.max(1, Math.ceil(nativeFeeSats * C.EXCHANGE_RATE_SCALE / rate));
+        const rate = Number(C.feeRateFor(asset));   // tSEQ is priced from the feed like every other asset — no SEQ=1 privilege
+        const refFee = Math.ceil(C.DEFAULT_FEERATE * 350 / 1000);   // reference-unit fee for a ~350-vB refund tx
+        fee = Math.max(1, Math.ceil(refFee * C.EXCHANGE_RATE_SCALE / rate));
       } catch {}
       { const amt = Number(SWAP.seq_amount); if (fee > Math.floor(amt/2)) fee = Math.max(1, Math.floor(amt/2)); }
       const txid = await C.seqLeg.refund({
@@ -835,8 +853,14 @@ function renderStepper(){
   const stat = el('div','status',''); stat.id = 'xrStepStatus'; ctl.appendChild(stat);
   const row = el('div','row'); row.style.marginTop = '6px';
   // Refund the asset leg: offered once it is funded and the swap isn't done.
-  if (SWAP.seq_leg && ![ST.BTC_CLAIMED, ST.REFUNDED].includes(SWAP.state)){
-    const rb = el('button','danger','Refund asset leg'); rb.onclick = onRefundSeq; row.appendChild(rb);
+  // Refund off-ramp: only while NOT complete/refunded AND before the maker has claimed the asset. At
+  // SEQ_CLAIMED the maker already took the asset leg (the secret is out), so a refund can only fail —
+  // hide it (the user should claim the BTC instead). Gated on the Sequentia CLTV maturity + countdown.
+  if (SWAP.seq_leg && ![ST.BTC_CLAIMED, ST.REFUNDED, ST.SEQ_CLAIMED].includes(SWAP.state)){
+    const rb = el('button','danger','Refund asset leg'); rb.onclick = onRefundSeq;
+    rb.disabled = true; rb.title = 'Checking the refund timelock…';
+    row.appendChild(rb);
+    gateSeqRefundByCltv(rb, SWAP.seq_locktime);
   }
   const ab = el('button','ghost', [ST.BTC_CLAIMED, ST.REFUNDED, ST.FAILED].includes(SWAP.state) ? 'Clear' : 'Abandon');
   ab.onclick = onAbandon; row.appendChild(ab);

@@ -1573,7 +1573,7 @@ function executableQuote(o, payAsset, receiveAsset, editedAsset, typedAtoms){
   // amount; the old `feeRateFor * vsize` produced an absurd fee (e.g. ~29,526 USDX) that broke funding.
   let feeAmount = 0n, feeRate = BigInt(C.EXCHANGE_RATE_SCALE);
   try {
-    feeRate = (feeAsset === C.POLICY_HEX) ? BigInt(C.EXCHANGE_RATE_SCALE) : C.feeRateFor(feeAsset);
+    feeRate = C.feeRateFor(feeAsset);   // tSEQ is priced from the feed like every other asset — no SEQ=1 privilege
     const nativeFeeSats = (BigInt(C.DEFAULT_FEERATE) * EST_SWAP_VSIZE) / 1000n;   // sat/kvB * vbytes / 1000
     feeAmount = ceilDiv(nativeFeeSats * BigInt(C.EXCHANGE_RATE_SCALE), feeRate);
   } catch {}
@@ -2559,7 +2559,7 @@ function fillHooksFor(matched){
 // fee converted via the asset's published exchange rate (a valuable asset pays fewer).
 function covFeeAtoms(feeAsset){
   try {
-    const rate = (feeAsset === C.POLICY_HEX) ? BigInt(C.EXCHANGE_RATE_SCALE) : C.feeRateFor(feeAsset);
+    const rate = C.feeRateFor(feeAsset);   // tSEQ is priced from the feed like every other asset — no SEQ=1 privilege
     const nativeFeeSats = (BigInt(C.DEFAULT_FEERATE) * EST_SWAP_VSIZE) / 1000n;
     return ceilDiv(nativeFeeSats * BigInt(C.EXCHANGE_RATE_SCALE), rate);
   } catch { return 1000n; }
