@@ -179,7 +179,46 @@ const S = {
   mode: 'take', modeTouched: false,
 };
 let INSTANT = {};    // ticker -> { spendable, receivable } atoms (best-effort from the LSP /status)
-let LAST_MID = null; // { price, cross } for the current pair — feeds the pair bar
+let LAST_MID = null; // { price, cross, base, quote } for the current pair — feeds the pair bar + cost line
+
+// ---- canonical price direction (C1) ----------------------------------------------------------------
+// A pair is priced ONE way — "1 base = N quote" (quote per base) — no matter which side the user is
+// paying, so the book / pair bar / rate line / trades / modal never disagree. base/quote are chosen by
+// a fixed quote-RANK: the numeraire (BTC, then fiat stables, then the Sequence token, then commodities)
+// is the QUOTE, so a pair reads the same whether you buy or sell. The pair-bar flip toggle (S.priceFlip)
+// swaps the DISPLAY only.
+function _quoteRank(hex){
+  if (hex === 'BTC') return 1000;
+  const t = String((C.assetMeta(hex) || {}).ticker || '').toUpperCase();
+  const r = { USDX:900, EURX:890, FEEUSD:880, USDT:870, USDC:865, USD:860, TSEQ:500, SEQ:500, GOLD:300, SILVR:200, OILX:100 };
+  return (t in r) ? r[t] : 400;   // unknown issued asset: below the stables/Sequence, above the commodities
+}
+// {base, quote} for an UNORDERED pair — the higher-rank asset is the QUOTE (numeraire). Deterministic
+// (a rank tie falls back to the asset id) so a pair's direction never flips with the buy/sell side.
+function canonicalPair(a, b){
+  if (!a || !b) return { base: a || b, quote: b || a };
+  const ra = _quoteRank(a), rb = _quoteRank(b);
+  if (ra !== rb) return ra > rb ? { base: b, quote: a } : { base: a, quote: b };
+  return String(a) < String(b) ? { base: a, quote: b } : { base: b, quote: a };
+}
+// The pair's DISPLAY direction, honouring the user's flip toggle.
+function pairDir(a, b){
+  const d = canonicalPair(a, b);
+  return S.priceFlip ? { base: d.quote, quote: d.base } : d;
+}
+// Format "1 base = N quote" from a RECEIVE-per-PAY scalar (what the composer/quote paths natively have).
+// qpb (quote per base) = the receive-per-pay rate when base==pay, else its inverse.
+function ratePerPayToLine(pay, receive, recvPerPay){
+  const { base, quote } = pairDir(pay, receive);
+  const bm = metaOf(base), qm = metaOf(quote);
+  const qpb = (base === pay) ? recvPerPay : (recvPerPay > 0 ? 1 / recvPerPay : 0);
+  return { base, quote, bt: bm.ticker, qt: qm.ticker, qpb, str: `1 ${bm.ticker} = ${trim(qpb)} ${qm.ticker}` };
+}
+// "1 base = N quote" for a concrete trade of payU pay -> recvU receive (DISPLAY units). null if no amounts.
+function priceLineStr(pay, receive, payU, recvU){
+  if (!(payU > 0 && recvU > 0)) return null;
+  return ratePerPayToLine(pay, receive, recvU / payU).str;
+}
 // The last LSP /status channel snapshot + provisioned-node state — the GROUND TRUTH the
 // composer gates the Lightning rail on (a real per-asset channel, NOT "LSP configured").
 // Refreshed by refreshInstant(); read synchronously by findRoute/updateRails.
@@ -698,20 +737,27 @@ function renderPairBar(){
   const host = C.$('swPairBar'); if (!host) return;
   if (!S.payAsset || !S.receiveAsset){ host.innerHTML = ''; host.classList.add('hide'); return; }
   host.classList.remove('hide');
-  const pm = metaOf(S.payAsset), rm = metaOf(S.receiveAsset);
-  let lastStr = '—';
-  if (LAST_MID && LAST_MID.price != null && isFinite(LAST_MID.price) && LAST_MID.price > 0){
-    if (LAST_MID.cross){
-      // Cross pairs are always priced in BTC per ASSET. The asset is whichever leg isn't BTC, so on a
-      // SELL (receive = BTC) the denominator is the PAY asset — never "BTC/BTC".
-      const assetTk = rm.ticker === 'BTC' ? pm.ticker : rm.ticker;
-      lastStr = `${trim(LAST_MID.price)} BTC/${assetTk}`;
-    } else {
-      lastStr = `${trim(LAST_MID.price)} ${pm.ticker}/${rm.ticker}`;
-    }
+  const { base, quote } = pairDir(S.payAsset, S.receiveAsset);
+  const bm = metaOf(base), qm = metaOf(quote);
+  // LAST_MID.price is quote-per-base in the SAME frame the book just rendered (pairDir already applied),
+  // so use it only when its base matches the current display base. Labelled "mid" — it IS the book mid,
+  // not a last trade (a real last price needs the durable trade log; until then, don't call it "last").
+  let midStr = '—';
+  if (LAST_MID && LAST_MID.price != null && isFinite(LAST_MID.price) && LAST_MID.price > 0 && LAST_MID.base === base){
+    midStr = `${trim(LAST_MID.price)} ${qm.ticker}`;
   }
-  host.innerHTML = `<div class="swpairsel">${esc(rm.ticker)} <span class="swpair-car">/</span> ${esc(pm.ticker)}</div>
-    <div class="swpair-last">last <b class="mono">${esc(lastStr)}</b></div>`;
+  host.innerHTML = `<div class="swpairsel">${esc(bm.ticker)} <span class="swpair-car">/</span> ${esc(qm.ticker)}`
+    + ` <button type="button" class="swpairflip" id="swPairFlip" title="Flip price direction" aria-label="Flip price direction"`
+    + ` style="background:none;border:0;color:var(--dim);cursor:pointer;font-size:13px;line-height:1;padding:2px 5px;margin-left:5px;border-radius:5px">&#8645;</button></div>`
+    + `<div class="swpair-last">mid <b class="mono">${esc(midStr)}</b></div>`;
+  const fb = C.$('swPairFlip');
+  if (fb) fb.onclick = (e) => {
+    e.stopPropagation();
+    S.priceFlip = !S.priceFlip;                                  // swap the DISPLAY direction only
+    renderPairBar();                                             // instant heading flip
+    requote().catch(()=>{});                                     // re-render book + rate line in the new frame
+    renderRecentTrades().catch(()=>{}); renderPairStats().catch(()=>{});   // keep the feed/stats in step
+  };
 }
 // The reference value of ONE unit of an asset (for the ladder's mid line).
 function oneUnitRefStr(hex){
@@ -1032,7 +1078,7 @@ function paintRouteLine(){
     : route.kind === 'ln'    ? (route.payIsBtc ? 'Lightning · buy with BTC' : 'Lightning · sell for BTC')
     : 'Same-chain · order book';
   // The rate line is filled by the quote (showQuote / showXRate); a placeholder until then.
-  if (!LAST_QUOTE) $('swRate').textContent = '1 ' + tk(S.payAsset) + ' = … ' + tk(S.receiveAsset);
+  if (!LAST_QUOTE){ const _d = pairDir(S.payAsset, S.receiveAsset); $('swRate').textContent = '1 ' + tk(_d.base) + ' = … ' + tk(_d.quote); }
 }
 
 // ---------------------------------------------------------------------------
@@ -1156,15 +1202,15 @@ function paintCostLine(){
   const payV = numVal(C.$('swPayAmt')), recvV = numVal(C.$('swRecvAmt'));
   if (!(payV > 0 && recvV > 0)) return;
   const cross = !!LAST_MID.cross, payIsBtc = S.payAsset === 'BTC';
-  // Effective price in the SAME units as the mid — same-chain mid is PAY per RECEIVE (renderBook),
-  // cross mid is BTC per ASSET (paintQuoteCross); invert the field ratio for a cross sell.
-  const eff = cross ? (payIsBtc ? payV / recvV : recvV / payV) : (payV / recvV);
+  // Effective execution price in the SAME units as the mid (quote per base, in the frame the book was
+  // rendered in). The taker BUYS the base when they RECEIVE it (base === receiveAsset; for cross that's
+  // paying BTC): buying wants a LOWER quote-per-base, selling wants a higher one — so the improvement
+  // direction follows the side, never mislabelling a favourable price as a "cost".
+  const buyingBase = cross ? payIsBtc : (LAST_MID.base === S.receiveAsset);
+  const eff = buyingBase ? (payV / recvV) : (recvV / payV);
   const mid = LAST_MID.price;
   if (!(eff > 0 && mid > 0) || !isFinite(eff)) return;
-  // DIRECTION matters: a lower effective price is better for the taker EXCEPT on a cross SELL, where
-  // you want MORE BTC per asset. betterWhenLower encodes that so we never mislabel a favorable price
-  // as a "cost". improvePct > 0 ⇒ better than mid; < 0 ⇒ you pay a premium (the real spread cost).
-  const betterWhenLower = cross ? payIsBtc : true;
+  const betterWhenLower = buyingBase;
   const rawPct = (eff / mid - 1) * 100;                    // + ⇒ effective above mid
   const improvePct = betterWhenLower ? -rawPct : rawPct;   // + ⇒ better for the taker
   const mag = Math.abs(improvePct);
@@ -1399,11 +1445,14 @@ function paintPlaceRate(pay, receive, best, bookLen){
   const pm = C.assetMeta(pay), rm = C.assetMeta(receive);
   const payV = numVal($('swPayAmt')), recvV = numVal($('swRecvAmt'));
   const yourPrice = (payV > 0 && recvV > 0) ? recvV / payV : 0;
+  // Display "1 base = N quote" (canonical direction); the crossing test stays in native receive-per-pay.
+  const yourLine = yourPrice > 0 ? ratePerPayToLine(pay, receive, yourPrice).str : null;
+  const bestQ = best ? ratePerPayToLine(pay, receive, best).qpb : 0;
   if (S.mode === 'post'){
     // LIMIT: the user's own price. Compare to the book so they know if/when it crosses.
     if (yourPrice > 0){
-      let s = `Limit · 1 ${pm.ticker} = ${trim(yourPrice)} ${rm.ticker}`;
-      if (best) s += yourPrice <= best ? ` — crosses now (best offer ${trim(best)})` : ` — rests until crossed (best offer ${trim(best)})`;
+      let s = `Limit · ${yourLine}`;
+      if (best) s += yourPrice <= best ? ` — crosses now (best ${trim(bestQ)})` : ` — rests until crossed (best ${trim(bestQ)})`;
       $('swRate').textContent = s;
     } else {
       $('swRate').textContent = 'Limit — set both amounts; their ratio is your price.';
@@ -1414,11 +1463,11 @@ function paintPlaceRate(pay, receive, best, bookLen){
       // If the order is bigger than the resting depth at this price, it fills what's there now and
       // rests the remainder as a limit — surface that split.
       const split = marketFillSplit(safeAtoms($('swPayAmt').value, pm.precision||0), safeAtoms($('swRecvAmt').value, rm.precision||0));
-      let s = `Market · 1 ${pm.ticker} = ${trim(yourPrice)} ${rm.ticker} (best offer)`;
+      let s = `Market · ${yourLine} (best offer)`;
       if (split) s += ` · fills ~${trim(Number(split.fill)/Math.pow(10, pm.precision||0))} ${pm.ticker} now, ~${trim(Number(split.rest)/Math.pow(10, pm.precision||0))} rests`;
       $('swRate').textContent = s;
     } else if (best){
-      $('swRate').textContent = `Market · fills at 1 ${pm.ticker} = ${trim(best)} ${rm.ticker} — set an amount.`;
+      $('swRate').textContent = `Market · fills at ${ratePerPayToLine(pay, receive, best).str} — set an amount.`;
     } else {
       $('swRate').textContent = bookLen
         ? 'No crossable offers yet — set both amounts to rest an order (their ratio is your price).'
@@ -1481,7 +1530,7 @@ function postModeSame(pay, receive){
   const hasBook = !!(BOOK.offers && BOOK.offers.length);
   LAST_QUOTE = { kind:'same', startMarket:true, post:true, pay, receive };
   if (pv > 0 && rv > 0){
-    $('swRate').textContent = `Your price · 1 ${pm.ticker} = ${trim(rv/pv)} ${rm.ticker} — Post to rest this offer.`;
+    $('swRate').textContent = `Your price · ${ratePerPayToLine(pay, receive, rv/pv).str} — Post to rest this offer.`;
   } else {
     $('swRate').textContent = hasBook
       ? `Set both amounts — their ratio is your limit price — then Post a resting offer.`
@@ -1745,7 +1794,7 @@ async function requoteMixed(route, amtStr){
     const { asset, btc } = xOfferAmts(o, route.payIsBtc);
     const assetU = Number(big(asset)) / Math.pow(10, am.precision || 0), btcU = Number(big(btc)) / 1e8;
     $('swRate').textContent = (assetU > 0 && btcU > 0)
-      ? `1 BTC = ${trim(assetU / btcU)} ${am.ticker} · best resting offer`
+      ? `1 ${am.ticker} = ${trim(btcU / assetU)} BTC · best resting offer`
       : `Mixed rails · ${am.ticker}/BTC`;
   } else {
     $('swRate').textContent = `No resting offers for ${am.ticker}/BTC yet.`;
@@ -1957,10 +2006,10 @@ function renderXBook(seqAsset, payIsBtc, forward, reverse, unified){
   const bestBid = bids.length ? Math.max(...bids.map(b => b.price)) : null;
   const mid = (bestAsk != null && bestBid != null) ? (bestAsk + bestBid) / 2 : (bestAsk != null ? bestAsk : bestBid);
   const spread = (bestAsk != null && bestBid != null) ? (bestAsk - bestBid) : null;
-  LAST_MID = { price: mid, cross: true };
+  LAST_MID = { price: mid, cross: true, base: seqAsset, quote: 'BTC' };
   renderLadder(host, {
     asks: asks.slice(0, 8).reverse(), bids: bids.slice(0, 8), mid, spread,   // 8 BEST (lowest) asks, shown high->low near the mid
-    priceLabel: `(BTC/${am.ticker})`, sizeLabel: am.ticker,
+    priceLabel: `(${am.ticker}/BTC)`, sizeLabel: am.ticker,
     refMidStr: oneUnitRefStr(seqAsset),
     headTitle: 'Order book', headSub: `${n} offer${n === 1 ? '' : 's'}`,
     emptyMsg: 'No resting offers yet - a market maker with BTC reserves needs to post one.',
@@ -2034,7 +2083,7 @@ function paintQuoteCross(){
   paintRefHints();
   const seqUnits = Number(reqSeq) / Math.pow(10, sm.precision || 0);
   const btcUnits = Number(reqBtc) / 1e8;
-  let line = btcUnits > 0 ? `1 BTC = ${trim(seqUnits / btcUnits)} ${sm.ticker} · cross-chain HTLC` : `cross-chain HTLC`;
+  let line = seqUnits > 0 ? `1 ${sm.ticker} = ${trim(btcUnits / seqUnits)} BTC · cross-chain HTLC` : `cross-chain HTLC`;
   // Market order bigger than the maker's depth: say how much fills now and how much rests — the
   // same "fills ~X now, ~Y rests" language the same-chain route uses. No more "Capped — reduce it".
   const rem = q.remainderSeqAtoms != null ? BigInt(q.remainderSeqAtoms) : 0n;
@@ -2616,7 +2665,7 @@ async function placeCovenantReview(q){
   const kv = [
     ['You pay', amtRow(pay, payAtoms) + refSuffix(pay, payAtoms)],
     ['You receive', amtRow(receive, recvAtoms) + refSuffix(receive, recvAtoms)],
-    ['Price', payU>0 ? `${isMarket ? 'Market · ' : 'Limit · '}1 ${pm.ticker} = ${trim(recvU/payU)} ${rm.ticker}` : '-'],
+    ['Price', payU>0 ? `${isMarket ? 'Market · ' : 'Limit · '}${ratePerPayToLine(pay, receive, recvU/payU).str}` : '-'],
     ['How it fills', isMarket
       ? `Fills against the order book now at your price or better. If your order is larger than what's resting, the filled part settles on-chain and the unfilled remainder keeps resting at the same price until it's crossed — even while this wallet is closed. Consensus rejects any underpay or redirect.`
       : `Rests on-chain at your price and fills — fully or partially — whenever someone crosses it, even while this wallet is closed. A partial fill settles that part and leaves the rest resting. Consensus rejects any underpay or redirect.`],
@@ -3645,7 +3694,7 @@ async function postOfferReview(q){
     ...((q.confidential || isConfBook()) ? [['Privacy', 'Blinded book — your offer rests confidentially and fills confidentially; a blinded receive address and blinding pubkey are published so the counterparty can blind their leg too.']] : []),
     ['You give', amtRow(pay, payAtoms) + refSuffix(pay, payAtoms)],
     ['You want', amtRow(receive, recvAtoms) + refSuffix(receive, recvAtoms)],
-    ['Price', payU>0 ? `1 ${pm.ticker} = ${trim(recvU/payU)} ${rm.ticker}` : '-'],
+    ['Price', payU>0 ? ratePerPayToLine(pay, receive, recvU/payU).str : '-'],
     ['Filling', 'A taker fills it from the other side. Filling needs you (the maker) online to co-sign; in-wallet co-sign is coming, so for now the offer rests publicly and you can cancel it anytime.'],
     ['Expires', 'In 1 hour (re-post to refresh).'],
     ['Finality', 'Settles in ~1 block · anchor-bound to Bitcoin (reverts only if Bitcoin reverts).'],
@@ -3720,22 +3769,25 @@ async function renderRecentTrades(){
       if (!r.ok) return []; const j = await r.json(); return Array.isArray(j.trades) ? j.trades : [];
     } catch { return []; }
   };
-  // composer maps pay/receive → the same-chain book's base=receive, quote=pay; try that, else inverse.
-  let base = recv, quote = pay, trades = await fetchDir(base, quote);
-  if (!trades.length){ const alt = await fetchDir(pay, recv); if (alt.length){ base = pay; quote = recv; trades = alt; } }
+  // ONE canonical base/quote per pair ("1 base = N quote") — query that direction, else the inverse and
+  // invert its prices, so the feed reads the SAME way as the book + rate line.
+  const canon = pairDir(pay, recv);
+  let sizeAsset = canon.base, inv = false, trades = await fetchDir(canon.base, canon.quote);
+  if (!trades.length){ const alt = await fetchDir(canon.quote, canon.base); if (alt.length){ trades = alt; inv = true; sizeAsset = canon.quote; } }
   if (req !== _tradesReq) return;                 // superseded by a newer pair
   if (!trades.length){ host.innerHTML = ''; return; }
   trades.sort((a, b) => (b.ts || 0) - (a.ts || 0));
-  const bm = C.assetMeta(base), qm = C.assetMeta(quote);
+  const bm = C.assetMeta(canon.base), qm = C.assetMeta(canon.quote), sm = C.assetMeta(sizeAsset);
+  const px = (t) => { const p = Number(t.price); return (p > 0 && inv) ? 1 / p : p; };   // quote per canonical base
   const nowS = Math.floor(Date.now() / 1000);
   const ago = (ts) => { const s = Math.max(0, nowS - (ts || 0)); return s < 60 ? s + 's' : s < 3600 ? Math.floor(s/60) + 'm' : s < 86400 ? Math.floor(s/3600) + 'h' : Math.floor(s/86400) + 'd'; };
   const row = (t) => '<div style="display:flex;justify-content:space-between;gap:8px;padding:3px 10px;font-size:12px">'
-    + '<span class="mono">' + trim(Number(t.price)) + '</span>'
-    + '<span class="mono sub">' + esc(C.fmtAtoms(big(String(t.size || 0)), bm.precision || 0)) + ' ' + esc(bm.ticker) + '</span>'
+    + '<span class="mono">' + trim(px(t)) + '</span>'
+    + '<span class="mono sub">' + esc(C.fmtAtoms(big(String(t.size || 0)), sm.precision || 0)) + ' ' + esc(sm.ticker) + '</span>'
     + '<span class="sub" style="min-width:30px;text-align:right">' + ago(t.ts) + '</span></div>';
   host.innerHTML = '<div class="swladder" style="margin-top:8px"><div class="swladder-head">'
     + '<span class="sub" style="color:var(--txt);font-weight:650">Recent trades</span>'
-    + '<span class="sub">price ' + esc(qm.ticker) + '/' + esc(bm.ticker) + '</span></div>'
+    + '<span class="sub">price ' + esc(bm.ticker) + '/' + esc(qm.ticker) + '</span></div>'
     + trades.slice(0, 30).map(row).join('') + '</div>';
 }
 
@@ -3754,19 +3806,26 @@ async function renderPairStats(){
       if (!r.ok) return []; const j = await r.json(); return Array.isArray(j.candles) ? j.candles : [];
     } catch { return []; }
   };
-  let base = recv, quote = pay, candles = await fetchDir(base, quote);
-  if (!candles.length){ const alt = await fetchDir(pay, recv); if (alt.length){ base = pay; quote = recv; candles = alt; } }
+  const canon = pairDir(pay, recv);
+  let sizeAsset = canon.base, inv = false, candles = await fetchDir(canon.base, canon.quote);
+  if (!candles.length){ const alt = await fetchDir(canon.quote, canon.base); if (alt.length){ candles = alt; inv = true; sizeAsset = canon.quote; } }
   if (req !== _statsReq) return;
   if (!candles.length){ host.innerHTML = ''; return; }
+  // Normalise every candle to the canonical quote-per-base frame; inverting an inverse-direction feed
+  // swaps each candle's high and low. vol stays in the candle's own (size) asset.
+  const iv = (x) => { const n = Number(x); return (n > 0) ? 1 / n : 0; };
+  const cN = candles.map(c => inv
+    ? { t: c.t, o: iv(c.o), c: iv(c.c), h: iv(c.l), l: iv(c.h), v: c.v }
+    : { t: c.t, o: Number(c.o), c: Number(c.c), h: Number(c.h), l: Number(c.l), v: c.v });
   const cutoff = Math.floor(Date.now() / 1000) - 86400;
-  const win = candles.filter(c => (c.t || 0) >= cutoff);
-  const use = win.length ? win : candles.slice(-1);   // nothing in 24h → show the latest as a flat point
+  const win = cN.filter(c => (c.t || 0) >= cutoff);
+  const use = win.length ? win : cN.slice(-1);   // nothing in 24h → show the latest as a flat point
   let hi = -Infinity, lo = Infinity, vol = 0n;
-  for (const c of use){ if (Number(c.h) > hi) hi = Number(c.h); if (Number(c.l) < lo) lo = Number(c.l); vol += big(String(c.v || 0)); }
+  for (const c of use){ if (c.h > hi) hi = c.h; if (c.l < lo) lo = c.l; vol += big(String(c.v || 0)); }
   const first = use[0], lastc = use[use.length - 1];
-  const changePct = (first && Number(first.o) > 0) ? ((Number(lastc.c) - Number(first.o)) / Number(first.o) * 100) : 0;
-  const bm = C.assetMeta(base);
-  const pts = use.map(c => Number(c.c)).filter(isFinite);
+  const changePct = (first && first.o > 0) ? ((lastc.c - first.o) / first.o * 100) : 0;
+  const bm = C.assetMeta(sizeAsset);
+  const pts = use.map(c => c.c).filter(isFinite);
   const up = changePct >= 0, col = up ? '#3ddc84' : 'var(--amber2)';
   let spark = '';
   if (pts.length >= 2){
@@ -3785,21 +3844,28 @@ async function renderPairStats(){
 
 function renderBook(pay, receive){
   const host = C.$('swBook'); if (!host) return;
-  const pm = C.assetMeta(pay), rm = C.assetMeta(receive);
+  const { base, quote } = pairDir(pay, receive);
+  const bm = C.assetMeta(base), qm = C.assetMeta(quote);
   const toU = (a, p) => Number(big(a)) / Math.pow(10, p || 0);
   const MY = (typeof makerPubHex === 'function') ? makerPubHex() : null;   // this wallet's own maker id
   const isMine = (o) => !!(MY && (o.maker_pubkey || o.makerPubkey) === MY);
-  let asks = (BOOK.offers || []).map(o => {
-    const recvSize = toU(o.offer_amount || o.offerAmount, rm.precision);   // offer asset = receive
-    const payWanted = toU(o.want_amount || o.wantAmount, pm.precision);    // want asset  = pay
-    return { price: recvSize > 0 ? payWanted / recvSize : 0, size: recvSize,
+  // Every offer, mapped into the FIXED base/quote frame: price = quote per base ("1 base = N quote"),
+  // size in base units. An offer that GIVES the base is selling base (an ASK); giving quote is a BID.
+  // `take` marks the liftable side (only BOOK.offers can be lifted) — it flips with buy/sell, not display.
+  const classify = (o, offerAsset, take) => {
+    const offerIsBase = (offerAsset === base);
+    const baseA  = big(offerIsBase ? (o.offer_amount || o.offerAmount) : (o.want_amount || o.wantAmount));
+    const quoteA = big(offerIsBase ? (o.want_amount || o.wantAmount)  : (o.offer_amount || o.offerAmount));
+    const baseU = toU(baseA, bm.precision), quoteU = toU(quoteA, qm.precision);
+    return { price: baseU > 0 ? quoteU / baseU : 0, size: baseU, isAsk: offerIsBase, take,
              id: o.offer_id || o.offerId, maker: o.maker_pubkey || o.makerPubkey, mine: isMine(o) };
-  }).filter(r => r.price > 0 && r.size > 0);
-  let bids = (BOOK.otherOffers || []).map(o => {
-    const payGiven = toU(o.offer_amount || o.offerAmount, pm.precision);   // offer asset = pay
-    const recvWanted = toU(o.want_amount || o.wantAmount, rm.precision);   // want asset  = receive
-    return { price: recvWanted > 0 ? payGiven / recvWanted : 0, size: recvWanted, mine: isMine(o) };
-  }).filter(r => r.price > 0 && r.size > 0);
+  };
+  const rows = [
+    ...(BOOK.offers || []).map(o => classify(o, receive, true)),     // give receive, want pay — liftable
+    ...(BOOK.otherOffers || []).map(o => classify(o, pay, false)),   // give pay, want receive — the other side
+  ].filter(r => r.price > 0 && r.size > 0);
+  let asks = rows.filter(r => r.isAsk);
+  let bids = rows.filter(r => !r.isAsk);
   const bestAsk = asks.length ? Math.min(...asks.map(a => a.price)) : null;
   const bestBid = bids.length ? Math.max(...bids.map(b => b.price)) : null;
   const mid = (bestAsk != null && bestBid != null) ? (bestAsk + bestBid) / 2 : (bestAsk != null ? bestAsk : bestBid);
@@ -3814,12 +3880,14 @@ function renderBook(pay, receive){
   // the mid); bids are already best-first (descending). Previously the ask side reversed BEFORE slicing,
   // so it showed the 8 HIGHEST asks and hid the best ones — visibly inconsistent with the spread/mid.
   asks = asks.slice(0, 8); asks.reverse(); bids = bids.slice(0, 8);
-  asks.forEach(r => r.onClick = () => fillFromOffer(r.id, r.maker, pay, receive));   // takeable
-  LAST_MID = { price: mid, cross: false };
+  // Only the liftable rows (from BOOK.offers) are clickable — seed the composer at that level's price.
+  const wire = (r) => { if (r.take) r.onClick = () => fillFromOffer(r.id, r.maker, pay, receive); };
+  asks.forEach(wire); bids.forEach(wire);
+  LAST_MID = { price: mid, cross: false, base, quote };
   renderLadder(host, {
     asks, bids, mid, spread,
-    priceLabel: `(${pm.ticker}/${rm.ticker})`, sizeLabel: rm.ticker,
-    refMidStr: oneUnitRefStr(receive),
+    priceLabel: `(${bm.ticker}/${qm.ticker})`, sizeLabel: bm.ticker,
+    refMidStr: oneUnitRefStr(base),
     headTitle: 'Order book', headSub: `${(BOOK.offers || []).length} offer${(BOOK.offers || []).length === 1 ? '' : 's'}${liveBookOn() ? ' · live' : ''}`,
     emptyMsg: 'No resting offers - enter an amount and Review to start this market.',
   });
