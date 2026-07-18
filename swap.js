@@ -212,7 +212,7 @@ function ratePerPayToLine(pay, receive, recvPerPay){
   const { base, quote } = pairDir(pay, receive);
   const bm = metaOf(base), qm = metaOf(quote);
   const qpb = (base === pay) ? recvPerPay : (recvPerPay > 0 ? 1 / recvPerPay : 0);
-  return { base, quote, bt: bm.ticker, qt: qm.ticker, qpb, str: `1 ${bm.ticker} = ${trim(qpb)} ${qm.ticker}` };
+  return { base, quote, bt: bm.ticker, qt: qm.ticker, qpb, str: `1 ${bm.ticker} = ${fmtPrice(qpb)} ${qm.ticker}` };
 }
 // "1 base = N quote" for a concrete trade of payU pay -> recvU receive (DISPLAY units). null if no amounts.
 function priceLineStr(pay, receive, payU, recvU){
@@ -744,7 +744,7 @@ function renderPairBar(){
   // not a last trade (a real last price needs the durable trade log; until then, don't call it "last").
   let midStr = '—';
   if (LAST_MID && LAST_MID.price != null && isFinite(LAST_MID.price) && LAST_MID.price > 0 && LAST_MID.base === base){
-    midStr = `${trim(LAST_MID.price)} ${qm.ticker}`;
+    midStr = `${fmtPrice(LAST_MID.price)} ${qm.ticker}`;
   }
   host.innerHTML = `<div class="swpairsel">${esc(bm.ticker)} <span class="swpair-car">/</span> ${esc(qm.ticker)}`
     + ` <button type="button" class="swpairflip" id="swPairFlip" title="Flip price direction" aria-label="Flip price direction"`
@@ -1453,7 +1453,7 @@ function paintPlaceRate(pay, receive, best, bookLen){
     // LIMIT: the user's own price. Compare to the book so they know if/when it crosses.
     if (yourPrice > 0){
       let s = `Limit · ${yourLine}`;
-      if (best) s += yourPrice <= best ? ` — crosses now (best ${trim(bestQ)})` : ` — rests until crossed (best ${trim(bestQ)})`;
+      if (best) s += yourPrice <= best ? ` — crosses now (best ${fmtPrice(bestQ)})` : ` — rests until crossed (best ${fmtPrice(bestQ)})`;
       $('swRate').textContent = s;
     } else {
       $('swRate').textContent = 'Limit — set both amounts; their ratio is your price.';
@@ -2040,7 +2040,7 @@ function renderLadder(host, o){
     const clk = typeof r.onClick === 'function';
     const w = Math.max(2, Math.min(100, Math.round((r.frac || 0) * 100)));
     return `<button type="button" class="swlrow ${cls}${clk ? '' : ' noclick'}${r.mine ? ' mine' : ''}" data-side="${cls}" data-i="${i}"${r.mine ? ' title="Your resting order"' : ''}${clk ? '' : ' tabindex="-1"'}>
-      <span>${r.mine ? '<i class="swlyou">you</i>' : ''}${esc(trim(r.price))}</span><span>${esc(trim(r.size))}</span><span>${esc(trim(r.cum != null ? r.cum : r.size))}</span>
+      <span>${r.mine ? '<i class="swlyou">you</i>' : ''}${esc(fmtPrice(r.price))}</span><span>${esc(fmtGroup(r.size))}</span><span>${esc(fmtGroup(r.cum != null ? r.cum : r.size))}</span>
       <i class="swldepth" style="width:${w}%"></i></button>`;
   };
   const asks = o.asks || [], bids = o.bids || [];
@@ -2049,7 +2049,7 @@ function renderLadder(host, o){
   const hasRows = asks.length || bids.length;
   const cols = `<div class="swladder-cols"><span>Price ${esc(o.priceLabel || '')}</span><span>Size${o.sizeLabel ? ' (' + esc(o.sizeLabel) + ')' : ''}</span><span>Sum</span></div>`;
   const midHtml = hasRows
-    ? `<div class="swlmid"><b>${o.mid != null ? esc(trim(o.mid)) : '—'}</b> <span class="sp">${o.spread != null ? 'spread ' + esc(trim(o.spread)) + ' · mid' : 'mid'}</span> <span>${esc(o.refMidStr || '')}</span></div>`
+    ? `<div class="swlmid"><b>${o.mid != null ? esc(fmtPrice(o.mid)) : '—'}</b> <span class="sp">${o.spread != null ? 'spread ' + esc(fmtPrice(o.spread)) + ' · mid' : 'mid'}</span> <span>${esc(o.refMidStr || '')}</span></div>`
     : '';
   const empty = hasRows ? '' : `<div class="swladder-empty">${esc(o.emptyMsg || 'No resting offers yet.')}</div>`;
   host.innerHTML = `<div class="swladder">
@@ -3637,6 +3637,19 @@ function trim(n){
   let s = r.toFixed(8);
   if (s.indexOf('.') >= 0) s = s.replace(/0+$/, '').replace(/\.$/, '');
   return s;
+}
+// Group the integer part of an already-formatted number string with thousands separators.
+function _group(s){ const neg = s[0] === '-'; if (neg) s = s.slice(1); const [i, f] = s.split('.'); const ig = i.replace(/\B(?=(\d{3})+(?!\d))/g, ','); return (neg ? '-' : '') + (f ? ig + '.' + f : ig); }
+// Size/amount for DISPLAY: trim()'s precision + thousands separators. NEVER write this into an input.
+function fmtGroup(n){ return _group(trim(n)); }
+// PRICE for DISPLAY: magnitude-appropriate precision (a ~2350 price doesn't need 8dp) + separators.
+function fmtPrice(n){
+  if (!isFinite(n)) return '-';
+  if (n === 0) return '0';
+  const a = Math.abs(n), dp = a >= 1000 ? 2 : a >= 1 ? 4 : a >= 0.01 ? 6 : 8;
+  let s = (Math.round(n * Math.pow(10, dp)) / Math.pow(10, dp)).toFixed(dp);
+  if (s.indexOf('.') >= 0) s = s.replace(/0+$/, '').replace(/\.$/, '');
+  return _group(s);
 }
 
 // ---------------------------------------------------------------------------
