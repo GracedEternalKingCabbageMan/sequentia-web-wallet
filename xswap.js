@@ -608,7 +608,14 @@ function confirmLockModal(fq, sm){
 export function hasInFlight(){
   loadSwap();
   if (!SWAP) return false;
-  return SWAP.state !== ST.BTC_CLAIMED && SWAP.state !== ST.REFUNDED && SWAP.state !== ST.FAILED;
+  // A FAILED swap that STILL holds a funded, un-refunded BTC leg is NOT free to overwrite:
+  // its btc_leg + redeem script + refund key are the ONLY way to reclaim the locked BTC after
+  // T_btc. Treat it as in-flight so the stepper (with its Refund off-ramp) stays up and a new
+  // swap can't clobber it. A FAILED swap with nothing locked is genuinely done (clearable).
+  const lockedUnrefunded = !!(SWAP.btc_leg && SWAP.btc_leg.txid)
+    && SWAP.state !== ST.REFUNDED && SWAP.state !== ST.BTC_CLAIMED;
+  if (SWAP.state === ST.FAILED) return lockedUnrefunded;
+  return SWAP.state !== ST.BTC_CLAIMED && SWAP.state !== ST.REFUNDED;
 }
 
 function selMarket(){
@@ -1276,6 +1283,16 @@ async function gateRefundByCltv(btn, locktime){
 // REFUNDED / FAILED, or to start over). Does not touch on-chain funds. With no
 // swap left, hand control back to the composer (the single swap entry point).
 function onAbandon(){
+  loadSwap();
+  // NEVER discard a swap that still holds locked BTC: clearSwap() deletes the ONLY reclaim
+  // material (redeem script + refund key + outpoint), permanently stranding the BTC. If a leg
+  // is funded and not yet refunded/claimed, keep the record and point at the Refund off-ramp.
+  const lockedUnrefunded = !!(SWAP && SWAP.btc_leg && SWAP.btc_leg.txid)
+    && !isForwardComplete() && SWAP.state !== ST.REFUNDED && SWAP.state !== ST.BTC_CLAIMED;
+  if (lockedUnrefunded){
+    try { C.toast && C.toast('Your Bitcoin is still locked. Use “Refund BTC leg” (available after the timeout) before clearing — otherwise the reclaim keys are lost.'); } catch {}
+    return;
+  }
   stopPoll(); clearSwap(); renderStepper();
   if (C.onExit) C.onExit();
 }
@@ -1365,7 +1382,12 @@ function renderStepper(){
     row.appendChild(rb);
     gateRefundByCltv(rb, SWAP.btc_locktime);
   }
-  const ab = el('button','ghost', (isForwardComplete() || SWAP.state === ST.REFUNDED || SWAP.state === ST.FAILED) ? 'Clear' : 'Abandon');
+  // "Clear" (safe to discard) only when nothing is locked; while BTC is locked+unrefunded it's
+  // "Abandon" and onAbandon refuses — the record holds the reclaim keys. A FAILED swap with a
+  // locked leg therefore keeps its refund surface instead of offering a fund-destroying Clear.
+  const _lockedNow = !!(SWAP.btc_leg && SWAP.btc_leg.txid) && !isForwardComplete()
+    && SWAP.state !== ST.REFUNDED && SWAP.state !== ST.BTC_CLAIMED;
+  const ab = el('button','ghost', (!_lockedNow && (isForwardComplete() || SWAP.state === ST.REFUNDED || SWAP.state === ST.FAILED)) ? 'Clear' : 'Abandon');
   ab.id = 'btnXAbandon'; ab.onclick = onAbandon; row.appendChild(ab);
   ctl.appendChild(row);
   wrap.appendChild(ctl);

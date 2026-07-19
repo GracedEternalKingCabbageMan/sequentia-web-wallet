@@ -4310,8 +4310,20 @@ async function renderMyOrders(){
   try { orders = await seqob.fetchMyOrders(makerPubHex()); } catch { if (credits) host.innerHTML = credits; return; }
   // D2/T13: prune fill-progress for orders no longer resting, so a stale entry can't paint a wrong
   // "~N% filled" if the relay ever re-uses an offer_id.
-  { const live = new Set(orders.map(o => o.offer_id || o.offerId)); for (const k of Object.keys(_ordStatus)) if (!live.has(k)) delete _ordStatus[k]; }
-  if (!orders.length){ host.innerHTML = credits; return; }
+  const relayIds = new Set(orders.map(o => o.offer_id || o.offerId));
+  { for (const k of Object.keys(_ordStatus)) if (!relayIds.has(k)) delete _ordStatus[k]; }
+  // LOCAL reclaim rows: covenant orders THIS wallet funded on-chain that the relay no longer
+  // lists (its offer TTL is far shorter than the ~24h on-chain lock) but whose locked asset is
+  // still reclaimable via the CLTV refund. Without these the reclaim UI vanished with the relay
+  // listing and the funds became unreachable through the wallet.
+  const localReclaim = PLACED.filter(r => r.covTxid != null && !relayIds.has(r.offerId) && !r._orphan);
+  const localRows = localReclaim.map(r => {
+    const give = C.assetMeta(r.pay);
+    return `<div class="swbook-row myorder">
+      <span class="mono">give ${esc(C.fmtAtoms(BigInt(r.sellAtoms), give.precision))} ${esc(give.ticker)} · funded on-chain (delisted from the relay)</span>
+      <button type="button" class="ghost swcancel" data-id="${esc(r.offerId)}">Reclaim</button></div>`;
+  }).join('');
+  if (!orders.length && !localRows){ host.innerHTML = credits; return; }
   const rows = orders.map(o => {
     const give = C.assetMeta(o.offer_asset||o.offerAsset), want = C.assetMeta(o.want_asset||o.wantAsset);
     const isCov = !!(o.covenant || o.Covenant);
@@ -4330,7 +4342,7 @@ async function renderMyOrders(){
       <button type="button" class="ghost swcancel" data-id="${esc(id)}">Cancel</button></div>`;
   }).join('');
   host.innerHTML = credits + `<div class="swbook"><div class="swbook-head"><span class="lbl">Your resting orders</span>
-      <span class="sub">funded on-chain · fill whenever matched, even offline</span></div>${rows}</div>`;
+      <span class="sub">funded on-chain · fill whenever matched, even offline</span></div>${rows}${localRows}</div>`;
   host.querySelectorAll('.swcancel').forEach(b => b.onclick = async () => {
     b.disabled = true; b.textContent = 'Cancelling…';
     const id = b.dataset.id;

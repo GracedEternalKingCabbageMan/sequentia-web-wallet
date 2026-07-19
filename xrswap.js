@@ -808,6 +808,17 @@ function takerDestSpkHex(){
 }
 
 function onAbandon(){
+  loadSwap();
+  // NEVER discard a reverse swap that still holds a locked ASSET leg: clearSwap() drops the
+  // seq_leg outpoint (txid/vout/redeem/block) needed to build the CLTV asset refund, stranding
+  // it. Keep the record + point at the Refund off-ramp until the asset is refunded or the taker
+  // has already claimed the maker's BTC (terminal — nothing of ours left locked).
+  const lockedUnrefunded = !!(SWAP && SWAP.seq_leg && SWAP.seq_leg.txid)
+    && !SWAP.btc_claim_txid && SWAP.state !== ST.REFUNDED && SWAP.state !== ST.BTC_CLAIMED;
+  if (lockedUnrefunded){
+    try { C.toast && C.toast('Your asset is still locked in this swap. Refund it (after the timeout) before clearing — otherwise the reclaim data is lost.'); } catch {}
+    return;
+  }
   stopPoll(); clearSwap(); renderStepper();
   if (C.onExit) C.onExit();
 }
