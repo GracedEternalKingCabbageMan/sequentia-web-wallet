@@ -1178,12 +1178,24 @@ async function claimSeq(){
   // of a valuable asset is a huge native-equivalent fee the node rejects ("Fee exceeds
   // maximum ... maxfeerate") — a valuable asset needs only ~1 atom.
   const claimAsset = SWAP.seq_leg.asset_id;
-  let fee = 1;
+  let fee = 1, feeSized = false;
   try {
     const rate = Number(C.feeRateFor(claimAsset));   // tSEQ is priced from the feed like every other asset — no SEQ=1 privilege
-    const nativeFeeSats = Math.ceil(C.DEFAULT_FEERATE * 350 / 1000);   // ~policy fee (tSEQ-sats), ~350-vB claim
-    fee = Math.max(1, Math.ceil(nativeFeeSats * C.EXCHANGE_RATE_SCALE / rate));
+    if (isFinite(rate) && rate > 0){
+      const nativeFeeSats = Math.ceil(C.DEFAULT_FEERATE * 350 / 1000);   // ~policy fee (tSEQ-sats), ~350-vB claim
+      fee = Math.max(1, Math.ceil(nativeFeeSats * C.EXCHANGE_RATE_SCALE / rate));
+      feeSized = true;
+    }
   } catch {}
+  // NEVER reveal the secret with a fee we could not size from a LIVE rate. The old fallback of fee=1 is
+  // below the per-asset producer fee floor for a low-value asset, so the claim would sit UNMINED in the
+  // mempool while its preimage is already public; once the Sequentia tip reaches T_seq the maker refunds
+  // the asset leg and sweeps the taker's BTC with that secret — the taker loses BOTH legs. Refuse: the
+  // secret stays hidden and the leg stays claimable, so resumeAnchorClaim retries once the feed is back.
+  if (!feeSized){
+    const tk = (C.assetMeta(claimAsset) || {}).ticker || 'this asset';
+    throw new Error(`The Sequentia fee rate for ${tk} is unavailable right now, so the claim fee cannot be sized safely · your secret was NOT revealed. This retries automatically; your BTC stays refundable after block ${SWAP.btc_locktime}.`);
+  }
   { const amt = Number(SWAP.seq_leg.amount); if (fee > Math.floor(amt/2)) fee = Math.max(1, Math.floor(amt/2)); }
   const spend = {
     txid: SWAP.seq_leg.txid,

@@ -164,7 +164,7 @@ function offerField(o, ...names){ for (const n of names){ if (o[n] !== undefined
 // book pair is <asset>/BTC; a reverse offer is a maker BUY of the asset (it gives
 // BTC). Picks the offer paying the most BTC per asset atom; whole-HTLC (the taker
 // sells the offer's full asset amount).
-async function findReverseOffer(seqAsset){
+async function findReverseOffer(seqAsset, seqAtoms){
   const book = await seqob.fetchBook(seqAsset, 'BTC');
   const offers = (book.offers || book.Offers || []).filter(o => {
     if (o._verified === false) return false;
@@ -183,8 +183,21 @@ async function findReverseOffer(seqAsset){
     const asset = big(offerField(o, 'want_amount', 'wantAmount') || offerField(o, 'base_amount', 'baseAmount'));
     return { o, btc, asset, ratio: asset > 0n ? Number(btc) / Number(asset) : 0 };
   };
-  const ranked = offers.map(norm).filter(x => x.btc > 0n && x.asset > 0n).sort((a, b) => b.ratio - a.ratio);
-  return ranked.length ? ranked : null;   // best-first (highest BTC per asset); [0] is best
+  const all = offers.map(norm).filter(x => x.btc > 0n && x.asset > 0n);
+  if (!all.length) return null;
+  const req = seqAtoms ? big(seqAtoms) : 0n;
+  if (req <= 0n) return all.sort((a, b) => b.ratio - a.ratio);   // no size hint -> best price first ([0] best)
+  // Whole-HTLC rail: pick the offer CLOSEST in size to the request (mirror the forward's bestForwardOffer)
+  // so a small sell doesn't lift a huge offer, while staying within a price tolerance of the best rate.
+  // Smallest offer that COVERS the request first, then the largest below it. Consent is still re-taken on
+  // the chosen offer's exact whole-HTLC terms before any asset is funded.
+  const bestRatio = all.reduce((m, x) => Math.max(m, x.ratio), 0);
+  const pool0 = all.filter(x => bestRatio > 0 ? x.ratio >= bestRatio * 0.98 : true);
+  const pool = pool0.length ? pool0 : all;
+  const cmpAsc = (a, b) => (a.asset < b.asset ? -1 : a.asset > b.asset ? 1 : 0);
+  const covering = pool.filter(x => x.asset >= req).sort(cmpAsc);              // smallest covering first
+  const below = pool.filter(x => x.asset < req).sort((a, b) => cmpAsc(b, a));  // then largest below
+  return [...covering, ...below];
 }
 
 // Read the maker's revealed preimage OFF-CHAIN: find the tx that spent our funded
@@ -258,7 +271,7 @@ export async function fetchRQuote(seqAsset, seqAtoms){
       throw new Error(`maker returned a bad ordering: T_btc(${q.btc_locktime}) must exceed T_seq(${q.seq_locktime})`);
     return q;
   }
-  const ranked = await findReverseOffer(seqAsset);
+  const ranked = await findReverseOffer(seqAsset, seqAtoms);
   if (!ranked) throw new Error('No one is buying this asset for BTC right now. Try again later, or place a same-chain order.');
   const best = ranked[0];
   // T4 retry-down-book (reverse): the other reverse offers as fallbacks if the best maker doesn't

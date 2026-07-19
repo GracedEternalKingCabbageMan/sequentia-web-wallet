@@ -2764,6 +2764,10 @@ function initSwapTab(){
       nodeReceive: (p) => seqlnNodeReceive(p),
       nodePay: (p) => seqlnNodePay(p),
       jobStatus: (pathOrId) => seqlnJobStatus(pathOrId),   // advisory async-job status (sub-asset HODL BUY)
+      // The submarine (mixed) async-job status — GET /swap/<id>, the SAME endpoint as jobStatus. Wiring
+      // this is what lets pollMixed advance an anchor-gated (over-0-conf) submarine past SETTLING; it was
+      // referenced by pollMixed but never defined, so those swaps could never learn they settled.
+      swapStatus: (pathOrId) => seqlnJobStatus(pathOrId),
       // The registry node_key for the user's OWN hosted LN node for `assetHex`
       // (seq:<asset>:<deviceTransportPubkey>) — matches refreshOwnLnNodeKeys. Needed by the
       // sub-asset sell/buy /swap calls to name which hosted node pays over Lightning.

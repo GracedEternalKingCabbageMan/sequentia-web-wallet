@@ -1837,9 +1837,17 @@ async function requoteMixed(route, amtStr){
     }
     const assetStr = C.fmtAtoms(BigInt(offer.asset_amount), am.precision || 0);
     const btcStr = C.fmtAtoms(BigInt(offer.btc_sats), 8);
+    // Capture what the user typed to SPEND (the BTC pay field) BEFORE we overwrite it with the offer's
+    // amounts: this rail lifts the WHOLE offer, so if the offer's BTC differs materially from the typed
+    // amount, say so (mirror the cross/pure-LN whole-offer note) instead of silently overwriting.
+    const typedBtcU = parseFloat(String($('swPayAmt').value || '').replace(/,/g, '')) || 0;
+    const offerBtcU = Number(BigInt(offer.btc_sats)) / 1e8;
     setNativeField($('swRecvAmt'), assetStr);
     setNativeField($('swPayAmt'), btcStr);
-    $('swRate').textContent = `${btcStr} BTC → ${assetStr} ${am.ticker} · best resting offer`;
+    let mixRate = `${btcStr} BTC → ${assetStr} ${am.ticker} · best resting offer`;
+    if (typedBtcU > 0 && offerBtcU > 0 && Math.abs(offerBtcU - typedBtcU) / offerBtcU > 0.02)
+      mixRate += ` · ⚠ lifts the whole offer (${btcStr} BTC), not the ${trim(typedBtcU)} you entered`;
+    $('swRate').textContent = mixRate;
     $('swRoute').textContent = 'Mixed rails · buy over Lightning, pay BTC on-chain';
     paintFee('BTC', null, 'You pay BTC on-chain; the maker pays the ' + am.ticker + ' to your device over Lightning.');
     LAST_QUOTE = { kind: 'mixed', route, seqAsset: route.seqAsset, payIsBtc: true,
@@ -3052,6 +3060,14 @@ async function startSell(params){
     const btc_claim_pub = C.btcLeg.claimKey().public_key;   // the device claim key; only we can claim
     const node_key = await L.assetNodeKey(asset);           // our own hosted asset node pays over LN
     const offer = params.offer || null;
+    // FUND-SAFETY: this rail pays the asset over Lightning and can only compare the maker's returned BTC
+    // HTLC against the quote AFTER that (irrevocable) payment. Never pay without a resting offer's
+    // btc_sats to compare against — otherwise expected_btc falls back to 0, the shortfall gate in
+    // claimSell is skipped entirely, and a maker handing back a dust HTLC goes completely unwarned. This
+    // makes the economic gate reliable; verifying the BTC HTLC BEFORE paying needs a 2-phase LSP
+    // handshake (the atomic flow reveals the preimage only after the pay), tracked as an LSP change.
+    const expectedBtc = Number((offer && offer.btc_sats) || 0);
+    if (!(expectedBtc > 0)) throw new Error('This sell has no resting Bitcoin offer to price against · refresh the order book and pick an offer, so the Bitcoin you will receive is known before you pay the asset.');
     // Bring our asset LN node's device signer ONLINE — a per-user node isn't auto-connected on
     // load, and the LSP needs it serving to command the pay. Idempotent (re-attaches, no re-fund).
     if (L.connectNode){
@@ -3082,7 +3098,7 @@ async function startSell(params){
     // Persist BEFORE the on-chain claim: the asset is now paid, so the BTC claim is the fund step
     // and MUST survive a reload — resumeSell() re-attempts it from here.
     SELL = { state: 'claiming', asset, ticker: am.ticker, preimage: resp.preimage, hash_h: resp.hash_h, btc_htlc: H,
-      expected_btc: Number((offer && offer.btc_sats) || 0), swap_nonce, ts: mixedTip() }; saveSell();
+      expected_btc: expectedBtc, swap_nonce, ts: mixedTip() }; saveSell();
     say('Preimage revealed · verifying and claiming your BTC on-chain…');
     await claimSell();   // verify + claim; updates SELL + st
     say('Done. You paid ' + am.ticker + ' over Lightning and claimed BTC on-chain (' + String(SELL.claim_txid || '').slice(0,16) + '…).', 'ok');
@@ -3469,12 +3485,16 @@ async function startMixed(params){
 // Poll the LSP for the swap's progress until terminal (best-effort: needs L.swapStatus).
 let _mixedPoll = null;
 function pollMixed(){
-  if (!MIXED || sub.isTerminal(MIXED) || !(L && L.swapStatus)) return;
+  // Poll the LSP JOB handle (poll path / job_id captured from the 202), NOT MIXED.id (a LOCAL id from
+  // newSwap that the LSP never knew). Without a handle there is no async job to poll — a sub-0-conf
+  // submarine already answered synchronously and is terminal, so there is nothing to do.
+  const pollRef = MIXED && (MIXED.poll || MIXED.job_id);
+  if (!MIXED || sub.isTerminal(MIXED) || !(L && L.swapStatus) || !pollRef) return;
   clearTimeout(_mixedPoll);
   _mixedPoll = setTimeout(async () => {
     if (!MIXED || sub.isTerminal(MIXED)) return;
     try {
-      const r = await L.swapStatus(MIXED.id);
+      const r = await L.swapStatus(MIXED.poll || MIXED.job_id);
       MIXED = sub.applyStatus(MIXED, r || {}); saveMixed(); renderMixedSwap();
       if (MIXED.state === sub.ST.SETTLED){ try { await C.sync(); } catch {} }
     } catch {}

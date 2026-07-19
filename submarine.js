@@ -86,6 +86,12 @@ export function applyStatus(rec, resp) {
   if (resp && resp.preimage) next.preimage = resp.preimage;
   if (resp && (resp.htlc || resp.onchain_leg)) next.htlc = normHtlc(resp.htlc || resp.onchain_leg);
   if (resp && (resp.detail || resp.message)) next.detail = resp.detail || resp.message;
+  // Capture the LSP async-job handle from a 202 {job_id, poll, status:'confirming'} so pollMixed can
+  // drive GET /swap/<id>. The record's own `id` is a LOCAL id (newSwap), NOT the LSP job id — an
+  // anchor-gated (over-0-conf) submarine returns 202 and MUST be polled by this handle, or it can never
+  // learn it settled and stays stuck at SETTLING forever.
+  if (resp && resp.poll) next.poll = resp.poll;
+  if (resp && (resp.job_id || resp.jobId)) next.job_id = resp.job_id || resp.jobId;
   if (fin === 'final' || fin === 'settled' || fin === 'complete' || (resp && resp.settled === true)) {
     next.state = ST.SETTLED;
   } else if (fin === 'failed' || fin === 'error' || (resp && resp.ok === false)) {
