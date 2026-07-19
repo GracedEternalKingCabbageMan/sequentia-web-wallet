@@ -3121,9 +3121,11 @@ export async function resumeSell(){
   //     nonce — the LSP returns the already-settled {preimage, btc_htlc} idempotently (it never
   //     re-pays for a stored nonce), then we claim as usual. This closes the fund-loss window.
   if (SELL.state === 'paying' && SELL.swap_nonce && !SELL.preimage){
-    // Bounded: past the Lightning leg's own timeout any unsettled asset payment has auto-returned, so a
-    // still-'paying' record this old can't complete — clear it rather than re-attempt (or re-run) forever.
-    if (SELL.ts && (Date.now() - SELL.ts) > SELL_PAYING_TTL_MS){ clearSell(); try { C.toast && C.toast('A sub-asset sell that never completed has expired; any Lightning payment has auto-returned.'); } catch {} return; }
+    // FUND-SAFETY: NEVER clear on the TTL before an idempotent recovery re-call. The old code
+    // cleared any old 'paying' record assuming "unsettled -> auto-returned" — but a payment that
+    // DID settle and only lost its response left the asset spent and the BTC owed; clearing it
+    // abandoned that BTC. So re-call FIRST; only clear once the LSP confirms the payment did not
+    // settle. If the service is unavailable, keep the record (retry next load) regardless of age.
     if (!(L && L.swap && L.assetNodeKey)) return;                                             // service unavailable in this build; retry next load
     if (!(C.btcLeg && C.btcLeg.claim && C.btcLeg.claimKey && C.btcLeg.verifyClaimable)) return;
     try {
@@ -3135,7 +3137,13 @@ export async function resumeSell(){
         payRail: 'ln', recvRail: 'chain',
         offer_id: offer && offer.offer_id, maker_pubkey: offer && offer.maker_pubkey,
         swap_nonce: SELL.swap_nonce });
-      if (!(resp && resp.settled && resp.preimage && resp.btc_htlc)) return;                  // not settled yet; keep the 'paying' record for a later retry
+      if (!(resp && resp.settled && resp.preimage && resp.btc_htlc)){
+        // Confirmed NOT settled. Only now is a TTL clear safe: past the Lightning leg's own timeout
+        // an unsettled asset payment has auto-returned, so this record can never complete. Within the
+        // TTL, keep it for a later retry.
+        if (SELL.ts && (Date.now() - SELL.ts) > SELL_PAYING_TTL_MS){ clearSell(); try { C.toast && C.toast('A sub-asset sell that never completed has expired; any Lightning payment has auto-returned.'); } catch {} }
+        return;
+      }
       SELL = { state: 'claiming', asset, ticker: SELL.ticker || ((C.assetMeta(asset)||{}).ticker || ''),
         preimage: resp.preimage, hash_h: resp.hash_h, btc_htlc: resp.btc_htlc,
         expected_btc: Number((offer && offer.btc_sats) || SELL.expected_btc || 0),

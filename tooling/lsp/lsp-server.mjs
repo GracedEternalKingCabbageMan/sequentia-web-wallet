@@ -391,7 +391,7 @@ function lnrpcKw(method, kv = [], rpc, timeoutMs = 0) {
         if (err) {
           let detail = (stderr || '').trim();
           try { const j = JSON.parse(stdout); if (j && j.message) detail = j.message; } catch { /* not json */ }
-          return reject(new Error(`${method}: ${detail || err.message}`));
+          return reject(new Error(`${method}: ${detail || scrubDetail(err.message)}`));
         }
         try { resolve(JSON.parse(stdout)); } catch { reject(new Error(`${method}: bad json`)); }
       });
@@ -411,7 +411,7 @@ function lnrpc(method, args = [], rpc, timeoutMs = 0) {
         if (err) {
           let detail = (stderr || '').trim();
           try { const j = JSON.parse(stdout); if (j && j.message) detail = j.message; } catch { /* not json */ }
-          return reject(new Error(`${method}: ${detail || err.message}`));
+          return reject(new Error(`${method}: ${detail || scrubDetail(err.message)}`));
         }
         try { resolve(JSON.parse(stdout)); } catch { reject(new Error(`${method}: bad json`)); }
       });
@@ -917,7 +917,7 @@ async function runSubasBuyHodl(job, body) {
   if (err && !job.held && !heldBanner) {
     watching = false;
     job.status = 'failed';
-    job.error = `sub-asset buy failed before held: ${err.message}`;
+    job.error = `sub-asset buy failed before held: ${scrubDetail(err.message)}`;
     job.detail = scrubDetail(out);
     job.note = 'the BTC HTLC is refundable after T_btc via btcLeg.refund (the device holds the refund key).';
     job.done_ms = Date.now();
@@ -1039,7 +1039,7 @@ function runSwap({ side, asset, amount }) {
         base_amount: Number(m[2]), quote_asset: CFG.btcx || 'BTC', quote_amount: Number(m[4]),
         preimage: m[5], finality: 'final', settled_ms: Date.now() - t0, requested_amount: amount ?? null,
       });
-      resolve({ ok: false, error: err ? `swap failed: ${err.message}` : 'swap did not settle',
+      resolve({ ok: false, error: err ? `swap failed: ${scrubDetail(err.message)}` : 'swap did not settle',
         detail: scrubDetail(out), settled_ms: Date.now() - t0 });
     });
   });
@@ -1346,7 +1346,7 @@ function runMixed({ side, asset, amount, payRail, recvRail, node_key, asset_bolt
         // maker refunds its BTC HTLC at T_btc and nothing is lost. The state file is left in place
         // (harmless temp; pre-cleaned on the next same-nonce run).
         return resolve({ ok: false,
-          error: (j && j.error) ? `sub-asset sell failed: ${j.error}` : (err ? `sub-asset sell failed: ${err.message}` : 'sub-asset sell did not settle'),
+          error: (j && j.error) ? `sub-asset sell failed: ${scrubDetail(j.error)}` : (err ? `sub-asset sell failed: ${scrubDetail(err.message)}` : 'sub-asset sell did not settle'),
           detail: scrubDetail(out), settled_ms: dt });
       });
     }
@@ -1479,7 +1479,7 @@ function runMixed({ side, asset, amount, payRail, recvRail, node_key, asset_bolt
       });
       const fdetail = scrubDetail(out);
       console.error(`[router] ${execName || 'mixed'} FAILED after ${dt}ms: ${err ? err.message : 'did not settle'}; tail: ${String(fdetail).trim().split('\n').filter(Boolean).slice(-3).join(' | ').slice(0, 500)}`);
-      resolve({ ok: false, error: err ? `mixed swap failed: ${err.message}` : 'mixed swap did not settle',
+      resolve({ ok: false, error: err ? `mixed swap failed: ${scrubDetail(err.message)}` : 'mixed swap did not settle',
         detail: fdetail, settled_ms: dt });
     });
   });
