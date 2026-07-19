@@ -3832,22 +3832,26 @@ async function requoteLn(route, amtStr){
   $('swStatus').textContent = ''; $('swErr').textContent = '';
   renderTiming(route);
   // The pure-LN CLI (xpln) has NO partial fill: it lifts the best resting offer IN FULL, so the size
-  // that actually executes is the OFFER'S size, not the typed amount. Read the best takeable offer and
-  // carry its true amounts on the quote so Review can show what will really move (and warn on mismatch).
-  // Never present the typed amount as if it were the executed size.
-  const best = (XBOOK && XBOOK.offers || [])[0];
+  // that actually executes is the OFFER'S size, not the typed amount. Price + PIN off the SAME book
+  // xpln lifts from — the LSP's /lnbook, sourced from the pure-LN relay (:9965) — NOT the on-chain
+  // cross book (XBOOK, a DIFFERENT market on :9955). Quoting the cross book showed a price/amounts the
+  // settle never honoured and enabled Review whenever cross had liquidity but pure-LN did not. Carry
+  // the chosen offer's real amounts AND its id/maker_pubkey so Review shows what will move and the
+  // settle lifts exactly THIS offer (pinned), never a relay-arbitrary one.
   let lnOffer = null;
-  if (best){
+  if (L && L.lnBook){
     try {
-      const { asset: offAsset, btc: offBtc } = xOfferAmts(best, route.payIsBtc);
-      if (big(offAsset) > 0n && big(offBtc) > 0n)
-        lnOffer = { assetAtoms: String(big(offAsset)), btcAtoms: String(big(offBtc)) };
-    } catch {}
+      const lb = await L.lnBook(route.seqAsset);
+      const best = ((side === 'buy' ? lb.buy_offers : lb.sell_offers) || [])[0];
+      if (best && Number(best.asset_amount) > 0 && Number(best.btc_sats) > 0)
+        lnOffer = { assetAtoms: String(best.asset_amount), btcAtoms: String(best.btc_sats),
+          offer_id: best.offer_id || null, maker_pubkey: best.maker_pubkey || null };
+    } catch { /* LSP unreachable / older LSP without /lnbook -> treat as no pure-LN liquidity (honest) */ }
   }
   if (!lnOffer){
     LAST_QUOTE = null; setReviewEnabled(false);
     paintFee('BTC', null, null);
-    $('swRate').textContent = `No resting Lightning offer for ${am.ticker}/BTC yet.`;
+    $('swRate').textContent = `No resting Lightning offer for ${am.ticker}/BTC yet · use the on-chain book above.`;
     return;
   }
   LAST_QUOTE = { kind: 'ln', side, seqAsset: route.seqAsset, payIsBtc: route.payIsBtc,
@@ -3926,7 +3930,11 @@ async function reviewLn(q){
   ok.onclick = async () => {
     ok.disabled = true; st.className = 'status'; st.innerHTML = '<span class="spin"></span>Settling over Lightning…';
     try {
-      const r = await L.swap({ side: q.side, asset: q.seqAsset, amount: q.amount });
+      // PIN the exact offer the user just reviewed: the LSP forwards offer_id/maker_pubkey to xpln so
+      // it lifts THIS resting offer, not a relay-arbitrary one at a different price.
+      const r = await L.swap({ side: q.side, asset: q.seqAsset, amount: q.amount,
+        offer_id: (q.lnOffer && q.lnOffer.offer_id) || undefined,
+        maker_pubkey: (q.lnOffer && q.lnOffer.maker_pubkey) || undefined });
       const bm = C.assetMeta(r.asset || q.seqAsset);
       const got = (r.direction === 'sold') ? `${r.quote_amount} BTC`
         : `${r.base_amount} ${bm.ticker}`;

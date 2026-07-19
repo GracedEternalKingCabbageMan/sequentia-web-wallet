@@ -1051,7 +1051,7 @@ function runSwap({ side, asset, amount, offer_id, maker_pubkey }) {
     if (offer_id) args.push('-offer-id', String(offer_id));
     if (maker_pubkey) args.push('-maker-pubkey', String(maker_pubkey));
     const t0 = Date.now();
-    execFile(CFG.seqobCli, args, { timeout: CFG.swapTimeoutMs, maxBuffer: 8 << 20 }, (err, stdout, stderr) => {
+    execFile(CFG.seqobCli, args, { timeout: CFG.swapTimeoutMs, maxBuffer: 8 << 20 }, async (err, stdout, stderr) => {
       const out = (stdout || '') + (stderr || '');
       const m = out.match(/PURE-LN SWAP SETTLED:\s+(bought|sold)\s+(\d+)\s+([0-9a-f]+)\s+for\s+(\d+)\s+BTC sats[^;]*;\s+preimage\s+([0-9a-f]+)/i);
       if (m) return resolve({
@@ -1059,6 +1059,25 @@ function runSwap({ side, asset, amount, offer_id, maker_pubkey }) {
         base_amount: Number(m[2]), quote_asset: CFG.btcx || 'BTC', quote_amount: Number(m[4]),
         preimage: m[5], finality: 'final', settled_ms: Date.now() - t0, requested_amount: amount ?? null,
       });
+      // RECONCILE before declaring nothing was spent. If xpln got as far as committing funds it
+      // printed `paying maker hold on H=<hash>` (the taker pays the maker's hold: BTC for a buy, the
+      // asset for a sell). A kill during that pay (e.g. the exec timeout firing mid-settle) leaves the
+      // HTLC in flight while err is set — reporting a flat failure invites a double-pay. Ask the paying
+      // node `listsendpays H`: a pending/complete payment means funds ARE committed, so return an
+      // "uncertain, do not retry" instead of "did not settle". H is unique, so this never collides with
+      // another user's payment on the shared node.
+      const hm = out.match(/paying maker hold on H=([0-9a-f]{64})/i);
+      if (hm) {
+        const H = hm[1];
+        const payRpc = side === 'buy' ? CFG.hostedBtcRpc : CFG.hostedAssetRpc;
+        try {
+          const ls = await lnrpcKw('listsendpays', ['payment_hash=' + H], payRpc, 6000);
+          const live = ((ls && ls.payments) || []).find((x) => x.status === 'pending' || x.status === 'complete');
+          if (live) return resolve({ ok: false, uncertain: true, payment_status: live.status,
+            error: 'The Lightning swap was interrupted while your payment was in flight. Do NOT retry — check your balance shortly; it may still complete on its own.',
+            detail: scrubDetail(out), settled_ms: Date.now() - t0 });
+        } catch { /* reconciliation is best-effort; fall through to the plain failure below */ }
+      }
       resolve({ ok: false, error: err ? `swap failed: ${scrubDetail(err.message)}` : 'swap did not settle',
         detail: scrubDetail(out), settled_ms: Date.now() - t0 });
     });
@@ -1715,6 +1734,44 @@ const server = http.createServer(async (req, res) => {
       buy.sort((a, b) => (a.price_sats_per_atom ?? Infinity) - (b.price_sats_per_atom ?? Infinity));
       return send(res, 200, { ok: true, asset: assetId, asset_label: assetLabel(assetId),
         sell_available: sell.length > 0, buy_available: buy.length > 0, sell_offers: sell, buy_offers: buy });
+    }
+
+    // GET /lnbook?asset=<id> -> the PURE-LN order book from the SAME relay xpln lifts from (CFG.relay,
+    // the pure-LN maker relay on the box). The wallet MUST price + pin the pure-LN rail off this, NOT
+    // the on-chain cross book (a different market): quoting the cross book showed a price/amounts that
+    // the settle never honoured (xpln lifts a pure-LN offer, whole-offer) and enabled Review on a dead
+    // rail whenever cross had liquidity but pure-LN did not. Offer identity mirrors xpln.go exactly:
+    // a pure-LN offer carries lightning.ln_direction 2 (LnAssetLNForBTCLN -> the taker can SELL the
+    // asset) or 3 (LnBTCLNForAssetLN -> the taker can BUY); asset = base_amount; btc = want_amount,
+    // or offer_amount when the offer's give-leg IS the BTC sentinel. Returned best-first so offers[0]
+    // is exactly what a pinned xpln will take.
+    if (req.method === 'GET' && url.pathname === '/lnbook') {
+      const assetId = resolveAsset(url.searchParams.get('asset'));
+      if (!assetId || assetId === CFG.btcx) return send(res, 400, { ok: false, error: '?asset=<sequentia asset id> is required (not BTC)' });
+      const seen = new Set(), sell = [], buy = [];
+      let offers = [];
+      try {
+        const rr = await fetch(`${CFG.relay}/v1/market/${assetId}/BTC/orderbook`, { signal: AbortSignal.timeout(5000) });
+        if (rr.ok) offers = (await rr.json()).offers || [];
+      } catch { /* relay down -> empty book -> the wallet honestly reports the rail unavailable */ }
+      for (const o of offers) {
+        const lt = o.lightning || {}, dir = Number(lt.ln_direction);
+        if (dir !== 2 && dir !== 3) continue;                     // not a pure-LN offer
+        const key = (o.maker_pubkey || '') + ':' + (o.offer_id || '');
+        if (seen.has(key)) continue; seen.add(key);
+        const asset_amount = Number(o.base_amount || 0);
+        let btc_sats = Number(o.want_amount || 0);
+        if (o.offer_asset === 'BTC') btc_sats = Number(o.offer_amount || 0);
+        const row = { offer_id: o.offer_id, maker_pubkey: o.maker_pubkey, ln_direction: dir,
+          asset_amount, btc_sats, price_sats_per_atom: asset_amount ? btc_sats / asset_amount : null,
+          expires_at: Number(o.expires_at_unix || 0) };
+        if (dir === 3) buy.push(row); else sell.push(row);        // 3 => taker BUYs, 2 => taker SELLs
+      }
+      // Best-first for the taker: a BUYER wants the LOWEST sats/atom, a SELLER the HIGHEST.
+      buy.sort((a, b) => (a.price_sats_per_atom ?? Infinity) - (b.price_sats_per_atom ?? Infinity));
+      sell.sort((a, b) => (b.price_sats_per_atom ?? -Infinity) - (a.price_sats_per_atom ?? -Infinity));
+      return send(res, 200, { ok: true, asset: assetId, asset_label: assetLabel(assetId),
+        buy_available: buy.length > 0, sell_available: sell.length > 0, buy_offers: buy, sell_offers: sell });
     }
 
     // POST /offer { offer: <signed Offer protojson> } -> forward to the sub-asset relay.

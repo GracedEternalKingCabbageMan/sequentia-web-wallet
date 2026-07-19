@@ -888,7 +888,7 @@ import { initXswap, renderXswap, fetchXmarkets, fetchXquote, fetchXbook, openFro
 import { initXrswap, fetchRQuote, openReverseFromComposer, hasInFlight as hasReverseInFlight, renderReverse } from './xrswap.js';
 import { initXmaker, startForwardMaker, startReverseMaker, liveMakerOffers, resumeMakerSwaps } from './xmaker.js';
 import { initSeqln, connectDevice as lnConnectDevice, disconnectDevice as lnDisconnect,
-  onSeqlnStatus, seqlnState, seqlnAvailable, seqlnGetStatus, seqlnListNodes, seqlnNodeOnchain, seqlnSwap, seqlnBook, seqlnUnifiedBook, seqlnPostOffer, lnFinalityCopy,
+  onSeqlnStatus, seqlnState, seqlnAvailable, seqlnGetStatus, seqlnListNodes, seqlnNodeOnchain, seqlnSwap, seqlnBook, seqlnUnifiedBook, seqlnLnBook, seqlnPostOffer, lnFinalityCopy,
   seqlnChannelInbound, seqlnNodeInvoice, seqlnInvoiceStatus, seqlnNodeSettle, seqlnNodeReceive, seqlnNodePay, seqlnJobStatus,
   seqlnChannels, seqlnFunding, fundChannel, resumeFundChannel, provisionAndConnect, waitNodeReady, provisionedState,
   disconnectProvisioned, deviceTransportPubkey, registerOwnStatusKeys, closeChannelLsp } from './seqln.js';
@@ -2745,6 +2745,9 @@ function initSwapTab(){
       book: (asset) => seqlnBook(asset),
       // Unified book: on-chain cross + sub-asset LN offers merged, price-sorted, rail-tagged.
       unifiedBook: (asset) => seqlnUnifiedBook(asset),
+      // PURE-LN book from the relay xpln actually lifts from — the composer prices + PINS off this so
+      // Review matches the settle (not the on-chain cross book, a different market).
+      lnBook: (asset) => seqlnLnBook(asset),
       postOffer: (o) => seqlnPostOffer(o),
       // Which of the device's candidate node keys are actually provisioned (registry-resolved, works
       // for nodes blocked waiting for their signer). Used by the on-load reconnect to rediscover a

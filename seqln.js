@@ -347,6 +347,15 @@ export function seqlnGetStatus() {
   return lspFetch('/status' + (keys.length ? ('?nodes=' + encodeURIComponent(keys.join(','))) : ''));
 }
 
+// The PURE-LN order book for <asset>/BTC, read from the SAME relay the LSP's xpln lifts from — so the
+// composer prices and PINS the exact offer that will execute, instead of the on-chain cross book (a
+// different market). Returns { buy_offers, sell_offers } each best-first (buy = cheapest, sell =
+// richest), with offer_id + maker_pubkey to pin into the swap. A thrown error / older LSP without the
+// endpoint means "no pure-LN liquidity" — the caller degrades honestly (disables Review).
+export function seqlnLnBook(asset) {
+  return lspFetch('/lnbook?asset=' + encodeURIComponent(String(asset || '')));
+}
+
 // Ask the LSP which of the device's CANDIDATE node keys are ACTUALLY provisioned (exist in the
 // registry) — resolved from the PROV registry, NOT the node RPC, so a node blocked waiting for its
 // signer (invisible to /status) is still discoverable. This breaks the reconnect deadlock: a just-
