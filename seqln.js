@@ -427,7 +427,7 @@ export function closeChannelLsp({ chain = 'seq', asset, node, scid, destination,
 //     over Lightning). Anchor-gated; returns finality:'confirming' (anchor-bound).
 // Rails are only serialized when present, so the pure-LN call is byte-identical to
 // before (the LSP treats a missing rail as ln/ln).
-export function seqlnSwap({ side, asset, amount, payRail, recvRail, node_key, btc_claim_pub, offer_id, maker_pubkey, swap_nonce }) {
+export function seqlnSwap({ side, asset, amount, payRail, recvRail, node_key, btc_claim_pub, offer_id, maker_pubkey, swap_nonce, hodl, payment_hash, asset_amount, btc_htlc }) {
   const body = { side, asset, amount };
   if (payRail) body.payRail = payRail;
   if (recvRail) body.recvRail = recvRail;
@@ -444,6 +444,14 @@ export function seqlnSwap({ side, asset, amount, payRail, recvRail, node_key, bt
   // value on a recovery re-call so the LSP returns the already-settled {preimage, btc_htlc} without
   // re-paying the asset. Only serialized when present, so the pure-LN body is byte-identical to before.
   if (swap_nonce) body.swap_nonce = swap_nonce;
+  // Sub-asset BUY (pay BTC on-chain, receive asset over LN): the device funds a BTC HTLC + registers a
+  // HODL invoice on H, then the LSP drives the maker's pay-by-hash. These MUST reach the LSP or its
+  // /swap handler never takes the `hodl` BUY branch and falls through to pure-LN — silently breaking
+  // the whole sub-asset buy. (They were dropped by this destructure.)
+  if (hodl) body.hodl = hodl;
+  if (payment_hash) body.payment_hash = payment_hash;
+  if (asset_amount != null) body.asset_amount = asset_amount;
+  if (btc_htlc) body.btc_htlc = btc_htlc;
   return lspFetch('/swap', { method: 'POST', body: JSON.stringify(body) });
 }
 

@@ -482,8 +482,13 @@ export async function lift(offer, takeAtoms, feeAsset, hooks){
   const pushIn = (msg) => { if (waiter){ const w = waiter; waiter = null; w.resolve(msg); } else inbox.push(msg); };
   const nextMsg = (timeoutMs) => new Promise((resolve, reject) => {
     if (inbox.length){ return resolve(inbox.shift()); }
-    waiter = { resolve, reject };
-    if (timeoutMs) setTimeout(() => { if (waiter){ waiter = null; reject(new Error('timed out waiting for the maker')); } }, timeoutMs);
+    const w = { resolve, reject };
+    waiter = w;
+    // Bind the timeout to THIS waiter (w), not the shared `waiter`. A stale timeout from an already-
+    // resolved earlier nextMsg used to fire later and null+reject whatever the CURRENT waiter was —
+    // rejecting a fresh live wait with a spurious "timed out" (or orphaning it). `waiter === w` makes a
+    // stale timeout a no-op.
+    if (timeoutMs) setTimeout(() => { if (waiter === w){ waiter = null; reject(new Error('timed out waiting for the maker')); } }, timeoutMs);
   });
 
   await new Promise((resolve, reject) => {

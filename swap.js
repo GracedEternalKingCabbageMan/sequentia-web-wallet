@@ -3178,7 +3178,7 @@ function saveBuy(){ try { localStorage.setItem(BUY_KEY, JSON.stringify(BUY)); } 
 function clearBuy(){ BUY = null; try { localStorage.removeItem(BUY_KEY); } catch {} }
 // True while a buy is starting or has FUNDED its BTC HTLC but is not yet settled/refunded — the BTC is
 // locked, so the record must survive a reload (resumeBuy settles on hold, or refunds after T_btc).
-export function hasBuyInFlight(){ return !!(_buyStarting || (BUY && (BUY.state === 'funded' || BUY.state === 'holding'))); }
+export function hasBuyInFlight(){ return !!(_buyStarting || (BUY && (BUY.state === 'funding' || BUY.state === 'funded' || BUY.state === 'holding'))); }
 // T_btc safety delta over the current BTC tip (parent-chain blocks), matching the maker's
 // BtcLocktimeDelta so the refund branch matures well after the swap should have settled.
 const BUY_CLTV_DELTA = 100;
@@ -3250,14 +3250,19 @@ async function startBuy(params){
     const tip = await C.btcLeg.tipHeight();
     const T_btc = Math.max(Number(offer.onchain_cltv || 0), tip + BUY_CLTV_DELTA);
     const redeem = C.wasm.buildSeqHtlcRedeemScript(H, makerClaimPub, refund.public_key, T_btc);
-    say('Locking your Bitcoin in the on-chain HTLC…');
-    const funded = await C.btcLeg.fund(redeem, btcSats);   // { txid, vout, height, amount }
-    const btc_htlc = { txid: String(funded.txid), vout: funded.vout, amount: btcSats,
-      redeem_script: redeem, cltv: T_btc, maker_claim_pub: makerClaimPub, taker_refund_pub: refund.public_key };
-    // PERSIST BEFORE /swap: the BTC is now locked, so this record is the ONLY recovery handle.
-    BUY = { state: 'funded', asset, ticker: am.ticker, preimage: P, hash_h: H, node_key, btc_htlc,
+    // PERSIST-BEFORE-BROADCAST (fund-safety): the funding tx below locks BTC and then BLOCKS for a
+    // confirmation (minutes). H is random (NOT HD-derivable) and the redeem script embeds it, so losing
+    // it before the txid is captured strands the BTC with no refund. Persist the recovery material as
+    // 'funding' NOW, capture the txid via onBroadcast (BEFORE the confirmation wait), and advance to
+    // 'funded' only once the outpoint is known. resumeBuy recovers a 'funding' record by its txid.
+    BUY = { state: 'funding', asset, ticker: am.ticker, preimage: P, hash_h: H, node_key,
+      btc_htlc: { redeem_script: redeem, cltv: T_btc, amount: btcSats, maker_claim_pub: makerClaimPub, taker_refund_pub: refund.public_key },
       t_btc: T_btc, asset_amount: assetAtoms, offer_id: offer.offer_id, maker_pubkey: offer.maker_pubkey, ts: mixedTip() };
     saveBuy();
+    say('Locking your Bitcoin in the on-chain HTLC…');
+    const funded = await C.btcLeg.fund(redeem, btcSats, (txid) => { if (BUY && BUY.btc_htlc){ BUY.btc_htlc.txid = String(txid); saveBuy(); } });
+    BUY.btc_htlc.txid = String(funded.txid); BUY.btc_htlc.vout = funded.vout; BUY.state = 'funded'; saveBuy();
+    const btc_htlc = BUY.btc_htlc;   // { txid, vout, amount, redeem_script, cltv, ... } for the /swap call
     logTrade({ id: 'buy:' + H, title: 'Buying ' + am.ticker + ' with BTC', status: 'BTC locked' });
     // 4. Command the LSP to drive the maker's pay-by-hash (ASYNC job -> 202 { job_id, poll, held:false }).
     say('Asking the maker to pay you ' + am.ticker + ' over Lightning…');
@@ -3335,7 +3340,21 @@ async function refundBuy(){
 // is now held, or refund the BTC once past T_btc. The fund-recovery path (mirrors resumeSell).
 export async function resumeBuy(){
   try { BUY = JSON.parse(localStorage.getItem(BUY_KEY) || 'null'); } catch { BUY = null; }
-  if (!BUY || !(BUY.state === 'funded' || BUY.state === 'holding') || !BUY.preimage || !BUY.btc_htlc) return;
+  if (!BUY || !BUY.preimage || !BUY.btc_htlc) return;
+  // A 'funding' record died between persist-before-broadcast and confirmation. If onBroadcast captured
+  // the txid, the BTC is locked -> recover the outpoint and advance to 'funded'. If no txid was ever
+  // captured, the funding never broadcast (nothing locked) -> drop the stub.
+  if (BUY.state === 'funding'){
+    if (!BUY.btc_htlc.txid){ clearBuy(); return; }
+    if (BUY.btc_htlc.vout == null){
+      try {
+        const f = await C.btcLeg.findFunding(BUY.btc_htlc.txid, BUY.btc_htlc.redeem_script);
+        if (f && f.vout != null){ BUY.btc_htlc.vout = f.vout; BUY.state = 'funded'; saveBuy(); }
+        else return;   // not indexed yet; retry next load — the BTC stays refundable at T_btc
+      } catch { return; }
+    } else { BUY.state = 'funded'; saveBuy(); }
+  }
+  if (!(BUY.state === 'funded' || BUY.state === 'holding')) return;
   try {
     await driveBuy();
     if (BUY.state === 'settled'){ try { C.toast && C.toast('Recovered your buy · ' + BUY.ticker + ' received over Lightning.'); } catch {} try { await C.sync(); } catch {} clearBuy(); }
@@ -3360,10 +3379,17 @@ function mixedTip(){ try { return C.wollet ? C.wollet.tip().height() : 0; } catc
 
 // Start (and drive) a submarine swap: persist a live record FIRST (so a refresh mid-call
 // still resumes), show the stepper, then command the LSP and fold the result back in.
+let _mixedStarting = false;
 async function startMixed(params){
-  MIXED = sub.newSwap(params); saveMixed();
-  showMixed(true); renderMixedSwap();
+  // Synchronous double-start guard: two confirmed reviews (double-tap / a second Review before the
+  // first awaits) would each overwrite MIXED — the single-key handle to a funded submarine HTLC leg —
+  // stranding the first. hasMixedInFlight covers a persisted swap; _mixedStarting covers the window
+  // before the first newSwap persists.
+  if (_mixedStarting || hasMixedInFlight()){ try { C.toast && C.toast('A submarine swap is already in progress · finish or refund it first under Active trades.'); } catch {} return; }
+  _mixedStarting = true;
   try {
+    MIXED = sub.newSwap(params); saveMixed();
+    showMixed(true); renderMixedSwap();
     const r = await L.swap({ side: params.side, asset: params.asset, amount: params.amount,
       payRail: params.payRail, recvRail: params.recvRail });
     MIXED = sub.applyStatus(MIXED, r || {}); saveMixed();
@@ -3379,6 +3405,8 @@ async function startMixed(params){
     if (MIXED && MIXED.htlc){ MIXED = { ...MIXED, detail: C.prettyErr(e) }; saveMixed(); pollMixed(); }
     else { MIXED = sub.markFailed(MIXED, C.prettyErr(e)); saveMixed(); }
     renderMixedSwap();
+  } finally {
+    _mixedStarting = false;
   }
 }
 

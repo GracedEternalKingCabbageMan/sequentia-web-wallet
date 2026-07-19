@@ -89,8 +89,11 @@ export function applyStatus(rec, resp) {
   if (fin === 'final' || fin === 'settled' || fin === 'complete' || (resp && resp.settled === true)) {
     next.state = ST.SETTLED;
   } else if (fin === 'failed' || fin === 'error' || (resp && resp.ok === false)) {
-    next.state = ST.FAILED;
+    // FUND-SAFETY: a failure WITH a funded on-chain HTLC leg is NOT terminal — the leg is reclaimable
+    // at its CLTV timeout, so stay SETTLING to keep the "Refund BTC leg" off-ramp live (and so resume
+    // never erases a refundable record). Only a failure with nothing locked is a clean terminal FAILED.
     next.detail = (resp && (resp.error || resp.detail)) || next.detail;
+    next.state = next.htlc ? ST.SETTLING : ST.FAILED;
   } else {
     next.state = ST.SETTLING;
   }
