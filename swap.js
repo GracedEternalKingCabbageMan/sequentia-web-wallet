@@ -164,20 +164,18 @@ const S = {
   edited: 'pay',          // which side the user last typed ('pay' | 'receive')
   feeAsset: null,         // chosen fee asset hex (defaults to POLICY_HEX)
   quoting: false,
-  // TWO independent settlement rails, one per leg. Each is 'ln' (instant Lightning)
-  // or 'chain' (on-chain). ln+ln -> pure-LN LSP route; chain+chain -> on-chain
-  // cross-chain HTLC; a MIXED pair (one leg each) needs the submarine backend (not
-  // yet wired) and fails closed with an honest message. Only meaningful on a
-  // BTC<->asset pair; forced to chain/chain otherwise so an LN-unconfigured wallet
-  // behaves exactly as before.
-  payRail: 'chain', recvRail: 'chain',
-  railsTouched: false,    // true once the user (or a "fix" link) picks a rail -> stop auto-defaulting
-  // TAKE = lift resting offers (fields LINKED via the book price; today's behavior).
-  // POST = rest a LIMIT order at your OWN price (fields INDEPENDENT; pay÷receive IS the
-  // price). Auto-defaults to 'post' for a pair with no resting orders so the market can be
-  // started; 'take' when there is a book to lift. modeTouched stops the auto-default once
-  // the user picks a mode. Only 'same' + 'cross' routes can be posted (LN/mixed are take-only).
-  mode: 'take', modeTouched: false,
+  // TWO independent settlement PREFERENCES the user sets per order: how they PAY and how
+  // they RECEIVE, each 'ln' (Lightning) or 'chain' (on-chain). RAIL-BLIND MODEL (spec §5):
+  // these NEVER touch the book or matching — the book matches on price/asset/size only.
+  // They are honored at settlement per leg (P2P when both sides agree, else the atomic
+  // seqob-bridge). They start NULL — there is NO default (spec §6.5): an order cannot be
+  // placed until both are chosen, on EVERY pair (same-chain assets can move over SeqLN too).
+  payRail: null, recvRail: null,
+  // MARKET = walk the book at the best executable price, partial-fill what's there, cancel
+  // any remainder (taker). LIMIT = rest a signed order at YOUR price until crossed (maker);
+  // the two amounts are independent, their ratio is the price. Always available on every
+  // pair (spec §4/§6.3). Default MARKET; the toggle never disappears.
+  mode: 'take',
 };
 let INSTANT = {};    // ticker -> { spendable, receivable } atoms (best-effort from the LSP /status)
 let LAST_MID = null; // { price, cross, base, quote } for the current pair — feeds the pair bar + cost line
@@ -762,7 +760,14 @@ function paintPanes(){
   paintModeSeg();
   paintBookSeg();
   paintConfControl();
-  const cta = $('swReview'); if (cta) cta.textContent = 'Place order';   // one CTA, always
+  // One CTA. When a pair is chosen but the settlement rails aren't both set, the CTA prompts for them
+  // (and setReviewEnabled keeps it disabled) — no order can be placed on an unstated settlement choice.
+  const cta = $('swReview');
+  if (cta){
+    const needRails = !!(S.payAsset && S.receiveAsset) && !(S.payRail && S.recvRail);
+    cta.textContent = needRails ? 'Choose how you pay & receive' : 'Place order';
+    if (needRails) cta.disabled = true;
+  }
 }
 
 // The opt-in confidential-RECEIVE control shows ONLY when you are receiving a Sequentia-issued asset
@@ -809,7 +814,7 @@ function setBook(next){
   // Fresh namespace: drop the stale book/quote and re-derive defaults + pickers.
   BOOK = { offers: [], pair: null };
   LAST_QUOTE = null; setReviewEnabled(false);
-  S.railsTouched = false; S.modeTouched = false;
+  S.payRail = null; S.recvRail = null;   // rails are unselected until the user picks (no default)
   ensureDefaults();
   paintPanes();
   requote().catch(()=>{});
@@ -823,39 +828,26 @@ function setBook(next){
 // (postCrossOfferReview -> X.makerStart/makerStartReverse). LN + mixed rails are
 // taker-only (LP fixed terms / submarine), so they stay in Take.
 function postSupported(route){ return !!route && (route.kind === 'same' || route.kind === 'cross'); }
-// After the book is known, pick the default mode for a fresh pair: Post when there is
-// nothing resting to lift (start the market), Take when there is. Once the user picks a
-// mode (modeTouched) we stop overriding it. Unsupported routes are forced to Take.
+// Market is the default order type; the Market/Limit toggle is always shown and the user switches
+// freely. No auto-override (kept as a no-op reconciler so existing callers stay valid).
 function applyAutoMode(bookLen, route){
-  // Default MARKET (S.mode='take') always: type one amount, the other auto-fills at the best
-  // executable price. The user can switch to LIMIT (S.mode='post') to set their own price
-  // (independent fields). Unsupported routes are forced to take. (bookLen kept for callers.)
-  if (!postSupported(route)) S.mode = 'take';
-  else if (!S.modeTouched) S.mode = 'take';
+  // Market is the default; the user switches to Limit to rest at their own price. No auto-override:
+  // the Market/Limit toggle is available on every pair and never disappears. (args kept for callers.)
   paintModeSeg();
 }
 function wireModeSeg(){
   const seg = C.$('swModeSeg'); if (!seg || seg._wired) return; seg._wired = true;
   seg.querySelectorAll('button[data-m]').forEach(b => b.onclick = () => { if (!b.disabled) setMode(b.dataset.m); });
 }
-// The visible Take vs Post distinction is DELETED (project directive): every order
-// is just "Place order", and whether it lifts the book, rests a covenant, or posts
-// a cross offer is a backend decision. The segmented control stays hidden; the
-// internal S.mode is still used by the cross-chain route to pick take-vs-post
-// automatically (never surfaced). The CTA label is fixed to "Place order" in
-// paintPanes. paintModeSeg is now just the internal auto-mode reconciler.
+// Market / Limit is a first-class control on EVERY pair (spec §4/§6.3): MARKET walks the book at the
+// best executable price now (partial-filling what's there); LIMIT rests a signed order at YOUR price.
+// The toggle never disappears once a pair is chosen — no per-rail hiding.
 function paintModeSeg(){
   if (!C) return;
   const wrap = C.$('swModeWrap'), seg = C.$('swModeSeg');
-  const route = findRoute(S.payAsset, S.receiveAsset);
-  if (!postSupported(route)) S.mode = 'take';
-  // Market/Limit is only meaningful where a limit order can rest (same-chain + cross); LN/mixed are
-  // market-only, so the toggle hides there. Shows once a limit-capable pair is chosen.
-  const show = !!(S.payAsset && S.receiveAsset && postSupported(route));
+  const show = !!(S.payAsset && S.receiveAsset);
   if (wrap) wrap.classList.toggle('hide', !show);
   if (seg) seg.querySelectorAll('button[data-m]').forEach(b => b.classList.toggle('on', b.dataset.m === S.mode));
-  // Keep the mode hint in lockstep: it references "Switch to Limit", which is wrong when there's no Limit
-  // control (LN/mixed/no pair) — hide it there; when shown, phrase it for the current mode (C-8).
   const hint = C.$('swModeHint');
   if (hint){
     hint.classList.toggle('hide', !show);
@@ -864,60 +856,32 @@ function paintModeSeg(){
       : 'Type an amount; the other fills at the best price. Switch to Limit to set your own.';
   }
 }
-// Switch mode by hand (marks it touched so the auto-default stops). Take re-links the
-// fields (requote re-derives the opposite); Post leaves both fields independent.
+// Switch mode by hand. Market re-links the fields (requote re-derives the opposite at the book price);
+// Limit leaves both fields independent (their ratio is the price).
 function setMode(m){
   if (m !== 'take' && m !== 'post') return;
-  S.mode = m; S.modeTouched = true;
+  S.mode = m;
   LAST_QUOTE = null; setReviewEnabled(false);
   paintModeSeg();
   requote().catch(()=>{});
 }
 
-// Show BOTH rail choosers (Pay from / Receive to) only for a BTC<->asset pair when
-// the on-device signer is live; otherwise hide them and force both legs on-chain so
-// an LN-unconfigured wallet behaves exactly as before.
+// Rail choosers (Pay via / Receive via) for EVERY pair (spec §5). RAIL-BLIND: the rails are
+// SETTLEMENT preferences, never a route selector or a book filter. They start UNSELECTED — there
+// is NO default (spec §6.5) — and an order cannot be placed until BOTH are chosen (gated in
+// paintPanes). We never auto-select or force a rail; we only surface an honest LN-readiness note
+// for a leg the user actually set to Lightning. Shown for same-chain pairs too: a Sequentia asset
+// can settle over SeqLN, so "pay/receive over Lightning" is a real choice on every pair.
 function updateRails(){
   const box = C.$('swRailPicks'); if (!box) return;
   const pay = S.payAsset, receive = S.receiveAsset;
-  const btcPair = pay && receive && pay !== receive
-    && ((pay === 'BTC') !== (receive === 'BTC'));   // exactly one side is BTC
-  if (btcPair && lnDeployed()){
-    box.classList.remove('hide');
-    // Probe the sub-asset order book for this pair's asset (async, cached) so the sub-asset
-    // BUY/SELL rails light from LIVE liquidity, not a hardcoded list. When it lands it may
-    // re-run updateRails to reflect a flipped availability.
-    try { refreshSubassetBook(pay === 'BTC' ? receive : pay); } catch {}
-    // HONEST per-asset gating: a leg may sit on Lightning ONLY when THAT asset (or BTC)
-    // has a real, usable channel with the liquidity the leg's direction needs. There is
-    // no silent submarine-funding of a cold channel — a leg with no channel defaults to
-    // (and is pinned to) on-chain, and the LN button is disabled with a Move-to-Lightning
-    // explanation. This kills the old "LSP configured => flash the LN rail" bug.
-    const ra = railAvail(pay, receive);
-    if (!S.railsTouched){
-      // Auto-default a BTC<->asset trade to the on-chain CROSS ORDER BOOK (chain+chain). It is the one
-      // rail with deep, always-on liquidity for every asset (the cross maker fleet), and it is the path
-      // the order-book architecture points at. Lightning rails (pure-LN, submarine, sub-asset) are an
-      // explicit opt-in via the toggle: auto-selecting LN merely because a channel exists routed a BUY
-      // into the submarine (asset-on-chain <-> BTC-LN), which has no maker, and stranded the trade with
-      // "did not settle". The cross book always has a counterparty, so it is the correct default.
-      S.payRail  = 'chain';
-      S.recvRail = 'chain';
-    }
-    // If the user chose Lightning for a leg with no channel yet, KEEP it — the channel is opened
-    // inline on Place-order (reviewLn). We no longer force it back to on-chain. (The unsupported
-    // mixed shape is still corrected below via railSupported.)
-    // Never sit on the undeployed mixed shape (asset over LN + BTC on-chain): if the
-    // channel-reconciled combo is unsupported, fall all the way back to the proven
-    // on-chain cross route (both legs on-chain), which is always available.
-    if (!railSupported(S.payRail, S.recvRail)){ S.payRail = 'chain'; S.recvRail = 'chain'; }
-    paintRailSegs(ra);
-    renderRailNote(ra);
-  } else {
-    box.classList.add('hide');
-    renderRailNote(null);
-    S.payRail = 'chain'; S.recvRail = 'chain'; S.railsTouched = false;
-  }
+  if (!(pay && receive && pay !== receive)){ box.classList.add('hide'); renderRailNote(null); return; }
+  box.classList.remove('hide');
+  // Probe the sub-asset book (async, cached) so the LN-readiness note reflects live liquidity.
+  if (pay === 'BTC' || receive === 'BTC'){ try { refreshSubassetBook(pay === 'BTC' ? receive : pay); } catch {} }
+  const ra = lnDeployed() ? railAvail(pay, receive) : null;
+  paintRailSegs(ra);
+  renderRailNote(ra);
 }
 // An honest inline note under the rail choosers when the Lightning option is NOT
 // offerable for a leg (no channel / wrong-side liquidity): says why + links to
@@ -1031,20 +995,20 @@ function paintRailSegs(ra){
   paint('swPayRailSeg', 'pay');
   paint('swRecvRailSeg', 'recv');
 }
-// Set ONE leg's rail (leg = 'pay' | 'recv'); marks the rails as user-chosen so the
-// auto-default stops overriding them. Changing rails can change the route kind, so the
-// Take/Post default is re-armed too.
+// Set ONE leg's settlement rail (leg = 'pay' | 'recv'). Rail-blind model: the choice is a
+// SETTLEMENT preference only — it never re-selects a route or reshapes the book. It does gate
+// placement (both rails must be chosen) and drive the honest LN-readiness note + fee freeze.
 function setRail(leg, r){
   const cur = leg === 'pay' ? S.payRail : S.recvRail;
   if (cur === r) return;
   if (leg === 'pay') S.payRail = r; else S.recvRail = r;
-  S.railsTouched = true; S.modeTouched = false;
   LAST_QUOTE = null; setReviewEnabled(false);
-  const ra = railAvail(S.payAsset, S.receiveAsset);
+  const ra = lnDeployed() ? railAvail(S.payAsset, S.receiveAsset) : null;
   paintRailSegs(ra);
   try { renderRailNote(ra); } catch {}   // refresh/clear the LN-channel note for the newly-selected rail
   try { renderFeePicker(); } catch {}   // reflect the pay-from-Lightning fee freeze immediately
   try { paintConfControl(); } catch {}  // the confidential-receive toggle depends on the receive rail (on-chain only)
+  try { paintPanes(); } catch {}        // re-evaluate the place-CTA gate (both rails now required)
   requote().catch(()=>{});
 }
 function paintRefHints(){
@@ -1097,14 +1061,10 @@ function onFlip(){
   [pa.value, ra.value] = [ra.value, pa.value];
   [pa._userTyped, ra._userTyped] = [ra._userTyped, pa._userTyped];   // keep the anti-clobber flags with their values
   [pa._refMode, ra._refMode] = [ra._refMode, pa._refMode];           // ref-input mode rides with its value too
-  // Flip the per-leg rails WITH the legs (pay-leg rail follows the asset that is now the pay leg),
-  // and re-arm the auto-rail so the flipped pair re-derives honestly. Without this, flipping turned
-  // an honest "pay on-chain / receive LN" into a mislabeled route while the toggles showed the old,
-  // now-wrong rail selection.
+  // Flip the per-leg rails WITH the legs (the pay-leg rail follows the asset that is now the pay leg).
+  // They stay whatever the user chose (or null if unchosen) — no auto-default.
   [S.payRail, S.recvRail] = [S.recvRail, S.payRail];
-  S.railsTouched = false;
   S.edited = S.edited === 'pay' ? 'receive' : 'pay';
-  S.modeTouched = false;   // re-arm the Take/Post default for the flipped pair
   S.feeAsset = null; S.feeAssetTouched = false;   // fee default re-follows the flipped pay asset (D2/C-11)
   LAST_QUOTE = null; setReviewEnabled(false);
   paintPanes();
@@ -1142,43 +1102,11 @@ async function requote(){
   $('swErr').textContent = '';
   LAST_MID = null;
   paintRouteLine();
-  // Rail-blind take (Stage 3): default the rails to the BEST-PRICE offer's rail across ALL rails,
-  // so a market take gets the best price whichever rail carries it — the taker matches on price, not
-  // rail. The user's explicit rail choice (railsTouched) always wins; then the rail is a settlement
-  // preference and the LSP bridges the difference. Only for a BTC<->asset pair (the one with a rail
-  // choice); the on-chain offer -> both legs on-chain (cross), an LN offer -> the ASSET leg over LN
-  // (recv for a buy, pay for a sell) + BTC on-chain (sub-asset). Cached, so it costs no extra fetch.
-  const oneBtc = (S.payAsset === 'BTC') !== (S.receiveAsset === 'BTC');
-  if (oneBtc && !S.railsTouched && S.payAsset && S.receiveAsset){
-    const seqAsset = S.payAsset === 'BTC' ? S.receiveAsset : S.payAsset;
-    const side = S.payAsset === 'BTC' ? 'buy' : 'sell';
-    try {
-      const ub = await getUnifiedBook(seqAsset);
-      const best = ub && (side === 'buy' ? (ub.best_ask || (ub.asks || [])[0]) : (ub.best_bid || (ub.bids || [])[0]));
-      if (best && best.rail){
-        if (best.rail === 'onchain'){ S.payRail = 'chain'; S.recvRail = 'chain'; }
-        else if (side === 'buy'){ S.payRail = 'chain'; S.recvRail = 'ln'; }
-        // Sell over LN only if a sub-asset sell offer is actually takeable; else keep the pay leg on
-        // chain (postable cross rail) so the LN best-bid doesn't strand the user. Upgrades to LN on a
-        // later requote once the sub-asset book loads.
-        else                    { S.payRail = sellCapable(seqAsset) ? 'ln' : 'chain'; S.recvRail = 'chain'; }
-        try { paintRailSegs(); } catch {}
-      }
-    } catch {}
-  }
+  // RAIL-BLIND: the rails NEVER change the book, the matching, or the quoted price. They are the user's
+  // settlement preference (set by hand, no default). So requote does not touch S.payRail/S.recvRail at
+  // all — it fetches the ONE book for the pair and quotes the market/limit against it, rail-blind.
   const route = findRoute(S.payAsset, S.receiveAsset);
-  // Keep the DISPLAYED rails in sync with what findRoute actually routes: the auto-select above is a
-  // heuristic from the best offer, but findRoute downgrades an unserviceable LN leg (no channel / no
-  // sub-asset maker) to on-chain. Without this the toggle could show "Lightning" while the trade settles
-  // on-chain (a cross HTLC) — a false rail display. Only sync when the user hasn't touched the rails.
-  if (route && !S.railsTouched && (route.payRail || route.recvRail)){
-    if (route.payRail) S.payRail = route.payRail;
-    if (route.recvRail) S.recvRail = route.recvRail;
-    try { paintRailSegs(); } catch {}
-  }
-  renderTiming(route);   // timing banner reflects the rails immediately, before amounts
-  // LN / mixed / no-route are take-only; keep the mode control honest before we quote.
-  if (!postSupported(route)) S.mode = 'take';
+  renderTiming(route);   // timing banner reflects the pair
   paintModeSeg();
   if (!route){ setReviewEnabled(false); clearOpposite(); clearBook(); paintCostLine(); stopLiveBook(); return; }
   const amtStr = typedAmount(S.edited);
@@ -1262,7 +1190,13 @@ function clearOpposite(){
   const other = S.edited === 'pay' ? C.$('swRecvAmt') : C.$('swPayAmt');
   clearDerived(other);   // never stomp a value the user typed or is editing on the OTHER side
 }
-function setReviewEnabled(on){ const b = C.$('swReview'); if (b) b.disabled = !on; }
+function setReviewEnabled(on){
+  const b = C.$('swReview'); if (!b) return;
+  // RAIL-BLIND gate (spec §6.5): never enable placement until BOTH settlement rails are chosen — there
+  // is NO default. A ready quote is necessary but not sufficient. paintPanes labels the CTA to prompt.
+  const railsChosen = !!(S.payRail && S.recvRail);
+  b.disabled = !(on && railsChosen);
+}
 
 // Build BOOK (asks/bids split by trade direction, expiry- and signature-filtered, best-price-first)
 // from a flat offer list, then render the ladder. Shared by the REST quote path (requoteSame) and
@@ -2441,7 +2375,7 @@ function openPicker(side){
     // If the other side no longer trades against the new pick, clear it.
     const o = side === 'pay' ? S.receiveAsset : S.payAsset;
     if (o && !counterpartsOf(hex).includes(o)){ if (side === 'pay') S.receiveAsset = null; else S.payAsset = null; }
-    S.railsTouched = false; S.modeTouched = false;   // re-arm rail + Take/Post defaults for the new pair
+    S.payRail = null; S.recvRail = null;   // rails reset to unselected for the new pair (no default; user must pick)
     S.feeAsset = null; S.feeAssetTouched = false; S.priceFlip = false;   // fee default re-follows the new pay asset; a manual pick + display flip are per-pair, not global (D2/C-11)
     LAST_QUOTE = null; setReviewEnabled(false);
     paintPanes();
