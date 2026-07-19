@@ -890,10 +890,14 @@ function updateRails(){
     // explanation. This kills the old "LSP configured => flash the LN rail" bug.
     const ra = railAvail(pay, receive);
     if (!S.railsTouched){
-      // Auto-default: Lightning when a usable channel already exists, else on-chain (never auto-pick
-      // a rail that would need provisioning — the user opts into that by choosing Lightning).
-      S.payRail  = ra.payLn.ok  ? 'ln' : 'chain';
-      S.recvRail = ra.recvLn.ok ? 'ln' : 'chain';
+      // Auto-default a BTC<->asset trade to the on-chain CROSS ORDER BOOK (chain+chain). It is the one
+      // rail with deep, always-on liquidity for every asset (the cross maker fleet), and it is the path
+      // the order-book architecture points at. Lightning rails (pure-LN, submarine, sub-asset) are an
+      // explicit opt-in via the toggle: auto-selecting LN merely because a channel exists routed a BUY
+      // into the submarine (asset-on-chain <-> BTC-LN), which has no maker, and stranded the trade with
+      // "did not settle". The cross book always has a counterparty, so it is the correct default.
+      S.payRail  = 'chain';
+      S.recvRail = 'chain';
     }
     // If the user chose Lightning for a leg with no channel yet, KEEP it — the channel is opened
     // inline on Place-order (reviewLn). We no longer force it back to on-chain. (The unsupported
