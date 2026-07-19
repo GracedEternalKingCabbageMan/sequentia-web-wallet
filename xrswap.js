@@ -209,7 +209,11 @@ async function readPreimageOnChain(seqLegTxid, vout, hashHex){
       }
       for (const w of (vin.witness || [])) if (/^[0-9a-fA-F]{2,}$/.test(w)) pushes.push(w.toLowerCase());
       for (const p of pushes){
-        if (p.length === 64 && sha256Hex(p) === want) return p;
+        // Match ANY push whose sha256 equals H, not only 32-byte ones. The HTLC redeem has no
+        // OP_SIZE guard, so a maker can claim the asset with a non-32-byte secret; gating on
+        // p.length===64 meant the taker never recognised such a preimage on-chain and could not
+        // claim the BTC (asset gone, BTC unclaimable). sha256(p)===H is the real, sufficient filter.
+        if (sha256Hex(p) === want) return p;
       }
     }
   } catch {}
@@ -297,10 +301,20 @@ export function hasInFlight(){
 export function renderReverse(){
   loadSwap();
   renderStepper();
-  // Resume a courier swap's on-chain tail after a reload (funded but not yet
-  // claimed): read the revealed secret and claim the BTC. Pre-funding courier
-  // swaps can't resume the WS session, but nothing of ours is at risk there.
-  if (SWAP && SWAP.courier && SWAP.seq_leg && ![ST.BTC_CLAIMED, ST.REFUNDED, ST.FAILED].includes(SWAP.state)) driveSettle();
+  // Resume a courier swap's on-chain tail after a reload. Pre-funding courier swaps can't
+  // resume the WS session, but nothing of ours is at risk there.
+  if (SWAP && SWAP.courier && ![ST.BTC_CLAIMED, ST.REFUNDED, ST.FAILED].includes(SWAP.state)){
+    if (SWAP.seq_leg){
+      driveSettle();                       // asset leg confirmed: read the revealed secret + claim the BTC
+    } else if (SWAP.seq_fund_txid){
+      // RESUME GAP: the asset HTLC was BROADCAST (seq_fund_txid persisted) but the app died during
+      // waitConf, before seq_leg was set. renderReverse used to skip this (it only checked seq_leg),
+      // stranding the funded asset — the refund path also keys on seq_leg. Re-enter fundSeq: it is
+      // idempotent (reuses seq_fund_txid, never re-funds), waits for the confirmation, sets seq_leg,
+      // resubmits to the maker, then settles. Now the asset is always resumable AND refundable.
+      fundSeq().then(() => driveSettle()).catch(() => { /* surfaced on the stepper; the CLTV refund off-ramp appears once seq_leg is set */ });
+    }
+  }
 }
 
 function startCountdown(){
@@ -565,7 +579,20 @@ async function waitMakerBtcConf(txid, redeemHex, tBtc){
     if (!SWAP || SWAP.state === ST.FAILED) return null;
     try {
       const f = await C.btcLeg.findFunding(txid, redeemHex);
-      if (f && f.confirmed && f.height > 0){ if (SWAP.btc_leg) SWAP.btc_leg.vout = f.vout; return f.height; }
+      if (f && f.confirmed && f.height > 0){
+        // FUND-SAFETY: verify the ACTUAL on-chain output value meets the agreed amount before we
+        // fund our asset leg. verifyMakerBtcLeg only checked the maker-REPORTED btc_leg.amount; a
+        // maker can report the agreed amount yet lock LESS on-chain. Since this runs BEFORE fundSeq,
+        // an underfunded leg aborts with nothing of ours spent.
+        if (BigInt(f.value) < BigInt(SWAP.btc_amount)){
+          SWAP.state = ST.FAILED;
+          SWAP.detail = `the maker's on-chain BTC lock (${f.value} sats) is less than the agreed ${SWAP.btc_amount} - nothing of yours was spent`;
+          saveSwap(); renderStepper();
+          return null;
+        }
+        if (SWAP.btc_leg){ SWAP.btc_leg.vout = f.vout; SWAP.btc_leg.amount = BigInt(f.value); }
+        return f.height;
+      }
     } catch { /* transient; keep polling */ }
     await new Promise(r => setTimeout(r, 8000));
   }

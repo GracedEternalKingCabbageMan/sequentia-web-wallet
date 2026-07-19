@@ -2069,22 +2069,33 @@ const server = http.createServer(async (req, res) => {
         if (inflight) {
           r = await inflight;                              // a retry raced the original run -> await it, never launch a second
         } else {
-          // PRE-SPAWN RECOVERY GUARD (closes the double-EXECUTION windows): a same-nonce retry
-          // must NEVER re-pay an asset a prior attempt may already have paid (LSP death after pay
-          // before the store-write; or a maker that settled after our within-call poll gave up).
-          // If a prior attempt for this exact nonce left a state file, recover a settled result,
-          // HOLD if a pay is in-flight/unprovable, and only fall through to a fresh run when the
-          // node PROVES no pay for H ever left. No file (genuine first attempt) -> rerun.
-          if (nonce) {
-            const guard = await preSpawnGuardSubasSell(body);
-            if (guard.action === 'recover') { putSubasSellResult(nonce, guard.result); return send(res, 200, guard.result); }
-            if (guard.action === 'hold') { return send(res, 200, guard.result); }
-            // guard.action === 'rerun' -> a fresh run is safe; runMixed pre-cleans the stale file.
+          // FUND-SAFETY (double-pay race): RESERVE the single-flight slot SYNCHRONOUSLY, before any
+          // await. The old code set the slot only AFTER preSpawnGuardSubasSell (which awaits a node
+          // RPC — a real macrotask window), so a same-nonce retry arriving during that await found no
+          // in-flight entry, ran the guard too, both saw "no pay yet" and BOTH spawned xsubas-sell —
+          // paying the asset TWICE for one BTC HTLC. Now a late arrival awaits THIS run instead.
+          let settle;
+          const slot = nonce ? new Promise((res2) => { settle = res2; }) : null;
+          if (nonce) subasSellInflight.set(nonce, slot);
+          try {
+            // PRE-SPAWN RECOVERY GUARD: a same-nonce retry must NEVER re-pay an asset a prior attempt
+            // may already have paid. Recover a settled result, HOLD if a pay is in-flight/unprovable,
+            // and only run fresh when the node PROVES no pay for H ever left (or there's no nonce).
+            if (nonce) {
+              const guard = await preSpawnGuardSubasSell(body);
+              if (guard.action === 'recover') { putSubasSellResult(nonce, guard.result); r = guard.result; }
+              else if (guard.action === 'hold') { r = guard.result; }
+              // guard.action === 'rerun' -> a fresh run is safe; runMixed pre-cleans the stale file.
+            }
+            if (r === undefined) {
+              r = await runMixed({ ...body, payRail, recvRail });
+              if (nonce && r && r.ok && r.settled) putSubasSellResult(nonce, r);   // store BEFORE the finally delete
+            }
+          } catch (e) {
+            r = { ok: false, error: 'sub-asset sell failed: ' + scrubDetail(String((e && e.message) || e)) };
+          } finally {
+            if (nonce) { settle(r); subasSellInflight.delete(nonce); }   // resolve late awaiters, then free the slot
           }
-          const run = runMixed({ ...body, payRail, recvRail });
-          if (nonce) subasSellInflight.set(nonce, run);
-          try { r = await run; if (nonce && r && r.ok && r.settled) putSubasSellResult(nonce, r); }
-          finally { if (nonce) subasSellInflight.delete(nonce); }   // store BEFORE delete: a caller arriving after the delete finds the stored result
         }
         return send(res, r.ok ? 200 : 502, r);
       }
