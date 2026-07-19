@@ -319,7 +319,13 @@ async function lspFetch(path, opts = {}) {
   const r = await fetch(CFG.lspUrl + path, { ...opts, headers });
   const txt = await r.text();
   let j; try { j = txt ? JSON.parse(txt) : {}; } catch { j = { ok: false, error: txt || 'bad json' }; }
-  if (!r.ok || j.ok === false) throw new Error(j.error || ('HTTP ' + r.status));
+  if (!r.ok || j.ok === false) {
+    // Surface the LSP's `detail` (the settlement binary's actual output) alongside the
+    // summary error — dropping it left terminal failures as a bare "did not settle"
+    // with the real reason discarded.
+    const detail = j.detail ? String(j.detail).trim().split('\n').filter(Boolean).slice(-2).join(' · ') : '';
+    throw new Error((j.error || ('HTTP ' + r.status)) + (detail ? ` — ${detail.slice(0, 300)}` : ''));
+  }
   return j;
 }
 // Registry keys for the device's OWN provisioned nodes to also read in /status, BEYOND the ones

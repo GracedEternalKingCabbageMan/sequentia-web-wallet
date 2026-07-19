@@ -35,6 +35,7 @@ import { secp256k1 } from './btc.js';
 // fills permissionlessly (even while the wallet is offline), and settle an inbound
 // match as the taker. Everything routes through these; no crypto is hand-rolled here.
 import { planPlaceOrder, buildCovenantTerms, settleFill as covSettleFill, planRefund as covPlanRefund, cancel as covCancel } from './covenant-order.js';
+import { verifyAgainstSPK as covVerifyAgainstSPK } from './covenant.js';
 import { makeCovenantHooks, makerPayout } from './covenant-fill-host.js';
 import { computeRate, orderExpiry, deriveOtherField, buildCovenantOffer, fillRestSplit } from './covenant-flow.js';
 // HONEST per-asset Lightning-rail gating (offer LN only with a real usable channel).
@@ -773,7 +774,11 @@ function paintConfControl(){
   const wrap = C.$('swConfWrap'); if (!wrap) return;
   const route = (S.payAsset && S.receiveAsset) ? findRoute(S.payAsset, S.receiveAsset) : null;
   const recvOverLn = !!(route && route.recvRail === 'ln');
-  const hide = !S.receiveAsset || S.receiveAsset === 'BTC' || isConfBook() || recvOverLn;
+  // A wizard/stepper owning the tab hides the composer — the opt-in belongs to COMPOSING a
+  // swap, so it must never float above an in-flight or failed trade view.
+  const comp = C.$('swComposer');
+  const wizardOwns = !!(comp && comp.classList.contains('hide'));
+  const hide = wizardOwns || !S.receiveAsset || S.receiveAsset === 'BTC' || isConfBook() || recvOverLn;
   wrap.style.display = hide ? 'none' : 'flex';
 }
 
@@ -1091,6 +1096,13 @@ function onFlip(){
   const pa = C.$('swPayAmt'), ra = C.$('swRecvAmt');
   [pa.value, ra.value] = [ra.value, pa.value];
   [pa._userTyped, ra._userTyped] = [ra._userTyped, pa._userTyped];   // keep the anti-clobber flags with their values
+  [pa._refMode, ra._refMode] = [ra._refMode, pa._refMode];           // ref-input mode rides with its value too
+  // Flip the per-leg rails WITH the legs (pay-leg rail follows the asset that is now the pay leg),
+  // and re-arm the auto-rail so the flipped pair re-derives honestly. Without this, flipping turned
+  // an honest "pay on-chain / receive LN" into a mislabeled route while the toggles showed the old,
+  // now-wrong rail selection.
+  [S.payRail, S.recvRail] = [S.recvRail, S.payRail];
+  S.railsTouched = false;
   S.edited = S.edited === 'pay' ? 'receive' : 'pay';
   S.modeTouched = false;   // re-arm the Take/Post default for the flipped pair
   S.feeAsset = null; S.feeAssetTouched = false;   // fee default re-follows the flipped pay asset (D2/C-11)
@@ -1205,7 +1217,7 @@ function paintCostLine(){
   if (S.mode === 'post') return;                              // limit order: you set the price
   if (!LAST_QUOTE || !LAST_MID || !(LAST_MID.price > 0)) return;
   if (LAST_MID.oneSided) return;   // only one side of the book exists: "mid" is just top-of-book, so a "% vs mid" would be fake (C-4)
-  const payV = numVal(C.$('swPayAmt')), recvV = numVal(C.$('swRecvAmt'));
+  const payV = fieldUnits(C.$('swPayAmt'), S.payAsset), recvV = fieldUnits(C.$('swRecvAmt'), S.receiveAsset);
   if (!(payV > 0 && recvV > 0)) return;
   const cross = !!LAST_MID.cross, payIsBtc = S.payAsset === 'BTC';
   // Effective execution price in the SAME units as the mid (quote per base, in the frame the book was
@@ -1406,8 +1418,8 @@ async function requoteSame(route, amtStr){
 
     // Enable Place order once BOTH amounts are set and the pay leg is affordable.
     const pm = C.assetMeta(pay), rm = C.assetMeta(receive);
-    const payAtoms  = safeAtoms($('swPayAmt').value,  pm.precision || 0);
-    const recvAtoms = safeAtoms($('swRecvAmt').value, rm.precision || 0);
+    const payAtoms  = fieldAtoms($('swPayAmt'), pay);
+    const recvAtoms = fieldAtoms($('swRecvAmt'), receive);
     if (payAtoms <= 0n || recvAtoms <= 0n){ LAST_QUOTE = null; setReviewEnabled(false); return; }
     // Affordability: the pay leg AND the funding fee must both be covered. The covenant funding fee is
     // paid in the chosen fee asset (C-1), so when that's the pay asset the balance must cover BOTH; when
@@ -1463,7 +1475,7 @@ async function requoteSame(route, amtStr){
 function paintPlaceRate(pay, receive, best, bookLen){
   const { $ } = C;
   const pm = C.assetMeta(pay), rm = C.assetMeta(receive);
-  const payV = numVal($('swPayAmt')), recvV = numVal($('swRecvAmt'));
+  const payV = fieldUnits($('swPayAmt'), pay), recvV = fieldUnits($('swRecvAmt'), receive);
   const yourPrice = (payV > 0 && recvV > 0) ? recvV / payV : 0;
   // Display "1 base = N quote" (canonical direction); the crossing test stays in native receive-per-pay.
   const yourLine = yourPrice > 0 ? ratePerPayToLine(pay, receive, yourPrice).str : null;
@@ -1482,7 +1494,7 @@ function paintPlaceRate(pay, receive, best, bookLen){
     if (yourPrice > 0 && best){
       // If the order is bigger than the resting depth at this price, it fills what's there now and
       // rests the remainder as a limit — surface that split.
-      const split = marketFillSplit(safeAtoms($('swPayAmt').value, pm.precision||0), safeAtoms($('swRecvAmt').value, rm.precision||0));
+      const split = marketFillSplit(fieldAtoms($('swPayAmt'), pay), fieldAtoms($('swRecvAmt'), receive));
       let s = `Market · ${yourLine} (best offer)`;
       if (split) s += ` · fills ~${trim(Number(split.fill)/Math.pow(10, pm.precision||0))} ${pm.ticker} now, ~${trim(Number(split.rest)/Math.pow(10, pm.precision||0))} rests`;
       $('swRate').textContent = s;
@@ -1509,6 +1521,35 @@ function bestReceivePerPay(offers, pay, receive){
   return best || null;
 }
 function safeAtoms(str, prec){ try { return C.parseAtoms((str||'').trim(), prec); } catch { return 0n; } }
+
+// THE amount a field actually MEANS, in the asset's atoms. When the ⇄ toggle put the
+// field in reference-currency (USD) input mode, its raw text is a USD number, NOT native
+// units — C.assetAmountOf converts it back to the exact asset amount string (the same one
+// the ⇄ hint shows). Reading `el.value` raw in USD mode was the bug where "10 USD" became
+// "10 BTC" (470,159 EURX for a $6 buy). Every compose/quote/review/place atoms-read MUST
+// go through this, never safeAtoms(el.value, …) directly on a user-facing amount field.
+function fieldAtoms(el, hex){
+  if (!el) return 0n;
+  const prec = C.assetMeta(hex).precision || 0;
+  let s;
+  try { s = C.assetAmountOf(el, hex); } catch { s = null; }
+  if (s == null) s = el._refMode ? '' : (el.value || '');   // fail safe: never treat a USD number as native
+  return safeAtoms(s, prec);
+}
+// numVal that honors ref mode: the field's numeric value in ASSET units (for affordability
+// display / >0 checks). In USD mode the raw number is meaningless as an asset amount.
+function fieldUnits(el, hex){ const a = fieldAtoms(el, hex); const prec = C.assetMeta(hex).precision || 0; return Number(a) / Math.pow(10, prec); }
+
+// Write a fixed NATIVE amount into a field for a whole-offer lift (the amount the user can't
+// change — it's the maker's exact terms). Force the field OUT of ⇄ reference-currency mode so
+// the native number is never mislabeled as USD (and a later fieldAtoms read doesn't try to
+// convert a native number as if it were USD). Marks it derived, not user-typed.
+function setNativeField(el, str){
+  if (!el) return;
+  if (el._refMode){ el._refMode = false; try { paintRefHints(); } catch {} }
+  el._userTyped = false;
+  el.value = str;
+}
 
 // PAY-atoms of resting book depth that meets the order's price right now — the amount a Market
 // order can fill immediately (asks giving >= the order's receive-per-pay). Anything above this
@@ -1546,7 +1587,7 @@ function postModeSame(pay, receive){
   const { $ } = C;
   if (!S.feeAsset) S.feeAsset = defaultFeeAsset();
   const pm = C.assetMeta(pay), rm = C.assetMeta(receive);
-  const pv = numVal($('swPayAmt')), rv = numVal($('swRecvAmt'));
+  const pv = fieldUnits($('swPayAmt'), pay), rv = fieldUnits($('swRecvAmt'), receive);
   const hasBook = !!(BOOK.offers && BOOK.offers.length);
   LAST_QUOTE = { kind:'same', startMarket:true, post:true, pay, receive };
   if (pv > 0 && rv > 0){
@@ -1771,8 +1812,8 @@ async function requoteMixed(route, amtStr){
     // generic 8dp trim(), so a sub-8-decimal asset writes a re-parseable value into the field.
     const assetStr = C.fmtAtoms(BigInt(offer.asset_amount), am.precision || 0);
     const btcStr = C.fmtAtoms(BigInt(offer.btc_sats), 8);
-    $('swPayAmt').value = assetStr;
-    $('swRecvAmt').value = btcStr;
+    setNativeField($('swPayAmt'), assetStr);
+    setNativeField($('swRecvAmt'), btcStr);
     $('swRate').textContent = `${assetStr} ${am.ticker} → ${btcStr} BTC · best resting offer`;
     $('swRoute').textContent = 'Mixed rails · sell over Lightning, receive BTC on-chain';
     paintFee('BTC', null, 'You pay the ' + am.ticker + ' over Lightning; your device claims the BTC from its on-chain HTLC.');
@@ -1796,8 +1837,8 @@ async function requoteMixed(route, amtStr){
     }
     const assetStr = C.fmtAtoms(BigInt(offer.asset_amount), am.precision || 0);
     const btcStr = C.fmtAtoms(BigInt(offer.btc_sats), 8);
-    $('swRecvAmt').value = assetStr;
-    $('swPayAmt').value = btcStr;
+    setNativeField($('swRecvAmt'), assetStr);
+    setNativeField($('swPayAmt'), btcStr);
     $('swRate').textContent = `${btcStr} BTC → ${assetStr} ${am.ticker} · best resting offer`;
     $('swRoute').textContent = 'Mixed rails · buy over Lightning, pay BTC on-chain';
     paintFee('BTC', null, 'You pay BTC on-chain; the maker pays the ' + am.ticker + ' to your device over Lightning.');
@@ -1850,7 +1891,7 @@ function postModeCross(route){
     return;
   }
   LAST_QUOTE = { kind:'cross-make', reverse, assetHex: route.seqAsset };
-  const both = numVal($('swPayAmt')) > 0 && numVal($('swRecvAmt')) > 0;
+  const both = fieldUnits($('swPayAmt'), S.payAsset) > 0 && fieldUnits($('swRecvAmt'), S.receiveAsset) > 0;
   $('swRate').textContent = both
     ? `Your price · ${reverse ? `buy ${am.ticker} with BTC` : `sell ${am.ticker} for BTC`} · Post to rest this offer.`
     : `Set both amounts (the ${am.ticker} and the BTC) · their ratio is your price · then Post.`;
@@ -2565,25 +2606,29 @@ async function placeCovenant(pay, receive, payAtoms, recvAtoms, onStatus){
   };
   const plan = planPlaceOrder(params);
   const covAddr = C.wasm.scriptToAddress(plan.spkHex, C.network);
-  onStatus && onStatus('Funding the order on-chain…');
-  const { txid, vout } = await fundCovenant(covAddr, plan.spkHex, pay, payAtoms, S.feeAsset || defaultFeeAsset());
-  const covenant = buildCovenantTerms(plan.order, txid, vout, plan.tap);
-  const offer = buildCovenantOffer({
-    assetA: pay, assetB: receive, sellAtoms: BigInt(payAtoms), recvAtoms: BigInt(recvAtoms),
-    covenant, makerPubkey: makerPubHex(), recvAddress: payout.address, offerId: seqob.randHex(16),
-    allowPartial: true, minLot,                           // fill what crosses now; the covenant's remainder rests on
-  });
-  // FUND-SAFETY: the covenant is now funded ON-CHAIN, so persist its refund material (covTxid/vout/spkHex
-  // + the order params to re-derive the taptree) BEFORE attempting the post. If the post fails (a relay
-  // reject, a dropped connection), the funds would otherwise be stranded in a covenant with no local
-  // record to reclaim them after expiry. posted:false until the relay accepts it.
+  // FUND-SAFETY (persist-BEFORE-broadcast): fundCovenant broadcasts the on-chain funding tx and then
+  // polls ~30s to resolve the vout. A tab close/crash/reload in that window would lock asset A in a
+  // covenant with NO local record — permanently stranded, because the reclaim needs makerIndex +
+  // sellAtoms/recvAtoms + expiry + spkHex to re-derive the refund taptree. So persist the full reclaim
+  // material NOW, with covTxid null; resumeCovenantOrders locates the outpoint by spkHex on the next
+  // load if we die mid-broadcast. offerId is minted here (deterministic, no dependence on the funded tx).
+  const offerId = seqob.randHex(16);
   const rec = {
-    offerId: offer.offer_id, pay, receive,
+    offerId, pay, receive,
     sellAtoms: String(payAtoms), recvAtoms: String(recvAtoms),
-    makerIndex: idx, covTxid: txid, covVout: vout, spkHex: plan.spkHex,
+    makerIndex: idx, covTxid: null, covVout: null, spkHex: plan.spkHex,
     expiry: params.expiryLocktime, created: Date.now(), posted: false,
   };
   PLACED.push(rec); savePlaced();
+  onStatus && onStatus('Funding the order on-chain…');
+  const { txid, vout } = await fundCovenant(covAddr, plan.spkHex, pay, payAtoms, S.feeAsset || defaultFeeAsset());
+  rec.covTxid = txid; rec.covVout = vout; savePlaced();   // outpoint known -> reclaim is fully self-contained
+  const covenant = buildCovenantTerms(plan.order, txid, vout, plan.tap);
+  const offer = buildCovenantOffer({
+    assetA: pay, assetB: receive, sellAtoms: BigInt(payAtoms), recvAtoms: BigInt(recvAtoms),
+    covenant, makerPubkey: makerPubHex(), recvAddress: payout.address, offerId,
+    allowPartial: true, minLot,                           // fill what crosses now; the covenant's remainder rests on
+  });
   onStatus && onStatus('Posting your resting order…');
   await seqob.postCovenantOffer(offer, makerPriv());
   rec.posted = true; savePlaced();   // the relay accepted it; it is now a live resting order
@@ -2624,10 +2669,20 @@ function orderFromPlaced(rec){
   const { rateNum, rateDen } = computeRate(BigInt(rec.sellAtoms), BigInt(rec.recvAtoms));
   const order = {
     assetA: rec.pay, assetB: rec.receive,
-    rateNum, rateDen, minLot: BigInt(rec.sellAtoms),
+    // minLot MUST equal what placeCovenant committed into the funded covenant
+    // (covenantMinLot(sellAtoms) = sellAtoms/1000), NOT the all-or-nothing sellAtoms:
+    // minLot is pushed into the fill leaf, which sets the merkle root, the tweaked
+    // output key/spk AND the refund control block's sibling hash. The old
+    // BigInt(rec.sellAtoms) re-derived a DIFFERENT taptree, so every cancel/refund
+    // built a consensus-invalid taproot spend and the locked asset was unreclaimable.
+    rateNum, rateDen, minLot: covenantMinLot(BigInt(rec.sellAtoms)),
     makerProg: payout.program, makerVer: 1,
     expiryLocktime: Number(rec.expiry), makerX: payout.internalKey,
   };
+  // The promised guard (was missing): re-derive the spk and refuse to build a refund
+  // against a record whose taptree does not reproduce the funded covenant. verifyAgainstSPK
+  // throws loudly on a mismatch — better than silently broadcasting a consensus-invalid spend.
+  if (rec.spkHex) covVerifyAgainstSPK(order, rec.spkHex);
   return { order, payout };
 }
 
@@ -2695,7 +2750,46 @@ export function resumeCovenantOrders(){
   loadPlaced();
   ensureCompanion();
   scanCompanion().catch(()=>{});
+  reconcileUnfundedPlaced().catch(()=>{});   // recover any record that died mid-broadcast
   if (PLACED.length){ ensureCovenantRelay(); }
+}
+
+// A record persisted BEFORE the funding broadcast (covTxid null) whose tab died in
+// the resolve window: locate the covenant outpoint by its spkHex on-chain and fill in
+// txid/vout so the reclaim path is whole. If nothing is found after a grace period past
+// creation, the broadcast almost certainly never landed (nothing was spent) — drop it so
+// it doesn't linger as a fake resting order. Esplora indexes by scripthash = sha256(spk)
+// reversed; /scripthash/:h/utxo returns the funded outpoints.
+async function reconcileUnfundedPlaced(){
+  let changed = false;
+  for (const rec of PLACED){
+    if (rec.covTxid || !rec.spkHex) continue;
+    try {
+      const sh = await scripthashOf(rec.spkHex);
+      const res = await esplora(`/scripthash/${sh}/utxo`);
+      const utxos = (res && res.ok) ? await res.json() : [];
+      if (Array.isArray(utxos) && utxos.length){
+        // The covenant output is the one paying exactly this spk; take the first.
+        rec.covTxid = utxos[0].txid; rec.covVout = utxos[0].vout; changed = true;
+      } else if (Date.now() - (rec.created||0) > 10 * 60 * 1000){
+        rec._orphan = true; changed = true;   // 10 min, no on-chain output -> the funding tx never landed
+      }
+    } catch { /* transient esplora error; retry on the next resume */ }
+  }
+  if (changed){
+    const before = PLACED.length;
+    for (let i = PLACED.length - 1; i >= 0; i--) if (PLACED[i]._orphan) PLACED.splice(i, 1);
+    savePlaced();
+    if (PLACED.length !== before) { try { C.toast && C.toast('Cleared an order whose funding never confirmed (nothing was spent).'); } catch {} }
+  }
+}
+
+// scripthash = SHA-256 of the raw scriptPubKey bytes, BYTE-REVERSED (Esplora/Electrum convention).
+async function scripthashOf(spkHex){
+  const bytes = new Uint8Array((spkHex.match(/../g) || []).map(h => parseInt(h, 16)));
+  const digest = new Uint8Array(await crypto.subtle.digest('SHA-256', bytes));
+  digest.reverse();
+  return [...digest].map(b => b.toString(16).padStart(2, '0')).join('');
 }
 
 async function placeCovenantReview(q){
@@ -2792,7 +2886,7 @@ async function reviewMixed(q){
     if (!ra0.payLn.ok){
       const pm = metaOf(S.payAsset);
       const chain = S.payAsset === 'BTC' ? 'btc' : 'seq';
-      const atoms = safeAtoms(C.$('swPayAmt').value, pm.precision || 0);
+      const atoms = fieldAtoms(C.$('swPayAmt'), S.payAsset);
       if (atoms <= 0n){ $('swErr').textContent = 'Enter an amount so the Lightning channel can be sized.'; return; }
       try {
         $('swErr').textContent = '';
@@ -2811,7 +2905,7 @@ async function reviewMixed(q){
       }
     }
   }
-  const amount = parseFloat((($('swPayAmt').value || '') + '').trim()) || null;
+  const amount = fieldUnits($('swPayAmt'), S.payAsset) || null;
   const dir = isSubAsset
     ? `Buy ${am.ticker} with Bitcoin on-chain · receive ${am.ticker} over Lightning`
     : isSubAssetSell
@@ -3321,7 +3415,7 @@ function renderMixedSwap(){
     [sub.ST.REFUNDING]: 'Refunding the on-chain HTLC leg…',
     [sub.ST.REFUNDED]:  'Refund broadcast · the on-chain leg is being reclaimed; your funds return once it confirms.',
     [sub.ST.SETTLED]:   'Settled · anchor-bound to Bitcoin (reverts only if Bitcoin reverts).',
-    [sub.ST.FAILED]:    'Failed · nothing further to reclaim on-chain.',
+    [sub.ST.FAILED]:    MIXED.htlc ? 'Failed · reclaim the on-chain leg below.' : 'Failed · nothing was spent.',
   }[MIXED.state] || MIXED.state;
   const dir = MIXED.side === 'buy'
     ? `Buy ${esc(am.ticker)} with BTC over Lightning · receive ${esc(am.ticker)} on-chain`
@@ -3331,19 +3425,35 @@ function renderMixedSwap(){
     ? (refundable
         ? `On-chain HTLC leg is past its refund timeout (block ${lock}) · reclaimable now.`
         : `On-chain HTLC leg refundable after block ${lock}${tip ? ` (tip ${tip})` : ''}.`)
-    : 'The LSP is driving both legs; no separate on-chain leg to reclaim.';
+    : (MIXED.state === sub.ST.FAILED
+        ? 'The swap did not start: no on-chain leg was ever funded, so there is nothing to reclaim.'
+        : 'The LSP is driving both legs; no separate on-chain leg to reclaim.');
+  // ALWAYS show the failure/progress detail — hiding it on terminal states left users
+  // staring at a bare "Failed" with the actual reason discarded.
+  const detail = MIXED.detail ? ' · ' + esc(MIXED.detail) : '';
   host.innerHTML = `<div class="swbook"><div class="swbook-head">
       <span class="lbl">${dir}</span>
       <span class="sub">${esc(phase)}</span></div>
-    <div class="swbook-row"><span class="sub">${esc(legLine)}${MIXED.detail && !terminal ? ' · ' + esc(MIXED.detail) : ''}</span></div>
+    <div class="swbook-row"><span class="sub">${esc(legLine)}${detail}</span></div>
     <div class="swbook-row" id="swMixedBtns"></div></div>`;
   const btns = C.$('swMixedBtns');
+  // Only offer the reclaim button when a REAL refund mechanism exists (L.refund). Without it the
+  // button used to broadcast nothing yet mark the swap REFUNDED — a fake success that told the user
+  // their BTC was coming back while it stayed locked. When the LSP owns the on-chain leg, its own
+  // driver reclaims after the CLTV timeout; we say so instead of offering a button we can't honour.
+  const canRefund = !!(L && L.refund);
   if (MIXED.htlc && !terminal && MIXED.state !== sub.ST.REFUNDING){
-    const rb = C.el('button', 'danger', 'Refund BTC leg'); rb.id = 'swMixedRefund';
-    rb.disabled = !refundable;
-    if (!refundable) rb.title = `The on-chain HTLC leg is only refundable after its CLTV timeout (block ${lock}).`;
-    rb.onclick = onRefundMixed;
-    btns.appendChild(rb);
+    if (canRefund){
+      const rb = C.el('button', 'danger', 'Refund BTC leg'); rb.id = 'swMixedRefund';
+      rb.disabled = !refundable;
+      if (!refundable) rb.title = `The on-chain HTLC leg is only refundable after its CLTV timeout (block ${lock}).`;
+      rb.onclick = onRefundMixed;
+      btns.appendChild(rb);
+    } else {
+      const note = C.el('span', 'sub');
+      note.textContent = `The on-chain HTLC leg is refundable after its timeout (block ${lock}); the swap service reclaims it automatically — nothing to do here.`;
+      btns.appendChild(note);
+    }
   }
   const done = terminal;
   const clr = C.el('button', 'ghost', done ? 'Clear' : 'Dismiss');
@@ -3372,14 +3482,21 @@ async function onRefundMixed(){
   ];
   const { m: modal, ok, st } = C.modalRows({ title: 'Refund the on-chain leg', kv });
   ok.onclick = async () => {
+    // NEVER fake a refund: without a real broadcast mechanism, a "refund" that returns no txid must
+    // NOT mark the swap REFUNDED (that told the user their BTC was reclaimed while it stayed locked).
+    if (!(L && L.refund)){
+      st.className = 'status err';
+      st.textContent = 'This build cannot broadcast the reclaim from the wallet; the swap service reclaims the on-chain leg automatically after its timeout.';
+      return;
+    }
     ok.disabled = true; st.className = 'status'; st.innerHTML = '<span class="spin"></span>Refunding the on-chain HTLC leg…';
     MIXED = sub.markRefunding(MIXED); saveMixed(); renderMixedSwap();
     try {
-      let txid = null;
-      if (L && L.refund) txid = await L.refund({ id: MIXED.id, htlc: MIXED.htlc });
+      const txid = await L.refund({ id: MIXED.id, htlc: MIXED.htlc });
+      if (!txid) throw new Error('the refund did not return a transaction id (nothing was broadcast)');
       MIXED = sub.markRefunded(MIXED, txid); saveMixed();
       modal.remove();
-      C.toast(txid ? `On-chain HTLC leg refunded: ${String(txid).slice(0, 18)}…` : 'On-chain HTLC leg refund broadcast.');
+      C.toast(`On-chain HTLC leg refunded: ${String(txid).slice(0, 18)}…`);
       try { await C.sync(); } catch {}
       renderMixedSwap();
     } catch (e){
@@ -3417,11 +3534,11 @@ async function postCrossOfferReview(q){
   let assetAtoms, btcSats;
   try {
     if (reverse){
-      btcSats    = C.parseAtoms(($('swPayAmt').value || '').trim(), 8);
-      assetAtoms = C.parseAtoms(($('swRecvAmt').value || '').trim(), am.precision || 0);
+      btcSats    = fieldAtoms($('swPayAmt'), 'BTC');
+      assetAtoms = fieldAtoms($('swRecvAmt'), assetHex);
     } else {
-      assetAtoms = C.parseAtoms(($('swPayAmt').value || '').trim(), am.precision || 0);
-      btcSats    = C.parseAtoms(($('swRecvAmt').value || '').trim(), 8);
+      assetAtoms = fieldAtoms($('swPayAmt'), assetHex);
+      btcSats    = fieldAtoms($('swRecvAmt'), 'BTC');
     }
     if (assetAtoms <= 0n || btcSats <= 0n) throw 0;
   } catch { $('swErr').textContent = `Enter both amounts - the ${am.ticker} and the BTC.`; return; }
@@ -3848,8 +3965,8 @@ async function postOfferReview(q){
   const pay = q.pay, receive = q.receive;
   let payAtoms, recvAtoms;
   try {
-    payAtoms = C.parseAtoms($('swPayAmt').value.trim(), C.assetMeta(pay).precision || 0);
-    recvAtoms = C.parseAtoms($('swRecvAmt').value.trim(), C.assetMeta(receive).precision || 0);
+    payAtoms = fieldAtoms($('swPayAmt'), pay);
+    recvAtoms = fieldAtoms($('swRecvAmt'), receive);
     if (payAtoms <= 0n || recvAtoms <= 0n) throw 0;
   } catch { $('swErr').textContent = 'Enter both amounts - what you give and what you want - to start a market.'; return; }
   const pm = C.assetMeta(pay), rm = C.assetMeta(receive);

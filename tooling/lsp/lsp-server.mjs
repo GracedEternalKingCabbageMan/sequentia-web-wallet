@@ -94,6 +94,7 @@ import { makeProvisioner } from './provision.mjs';
 import { acceptUpgrade, bridgeWsToTcp } from './ws-bridge.mjs';
 import { settlementPlanForSide, planExecutionName } from './settlement-router.mjs';
 import { buildUnifiedBook } from './unified-book.mjs';
+import { hashPreimageOk, subasSellStateFileForNonce, subasSellGuardVerdict, assembleSubasSellSettled } from './subas-sell-recovery.mjs';
 
 function reqEnv(name) {
   const v = process.env[name];
@@ -1105,7 +1106,141 @@ async function provisionInbound({ nodeKey, assetId, amount }) {
     receivable_msat: chan.receivable_msat ?? null, fee_msat: feeMsat };
 }
 
-function runMixed({ side, asset, amount, payRail, recvRail, node_key, asset_bolt11, payment_hash, asset_amount, btc_claim_pub, offer_id, maker_pubkey, btc_htlc }) {
+// --- sub-asset SELL crash recovery ------------------------------------------
+// FUND-SAFETY: the xsubas-sell CLI pays the asset over LN INSIDE the /swap call and only then
+// prints the settled JSON. If that subprocess crashes AFTER paying (+ the maker settling) but
+// BEFORE we capture its stdout, the preimage P would be lost — the wallet could never claim the
+// BTC. The CLI now persists a -state-file (H + the full BTC HTLC terms after verifying, then P
+// after paying), so on a CLI failure we reconstruct the settled result — straight from the file
+// (P already written) or by asking the taker's OWN node whether its outgoing asset payment on H
+// genuinely COMPLETED (revealing P). We NEVER report settled without a real preimage in hand.
+const RECOVER_POLL_TRIES = 5;    // ~ (5-1)*2s = 8s max wait for a momentarily-pending pay to settle
+const RECOVER_POLL_MS = 2000;
+
+// paymentStatusForHash asks a hosted node about its OUTGOING payment on payment_hash H, returning
+// { preimage, pending }. The asset is paid with a bare-hash `sendpay`, so `listsendpays` (which
+// carries `payment_preimage` on each COMPLETE part and 'pending' on an in-flight part) is
+// authoritative; `listpays` (the xpay plugin's view, field `preimage`) is a best-effort fallback.
+// FUND-SAFETY: it THROWS if listsendpays itself is unreadable, so callers treat that as UNCERTAIN
+// (never "no pay"). `pending:true` means an attempt for H is still in flight (do not re-pay).
+async function paymentStatusForHash(rpc, hashH) {
+  let preimage = null, pending = false;
+  const r = await lnrpcKw('listsendpays', [`payment_hash=${hashH}`], rpc, SIGNER_RPC_TIMEOUT_MS);
+  for (const p of (r && r.payments) || []) {
+    if (!p) continue;
+    if (p.status === 'complete' && p.payment_preimage) preimage = String(p.payment_preimage).toLowerCase();
+    else if (p.status === 'pending') pending = true;
+  }
+  if (!preimage) {
+    try {
+      const rp = await lnrpcKw('listpays', [`payment_hash=${hashH}`], rpc, SIGNER_RPC_TIMEOUT_MS);
+      for (const p of (rp && rp.pays) || []) {
+        if (!p) continue;
+        if (p.status === 'complete' && p.preimage) preimage = String(p.preimage).toLowerCase();
+        else if (p.status === 'pending') pending = true;
+      }
+    } catch (e) { console.error('[lsp] listpays fallback failed:', e && e.message); }
+  }
+  return { preimage, pending };
+}
+
+// settledPreimageForHash is the tolerant variant used by the within-call poll: a genuinely-COMPLETE
+// preimage or null (swallowing an unreadable node, since the poll just retries).
+async function settledPreimageForHash(rpc, hashH) {
+  try { return (await paymentStatusForHash(rpc, hashH)).preimage; }
+  catch (e) { console.error('[lsp] recovery payment status failed:', e && e.message); return null; }
+}
+
+// recoverSubasSell reconstructs a SETTLED sub-asset SELL result after THIS run's CLI failed, or
+// returns null (=> the caller returns the original failure; the maker refunds its BTC HTLC at
+// T_btc, so nothing is lost). It NEVER fabricates a settle: a settled result is returned ONLY with
+// a real preimage — persisted to the state file (Phase "paid") or read back from a genuinely-
+// COMPLETE outgoing payment on the taker's own node. (The cross-call retry case is handled earlier
+// by preSpawnGuardSubasSell; this is the same-call fast path.)
+async function recoverSubasSell({ stateFile, userRpc, assetId, nodeKey, dt, requestedAmount }) {
+  let st;
+  try { st = JSON.parse(fs.readFileSync(stateFile, 'utf8')); }
+  catch { return null; }                                          // missing/unreadable => no recovery
+  const bh = st && st.btc_htlc;
+  const hashH = st && typeof st.hash_h === 'string' ? st.hash_h.toLowerCase() : '';
+  if (!bh || !bh.txid || !/^[0-9a-f]{64}$/i.test(hashH)) return null;   // nothing to rebuild from
+  const mk = (preimageHex) => assembleSubasSellSettled({
+    assetId, assetLabelStr: assetLabel(assetId), nodeKey, hashH, preimageHex,
+    makerLnNodeId: st.maker_ln_node_id, btcHtlc: bh, dt, requestedAmount,
+    note: 'Sub-asset SELL RECOVERED after a CLI crash: the asset was paid over Lightning. '
+        + 'Claim the BTC on-chain with your device key using the returned preimage + btc_htlc.',
+  });
+  // (1) The preimage was persisted (Phase "paid") -> reconstruct directly.
+  if (st.preimage && hashPreimageOk(hashH, st.preimage)) {
+    return mk(String(st.preimage).toLowerCase());
+  }
+  // (2) Verified but P not yet persisted -> the crash landed during/just-after the pay. Ask the
+  //     taker's OWN node whether the outgoing asset payment on H COMPLETED. Poll a few seconds:
+  //     the maker settles the hold moments after it is held (it already holds P), so a payment
+  //     that is momentarily 'pending' when the CLI died usually resolves right after. If it never
+  //     completes, the asset was not paid -> null (the caller returns the original failure).
+  for (let i = 0; i < RECOVER_POLL_TRIES; i++) {
+    const p = await settledPreimageForHash(userRpc, hashH);
+    if (p && hashPreimageOk(hashH, p)) return mk(p);
+    if (i < RECOVER_POLL_TRIES - 1) await sleep(RECOVER_POLL_MS);
+  }
+  return null;                                                    // asset NOT paid -> return the failure
+}
+
+// preSpawnGuardSubasSell runs BEFORE (re)spawning xsubas-sell for a nonce-carrying request. If a
+// prior attempt for this EXACT nonce left a state file, it decides — via the pure subasSellGuard-
+// Verdict — whether the asset may already have been paid, so a same-nonce retry NEVER re-pays.
+// Returns one of:
+//   { action: 'rerun' }           -> provably no prior pay: caller spawns (runMixed pre-cleans).
+//   { action: 'recover', result } -> a settled result to store + return (the asset was paid).
+//   { action: 'hold', result }    -> a retryable {ok:false,pending:true,retry:true} body: a pay is
+//                                    in-flight or unprovable. Caller returns it; the wallet re-polls
+//                                    with the SAME nonce instead of treating the swap as failed.
+async function preSpawnGuardSubasSell(body) {
+  const stateFile = subasSellStateFileForNonce(os.tmpdir(), body && body.swap_nonce);
+  if (!stateFile) return { action: 'rerun' };                     // unusable nonce -> no cross-call file
+  let st;
+  try { st = JSON.parse(fs.readFileSync(stateFile, 'utf8')); }
+  catch { return { action: 'rerun' }; }                           // no readable prior state -> fresh (re)attempt
+  const bh = st && st.btc_htlc;
+  const hashH = st && typeof st.hash_h === 'string' ? st.hash_h.toLowerCase() : '';
+  const assetId = resolveAsset(body && body.asset);
+  const nodeKey = String((body && body.node_key) || '').toLowerCase();
+  // Consult the node ONLY for a usable "verified" state (no persisted preimage). A persisted
+  // preimage / unusable state is decided by the verdict without a query. A verified state we
+  // cannot read from the node stays uncertain (nodeStatus=null -> the verdict holds, never reruns).
+  const usable = !!(bh && bh.txid && /^[0-9a-f]{64}$/i.test(hashH));
+  const hasPersistedP = usable && typeof st.preimage === 'string' && hashPreimageOk(hashH, st.preimage);
+  let nodeStatus = null;
+  if (usable && !hasPersistedP) {
+    const { rpc: userRpc } = assetId ? targetFor('seq', assetId, nodeKey) : { rpc: null };
+    if (userRpc) {
+      try { nodeStatus = await paymentStatusForHash(userRpc, hashH); }
+      catch (e) { console.error('[lsp] pre-spawn payment status failed:', e && e.message); nodeStatus = null; }
+    }
+  }
+  const verdict = subasSellGuardVerdict(st, nodeStatus);
+  if (verdict.kind === 'recover') {
+    const result = assembleSubasSellSettled({
+      assetId, assetLabelStr: assetLabel(assetId), nodeKey, hashH, preimageHex: verdict.preimage,
+      makerLnNodeId: st.maker_ln_node_id, btcHtlc: bh, requestedAmount: body.amount,
+      note: 'Sub-asset SELL RECOVERED on retry: a prior attempt for this swap already paid the asset '
+          + 'over Lightning. Claim the BTC on-chain with your device key using the returned preimage + btc_htlc.',
+    });
+    try { fs.unlinkSync(stateFile); } catch { /* best-effort; nonce store now holds it */ }
+    console.error(`[lsp] sub-asset SELL pre-spawn RECOVERED a prior settled attempt (hash_h=${hashH})`);
+    return { action: 'recover', result };
+  }
+  if (verdict.kind === 'hold') {
+    console.error(`[lsp] sub-asset SELL pre-spawn HOLD (${verdict.reason}); not re-running to avoid a double pay`);
+    return { action: 'hold', result: { ok: false, settled: false, pending: true, retry: true,
+      reason: verdict.reason,
+      error: 'asset payment for this swap may be in progress; retry shortly with the same swap_nonce' } };
+  }
+  return { action: 'rerun' };                                     // provably no prior pay
+}
+
+function runMixed({ side, asset, amount, payRail, recvRail, node_key, asset_bolt11, payment_hash, asset_amount, btc_claim_pub, offer_id, maker_pubkey, btc_htlc, swap_nonce }) {
   return new Promise(async (resolve) => {
     const assetId = resolveAsset(asset);
     if (side !== 'buy' && side !== 'sell') return resolve({ ok: false, error: "side must be 'buy' or 'sell'" });
@@ -1153,15 +1288,27 @@ function runMixed({ side, asset, amount, payRail, recvRail, node_key, asset_bolt
       if (!userRpc || !rec) {
         return resolve({ ok: false, error: 'user node not provisioned for this asset (POST /node/provision first)' });
       }
+      // Crash-recovery state file: the CLI writes H + the full BTC HTLC terms after verifying, and
+      // P after paying. Deterministic per swap via the SHARED derivation (so the pre-spawn guard and
+      // this spawn agree on the path); falls back to a random id when there's no usable nonce. On a
+      // CLI crash after paying we read this back (or query the node) to reconstruct the settled
+      // result instead of losing P.
+      const swapStateFile = subasSellStateFileForNonce(os.tmpdir(), swap_nonce)
+        || path.join(os.tmpdir(), `xsubas-sell-${Date.now()}-${Math.random().toString(36).slice(2)}.json`);
+      // Pre-clean any stale file at this path. This is only REACHED on a genuine first attempt or
+      // after the pre-spawn guard PROVED no prior pay for this nonce, so clearing a leftover
+      // "verified"-but-unpaid file here can never drop a recoverable pay (the guard already held on
+      // any paid/pending/uncertain state). The file then reflects ONLY this run.
+      try { fs.unlinkSync(swapStateFile); } catch { /* no stale file: fine */ }
       const sellArgs = ['xsubas-sell', '-asset', assetId, '-relay', CFG.subasSellRelay,
         '-btc-rpc', CFG.subasBtcRpc, '-btc-chain', CFG.subasBtcChain,
         '-asset-ln-socket', userRpc, '-btc-claim-pub', btc_claim_pub,
-        '-min-btc-conf', String(CFG.subasMinBtcConf), '-json'];
+        '-min-btc-conf', String(CFG.subasMinBtcConf), '-state-file', swapStateFile, '-json'];
       // Lift a SPECIFIC resting offer (order-book take) when the wallet names one.
       if (offer_id) sellArgs.push('-offer-id', String(offer_id));
       if (maker_pubkey) sellArgs.push('-maker-pubkey', String(maker_pubkey));
       const t0s = Date.now();
-      return execFile(CFG.seqobCli, sellArgs, { timeout: CFG.mixedTimeoutMs, maxBuffer: 8 << 20 }, (err, stdout, stderr) => {
+      return execFile(CFG.seqobCli, sellArgs, { timeout: CFG.mixedTimeoutMs, maxBuffer: 8 << 20 }, async (err, stdout, stderr) => {
         const out = (stdout || '') + (stderr || '');
         let j = null;
         for (const line of (stdout || '').trim().split('\n').reverse()) {
@@ -1170,6 +1317,7 @@ function runMixed({ side, asset, amount, payRail, recvRail, node_key, asset_bolt
         }
         const dt = Date.now() - t0s;
         if (j && j.settled) {
+          try { fs.unlinkSync(swapStateFile); } catch { /* best-effort */ }
           return resolve({
             ok: true, side: 'sell', asset: assetId, asset_label: assetLabel(assetId),
             rail: 'mixed', pay_rail: 'ln', recv_rail: 'chain',
@@ -1181,6 +1329,22 @@ function runMixed({ side, asset, amount, payRail, recvRail, node_key, asset_bolt
             settled_ms: dt, requested_amount: amount ?? null,
           });
         }
+        // FUND-SAFETY: the CLI errored/crashed. It may have crashed AFTER paying the asset + the
+        // maker settling but before printing the settled JSON -> P would be lost. Try to recover a
+        // settled result from the crash-recovery state file (P persisted there) or by asking the
+        // taker's own node whether the asset payment on H genuinely COMPLETED. recoverSubasSell
+        // returns a settled result ONLY with a real preimage in hand.
+        const recovered = await recoverSubasSell({
+          stateFile: swapStateFile, userRpc, assetId, nodeKey: node_key,
+          dt, requestedAmount: amount });
+        if (recovered) {
+          console.error(`[lsp] sub-asset SELL RECOVERED a settled result after a CLI failure (hash_h=${recovered.hash_h})`);
+          try { fs.unlinkSync(swapStateFile); } catch { /* best-effort */ }
+          return resolve(recovered);
+        }
+        // No real preimage -> the asset was NOT paid. Return the original failure unchanged; the
+        // maker refunds its BTC HTLC at T_btc and nothing is lost. The state file is left in place
+        // (harmless temp; pre-cleaned on the next same-nonce run).
         return resolve({ ok: false,
           error: (j && j.error) ? `sub-asset sell failed: ${j.error}` : (err ? `sub-asset sell failed: ${err.message}` : 'sub-asset sell did not settle'),
           detail: scrubDetail(out), settled_ms: dt });
@@ -1277,14 +1441,24 @@ function runMixed({ side, asset, amount, payRail, recvRail, node_key, asset_bolt
       // The preimage + on-chain outpoint are persisted to the session file. The on-chain
       // leg is the ASSET (seq_leg_txid) for xsubbuy/xsublift, or the BTC HTLC (btc_leg_txid)
       // for xsubas.
-      let preimage = null, htlcTxid = null;
+      let preimage = null, htlcTxid = null, hasFundedLeg = false;
       try {
         const st = JSON.parse(fs.readFileSync(stateFile, 'utf8'));
         preimage = st.preimage_hex || st.secret_hex || st.seq_preimage_hex || null;
         htlcTxid = st.seq_leg_txid || st.btc_leg_txid || null;
+        // A funded on-chain leg whose swap did NOT settle still needs the state file's
+        // private keys to reclaim after the timeout (seqob-cli xrefund -state-file …).
+        hasFundedLeg = !!(st.btc_leg_txid || st.seq_leg_txid || st.btc_funding_txid);
       } catch { /* file may be absent on early failure */ }
       const cm = out.match(/claimed the asset in ([0-9a-f]{64})/i);
-      try { fs.unlinkSync(stateFile); } catch { /* best-effort */ }
+      // FUND-SAFETY: delete the state file ONLY on settlement, or when it holds no funded
+      // leg (nothing to reclaim). Deleting it on a FAILURE with a funded HTLC destroyed the
+      // ONLY copy of the refund keys — permanent loss. Keep it + log the recovery handle.
+      if (settled || !hasFundedLeg) {
+        try { fs.unlinkSync(stateFile); } catch { /* best-effort */ }
+      } else {
+        console.error(`[router] KEEPING ${stateFile}: funded leg ${htlcTxid} did not settle; reclaim after timeout with: ${CFG.seqobCli} xrefund -state-file ${stateFile}`);
+      }
       const dt = Date.now() - t0;
       // PER-USER (device-preimage): the preimage is DEVICE-HELD and NEVER returned;
       // the settlement signal is `settled:true` (the device's node auto-settled its
@@ -1303,11 +1477,16 @@ function runMixed({ side, asset, amount, payRail, recvRail, node_key, asset_bolt
           : 'Mixed submarine swap: one leg on Lightning, one anchored on-chain. Anchor-bound to Bitcoin.',
         settled_ms: dt, requested_amount: amount ?? null,
       });
+      const fdetail = scrubDetail(out);
+      console.error(`[router] ${execName || 'mixed'} FAILED after ${dt}ms: ${err ? err.message : 'did not settle'}; tail: ${String(fdetail).trim().split('\n').filter(Boolean).slice(-3).join(' | ').slice(0, 500)}`);
       resolve({ ok: false, error: err ? `mixed swap failed: ${err.message}` : 'mixed swap did not settle',
-        detail: scrubDetail(out), settled_ms: dt });
+        detail: fdetail, settled_ms: dt });
     });
   });
 }
+
+// /rails probe cache: 10s per asset (4 relay fetches per miss).
+const _railsCache = new Map();
 
 function send(res, code, obj) {
   const body = JSON.stringify(obj);
@@ -1408,6 +1587,49 @@ const server = http.createServer(async (req, res) => {
     // is best-price rail-blind; the settlement router bridges the rails on take. The wallet reads
     // this instead of the two separate books. Each entry carries its raw offer so the wallet can
     // construct the take (cross HTLC or sub-asset LN) from the same payload.
+    // GET /rails?asset=<id> -> which BTC<->asset rails have LIVE resting liquidity for
+    // this asset, per side, so wallets can gate their rail toggles HONESTLY instead of
+    // offering a rail with no maker (the "mixed swap did not settle" class). Universal
+    // mapping: an offer with trade_dir SELL means the maker sells the asset => the USER
+    // can BUY on that rail; BUY => the user can SELL. Rail identity comes from the
+    // relay + the offer's settlement: :9955 BTC-leg = cross; :9965 lightning
+    // ln_direction 0/1 = submarine, 2/3 = pure-LN; :9966/:9971 = sub-asset.
+    if (req.method === 'GET' && url.pathname === '/rails') {
+      const assetId = resolveAsset(url.searchParams.get('asset'));
+      if (!assetId || assetId === CFG.btcx) return send(res, 400, { ok: false, error: '?asset=<sequentia asset id> is required (not BTC)' });
+      const now = Date.now();
+      const hit = _railsCache.get(assetId);
+      if (hit && now - hit.at < 10_000) return send(res, 200, hit.body);
+      const rails = { cross: { buy: false, sell: false }, submarine: { buy: false, sell: false },
+                      pureln: { buy: false, sell: false }, subasset: { buy: false, sell: false } };
+      const probe = async (relay, classify) => {
+        try {
+          const rr = await fetch(`${relay}/v1/market/${assetId}/BTC/orderbook`, { signal: AbortSignal.timeout(5000) });
+          if (!rr.ok) return;
+          for (const o of ((await rr.json()).offers || [])) {
+            const rail = classify(o);
+            if (!rail) continue;
+            const dir = String(o.trade_dir || o.tradeDir || '');
+            if (/SELL/.test(dir)) rails[rail].buy = true; else if (/BUY/.test(dir)) rails[rail].sell = true;
+          }
+        } catch { /* a down relay contributes no liquidity */ }
+      };
+      const lnRail = (o) => {
+        const lt = o.lightning || o.Lightning;
+        if (!lt) return null;
+        const d = Number(lt.ln_direction ?? lt.lnDirection ?? 0);
+        return d <= 1 ? 'submarine' : d <= 3 ? 'pureln' : 'subasset';
+      };
+      await Promise.all([
+        probe(CFG.crossRelay, (o) => ((o.want_asset ?? o.wantAsset) === 'BTC' || (o.offer_asset ?? o.offerAsset) === 'BTC') ? 'cross' : null),
+        probe(CFG.relay, lnRail),
+        CFG.subasRelay && CFG.subasRelay !== CFG.relay ? probe(CFG.subasRelay, lnRail) : null,
+        CFG.subasSellRelay && CFG.subasSellRelay !== CFG.relay ? probe(CFG.subasSellRelay, lnRail) : null,
+      ].filter(Boolean));
+      const body = { ok: true, asset: assetId, rails };
+      _railsCache.set(assetId, { at: now, body });
+      return send(res, 200, body);
+    }
     if (req.method === 'GET' && url.pathname === '/book/unified') {
       const assetId = resolveAsset(url.searchParams.get('asset'));
       if (!assetId || assetId === CFG.btcx) return send(res, 400, { ok: false, error: '?asset=<sequentia asset id> is required (not BTC)' });
@@ -1847,6 +2069,18 @@ const server = http.createServer(async (req, res) => {
         if (inflight) {
           r = await inflight;                              // a retry raced the original run -> await it, never launch a second
         } else {
+          // PRE-SPAWN RECOVERY GUARD (closes the double-EXECUTION windows): a same-nonce retry
+          // must NEVER re-pay an asset a prior attempt may already have paid (LSP death after pay
+          // before the store-write; or a maker that settled after our within-call poll gave up).
+          // If a prior attempt for this exact nonce left a state file, recover a settled result,
+          // HOLD if a pay is in-flight/unprovable, and only fall through to a fresh run when the
+          // node PROVES no pay for H ever left. No file (genuine first attempt) -> rerun.
+          if (nonce) {
+            const guard = await preSpawnGuardSubasSell(body);
+            if (guard.action === 'recover') { putSubasSellResult(nonce, guard.result); return send(res, 200, guard.result); }
+            if (guard.action === 'hold') { return send(res, 200, guard.result); }
+            // guard.action === 'rerun' -> a fresh run is safe; runMixed pre-cleans the stale file.
+          }
           const run = runMixed({ ...body, payRail, recvRail });
           if (nonce) subasSellInflight.set(nonce, run);
           try { r = await run; if (nonce && r && r.ok && r.settled) putSubasSellResult(nonce, r); }
