@@ -123,9 +123,22 @@ export function makeProvisioner(opts) {
     });
   }
 
+  // Serialize provision() so concurrent onboarding (e.g. the asset node + a chain:'btc' node POSTed
+  // in parallel) can never lost-update the registry or collide on a port slot: the load -> mutate ->
+  // save sequence has awaits in the middle (getinfo, bootNode), so two overlapping calls both read
+  // seq=N, both take idx=N (identical ports -> a half-booted EADDRINUSE node), and the later save drops
+  // the earlier call's nodes[key]. A one-at-a-time promise chain makes each operation atomic.
+  let _provQueue = Promise.resolve();
+  function provision(args) {
+    const run = _provQueue.then(() => provisionImpl(args));
+    _provQueue = run.then(() => {}, () => {});   // keep the chain alive regardless of this call's outcome
+    return run;
+  }
+
   // Provision (or return the existing) hosted node for `assetId`, keyed to the device's
-  // transport pubkey. Boots lightningd + the relay if not already running.
-  async function provision({ assetId, deviceTransportPubkey, label, chain = 'seq' }) {
+  // transport pubkey. Boots lightningd + the relay if not already running. Always invoked
+  // through the [provision] mutex above — never call this directly.
+  async function provisionImpl({ assetId, deviceTransportPubkey, label, chain = 'seq' }) {
     const chainCfg = CFG.chains[chain];
     if (!chainCfg) throw new Error(`unknown chain '${chain}' (want 'seq' or 'btc')`);
     if (!/^[0-9a-fA-F]{66}$/.test(deviceTransportPubkey || '')) throw new Error('deviceTransportPubkey must be a 33-byte compressed pubkey hex');

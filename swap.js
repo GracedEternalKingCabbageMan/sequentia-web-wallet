@@ -3388,10 +3388,15 @@ async function startMixed(params){
   if (_mixedStarting || hasMixedInFlight()){ try { C.toast && C.toast('A submarine swap is already in progress · finish or refund it first under Active trades.'); } catch {} return; }
   _mixedStarting = true;
   try {
-    MIXED = sub.newSwap(params); saveMixed();
+    MIXED = sub.newSwap(params);
+    // Idempotency key (fund-safety): the LSP dedupes a same-nonce re-POST to ONE submarine HTLC, so a
+    // lost /swap response + a retry (or a restart-then-resume) never funds a second on-chain leg. Persist
+    // it in the record and re-send the SAME value on any resume.
+    MIXED.swap_nonce = MIXED.swap_nonce || newSwapNonce();
+    saveMixed();
     showMixed(true); renderMixedSwap();
     const r = await L.swap({ side: params.side, asset: params.asset, amount: params.amount,
-      payRail: params.payRail, recvRail: params.recvRail });
+      payRail: params.payRail, recvRail: params.recvRail, swap_nonce: MIXED.swap_nonce });
     MIXED = sub.applyStatus(MIXED, r || {}); saveMixed();
     renderMixedSwap();
     if (!sub.isTerminal(MIXED)) pollMixed();

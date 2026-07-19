@@ -288,11 +288,21 @@ function persistJobs() {
 // Every mutation of `jobs` must go through these so the on-disk copy stays current.
 function setJob(id, job) { jobs.set(id, job); persistJobs(); return job; }
 
+// Nonce-keyed idempotency for the SYNCHRONOUS (0-conf) mixed path (the async path dedupes via `jobs`).
+// In-memory only: a completed 0-conf swap resolves in seconds, so surviving a restart is not needed
+// (an in-flight one would already have funded; a retry after a restart falls through to a fresh run,
+// which is the pre-existing behaviour for that narrow window).
+const mixedResult = new Map();   // nonce -> { ...result, ts }
+const mixedInflight = new Map(); // nonce -> Promise<result>
+
 function reapJobs() {
   const now = Date.now();
   let changed = false;
   for (const [id, j] of jobs) {
     if (j.done_ms && now - j.done_ms > JOB_TTL_MS) { jobs.delete(id); changed = true; }
+  }
+  for (const [nonce, r] of mixedResult) {
+    if (r.ts && now - r.ts > JOB_TTL_MS) mixedResult.delete(nonce);
   }
   if (changed) persistJobs();
 }
@@ -1696,6 +1706,13 @@ const server = http.createServer(async (req, res) => {
           }
         }
       }
+      // Sort each side BEST-FIRST so a taker's offers[0] is the best price, not a relay-random one
+      // (the relay serves offers in Go-map iteration order). A SELLER (dir-5 'sell' offers: user gives
+      // the asset, receives BTC) wants the HIGHEST sats/atom; a BUYER (dir-4 'buy': user pays BTC) the
+      // LOWEST. price_sats_per_atom is null only for a zero-amount offer (filtered above), so treat null
+      // as worst.
+      sell.sort((a, b) => (b.price_sats_per_atom ?? -Infinity) - (a.price_sats_per_atom ?? -Infinity));
+      buy.sort((a, b) => (a.price_sats_per_atom ?? Infinity) - (b.price_sats_per_atom ?? Infinity));
       return send(res, 200, { ok: true, asset: assetId, asset_label: assetLabel(assetId),
         sell_available: sell.length > 0, buy_available: buy.length > 0, sell_offers: sell, buy_offers: buy });
     }
@@ -2110,6 +2127,7 @@ const server = http.createServer(async (req, res) => {
         return send(res, r.ok ? 200 : 502, r);
       }
       reapJobs();
+      const mixNonce = (typeof body.swap_nonce === 'string' && body.swap_nonce.trim()) ? body.swap_nonce.trim() : '';
       // Under the 0-conf cap -> the submarine skips the anchor-bury wait, so the swap
       // is fast: answer SYNCHRONOUSLY with the preimage. Over the cap (or unknown
       // amount) -> the anchor gate takes many Bitcoin blocks, so run it in the
@@ -2117,13 +2135,44 @@ const server = http.createServer(async (req, res) => {
       const amt = Number(body.amount || 0);
       const under0conf = CFG.mixedMax0conf > 0 && amt > 0 && amt <= CFG.mixedMax0conf;
       if (under0conf) {
-        const r = await runMixed({ ...body, payRail, recvRail });
-        if (r.ok) { r.zero_conf = true; r.finality = 'confirming'; }
+        // Idempotency (fund-safety): a same-nonce retry (a lost 200 then a re-POST) must NOT fund a
+        // second submarine HTLC. Replay a completed run, or join an in-flight one, keyed by the nonce.
+        if (mixNonce) {
+          const hit = mixedResult.get(mixNonce);
+          if (hit) { const { ts, ...r } = hit; return send(res, r.ok ? 200 : 502, { ...r, idempotent_replay: true }); }
+          const inf = mixedInflight.get(mixNonce);
+          if (inf) { const r = await inf; return send(res, r && r.ok ? 200 : 502, r); }
+        }
+        let settle;
+        const slot = mixNonce ? new Promise((res2) => { settle = res2; }) : null;
+        if (mixNonce) mixedInflight.set(mixNonce, slot);
+        let r;
+        try {
+          r = await runMixed({ ...body, payRail, recvRail });
+          if (r.ok) { r.zero_conf = true; r.finality = 'confirming'; }
+          if (mixNonce) mixedResult.set(mixNonce, { ...r, ts: Date.now() });
+        } catch (e) {
+          r = { ok: false, error: 'mixed swap failed: ' + scrubDetail(String((e && e.message) || e)) };
+        } finally {
+          if (mixNonce) { settle(r); mixedInflight.delete(mixNonce); }
+        }
         return send(res, r.ok ? 200 : 502, r);
+      }
+      // Idempotency (fund-safety): a same-nonce re-POST — a lost 202 then a retry, or a restart-then-
+      // retry — must return the EXISTING job, never fund a SECOND on-chain HTLC from the hosted wallet.
+      // The nonce is persisted IN the job record, so the scan also matches an 'interrupted' job after a
+      // restart. (A missing nonce is an old client: no dedupe, exactly as before.)
+      if (mixNonce) {
+        for (const [jid, j] of jobs) {
+          if (j.swap_nonce === mixNonce) {
+            return send(res, 202, { ...j, job_id: jid, poll: '/swap/' + jid, idempotent_replay: true });
+          }
+        }
       }
       const jobId = crypto.randomUUID();
       const job = { job_id: jobId, status: 'confirming', side, asset: body.asset,
         rail: 'mixed', pay_rail: payRail, recv_rail: recvRail, finality: 'confirming',
+        ...(mixNonce ? { swap_nonce: mixNonce } : {}),   // idempotency key, persisted with the job
         requested_amount: body.amount ?? null, started_ms: Date.now() };
       setJob(jobId, job);   // persist on creation (a restart sees 'interrupted', not a 404)
       runMixed({ ...body, payRail, recvRail })
