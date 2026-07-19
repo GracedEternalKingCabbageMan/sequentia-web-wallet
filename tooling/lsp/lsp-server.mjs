@@ -117,7 +117,10 @@ const CFG = {
   crossRelay: process.env.SEQOB_RELAY_URL || 'http://127.0.0.1:9955',
   gold: reqEnv('GOLD'),
   btcx: process.env.BTCX || '', // empty => real BTC-LN (seqob-cli -btc-asset "")
-  swapTimeoutMs: Number(process.env.LSP_SWAP_TIMEOUT_MS || 150000),
+  // Must EXCEED the xpln CLI's own wait budget (terms-wait 60s + hold-wait 90s = 150s) plus a
+  // settle+print margin: at exactly 150s the execFile killed a swap that had just settled and the
+  // LSP reported "failed" for a completed swap. 180s = 150s CLI budget + 30s margin.
+  swapTimeoutMs: Number(process.env.LSP_SWAP_TIMEOUT_MS || 180000),
   // Mixed (submarine) rail: the on-chain asset leg needs a txindex Sequentia node.
   seqRpc: process.env.SEQ_RPC || '',
   seqWallet: process.env.SEQ_WALLET || '',
@@ -461,9 +464,11 @@ async function nodeStatus(rpc, leg) {
 async function status(deviceKeys = []) {
   // Aggregate BOTH hosted nodes: the asset (GOLD) node and the BTC node.
   // In one-node fallback mode both sockets are identical and return the same data.
+  // Per-node catch: a down/hung demo node must NOT fail the whole /status (which would blank the
+  // wallet's LN badge + balance for everyone). It drops to null; the response omits its channels.
   const [assetNode, btcNode] = await Promise.all([
-    nodeStatus(CFG.hostedAssetRpc, 'asset'),
-    nodeStatus(CFG.hostedBtcRpc, 'btc'),
+    nodeStatus(CFG.hostedAssetRpc, 'asset').catch(() => null),
+    nodeStatus(CFG.hostedBtcRpc, 'btc').catch(() => null),
   ]);
   // Include the REQUESTING DEVICE's OWN provisioned-node channels, so the wallet reads back its
   // LN balance right after a "Move to Lightning" (else a just-created channel on the user's own
@@ -503,7 +508,7 @@ async function status(deviceKeys = []) {
     asset_node: assetNode,
     btc_node: btcNode,
     provisioned_nodes: provNodes,                                       // the device's own nodes it named
-    channels: [...assetNode.channels, ...btcNode.channels, ...provChannels], // merged, leg-tagged (incl. the device's own)
+    channels: [...(assetNode?.channels || []), ...(btcNode?.channels || []), ...provChannels], // merged, leg-tagged; a down node contributes none
     // Which chains/assets "Move to Lightning" can fund on THIS LSP. SeqLN nodes are
     // single-asset, so each Sequentia asset needs its OWN hosted node; `assets` lists
     // the demo GOLD node PLUS every asset the provisioner has booted a node for, and
@@ -896,7 +901,7 @@ async function runSubasBuyHodl(job, body) {
   (async () => {
     while (watching) {
       try {
-        const l = await lnrpc('holdinvoicelookup', [job.payment_hash], userRpc);
+        const l = await lnrpc('holdinvoicelookup', [job.payment_hash], userRpc, SIGNER_RPC_TIMEOUT_MS);
         if (l.state === 'accepted' && !job.held) {
           job.held = true; job.held_ms = Date.now();
           if (job.status === 'pending') job.status = 'held';
@@ -1019,7 +1024,7 @@ async function closeChannel(body) {
     scid: ch.short_channel_id || null, destination: dest, asset_label: assetId ? assetLabel(assetId) : 'BTC' };
 }
 
-function runSwap({ side, asset, amount }) {
+function runSwap({ side, asset, amount, offer_id, maker_pubkey }) {
   return new Promise((resolve) => {
     const assetId = resolveAsset(asset);
     if (side !== 'buy' && side !== 'sell') return resolve({ ok: false, error: "side must be 'buy' or 'sell'" });
@@ -1030,6 +1035,11 @@ function runSwap({ side, asset, amount }) {
       '-asset-ln-socket', CFG.hostedAssetRpc, '-ln-socket', CFG.hostedBtcRpc,
       '-terms-wait', '60s', '-hold-wait', '90s',
     ];
+    // Lift the SPECIFIC offer the taker priced, not just the first match: xpln supports
+    // -offer-id/-maker-pubkey. Without them the composer showed a price for one offer while
+    // xpln filled a relay-arbitrary one (a worse-price surprise). Pass them through when given.
+    if (offer_id) args.push('-offer-id', String(offer_id));
+    if (maker_pubkey) args.push('-maker-pubkey', String(maker_pubkey));
     const t0 = Date.now();
     execFile(CFG.seqobCli, args, { timeout: CFG.swapTimeoutMs, maxBuffer: 8 << 20 }, (err, stdout, stderr) => {
       const out = (stdout || '') + (stderr || '');
@@ -1800,8 +1810,8 @@ const server = http.createServer(async (req, res) => {
         if (H) {
           // HODL: register H to be HELD (holdinvoice-seq creates NO bolt11 — the maker pays the
           // hash directly via sendpay to this node id). The DEVICE holds P; settle via /node/settle.
-          inv = await lnrpc('holdinvoice', [H, amtMsat, label, 'asset buy (HODL)'], rec.rpc);
-          const ni = await lnrpc('getinfo', [], rec.rpc).catch(() => ({}));
+          inv = await lnrpc('holdinvoice', [H, amtMsat, label, 'asset buy (HODL)'], rec.rpc, SIGNER_RPC_TIMEOUT_MS);
+          const ni = await lnrpc('getinfo', [], rec.rpc, SIGNER_RPC_TIMEOUT_MS).catch(() => ({}));
           return send(res, 200, { ok: true, bolt11: null, payment_hash: H, hodl: true, node_id: ni.id || rec.node_id || null, amount_msat: Number(amtMsat) });
         } else {
           // NORMAL invoice. Use keyword args so the optional `preimage` can be set without
@@ -1827,7 +1837,7 @@ const server = http.createServer(async (req, res) => {
       const rec = PROV.getByKey(nodeKey);
       if (!rec || !rec.rpc) return send(res, 404, { ok: false, error: 'unknown node key' });
       try {
-        const l = await lnrpc('holdinvoicelookup', [H], rec.rpc);
+        const l = await lnrpc('holdinvoicelookup', [H], rec.rpc, SIGNER_RPC_TIMEOUT_MS);
         return send(res, 200, { ok: true, state: l.state,
           held: l.state === 'accepted', settled: l.state === 'settled' });
       } catch (e) { return send(res, 502, { ok: false, error: `lookup: ${e.message}` }); }
@@ -1847,7 +1857,7 @@ const server = http.createServer(async (req, res) => {
       const rec = PROV.getByKey(nodeKey);
       if (!rec || !rec.rpc) return send(res, 404, { ok: false, error: 'unknown node key' });
       try {
-        await lnrpc('holdinvoicesettle', [H, P], rec.rpc);
+        await lnrpc('holdinvoicesettle', [H, P], rec.rpc, SIGNER_RPC_TIMEOUT_MS);
         return send(res, 200, { ok: true, settled: true });
       } catch (e) {
         return send(res, 502, { ok: false, error: `settle: ${e.message}` });
