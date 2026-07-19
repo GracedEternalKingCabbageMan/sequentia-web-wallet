@@ -3112,8 +3112,32 @@ export async function resumeSell(){
   // (A) Asset paid + response received: SELL holds the preimage + HTLC -> re-attempt the on-chain
   //     claim (the FUND step). The original recovery path, unchanged.
   if (SELL.state === 'claiming' && SELL.preimage && SELL.btc_htlc){
-    try { await claimSell(); try { C.toast && C.toast('Recovered your sell · BTC claimed on-chain (' + String(SELL.claim_txid||'').slice(0,16) + '…).'); } catch {} try { await C.sync(); } catch {} clearSell(); }
-    catch (e){ /* leave persisted; the HTLC may already be claimed, or needs a retry — surfaced when the user re-enters Swap */ }
+    try {
+      await claimSell();
+      try { C.toast && C.toast('Recovered your sell · BTC claimed on-chain (' + String(SELL.claim_txid||'').slice(0,16) + '…).'); } catch {}
+      try { await C.sync(); } catch {}
+      clearSell();
+    } catch (e){
+      // The claim failed. Record WHY (so the Active-trades row can SHOW it instead of a silent
+      // 'claiming' spinner), and decide whether it's terminal: if the HTLC outpoint is already SPENT
+      // on-chain (the maker reclaimed it after its CLTV — the classic "wallet stayed closed too long"
+      // case), the claim can NEVER succeed, so mark it terminal so it STOPS wedging every future sell.
+      // Otherwise keep 'claiming' for a Retry (transient, or the timelock not yet mature).
+      SELL.error = C.prettyErr(e); saveSell();
+      try {
+        const H = SELL.btc_htlc;
+        if (H && H.txid != null && H.vout != null && C.btcLeg && C.btcLeg.outspend){
+          const os = await C.btcLeg.outspend(H.txid, H.vout);
+          if (os.known && os.spent){
+            SELL.state = 'failed';
+            SELL.error = 'The Bitcoin HTLC was already resolved on-chain — either your claim confirmed, or the maker reclaimed it after the timeout. Your balance is up to date; you can clear this.';
+            saveSell();
+            try { await C.sync(); } catch {}
+          }
+        }
+      } catch { /* spend-check best-effort; leave as retryable */ }
+      try { renderInFlightCard(); } catch {}   // surface the error + a Retry/Clear off-ramp
+    }
     return;
   }
   // (B) Asset MAY have been paid but the /swap response was LOST (a network blip after the LSP
@@ -4295,9 +4319,18 @@ function renderInFlightCard(){
   // synchronous _sellStarting/_buyStarting sentinel DURING the pre-fund prologue, before SELL/BUY is
   // assigned — a bare predicate check here would deref null. The prologue has nothing to show in this
   // card anyway (the progress modal covers it); the row appears once the record exists.
-  if (SELL && hasSellInFlight()){
-    rows.push({ view: null, need: true, title: 'Sell ' + esc(SELL.ticker) + ' for BTC',
-      status: 'claiming your BTC on-chain (automatic)' });
+  // Show the sell row while it is genuinely in flight, AND when it has stopped with an error — a
+  // terminal 'failed' (the maker reclaimed the BTC) or a transient claim error. Without this a stuck
+  // sell either silently wedged the rail (old bug: 'claiming' forever, no message) or, once terminal,
+  // vanished with no explanation. A failed sell offers Clear (safe: the HTLC is resolved on-chain); a
+  // transient one offers Retry.
+  if (SELL && (hasSellInFlight() || SELL.state === 'failed' || SELL.error)){
+    const failed = SELL.state === 'failed';
+    const status = failed
+      ? (SELL.error || 'This sell could not be completed.')
+      : (SELL.error ? (SELL.error + ' · will retry') : 'claiming your BTC on-chain (automatic)');
+    rows.push({ view: null, need: !failed, title: 'Sell ' + esc(SELL.ticker) + ' for BTC',
+      status, action: failed ? 'clear-sell' : (SELL.error ? 'retry-sell' : null) });
   }
   if (BUY && hasBuyInFlight()){
     rows.push({ view: null, need: true, title: 'Buy ' + esc(BUY.ticker || 'asset') + ' with BTC',
@@ -4317,7 +4350,10 @@ function renderInFlightCard(){
         <span class="lbl">Active trades</span><span class="sub">running in the background · reopen anytime</span></div>`
       + rows.map(r => `<div class="swbook-row${r.need ? ' needsact' : ''}">
           <span class="mono">${r.title} · ${esc(r.status)}${r.need ? ' <b class="actneed">action may be needed</b>' : ''}</span>
-          ${r.view ? `<button type="button" class="ghost swviewtrade" data-view="${r.view}">View</button>` : '<span class="sub">automatic</span>'}
+          ${r.view ? `<button type="button" class="ghost swviewtrade" data-view="${r.view}">View</button>`
+            : r.action === 'clear-sell' ? `<button type="button" class="ghost swclearsell">Clear</button>`
+            : r.action === 'retry-sell' ? `<button type="button" class="ghost swretrysell">Retry</button>`
+            : '<span class="sub">automatic</span>'}
         </div>`).join('')
       + `</div>`;
   }
@@ -4330,6 +4366,16 @@ function renderInFlightCard(){
       + `</div>`;
   }
   host.innerHTML = html;
+  // Clear a terminally-failed sub-asset sell: its BTC HTLC is already resolved on-chain, so removing
+  // the record loses no funds and unblocks the sell rail. Retry re-drives resumeSell for a transient one.
+  host.querySelectorAll('.swclearsell').forEach(b => b.onclick = () => {
+    clearSell(); try { renderInFlightCard(); } catch {} try { updateRails(); } catch {}
+  });
+  host.querySelectorAll('.swretrysell').forEach(b => b.onclick = async () => {
+    b.disabled = true; b.textContent = 'Retrying…';
+    try { SELL && (SELL.error = null, saveSell()); await resumeSell(); } catch {}
+    try { renderInFlightCard(); } catch {}
+  });
   host.querySelectorAll('.swviewtrade').forEach(b => b.onclick = () => {
     const v = b.dataset.view; _dismissed.delete(v);
     if (v === 'mixed'){ showMixed(true); renderMixedSwap(); }

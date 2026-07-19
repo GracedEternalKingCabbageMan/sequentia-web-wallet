@@ -1698,6 +1698,17 @@ const btcLeg = {
     if(vout<0) throw new Error('maker BTC leg output not found in '+String(txid).slice(0,18)+'…');
     return { vout, value, confirmed: !!(tx.status && tx.status.confirmed), height: tx.status && tx.status.block_height };
   },
+  // Is an HTLC outpoint already spent (e.g. the counterparty refunded it after CLTV)? Returns
+  // { spent, by }: `by` is the spending txid when known. Used to terminalise a sub-asset sell whose
+  // BTC the maker reclaimed, so it stops wedging the rail. Best-effort: treats an error as unknown.
+  async outspend(txid, vout){
+    try {
+      const r = await fetch(`${T4_API}/tx/${txid}/outspend/${vout}`);
+      if(!r.ok) return { spent:false, by:null, known:false };
+      const os = await r.json();
+      return { spent: !!(os && os.spent), by: (os && os.txid) || null, known:true };
+    } catch { return { spent:false, by:null, known:false }; }
+  },
   // Claim the maker's BTC leg via the IF branch, revealing the preimage:
   // scriptSig <sig> <preimage> OP_1 <redeemScript>, to a fresh wallet address.
   async claim({ txid, vout, amount, redeem_script, preimage }){
