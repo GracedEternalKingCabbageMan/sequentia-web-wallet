@@ -279,9 +279,15 @@ function bestForwardOffer(fwd, wantAtoms){
     wa: big(pick(o, 'want_amount', 'wantAmount')),
     v: !!o._verified,
   })).filter(x => x.ba > 0n && x.wa > 0n);
-  const covering = withAmt.filter(x => x.ba >= wantAtoms).sort((a, b) => (a.ba < b.ba ? -1 : a.ba > b.ba ? 1 : 0));
+  // Price = BTC(wa) per asset(ba); a BUYER wants the LOWEST. Compare a vs b as wa_a/ba_a ? wa_b/ba_b
+  // via the integer cross-product wa_a*ba_b ? wa_b*ba_a (no float). Among offers that COVER the wanted
+  // size, cheapest first, tiebreak smallest (least overshoot on a whole-HTLC lift). Selecting by size
+  // alone (the old behaviour) routed takers to a materially worse-priced offer.
+  const priceCmp = (a, b) => { const l = a.wa * b.ba, r = b.wa * a.ba; return l < r ? -1 : l > r ? 1 : (a.ba < b.ba ? -1 : a.ba > b.ba ? 1 : 0); };
+  const covering = withAmt.filter(x => x.ba >= wantAtoms).sort(priceCmp);
   if (covering.length) return covering[0];
-  return withAmt.sort((a, b) => (a.ba > b.ba ? -1 : a.ba < b.ba ? 1 : 0))[0];
+  // Nothing covers the full size: take the largest available (fills against resting size), cheapest tiebreak.
+  return withAmt.sort((a, b) => (a.ba > b.ba ? -1 : a.ba < b.ba ? 1 : priceCmp(a, b)))[0];
 }
 // A cross offer whose direction is ASSET_TO_BTC (taker SELLS the asset for BTC).
 function isReverseCrossOffer(o){
