@@ -378,15 +378,38 @@ async function postJSON(path, body){
 // opts.confidential requests the BLINDED book namespace (a distinct order set the
 // relay keeps segregated from the transparent book); the default (omitted/false)
 // is the transparent book, byte-identical to the live route.
+// The relay marshals with protojson (server.go), which encodes proto `bytes` as BASE64. A
+// CovenantTerms offer's byte fields (maker_prog, maker_x, internal_key, merkle_path) therefore
+// arrive base64, but the wallet's canonical encoding (encodeCovenantTerms) hexToBytes()es them —
+// so a relay-served covenant offer's signature NEVER verified (base64 decoded as hex). Convert
+// those fields back to the wallet's hex convention at the fetch boundary. Scoped to covenant
+// offers; cross/same-chain string fields and the base64 maker_sig are untouched.
+function b64ToHex(s){
+  if (typeof s !== 'string' || !s) return s;
+  try { const b = b64decode(s); return [...b].map(x => x.toString(16).padStart(2, '0')).join(''); }
+  catch { return s; }
+}
+function normRelayOffer(o){
+  const cov = o && (o.covenant || o.Covenant);
+  if (cov){
+    for (const k of ['maker_prog', 'makerProg', 'maker_x', 'makerX', 'internal_key', 'internalKey']){
+      if (cov[k] != null) cov[k] = b64ToHex(cov[k]);
+    }
+    for (const k of ['merkle_path', 'merklePath']){
+      if (Array.isArray(cov[k])) cov[k] = cov[k].map(b64ToHex);
+    }
+  }
+  return o;
+}
 export async function fetchBook(baseAsset, quoteAsset, opts){
   const q = (opts && opts.confidential) ? '?confidential=1' : '';
   const j = await getJSON(`/v1/market/${baseAsset}/${quoteAsset}/orderbook${q}`);
-  const offers = (j.offers || j.Offers || []).map(o => ({ ...o, _verified: verifyOffer(o) }));
+  const offers = (j.offers || j.Offers || []).map(o => { normRelayOffer(o); return { ...o, _verified: verifyOffer(o) }; });
   return { pair: j.pair || { base_asset: baseAsset, quote_asset: quoteAsset }, offers };
 }
 export async function fetchMyOrders(makerPubkey){
   const j = await getJSON(`/v1/offers?maker_pubkey=${encodeURIComponent(makerPubkey)}`);
-  return j.offers || j.Offers || [];
+  return (j.offers || j.Offers || []).map(normRelayOffer);
 }
 export async function postOffer(offer){ return postJSON('/v1/offers', offer); }
 export async function cancelOffer(cancel){ return postJSON('/v1/offers/cancel', cancel); }
