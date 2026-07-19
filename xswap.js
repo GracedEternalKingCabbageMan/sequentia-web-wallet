@@ -1259,8 +1259,14 @@ async function resumeFunding(){
   if (leg && leg.txid && leg.vout == null){
     try {
       const f = await C.btcLeg.findFunding(leg.txid, SWAP.btc_redeem_script);
-      SWAP.btc_leg = { ...leg, vout: f.vout, height: f.height || 0, amount: big(f.value || leg.amount) };
-      saveSwap(); renderStepper();
+      // Only advance the leg to usable once it is CONFIRMED with a real height. Recording an
+      // unconfirmed leg as height 0 let a later anchor-ordering check ("SEQ leg anchored at/above
+      // the BTC leg") pass against height 0 — treating an unconfirmed leg as deeply buried. If it
+      // is found but unconfirmed, keep vout null so the next reload retries; it stays refundable.
+      if (f && f.confirmed && f.height > 0){
+        SWAP.btc_leg = { ...leg, vout: f.vout, height: f.height, amount: big(f.value || leg.amount) };
+        saveSwap(); renderStepper();
+      }
     } catch { /* not indexed yet — the leg is still refundable after T_btc; a later reload retries */ }
   } else if (!leg){
     clearSwap(); renderStepper();   // pre-broadcast stub that never funded — safe to drop (no BTC locked)
