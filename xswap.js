@@ -671,6 +671,65 @@ async function resumeAnchorClaim(){
   finally { _resumeClaiming = false; }
 }
 
+// Resume hook: a courier forward BUY persisted at PENDING with a CONFIRMED BTC leg but NO asset leg —
+// the reload cut the WS session between the BTC lock and the maker's SeqLegLocked. There is NO
+// re-announce path: the courier maker mints FRESH per-session keys (xdriver.go RunMakerForward), so a
+// reconnecting taker's leg (encoding the OLD maker key) is rejected btc_leg_invalid. Recovery is purely
+// on-chain and session-independent:
+//   TIER 2 (fund-optimal): the maker MAY have locked the asset before the cut. Its HTLC is a plain
+//     P2SH we reconstruct from persisted terms and FIND by address on the Sequentia esplora — no maker
+//     needed. Found -> promote to SEQ_LOCKED and let resumeAnchorClaim finish it.
+//   TIER 1 (honest): no asset locked -> the swap cannot complete; the BTC is safe and refunds at T_btc.
+//     Say so plainly (SWAP.stranded) instead of a stepper that implies the maker is still "locking now".
+let _resumeStranded = false;
+async function resumeCourierStranded(){
+  if (_resumeStranded) return;
+  if (!SWAP || !SWAP.courier || SWAP.state !== ST.PENDING) return;
+  const leg = SWAP.btc_leg;
+  if (!(leg && leg.txid && leg.vout != null && Number(leg.height) > 0)) return;  // not confirmed yet -> resumeFunding owns it
+  if (SWAP.seq_leg) return;                                                       // already have the asset leg
+  // Need the full terms to rebuild the maker's asset HTLC. A pre-handshake stub (locked BTC but never
+  // reached Terms) lacks them — it is refund-only, handled by the honest branch below.
+  const haveTerms = !!(SWAP.hash_hex && SWAP.seq_claim_pub && SWAP.maker_seq_refund_pub && SWAP.seq_locktime);
+  _resumeStranded = true;
+  try {
+    if (haveTerms && C.seqLeg && C.seqLeg.htlcAddress && C.wasm && C.wasm.buildSeqHtlcRedeemScript){
+      const redeem = C.wasm.buildSeqHtlcRedeemScript(SWAP.hash_hex, SWAP.seq_claim_pub, SWAP.maker_seq_refund_pub, SWAP.seq_locktime);
+      let addr = null;
+      try { addr = C.seqLeg.htlcAddress(redeem); } catch {}
+      const want = SWAP.market && SWAP.market.seq_asset;
+      if (addr){
+        let utxos = [];
+        try {
+          const base = (C.SEQ_ESPLORA || '');
+          utxos = await fetch(base + '/address/' + addr + '/utxo', { signal: AbortSignal.timeout(8000) }).then(r => r.ok ? r.json() : []);
+        } catch { /* esplora unreachable -> retry next reload; stays PENDING + refundable */ }
+        // The maker's asset HTLC: an explicit (unblinded) output of the agreed asset, >= the agreed size.
+        const hit = (utxos || []).find(u => {
+          try { return (!want || u.asset === want) && BigInt(String(u.value || 0)) >= BigInt(String(SWAP.seq_amount || 0)); }
+          catch { return false; }
+        });
+        if (hit){
+          SWAP.seq_leg = normCourierSeqLeg({ txid: hit.txid, vout: hit.vout, amount: String(hit.value),
+            asset: hit.asset || want, redeem_script: redeem,
+            block_hash: (hit.status && hit.status.block_hash) || '', anchor_height: -1 });
+          SWAP.state = ST.SEQ_LOCKED; SWAP.stranded = false; saveSwap(); renderStepper();
+          await resumeAnchorClaim();     // verifyLeg + verifyAnchor + claimSeq (session-independent)
+          return;
+        }
+      }
+    }
+    // No asset leg found: the swap can no longer complete with the maker. Mark it so the stepper stops
+    // implying progress, and point at the refund. The BTC HTLC stays reclaimable after T_btc.
+    SWAP.stranded = true;
+    SWAP.detail = 'Interrupted after your Bitcoin was locked; the maker did not lock the asset.';
+    saveSwap(); renderStepper();
+    if (C.$('xswapErr')) C.$('xswapErr').textContent =
+      'This swap was interrupted after your Bitcoin was locked and can no longer complete with the maker. Your BTC is safe and refunds at block ' + SWAP.btc_locktime + '.';
+  } catch { /* transient (esplora/tip); a later reload retries the recovery */ }
+  finally { _resumeStranded = false; }
+}
+
 export async function renderXswap(){
   const { $ } = C;
   if (!C.wollet) return;
@@ -694,8 +753,13 @@ export async function renderXswap(){
   // A reloaded forward buy stuck at the anchor gate finishes on its own (session-independent).
   resumeAnchorClaim();
   // A BTC funding interrupted between broadcast and confirmation: recover the outpoint (or clear a stub
-  // that never broadcast) so the wizard never strands the user or lies about what was spent.
-  resumeFunding();
+  // that never broadcast) so the wizard never strands the user or lies about what was spent. AWAIT it
+  // so the leg is confirmed BEFORE the stranded-courier recovery reads its height (else that recovery
+  // sees an unconfirmed leg and defers a whole reload).
+  await resumeFunding();
+  // A courier swap cut between the BTC lock and the maker's asset lock: recover the asset on-chain if
+  // the maker locked it, else honestly mark it refund-only (no re-announce path exists — fresh keys).
+  await resumeCourierStranded();
 }
 
 function marketLabel(m){
@@ -1464,10 +1528,15 @@ function stepLockCard(){
 }
 function stepProposeCard(){
   const done = !!(SWAP.swap_id);
-  const active = !done && !!(SWAP.btc_leg && SWAP.btc_leg.txid && SWAP.btc_leg.vout != null) && SWAP.state !== ST.FAILED;
-  const body = [ C.el('div','sub','The maker verifies your BTC leg, then locks the Sequentia leg in an anchored Sequentia block.') ];
+  // A stranded courier swap (BTC locked, maker session gone, no asset leg, no re-announce path) is NOT
+  // "active" — showing "Now" implied the maker was still locking. It is refund-only; render it as such.
+  const active = !done && !SWAP.stranded && !!(SWAP.btc_leg && SWAP.btc_leg.txid && SWAP.btc_leg.vout != null) && SWAP.state !== ST.FAILED;
+  const body = SWAP.stranded
+    ? [ C.el('div','sub','This swap was interrupted after your Bitcoin lock and can no longer complete with the maker.') ]
+    : [ C.el('div','sub','The maker verifies your BTC leg, then locks the Sequentia leg in an anchored Sequentia block.') ];
   if (done && SWAP.swap_id && !SWAP.courier) body.push(kvRowCopy('Swap id', SWAP.swap_id));
   if (SWAP.seq_leg && SWAP.seq_leg.txid) body.push(kvRowHtml('Sequentia lock tx', txLink(SWAP.seq_leg.txid, false)));
+  if (SWAP.stranded) body.push(errLine('Your BTC is safe and refunds at block ' + SWAP.btc_locktime + '.'));
   if (SWAP.state === ST.FAILED) body.push(errLine(SWAP.detail || 'propose failed'));
   const c = stepCard(2, SWAP.courier ? 'Maker locks the asset' : 'Propose to maker', done, active, body);
   // Courier swaps advance automatically (no manual propose); the RFQ path keeps

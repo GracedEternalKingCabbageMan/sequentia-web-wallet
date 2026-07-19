@@ -1990,15 +1990,27 @@ async function requoteCross(route, amtStr){
     const remSeq = split ? split.rest : 0n;
     const hasRemainder = remSeq > 0n;
     const remBtc = hasRemainder ? (remSeq * bestBtc) / bestAsset : 0n;
+    // Courier lifts the chosen offer WHOLE (no partial fill): when its size EXCEEDS the request there
+    // is no "rests" remainder — the taker simply takes MORE than they typed, and locks the offer's
+    // larger BTC. Carry that so the paint, the affordability gate, and Review all use the REAL
+    // committed amounts, not the smaller request (mirrors the pure-LN whole-offer note). The courier
+    // quote's fee_btc is 0 because the maker sets the lift fee at claim time, not a genuine zero.
+    const wholeOffer = !!rawXq.courier;
+    const offerSeqAtoms = big(rawXq.seq_amount), offerBtcAtoms = big(rawXq.btc_amount);
+    const overshoot = wholeOffer && offerSeqAtoms > reqSeqAtoms;
     LAST_QUOTE = { kind:'cross', reverse: !route.payIsBtc, route, xq: rawXq, seqAsset,
       requestedSeqAtoms: reqSeqAtoms, requestedBtcAtoms: reqBtcAtoms, fillSeqAtoms: fillSeq,
-      remainderSeqAtoms: hasRemainder ? remSeq : 0n, remainderBtcAtoms: remBtc };
+      remainderSeqAtoms: hasRemainder ? remSeq : 0n, remainderBtcAtoms: remBtc,
+      wholeOffer, overshoot, offerSeqAtoms: String(offerSeqAtoms), offerBtcAtoms: String(offerBtcAtoms) };
     status.textContent = '';
     paintQuoteCross();
     // AFFORDABILITY (C4): the cross take funds the fill now AND rests the remainder, so the FULL
     // requested pay amount is committed — gate Review on it, like the same-chain path, instead of
-    // letting the user start a swap they can't fund.
-    const _payAtoms = route.payIsBtc ? reqBtcAtoms : reqSeqAtoms;
+    // letting the user start a swap they can't fund. For a whole-offer overshoot the real commit is the
+    // OFFER's size, which is larger than the request, so gate on THAT (else a user who can afford their
+    // typed amount but not the whole offer passes Review and fails at funding).
+    const _payAtoms = overshoot ? (route.payIsBtc ? offerBtcAtoms : offerSeqAtoms)
+                                : (route.payIsBtc ? reqBtcAtoms : reqSeqAtoms);
     const _payBal   = balAtoms(route.payIsBtc ? 'BTC' : seqAsset);
     // Paying BTC funds an on-chain HTLC whose funding tx also needs a Bitcoin miner fee on top of the
     // locked amount, so reserve a little headroom (the exact fee is computed at btcBuildTx). Without it a
@@ -2142,9 +2154,13 @@ function renderLadder(host, o){
 function paintQuoteCross(){
   const { $ } = C; const q = LAST_QUOTE; if (!q || q.kind !== 'cross') return;
   const sm = C.assetMeta(q.seqAsset);
-  // Show the user's FULL requested amount (never the fillable sliver): the order they typed.
-  const reqSeq = q.requestedSeqAtoms != null ? BigInt(q.requestedSeqAtoms) : big(q.xq.seq_amount);
-  const reqBtc = q.requestedBtcAtoms != null ? BigInt(q.requestedBtcAtoms) : big(q.xq.btc_amount);
+  // Show the user's FULL requested amount (never the fillable sliver): the order they typed. EXCEPT a
+  // courier whole-offer overshoot, where the lift takes the OFFER's larger size — show THAT (the real
+  // commit), not the smaller request, so the panes match what actually locks.
+  const reqSeq = q.overshoot ? BigInt(q.offerSeqAtoms)
+                             : (q.requestedSeqAtoms != null ? BigInt(q.requestedSeqAtoms) : big(q.xq.seq_amount));
+  const reqBtc = q.overshoot ? BigInt(q.offerBtcAtoms)
+                             : (q.requestedBtcAtoms != null ? BigInt(q.requestedBtcAtoms) : big(q.xq.btc_amount));
   const seqStr = C.fmtAtoms(reqSeq, sm.precision);
   const btcStr = C.fmtAtoms(reqBtc, 8);
   // Map BTC<->asset onto pay/receive panes (whichever the user has on each side).
@@ -2168,9 +2184,20 @@ function paintQuoteCross(){
     const restU = Number(rem) / Math.pow(10, sm.precision || 0);
     line += ` · fills ~${trim(fillU)} ${sm.ticker} now, ~${trim(restU)} rests`;
   }
+  // Whole-offer overshoot: the courier lifts this offer IN FULL (no partial fill on the cross rail), so
+  // it takes more than the user typed. Say so plainly in the composer's info line — the same honesty the
+  // pure-LN rail's Review note gives — rather than surfacing the larger amount only in the final modal.
+  if (q.overshoot){
+    const reqU = Number(BigInt(q.requestedSeqAtoms)) / Math.pow(10, sm.precision || 0);
+    line += ` · ⚠ fills whole: takes ${trim(Number(reqSeq) / Math.pow(10, sm.precision || 0))} ${sm.ticker} for ${btcStr} BTC (more than the ${trim(reqU)} you entered · partial fills aren't possible here)`;
+  }
   $('swRate').textContent = line;
-  // Cross-chain "fee" is the maker fee in BTC (no open fee-asset market on the BTC leg).
-  paintFee('BTC', q.xq.fee_btc, 'Maker fee, paid in BTC on the parent chain.');
+  // Cross-chain "fee" is the maker fee in BTC (no open fee-asset market on the BTC leg). The courier
+  // quote does not know it up front (the maker sets it at lift), so never show a misleading "0 BTC".
+  if (q.wholeOffer && (!q.xq.fee_btc || big(q.xq.fee_btc) === 0n))
+    paintFee('BTC', null, 'Maker fee set at lift · added to the BTC you lock on the parent chain.');
+  else
+    paintFee('BTC', q.xq.fee_btc, 'Maker fee, paid in BTC on the parent chain.');
   setFinality('cross');
 }
 
