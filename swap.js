@@ -389,27 +389,11 @@ export async function renderSwap(){
   if (!hasMixedInFlight()) _dismissed.delete('mixed');
   if (!(X && X.hasInFlight && X.hasInFlight())) _dismissed.delete('cross');
   if (!(X && X.hasReverseInFlight && X.hasReverseInFlight())) _dismissed.delete('reverse');
-  // A persisted mixed-rail (submarine) swap owns the tab until it is terminal or
-  // dismissed: its on-chain HTLC leg is recoverable only via the Refund off-ramp, so
-  // the trade-process view (not the composer) must show on entry — including after a reload.
-  if (hasMixedInFlight() && !_dismissed.has('mixed')){
-    showMixed(true); renderMixedSwap();
-    return;
-  }
-  // If a cross-chain swap is already in flight, jump straight to its stepper —
-  // the composer's single entry point also resumes an interrupted BTC swap. Two
-  // directions, two wizards: forward (pay BTC, get asset) and reverse (sell asset).
-  // Skipped if the user DISMISSED it this session — the Active-trades card reopens it.
-  if (X && X.hasInFlight && X.hasInFlight() && !_dismissed.has('cross')){
-    showCross(true);
-    X.renderXswap();
-    return;
-  }
-  if (X && X.hasReverseInFlight && X.hasReverseInFlight() && !_dismissed.has('reverse')){
-    showReverse(true);
-    X.renderReverse();
-    return;
-  }
+  // In-flight swaps NEVER hijack the tab (spec §7): the composer stays up and every in-flight/pending
+  // trade lives in the COMPACT "Active trades" card (renderInFlightCard) beside it, so you keep trading
+  // while they settle — essential for rapid/HFT use. The full-screen stepper is opt-in: the card's
+  // "View" button reopens it for detail or a refund off-ramp. (This replaces the old auto-takeover that
+  // jumped into a mixed/cross/reverse stepper on entry and owned the whole tab.)
   showCross(false); showReverse(false); showMixed(false);
   const _bh = C.$('swBook'); if (_bh) _bh.innerHTML = '';   // cleared; requote re-renders for the selected pair
   renderInFlightCard();   // any dismissed / background in-flight trade, reopenable
