@@ -176,6 +176,12 @@ const S = {
   // the two amounts are independent, their ratio is the price. Always available on every
   // pair (spec §4/§6.3). Default MARKET; the toggle never disappears.
   mode: 'take',
+  // KEEP RESTING WHILE OFFLINE (spec §5 / SBTC design §5). Relevant ONLY for an on-chain-BTC-pay
+  // LIMIT order: ON -> silently peg the maker's BTC to SBTC and rest it in a covenant (survives
+  // the wallet going offline), peg back out to real BTC on fill; OFF -> a native-BTC HTLC (needs
+  // the wallet online). Default ON. Market orders and any Lightning leg IGNORE this — pure native
+  // BTC. The placement path reads keepResting only when payingBtcOnChain(route) && S.mode==='post'.
+  keepResting: true,
 };
 let INSTANT = {};    // ticker -> { spendable, receivable } atoms (best-effort from the LSP /status)
 let LAST_MID = null; // { price, cross, base, quote } for the current pair — feeds the pair bar + cost line
@@ -744,6 +750,7 @@ function paintPanes(){
   paintModeSeg();
   paintBookSeg();
   paintConfControl();
+  paintOfflineToggle();
   // One CTA. When a pair is chosen but the settlement rails aren't both set, the CTA prompts for them
   // (and setReviewEnabled keeps it disabled) — no order can be placed on an unstated settlement choice.
   const cta = $('swReview');
@@ -769,6 +776,29 @@ function paintConfControl(){
   const wizardOwns = !!(comp && comp.classList.contains('hide'));
   const hide = wizardOwns || !S.receiveAsset || S.receiveAsset === 'BTC' || isConfBook() || recvOverLn;
   wrap.style.display = hide ? 'none' : 'flex';
+}
+
+// TRUE when the user is PAYING real Bitcoin ON-CHAIN (as opposed to over Lightning, or paying a
+// Sequentia asset). The "keep resting while offline" peg is relevant ONLY for this pay leg.
+function payingBtcOnChain(){ return S.payAsset === 'BTC' && S.payRail === 'chain'; }
+
+// The "Keep resting while offline" opt-out (spec §5, SBTC design §5). It is the ONE place SBTC
+// touches the DEX, and it appears in exactly one situation: paying on-chain BTC AND a LIMIT
+// (resting) order. In every other case (market orders, any Lightning leg, or paying an asset) it
+// is HIDDEN and irrelevant — those are pure native BTC. Default ON; the placement path reads
+// S.keepResting only when payingBtcOnChain() && S.mode === 'post'.
+function paintOfflineToggle(){
+  const wrap = C.$('swOfflineWrap'); if (!wrap) return;
+  const comp = C.$('swComposer');
+  const wizardOwns = !!(comp && comp.classList.contains('hide'));
+  const show = !wizardOwns && payingBtcOnChain() && S.mode === 'post';
+  wrap.style.display = show ? 'flex' : 'none';
+  if (!show) return;
+  const chk = C.$('swOfflineChk');
+  if (chk){
+    chk.checked = !!S.keepResting;
+    if (!chk._wired){ chk._wired = true; chk.onchange = () => { S.keepResting = !!chk.checked; }; }
+  }
 }
 
 // --- Unblinded / Blinded book toggle -------------------------------------------

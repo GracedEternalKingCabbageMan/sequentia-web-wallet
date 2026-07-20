@@ -630,6 +630,18 @@
                 </div>
               </div>
 
+              <!-- KEEP RESTING WHILE OFFLINE: shown ONLY for an on-chain-BTC-pay LIMIT order — the
+                   one case that needs a peg, because Bitcoin has no covenants and a resting order
+                   must survive while the wallet is offline. Default ON: the order rests as pegged
+                   BTC (SBTC) so it stays live without the wallet; funds return as regular BTC on
+                   fill/cancel. OFF: a native-BTC HTLC (trustless, but needs the wallet online).
+                   Market orders and any Lightning leg never see this — they are pure native BTC.
+                   Toggled by paintOfflineToggle(); the placement path reads S.keepResting. -->
+              <label class="swconf hide" id="swOfflineWrap" style="align-items:center;gap:9px;margin-top:2px;font-size:12.5px;color:var(--dim);cursor:pointer">
+                <input type="checkbox" id="swOfflineChk" checked style="width:16px;height:16px;flex:0 0 auto">
+                <span id="swOfflineTx">Keep this order <b style="color:var(--txt);font-weight:650">resting while you're offline</b>. It rests as pegged BTC (SBTC) so it stays live without your wallet open; your funds return as regular BTC if it fills or is cancelled. Turn off to rest as native BTC (keeps your wallet online for the trade).</span>
+              </label>
+
               <!-- FEE: pay the network fee in any asset a producer prices (open fee market). -->
               <div class="swsec swfee" id="swFeeRow">
                 <div class="swfee-head">
