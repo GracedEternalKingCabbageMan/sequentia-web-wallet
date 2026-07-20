@@ -1709,6 +1709,9 @@ const btcLeg = {
     if(typeof onBroadcast==='function'){ try{ onBroadcast(txt); }catch{} }
     return txt;   // txid
   },
+  // A wallet BTC receive address (testnet4, the shared tb1 keychain — same as the Receive tab). Used
+  // as the peg-OUT destination when a taker redeems just-received SBTC back to real BTC.
+  receiveAddress(){ return btcAddr(false, 0); },
   // The taker's dedicated BTC-leg CLAIM keypair (reverse swap: the taker claims the
   // maker's funded BTC leg with the revealed preimage).
   claimKey(){

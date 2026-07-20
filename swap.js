@@ -2726,6 +2726,46 @@ export async function resumePegIns(){
   }
 }
 
+// Send `atoms` of a Sequentia asset to `toAddr` (a plain transfer; fee in the chosen fee asset).
+// Used by the taker peg-OUT to hand the just-received SBTC back to the bridge.
+async function sendSeqAsset(toAddr, assetHex, atoms){
+  const addr = new C.wasm.Address(toAddr);
+  const b = C.network.txBuilder().addExplicitRecipient(addr, BigInt(atoms), new C.wasm.AssetId(assetHex));
+  const pset = C.applyFee(b, S.feeAsset || defaultFeeAsset()).finish(C.wollet);
+  const signed = C.signer.sign(pset);
+  const finalized = C.wollet.finalize(signed);
+  const t = await C.client.broadcast(finalized);
+  return (t && t.toString) ? t.toString() : String(t);
+}
+
+// Peg the taker's just-received SBTC back OUT to real BTC. When a taker fills a covenant that was
+// ADVERTISED as BTC (the SBTC silent peg), the on-chain fill pays them in SBTC — but they were buying
+// BTC, so the wallet immediately redeems it: ask the bridge for a peg-out address bound to a wallet
+// BTC address, send the SBTC there, and the bridge releases real BTC. Best-effort + safe: on any
+// failure the user simply holds redeemable SBTC (never lost). `atoms` = the SBTC just received.
+async function pegOutReceivedSbtc(atoms){
+  if (BigInt(atoms) <= 0n) return;
+  const btcDest = C.btcLeg && C.btcLeg.receiveAddress ? C.btcLeg.receiveAddress() : null;
+  if (!btcDest) throw new Error('no BTC address to redeem to');
+  const sbtcAddr = await sbtc.requestPegOut(btcDest);
+  await sendSeqAsset(sbtcAddr, sbtcAssetId(), BigInt(atoms));
+  try { C.toast && C.toast('Redeeming your SBTC to BTC at the bridge…'); } catch {}
+}
+
+// TRUE if an inbound covenant match paid us in SBTC for what we were buying as BTC — i.e. we lifted a
+// silent-peg bid (advertised BTC, locks SBTC) and must peg the SBTC out. Distinguished from a genuine
+// SBTC trade (where the market itself is SBTC/…, so the advertised pair carries no BTC sentinel).
+function isPeggedFillToRedeem(m){
+  const ct = m.covenant || m.Covenant || {};
+  const gotAsset = String(ct.asset_a || ct.assetA || '').toLowerCase();
+  const sbtcHex = (sbtcAssetId() || '').toLowerCase();
+  if (!sbtcHex || gotAsset !== sbtcHex) return false;           // we didn't receive SBTC
+  const pair = m.pair || m.Pair || {};
+  const advertisedBtc = String(pair.base_asset || pair.baseAsset || '') === 'BTC'
+    || String(pair.quote_asset || pair.quoteAsset || '') === 'BTC';
+  return advertisedBtc;                                          // received SBTC on a BTC-advertised market -> redeem
+}
+
 // The taker FILL hooks for an inbound match: the credit asset is asset B, so the fee
 // is paid in B too (never asset A — the covenant-fill host rejects that). Amounts are
 // coin-selected from THIS wallet's own B + fee UTXOs by the wasm assembler.
@@ -2819,6 +2859,14 @@ async function onCovMatched(m){
     C.toast && C.toast('Fill settled · anchor-bound to Bitcoin.',
       txid ? { href:'/explorer/tx/'+txid, label:String(txid).slice(0,18)+'…' } : undefined);
     await C.sync(); await scanCompanion(); try { renderSwap(); } catch {}
+    // SBTC silent peg (taker side): if this fill paid us SBTC on a BTC-advertised market, we were
+    // buying real BTC — peg the received SBTC back OUT. Best-effort: on failure we simply hold
+    // redeemable SBTC (fund-safe). The amount received is the covenant fill's base (asset_a) amount.
+    if (isPeggedFillToRedeem(m)){
+      const got = BigInt(m.fill_base_amount || m.fillBaseAmount || m.covenant_locked || m.covenantLocked || 0);
+      try { await pegOutReceivedSbtc(got); await C.sync(); try { renderSwap(); } catch {} }
+      catch (e){ try { C.toast && C.toast('Received SBTC (redeemable to BTC); auto-redeem will retry.'); } catch {} }
+    }
   } catch (e){ try { C.toast && C.toast('Fill could not settle: ' + C.prettyErr(e)); } catch {} }
 }
 async function onCovOrderStatus(s){
@@ -4602,6 +4650,9 @@ async function renderMyOrders(){
           { relayCancel: async (offerId) => seqob.signAndCancel(offerId, makerPriv()), ...refundHooksFor() });
         if (out.refundTxid){
           C.toast('Order cancelled · reclaimed on-chain (' + String(out.refundTxid).slice(0,12) + '…).');
+          // SBTC silent peg: the reclaimed asset is SBTC, but the maker paid BTC and expects BTC back.
+          // Redeem it (best-effort; on failure the user simply holds redeemable SBTC — fund-safe).
+          if (rec.pegged){ try { await C.sync(); await pegOutReceivedSbtc(BigInt(rec.sellAtoms)); } catch {} }
         } else if (out.reclaimable){
           const meta = C.assetMeta(rec.pay);
           C.toast('Order delisted. The locked ' + esc(meta.ticker) + ' is reclaimable on-chain after block ' + out.reclaimable.afterHeight + '.');
