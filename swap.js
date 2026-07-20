@@ -43,6 +43,9 @@ import { railAvailability } from './ln-rail.js';
 // The mixed-rail (submarine) swap state machine + localStorage resume (fund-safety:
 // an in-flight on-chain HTLC leg must survive a reload so it can be refunded).
 import * as sub from './submarine.js';
+// The SBTC bridge client (the silent peg for resting on-chain-BTC LIMIT orders). Allocates
+// peg-in/peg-out addresses only; the wallet's own signed sends move the funds. See sbtc.js.
+import * as sbtc from './sbtc.js';
 
 let C = null;            // injected app context (see index.html initSwapTab)
 let X = null;            // the cross-chain route handle ({ openFromComposer, renderXswap, hasInFlight })
@@ -2490,7 +2493,14 @@ async function onReview(){
   const { $ } = C; $('swErr').textContent = '';
   const q = LAST_QUOTE;
   if (!q){ $('swErr').textContent = 'Enter an amount to get a quote first.'; return; }
-  if (q.kind === 'cross-make') return postCrossOfferReview(q);
+  if (q.kind === 'cross-make'){
+    // BUY-with-BTC LIMIT + "keep resting while offline" ON -> the SBTC silent peg: rest as a covenant
+    // that survives the wallet closing (spec §5). `reverse` = BUY the asset with BTC (the only side
+    // that PAYS BTC). Everything else (SELL for BTC, toggle OFF, or no SBTC on this network) stays on
+    // the interactive HTLC maker path.
+    if (q.reverse && S.keepResting && payingBtcOnChain() && sbtcAssetId()) return postPeggedBtcReview(q);
+    return postCrossOfferReview(q);
+  }
   if (q.kind === 'ln') return reviewLn(q);
   if (q.kind === 'mixed') return reviewMixed(q);
   if (q.kind === 'cross') return reviewCross(q);
@@ -2573,7 +2583,8 @@ async function resolveVout(txid, spkHex){
 // almost all of the available book, coarse enough that no dust remainder is ever left.
 function covenantMinLot(sellAtoms){ const s = BigInt(sellAtoms); const f = s / 1000n; return f > 0n ? f : 1n; }
 
-async function placeCovenant(pay, receive, payAtoms, recvAtoms, onStatus){
+async function placeCovenant(pay, receive, payAtoms, recvAtoms, onStatus, opts){
+  opts = opts || {};
   const tip = C.wollet.tip().height();
   const { rateNum, rateDen } = computeRate(payAtoms, recvAtoms);
   const idx = nextMakerIndex();
@@ -2601,6 +2612,10 @@ async function placeCovenant(pay, receive, payAtoms, recvAtoms, onStatus){
     sellAtoms: String(payAtoms), recvAtoms: String(recvAtoms),
     makerIndex: idx, covTxid: null, covVout: null, spkHex: plan.spkHex,
     expiry: params.expiryLocktime, created: Date.now(), posted: false,
+    // SBTC silent peg: the covenant locks `pay` (SBTC) but was ADVERTISED as `advertiseOfferAssetAs`
+    // (BTC). Tag it so the cancel/refund path knows to peg the reclaimed SBTC back OUT to real BTC
+    // (the user paid BTC and expects BTC back). Absent for ordinary same-chain orders.
+    ...(opts.advertiseOfferAssetAs ? { pegged: true, advertiseAs: opts.advertiseOfferAssetAs } : {}),
   };
   PLACED.push(rec); savePlaced();
   onStatus && onStatus('Funding the order on-chain…');
@@ -2611,12 +2626,104 @@ async function placeCovenant(pay, receive, payAtoms, recvAtoms, onStatus){
     assetA: pay, assetB: receive, sellAtoms: BigInt(payAtoms), recvAtoms: BigInt(recvAtoms),
     covenant, makerPubkey: makerPubHex(), recvAddress: payout.address, offerId,
     allowPartial: true, minLot,                           // fill what crosses now; the covenant's remainder rests on
+    advertiseOfferAssetAs: opts.advertiseOfferAssetAs,     // SBTC peg: advertise BTC while the covenant locks SBTC
   });
   onStatus && onStatus('Posting your resting order…');
   await seqob.postCovenantOffer(offer, makerPriv());
   rec.posted = true; savePlaced();   // the relay accepted it; it is now a live resting order
   ensureCovenantRelay();   // watch for a match so we can settle / reflect a fill
   return rec;
+}
+
+// ---------------------------------------------------------------------------
+// SBTC silent peg — rest an on-chain-BTC LIMIT order while the wallet is offline
+// ---------------------------------------------------------------------------
+// The ONE place SBTC touches the DEX (spec §5, sbtc-peg-design.md). Used ONLY for BUY-with-BTC LIMIT
+// orders with "keep resting while offline" ON. Everything else (market orders, any Lightning leg,
+// selling an asset for BTC) stays pure native BTC on the interactive cross rail.
+
+// The SBTC asset id, resolved from the registry (ticker SBTC), or null if the bridge asset isn't
+// registered on this network — then the silent peg is simply unavailable and we fall back to native.
+function sbtcAssetId(){
+  try { return sbtc.resolveSbtcAsset((C.registryAssets && C.registryAssets()) || [], (h) => (C.assetMeta(h) || {}).ticker); }
+  catch { return null; }
+}
+
+// Persisted pending peg-ins so a BUY-with-BTC resting order survives the wallet closing during the
+// (multi-block) peg-in wait and resumes to post its covenant on reopen. FUND-SAFETY: the bridge
+// credits SBTC to `seqAddr` regardless of this wallet, so a crash never loses funds — worst case the
+// user simply holds SBTC to reconcile, and resumePegIns finishes the covenant post next load.
+const PEGPENDING_KEY = 'swk.sequentia.pegpending';
+function loadPegPending(){ try { return JSON.parse(localStorage.getItem(PEGPENDING_KEY) || '[]'); } catch { return []; } }
+function savePegPending(list){ try { localStorage.setItem(PEGPENDING_KEY, JSON.stringify(list)); } catch {} }
+function upsertPegPending(rec){ const l = loadPegPending().filter((r) => r.id !== rec.id); l.push(rec); savePegPending(l); }
+function dropPegPending(id){ savePegPending(loadPegPending().filter((r) => r.id !== id)); }
+
+// Poll THIS wallet's SBTC balance until it has risen by >= `amount` (the bridge minted the peg-in).
+// Generous timeout: a peg-in needs BTC confirmations. The caller shows a waiting status; on timeout
+// the funds are safe (SBTC will still arrive) and the order can be re-opened once credited.
+async function awaitSbtcCredit(sbtcHex, before, amount, timeoutMs){
+  const deadline = Date.now() + (timeoutMs || 45 * 60 * 1000);
+  while (Date.now() < deadline){
+    try { if (C.refreshBalances) await C.refreshBalances(); } catch {}
+    if (balAtoms(sbtcHex) - before >= amount) return true;
+    await new Promise((r) => setTimeout(r, 15000));
+  }
+  throw new Error('The peg-in hasn’t been credited yet. Your BTC is safe at the bridge and your SBTC will arrive; re-open the order once it does.');
+}
+
+// Maker flow: peg the maker's real BTC IN to SBTC, then rest that SBTC in a covenant ADVERTISED as a
+// BTC offer on the asset/BTC market (advertiseOfferAssetAs='BTC') so BTC takers find + fill it (and
+// peg out to real BTC). btcSats = BTC paid; assetHex/assetAtoms = the asset + amount wanted.
+async function placePeggedBtcCovenant(assetHex, btcSats, assetAtoms, onStatus){
+  const sbtcHex = sbtcAssetId();
+  if (!sbtcHex) throw new Error('SBTC (the pegged-BTC asset) isn’t available on this network, so an offline-resting BTC order can’t be placed. Turn off “keep resting while offline” to rest as native BTC.');
+  if (BigInt(btcSats) <= 0n || BigInt(assetAtoms) <= 0n) throw new Error('Enter both the BTC you pay and the amount you want.');
+  const haveBtc = balAtoms('BTC');
+  if (BigInt(btcSats) > haveBtc) throw new Error(`You only hold ${C.fmtAtoms(haveBtc, 8)} BTC.`);
+
+  // A fresh TRANSPARENT Sequentia address of THIS wallet to receive the minted SBTC (principle #6).
+  const seqAddrRaw = C.wollet.address(C.addrIndex == null ? undefined : C.addrIndex).address();
+  const seqAddr = (seqAddrRaw.toUnconfidential ? seqAddrRaw.toUnconfidential() : seqAddrRaw).toString();
+
+  onStatus && onStatus('Preparing the peg-in…');
+  const depositAddr = await sbtc.requestPegIn(seqAddr);
+
+  // Persist the intent BEFORE broadcasting the BTC deposit, so a crash after broadcast can resume.
+  const rec = { id: seqob.randHex(8), seqAddr, depositAddr, btcSats: String(btcSats),
+                assetHex, assetAtoms: String(assetAtoms), sbtcHex, btcTxid: null,
+                beforeSbtc: String(balAtoms(sbtcHex)), phase: 'depositing', created: Date.now() };
+  upsertPegPending(rec);
+
+  onStatus && onStatus('Sending your BTC to the peg…');
+  await C.btcLeg.payAddress(depositAddr, Number(btcSats), (txid) => {
+    rec.btcTxid = txid; rec.phase = 'minting'; upsertPegPending(rec);
+  });
+
+  onStatus && onStatus('Waiting for the bridge to mint SBTC (this can take a few blocks)…');
+  await awaitSbtcCredit(sbtcHex, BigInt(rec.beforeSbtc), BigInt(btcSats));
+
+  onStatus && onStatus('Resting your order…');
+  const posted = await placeCovenant(sbtcHex, assetHex, BigInt(btcSats), BigInt(assetAtoms), onStatus,
+    { advertiseOfferAssetAs: 'BTC' });
+  dropPegPending(rec.id);   // peg-in complete + order resting
+  return posted;
+}
+
+// Resume any peg-in that was mid-flight when the wallet last closed: if its SBTC has since been
+// credited, finish by posting the covenant; otherwise leave it pending (it will credit and resume
+// later). Called on load, alongside resumeCovenantOrders. Never re-sends BTC (idempotent by record).
+export async function resumePegIns(){
+  for (const rec of loadPegPending()){
+    try {
+      if (!rec.btcTxid) { dropPegPending(rec.id); continue; }   // never broadcast; nothing pegged in
+      const have = balAtoms(rec.sbtcHex) - BigInt(rec.beforeSbtc || '0');
+      if (have < BigInt(rec.btcSats)) continue;                 // not yet credited; leave it pending
+      await placeCovenant(rec.sbtcHex, rec.assetHex, BigInt(rec.btcSats), BigInt(rec.assetAtoms), null,
+        { advertiseOfferAssetAs: 'BTC' });
+      dropPegPending(rec.id);
+    } catch (e){ /* leave pending; a later load retries */ }
+  }
 }
 
 // The taker FILL hooks for an inbound match: the credit asset is asset B, so the fee
@@ -3650,6 +3757,49 @@ async function postCrossOfferReview(q){
       renderSwap();
     } catch (e){
       st.className = 'status err'; st.textContent = 'Could not post: ' + C.prettyErr(e); ok.disabled = false;
+    }
+  };
+}
+
+// Review + confirm for a BUY-with-BTC LIMIT order that rests via the SBTC silent peg (keepResting ON).
+// Mirrors postCrossOfferReview's reverse (bid) modal, but on confirm pegs the BTC in and rests an SBTC
+// covenant advertised as BTC (placePeggedBtcCovenant) instead of the interactive, wallet-must-stay-open
+// HTLC maker. This is the ONLY place the peg is entered from the composer.
+async function postPeggedBtcReview(q){
+  const { $ } = C;
+  const assetHex = q.assetHex;
+  const am = C.assetMeta(assetHex);
+  let btcSats, assetAtoms;
+  try {
+    btcSats    = fieldAtoms($('swPayAmt'), 'BTC');
+    assetAtoms = fieldAtoms($('swRecvAmt'), assetHex);
+    if (btcSats <= 0n || assetAtoms <= 0n) throw 0;
+  } catch { $('swErr').textContent = `Enter both the BTC and the ${am.ticker}.`; return; }
+  const haveBtc = balAtoms('BTC');
+  if (btcSats > haveBtc){ $('swErr').textContent = `You only hold ${C.fmtAtoms(haveBtc, 8)} BTC.`; return; }
+  const assetU = Number(assetAtoms)/Math.pow(10, am.precision||0), btcU = Number(btcSats)/1e8;
+  const kv = [
+    ['Posting', `A resting BID that stays live while you're offline — you become a maker of the ${am.ticker}/BTC market`],
+    ['You pay', C.fmtAtoms(btcSats, 8) + ' BTC'],
+    ['You buy', amtRow(assetHex, assetAtoms) + refSuffix(assetHex, assetAtoms)],
+    ['Price', assetU>0 ? `1 ${am.ticker} = ${trim(btcU/assetU)} BTC` : '-'],
+    ['How it rests', `Your BTC is pegged to SBTC and locked in a covenant that fills even while your wallet is closed. On a fill the taker receives real BTC and you receive the ${am.ticker}.`],
+    ['If it cancels', 'Cancel anytime — your funds return to you as regular BTC.'],
+    ['Heads up', 'Pegging in needs a few Bitcoin confirmations before the bid goes live; you can close the wallet and it resumes.'],
+    ['Finality', 'Anchor-bound to Bitcoin (reverts only if Bitcoin reverts).'],
+  ];
+  const { m: modal, ok, st } = C.modalRows({ title: 'Buy with BTC — rest this bid offline', kv });
+  if (ok) ok.textContent = 'Peg in & rest bid';
+  ok.onclick = async () => {
+    ok.disabled = true; st.className = 'status'; st.innerHTML = '<span class="spin"></span>Pegging in…';
+    try {
+      await placePeggedBtcCovenant(assetHex, btcSats, assetAtoms, (m) => { st.innerHTML = '<span class="spin"></span>' + esc(m); });
+      modal.remove();
+      C.toast('Your BTC bid is resting — it stays live even if you close the wallet.');
+      resetComposer();
+      renderSwap();
+    } catch (e){
+      st.className = 'status err'; st.textContent = 'Could not place: ' + C.prettyErr(e); ok.disabled = false;
     }
   };
 }
