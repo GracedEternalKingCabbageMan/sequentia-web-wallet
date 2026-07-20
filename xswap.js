@@ -302,13 +302,30 @@ function isReverseCrossOffer(o){
 // Only signature-verified offers are returned (see isForwardCrossOffer). An empty
 // side means no resting cross liquidity for that direction yet.
 export async function fetchXbook(seqAsset){
-  let offers = [], unreachable = false;
+  let unreachable = false;
   // T7: distinguish "no such cross market yet" (4xx = genuinely empty) from an unreachable relay
   // (network/5xx). The caller uses `unreachable` to offer a retry instead of inviting a first maker.
-  try { const bk = await seqob.fetchBook(seqAsset, 'BTC'); offers = bk.offers || []; }
-  catch (e){ if (!/HTTP\s*4\d\d/.test((e && e.message) || '')) unreachable = true; offers = []; }
+  // The relay keys markets by EXACT base/quote order, so — exactly like the same-chain book's
+  // applyOffersToBook — we fetch BOTH orientations and merge: cross-HTLC offers rest on seqAsset/BTC,
+  // while an SBTC silent-peg covenant advertises offer_asset=BTC and rests on BTC/seqAsset. Dedup by
+  // maker:offer_id. Classification (forward/reverse) reads offer_asset/want_asset, so it is orientation-
+  // independent; a covenant offer carries `covenant` and the take path routes it to a lift + peg-out.
+  const grab = async (base, quote) => {
+    try { const bk = await seqob.fetchBook(base, quote); return bk.offers || []; }
+    catch (e){ if (!/HTTP\s*4\d\d/.test((e && e.message) || '')) unreachable = true; return []; }
+  };
+  const both = [...(await grab(seqAsset, 'BTC')), ...(await grab('BTC', seqAsset))];
+  const seen = new Set(), offers = [];
+  for (const o of both){
+    const id = (pick(o, 'maker_pubkey', 'makerPubkey') || '') + ':' + (pick(o, 'offer_id', 'offerId') || '');
+    if (seen.has(id)) continue; seen.add(id);
+    offers.push(o);
+  }
   return { forward: offers.filter(isForwardCrossOffer), reverse: offers.filter(isReverseCrossOffer), unreachable };
 }
+// A BTC-book offer that actually settles via a COVENANT (the SBTC silent peg), not an HTLC. The take
+// path branches on this: lift the covenant (receiving SBTC), then peg the SBTC out to real BTC.
+export function isPeggedCovenantOffer(o){ return !!(o && (o.covenant || o.Covenant)); }
 
 // A courier quote is the chosen resting offer's size (whole-HTLC — cross lifts do
 // not partial-fill). The maker keys, locktimes and exact fee are minted per-lift
