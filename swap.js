@@ -600,6 +600,17 @@ function findRoute(pay, receive){
     // closed there with an honest message.
     return { kind: 'mixed', seqAsset, xm, payIsBtc, payRail: p, recvRail: r };
   }
+  // Same-chain asset<->asset can also settle over PURE Lightning (two asset-LN HTLCs bound by one
+  // preimage) — instant, exactly like asset<->BTC pure-LN, with the counter (quote) asset taking BTC's
+  // structural place. Route there when BOTH legs are set to Lightning + LN is deployed. requoteLn checks
+  // the REAL <base>/<quote> pure-LN book; reviewLn provisions both channels inline. No pure-LN liquidity
+  // -> requoteLn says so honestly and the user can switch either rail to on-chain (the covenant book).
+  if (lnDeployed() && S.payRail === 'ln' && S.recvRail === 'ln'){
+    const cp = canonicalPair(pay, receive);   // base = the market's base asset; quote = the numeraire side
+    return { kind: 'ln', assetAsset: true, seqAsset: cp.base, quoteAsset: cp.quote,
+      payIsBtc: pay === cp.quote,             // "paying the quote" is the structural analog of paying BTC (= a BUY of the base)
+      payRail: 'ln', recvRail: 'ln' };
+  }
   // Same-chain order book: ANY two distinct Sequentia assets form a market. It may
   // have no resting offers yet, in which case the user can start it by posting one.
   return { kind: 'same', pay, receive };
@@ -4292,14 +4303,17 @@ async function reviewCross(q){
 // actual amounts come back in the settle response.
 async function requoteLn(route, amtStr){
   const { $ } = C;
-  // ONE book: the SAME resting SeqOB (cross) book shows on the Lightning rail too —
-  // no rail distinction in the book UI. (Prior bug: the LN rail blanked the book.)
-  await loadBtcBook(route);
-  deriveXOpposite(route);
+  // The counter (quote) leg: BTC for asset<->BTC pure-LN, else the REAL quote asset for asset<->asset.
+  const qm = route.assetAsset ? C.assetMeta(route.quoteAsset) : { ticker: 'BTC', precision: 8 };
+  const qtk = qm.ticker;
+  // ONE book: the SAME resting on-chain book shows on the Lightning rail too — no rail distinction in the
+  // book UI. For asset<->BTC that's the cross (XBOOK) book; asset<->asset has no BTC leg, so skip it (the
+  // same-chain covenant book already rendered when the pair was picked).
+  if (!route.assetAsset){ await loadBtcBook(route); deriveXOpposite(route); }
   const side = route.payIsBtc ? 'buy' : 'sell';
   const am = C.assetMeta(route.seqAsset);
   const aprec = am.precision || 0;
-  $('swRoute').textContent = route.payIsBtc ? 'Lightning · buy with BTC' : 'Lightning · sell for BTC';
+  $('swRoute').textContent = route.payIsBtc ? `Lightning · buy with ${qtk}` : `Lightning · sell for ${qtk}`;
   $('swStatus').textContent = ''; $('swErr').textContent = '';
   renderTiming(route);
   // The pure-LN CLI (xpln) has NO partial fill: it lifts the best resting offer IN FULL, so the size
@@ -4312,7 +4326,7 @@ async function requoteLn(route, amtStr){
   let lnOffer = null;
   if (L && L.lnBook){
     try {
-      const lb = await L.lnBook(route.seqAsset);
+      const lb = await L.lnBook(route.seqAsset, route.quoteAsset);   // quoteAsset undefined for asset<->BTC
       const best = ((side === 'buy' ? lb.buy_offers : lb.sell_offers) || [])[0];
       if (best && Number(best.asset_amount) > 0 && Number(best.btc_sats) > 0)
         lnOffer = { assetAtoms: String(best.asset_amount), btcAtoms: String(best.btc_sats),
@@ -4321,15 +4335,17 @@ async function requoteLn(route, amtStr){
   }
   if (!lnOffer){
     LAST_QUOTE = null; setReviewEnabled(false);
-    paintFee('BTC', null, null);
-    $('swRate').textContent = `No resting Lightning offer for ${am.ticker}/BTC yet · use the on-chain book above.`;
+    paintFee(route.quoteAsset || 'BTC', null, null);
+    $('swRate').textContent = `No resting Lightning offer for ${am.ticker}/${qtk} yet · use the on-chain book above.`;
     return;
   }
   LAST_QUOTE = { kind: 'ln', side, seqAsset: route.seqAsset, payIsBtc: route.payIsBtc,
+    assetAsset: route.assetAsset, quoteAsset: route.quoteAsset,
     amount: amtStr ? parseFloat(amtStr) : null, lnOffer };
-  paintFee('BTC', null, 'This rail lifts the best resting offer in full · the rate includes the LP spread (no separate network fee).');
-  const assetStr = C.fmtAtoms(big(lnOffer.assetAtoms), aprec), btcStr = C.fmtAtoms(big(lnOffer.btcAtoms), 8);
-  $('swRate').innerHTML = `Instant over Lightning · lifts the best offer <b>in full</b>: ${assetStr} ${am.ticker} for ${btcStr} BTC`;
+  paintFee(route.quoteAsset || 'BTC', null, 'This rail lifts the best resting offer in full · the rate includes the LP spread (no separate network fee).');
+  const qprec = qm.precision || 0;
+  const assetStr = C.fmtAtoms(big(lnOffer.assetAtoms), aprec), btcStr = C.fmtAtoms(big(lnOffer.btcAtoms), qprec);
+  $('swRate').innerHTML = `Instant over Lightning · lifts the best offer <b>in full</b>: ${assetStr} ${am.ticker} for ${btcStr} ${qtk}`;
   setReviewEnabled(true);   // LP fixed terms (proven path) — Review is offerable
 }
 
@@ -4372,12 +4388,15 @@ async function reviewLn(q){
   }
   const am = C.assetMeta(q.seqAsset);
   const aprec = am.precision || 0;
-  const dir = q.side === 'buy' ? `Buy ${am.ticker} with BTC` : `Sell ${am.ticker} for BTC`;
+  // Counter (quote) leg: BTC for asset<->BTC pure-LN, else the REAL quote asset for asset<->asset.
+  const qm = q.assetAsset ? C.assetMeta(q.quoteAsset) : { ticker: 'BTC', precision: 8 };
+  const qtk = qm.ticker, qprec = qm.precision || 0;
+  const dir = q.side === 'buy' ? `Buy ${am.ticker} with ${qtk}` : `Sell ${am.ticker} for ${qtk}`;
   // xpln lifts the whole offer, so the amounts that actually move come from the offer, NOT q.amount.
   // Show them explicitly and warn if they differ materially from what the user typed.
   const off = q.lnOffer || null;
   const assetStr = off ? (C.fmtAtoms(big(off.assetAtoms), aprec) + ' ' + am.ticker) : null;
-  const btcStr = off ? (C.fmtAtoms(big(off.btcAtoms), 8) + ' BTC') : null;
+  const btcStr = off ? (C.fmtAtoms(big(off.btcAtoms), qprec) + ' ' + qtk) : null;
   const payStr = off ? (q.side === 'buy' ? btcStr : assetStr) : null;
   const recvStr = off ? (q.side === 'buy' ? assetStr : btcStr) : null;
   const kv = [
@@ -4393,9 +4412,9 @@ async function reviewLn(q){
   // Loud mismatch warning: the executed size is the offer's, so if the user typed something ~different,
   // say so before they commit (this rail cannot fill a partial amount).
   if (off && q.amount > 0){
-    const execUnits = q.side === 'buy' ? (Number(big(off.btcAtoms)) / 1e8) : (Number(big(off.assetAtoms)) / Math.pow(10, aprec));
+    const execUnits = q.side === 'buy' ? (Number(big(off.btcAtoms)) / Math.pow(10, qprec)) : (Number(big(off.assetAtoms)) / Math.pow(10, aprec));
     if (execUnits > 0 && Math.abs(execUnits - q.amount) / execUnits > 0.05)
-      kv.push(['⚠ Note', `This lifts the whole offer (${q.side === 'buy' ? btcStr : assetStr}), which differs from the ${C.fmtAtoms(BigInt(Math.round(q.amount * Math.pow(10, q.side === 'buy' ? 8 : aprec))), q.side === 'buy' ? 8 : aprec)} ${q.side === 'buy' ? 'BTC' : am.ticker} you entered. Partial fills are not possible on this rail.`]);
+      kv.push(['⚠ Note', `This lifts the whole offer (${q.side === 'buy' ? btcStr : assetStr}), which differs from the ${C.fmtAtoms(BigInt(Math.round(q.amount * Math.pow(10, q.side === 'buy' ? qprec : aprec))), q.side === 'buy' ? qprec : aprec)} ${q.side === 'buy' ? qtk : am.ticker} you entered. Partial fills are not possible on this rail.`]);
   }
   const { m: modal, ok, st } = C.modalRows({ title: 'Review Lightning swap', kv });
   ok.onclick = async () => {
@@ -4404,16 +4423,18 @@ async function reviewLn(q){
       // PIN the exact offer the user just reviewed: the LSP forwards offer_id/maker_pubkey to xpln so
       // it lifts THIS resting offer, not a relay-arbitrary one at a different price.
       const r = await L.swap({ side: q.side, asset: q.seqAsset, amount: q.amount,
+        quote_asset: q.assetAsset ? q.quoteAsset : undefined,   // asset<->asset: the real counter asset (BTC implied otherwise)
         offer_id: (q.lnOffer && q.lnOffer.offer_id) || undefined,
         maker_pubkey: (q.lnOffer && q.lnOffer.maker_pubkey) || undefined });
       const bm = C.assetMeta(r.asset || q.seqAsset);
-      const got = (r.direction === 'sold') ? `${r.quote_amount} BTC`
+      const qtkR = r.quote_asset_label || qtk;   // the LSP echoes the real quote label (BTC or the asset)
+      const got = (r.direction === 'sold') ? `${r.quote_amount} ${qtkR}`
         : `${r.base_amount} ${bm.ticker}`;
       modal.remove();
       // Receipt into the persistent history (W6); no on-chain txid on this rail, so key by the
       // payment hash. Drop the raw preimage from the toast — it is protocol jargon, not user info (C-7).
       logTrade({ id: 'ln:' + (r.hash_h || r.preimage || Date.now()),
-        title: (r.direction === 'sold' ? 'Sold ' + bm.ticker + ' for BTC' : 'Bought ' + bm.ticker + ' with BTC') + ' over Lightning',
+        title: (r.direction === 'sold' ? 'Sold ' + bm.ticker + ' for ' + qtkR : 'Bought ' + bm.ticker + ' with ' + qtkR) + ' over Lightning',
         status: 'settled' });
       C.toast(`Lightning swap settled and final: received ${got}.`);
       resetComposer();

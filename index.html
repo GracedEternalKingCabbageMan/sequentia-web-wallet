@@ -2827,7 +2827,7 @@ function initSwapTab(){
       unifiedBook: (asset) => seqlnUnifiedBook(asset),
       // PURE-LN book from the relay xpln actually lifts from — the composer prices + PINS off this so
       // Review matches the settle (not the on-chain cross book, a different market).
-      lnBook: (asset) => seqlnLnBook(asset),
+      lnBook: (asset, quote) => seqlnLnBook(asset, quote),
       postOffer: (o) => seqlnPostOffer(o),
       // Which of the device's candidate node keys are actually provisioned (registry-resolved, works
       // for nodes blocked waiting for their signer). Used by the on-load reconnect to rediscover a

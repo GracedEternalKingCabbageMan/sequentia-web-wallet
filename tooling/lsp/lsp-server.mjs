@@ -1071,15 +1071,24 @@ async function closeChannel(body) {
     scid: ch.short_channel_id || null, destination: dest, asset_label: assetId ? assetLabel(assetId) : 'BTC' };
 }
 
-function runSwap({ side, asset, amount, offer_id, maker_pubkey }) {
+function runSwap({ side, asset, amount, offer_id, maker_pubkey, quote_asset }) {
   return new Promise((resolve) => {
     const assetId = resolveAsset(asset);
     if (side !== 'buy' && side !== 'sell') return resolve({ ok: false, error: "side must be 'buy' or 'sell'" });
     if (!assetId) return resolve({ ok: false, error: 'unknown asset (want GOLD or a 32-byte hex id)' });
+    // Counter (quote) leg. asset<->asset (e.g. EURX/OILX): a real Sequentia asset id, so BOTH legs are
+    // asset-LN — resolve EACH asset's hosted socket (targetFor) so the base + quote legs route over nodes
+    // that actually hold those assets. Empty/BTC quote = the classic asset<->BTC (counter leg = BTC-LN).
+    const quoteId = quote_asset && String(quote_asset).toUpperCase() !== 'BTC' ? resolveAsset(quote_asset) : null;
+    const assetAsset = !!quoteId;
+    const baseSock = (targetFor('seq', assetId, null).rpc) || CFG.hostedAssetRpc;
+    const quoteSock = assetAsset ? ((targetFor('seq', quoteId, null).rpc) || CFG.hostedAssetRpc) : CFG.hostedBtcRpc;
+    if (!baseSock || !quoteSock) return resolve({ ok: false, error: `no hosted Lightning node for ${assetAsset ? assetLabel(assetId) + '/' + assetLabel(quoteId) : assetLabel(assetId) + '/BTC'}` });
     const args = [
       'xpln', '-side', side, '-relay', CFG.relay,
-      '-asset', assetId, '-btc-asset', CFG.btcx,
-      '-asset-ln-socket', CFG.hostedAssetRpc, '-ln-socket', CFG.hostedBtcRpc,
+      '-asset', assetId,
+      ...(assetAsset ? ['-quote-asset', quoteId] : ['-btc-asset', CFG.btcx]),
+      '-asset-ln-socket', baseSock, '-ln-socket', quoteSock,
       '-terms-wait', '60s', '-hold-wait', '90s',
     ];
     // Lift the SPECIFIC offer the taker priced, not just the first match: xpln supports
@@ -1093,7 +1102,9 @@ function runSwap({ side, asset, amount, offer_id, maker_pubkey }) {
       const m = out.match(/PURE-LN SWAP SETTLED:\s+(bought|sold)\s+(\d+)\s+([0-9a-f]+)\s+for\s+(\d+)\s+BTC sats[^;]*;\s+preimage\s+([0-9a-f]+)/i);
       if (m) return resolve({
         ok: true, side, direction: m[1], asset: m[3], asset_label: assetLabel(m[3]),
-        base_amount: Number(m[2]), quote_asset: CFG.btcx || 'BTC', quote_amount: Number(m[4]),
+        base_amount: Number(m[2]), quote_amount: Number(m[4]),
+        quote_asset: assetAsset ? quoteId : (CFG.btcx || 'BTC'),
+        quote_asset_label: assetAsset ? assetLabel(quoteId) : 'BTC',   // the "BTC sats" in the CLI line is a cosmetic label; the amount is the quote asset's atoms
         preimage: m[5], finality: 'final', settled_ms: Date.now() - t0, requested_amount: amount ?? null,
       });
       // RECONCILE before declaring nothing was spent. If xpln got as far as committing funds it
@@ -1106,7 +1117,7 @@ function runSwap({ side, asset, amount, offer_id, maker_pubkey }) {
       const hm = out.match(/paying maker hold on H=([0-9a-f]{64})/i);
       if (hm) {
         const H = hm[1];
-        const payRpc = side === 'buy' ? CFG.hostedBtcRpc : CFG.hostedAssetRpc;
+        const payRpc = side === 'buy' ? quoteSock : baseSock;   // buy pays the quote leg, sell pays the asset leg
         try {
           const ls = await lnrpcKw('listsendpays', ['payment_hash=' + H], payRpc, 6000);
           const live = ((ls && ls.payments) || []).find((x) => x.status === 'pending' || x.status === 'complete');
@@ -1785,10 +1796,16 @@ const server = http.createServer(async (req, res) => {
     if (req.method === 'GET' && url.pathname === '/lnbook') {
       const assetId = resolveAsset(url.searchParams.get('asset'));
       if (!assetId || assetId === CFG.btcx) return send(res, 400, { ok: false, error: '?asset=<sequentia asset id> is required (not BTC)' });
+      // The QUOTE side: a real Sequentia asset id for an asset<->asset pure-LN market (e.g. EURX/OILX),
+      // else the BTC sentinel (asset<->BTC). Offer identity is unchanged; the give-leg / "btc_sats" field
+      // simply carries the quote asset's atoms. `btc_sats` keeps its name for wire compatibility.
+      const quoteParam = url.searchParams.get('quote');
+      const quoteId = quoteParam && String(quoteParam).toUpperCase() !== 'BTC' ? resolveAsset(quoteParam) : null;
+      const quoteKey = quoteId || 'BTC';
       const seen = new Set(), sell = [], buy = [];
       let offers = [];
       try {
-        const rr = await fetch(`${CFG.relay}/v1/market/${assetId}/BTC/orderbook`, { signal: AbortSignal.timeout(5000) });
+        const rr = await fetch(`${CFG.relay}/v1/market/${assetId}/${quoteKey}/orderbook`, { signal: AbortSignal.timeout(5000) });
         if (rr.ok) offers = (await rr.json()).offers || [];
       } catch { /* relay down -> empty book -> the wallet honestly reports the rail unavailable */ }
       for (const o of offers) {
@@ -1798,7 +1815,7 @@ const server = http.createServer(async (req, res) => {
         if (seen.has(key)) continue; seen.add(key);
         const asset_amount = Number(o.base_amount || 0);
         let btc_sats = Number(o.want_amount || 0);
-        if (o.offer_asset === 'BTC') btc_sats = Number(o.offer_amount || 0);
+        if (o.offer_asset === quoteKey) btc_sats = Number(o.offer_amount || 0);
         const row = { offer_id: o.offer_id, maker_pubkey: o.maker_pubkey, ln_direction: dir,
           asset_amount, btc_sats, price_sats_per_atom: asset_amount ? btc_sats / asset_amount : null,
           expires_at: Number(o.expires_at_unix || 0) };
@@ -1808,6 +1825,7 @@ const server = http.createServer(async (req, res) => {
       buy.sort((a, b) => (a.price_sats_per_atom ?? Infinity) - (b.price_sats_per_atom ?? Infinity));
       sell.sort((a, b) => (b.price_sats_per_atom ?? -Infinity) - (a.price_sats_per_atom ?? -Infinity));
       return send(res, 200, { ok: true, asset: assetId, asset_label: assetLabel(assetId),
+        quote_asset: quoteKey, quote_asset_label: quoteId ? assetLabel(quoteId) : 'BTC',
         buy_available: buy.length > 0, sell_available: sell.length > 0, buy_offers: buy, sell_offers: sell });
     }
 

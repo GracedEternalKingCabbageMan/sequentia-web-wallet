@@ -352,8 +352,12 @@ export function seqlnGetStatus() {
 // different market). Returns { buy_offers, sell_offers } each best-first (buy = cheapest, sell =
 // richest), with offer_id + maker_pubkey to pin into the swap. A thrown error / older LSP without the
 // endpoint means "no pure-LN liquidity" — the caller degrades honestly (disables Review).
-export function seqlnLnBook(asset) {
-  return lspFetch('/lnbook?asset=' + encodeURIComponent(String(asset || '')));
+export function seqlnLnBook(asset, quote) {
+  // quote: a real Sequentia asset id for an asset<->asset pure-LN market (EURX/OILX), else omitted =
+  // the classic asset<->BTC book (unchanged wire for every existing call).
+  let q = '/lnbook?asset=' + encodeURIComponent(String(asset || ''));
+  if (quote && String(quote).toUpperCase() !== 'BTC') q += '&quote=' + encodeURIComponent(String(quote));
+  return lspFetch(q);
 }
 
 // Ask the LSP which of the device's CANDIDATE node keys are ACTUALLY provisioned (exist in the
@@ -436,8 +440,11 @@ export function closeChannelLsp({ chain = 'seq', asset, node, scid, destination,
 //     over Lightning). Anchor-gated; returns finality:'confirming' (anchor-bound).
 // Rails are only serialized when present, so the pure-LN call is byte-identical to
 // before (the LSP treats a missing rail as ln/ln).
-export function seqlnSwap({ side, asset, amount, payRail, recvRail, node_key, btc_claim_pub, offer_id, maker_pubkey, swap_nonce, hodl, payment_hash, asset_amount, btc_htlc }) {
+export function seqlnSwap({ side, asset, amount, quote_asset, payRail, recvRail, node_key, btc_claim_pub, offer_id, maker_pubkey, swap_nonce, hodl, payment_hash, asset_amount, btc_htlc }) {
   const body = { side, asset, amount };
+  // asset<->asset pure-LN: the counter (quote) asset id. Omitted (or 'BTC') => the classic asset<->BTC
+  // pure-LN, so the pure-LN body stays byte-identical to before for every existing asset<->BTC swap.
+  if (quote_asset && String(quote_asset).toUpperCase() !== 'BTC') body.quote_asset = quote_asset;
   if (payRail) body.payRail = payRail;
   if (recvRail) body.recvRail = recvRail;
   // Sub-asset SELL (pay asset over LN, receive BTC on-chain): the LSP drives the LN payment
