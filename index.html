@@ -128,7 +128,9 @@
   .swdesk-book{min-width:0;display:flex;flex-direction:column}
   /* zero the first ladder/book's top margin so its head aligns with the compose column */
   .swdesk-book #swBook .swladder,.swdesk-book #swBook .swbook{margin-top:0}
-  .swdesk-compose{min-width:0;display:flex;flex-direction:column;gap:14px}
+  /* The composer (you pay/receive) is the focus: put it FIRST, so the order book, resting orders,
+     stats and recent trades all sit BELOW it rather than pushing it down the page. */
+  .swdesk-compose{min-width:0;display:flex;flex-direction:column;gap:14px;order:-1}
   .swdesk-compose>.card{margin-top:0}
   /* Take (lift the book at its price) vs Post (rest a limit order at your own price). */
   .swmode{display:flex;align-items:center;gap:12px;flex-wrap:wrap}
@@ -516,10 +518,9 @@
 
         <!-- (the per-asset balance cards used to live here; their info now lives inside the
              asset dropdown's "Your assets" group, so the Swap view stays uncluttered.) -->
-        <!-- pair bar: the selected market + last price (derived from the book). -->
+        <!-- pair bar: the selected market + last price (derived from the book). A compact market
+             header, kept above the composer; the fuller stats/sparkline moves to the bottom. -->
         <div class="swpairbar hide" id="swPairBar"></div>
-        <!-- 24h stats + sparkline for the selected pair (from seqobd /candles). -->
-        <div id="swPairStats"></div>
 
         <!-- the desk: order book on the LEFT, composer on the RIGHT (stacks on mobile) -->
         <div class="swdesk">
@@ -669,9 +670,10 @@
           </div><!-- /.swdesk-compose -->
         </div><!-- /.swdesk -->
 
-        <!-- Recent trades for the pair — a full-width history strip at the BOTTOM of the terminal
-             (below the composer + book), so it doesn't compete with the swap card for attention. -->
-        <div id="swTrades" style="margin-top:18px"></div>
+        <!-- 24h stats + price sparkline, and recent trades — the price-history surfaces live at the
+             BOTTOM of the terminal (below the composer + book), so they don't push the swap card down. -->
+        <div id="swPairStats" style="margin-top:18px"></div>
+        <div id="swTrades" style="margin-top:12px"></div>
 
         <!-- Confidential-receive toggle: shown ONLY when receiving a Sequentia-issued asset ON-CHAIN
              (blinded addresses don't apply to BTC or to a Lightning receive). Gated by updateConfToggle(). -->

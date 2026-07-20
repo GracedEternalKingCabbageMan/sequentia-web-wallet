@@ -4679,7 +4679,7 @@ function renderInFlightCard(){
   }
   if (hist.length){
     html += `<div class="swbook"><div class="swbook-head">
-        <span class="lbl">Recent trades</span><span class="sub">last ${hist.length}</span></div>`
+        <span class="lbl">Your recent trades</span><span class="sub">last ${hist.length}</span></div>`
       + hist.slice(0, 6).map(e => `<div class="swbook-row myorder">
           <span class="mono">${esc(e.title)} · ${esc(e.status)}</span>
           ${e.txid ? `<span class="sub mono">${esc(String(e.txid).slice(0, 12))}…</span>` : ''}</div>`).join('')
