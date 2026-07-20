@@ -1081,8 +1081,12 @@ function runSwap({ side, asset, amount, offer_id, maker_pubkey, quote_asset }) {
     // that actually hold those assets. Empty/BTC quote = the classic asset<->BTC (counter leg = BTC-LN).
     const quoteId = quote_asset && String(quote_asset).toUpperCase() !== 'BTC' ? resolveAsset(quote_asset) : null;
     const assetAsset = !!quoteId;
-    const baseSock = (targetFor('seq', assetId, null).rpc) || CFG.hostedAssetRpc;
-    const quoteSock = assetAsset ? ((targetFor('seq', quoteId, null).rpc) || CFG.hostedAssetRpc) : CFG.hostedBtcRpc;
+    // Resolve EACH leg's node with NO hostedAssetRpc fallback: targetFor already returns the GOLD node
+    // for GOLD (line 607) and the provisioned node otherwise, so a fallback here only ever fired for a
+    // non-GOLD, unprovisioned asset — silently collapsing BOTH legs onto the GOLD demo node (wrong asset)
+    // AND making the guard below dead code. Without it an unresolved asset yields null -> honest failure.
+    const baseSock = targetFor('seq', assetId, null).rpc;
+    const quoteSock = assetAsset ? targetFor('seq', quoteId, null).rpc : CFG.hostedBtcRpc;
     if (!baseSock || !quoteSock) return resolve({ ok: false, error: `no hosted Lightning node for ${assetAsset ? assetLabel(assetId) + '/' + assetLabel(quoteId) : assetLabel(assetId) + '/BTC'}` });
     const args = [
       'xpln', '-side', side, '-relay', CFG.relay,

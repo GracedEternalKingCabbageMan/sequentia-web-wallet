@@ -70,8 +70,15 @@ let settled = applyStatus(live, { finality: 'final', preimage: 'cd'.repeat(32) }
 assert.ok(settled.state === ST.SETTLED && settled.preimage === 'cd'.repeat(32), 'a final poll settles the swap with its preimage');
 let stillGoing = applyStatus(live, { status: 'confirming', detail: 'burying under Bitcoin' });
 assert.ok(stillGoing.state === ST.SETTLING && /burying/.test(stillGoing.detail), 'a confirming poll keeps it SETTLING with detail');
-let failed = applyStatus(live, { ok: false, error: 'no route' });
-assert.ok(failed.state === ST.FAILED && /no route/.test(failed.detail), 'an ok:false poll fails the swap with its error');
+// FUND-SAFETY: an ok:false poll on a swap with a funded on-chain HTLC stays SETTLING — the leg is
+// reclaimable at its CLTV timeout, so keeping the "Refund BTC leg" off-ramp live (and not erasing a
+// refundable record on resume) matters more than a terminal FAILED. It still records the error.
+let failedWithHtlc = applyStatus(live, { ok: false, error: 'no route' });
+assert.ok(failedWithHtlc.state === ST.SETTLING && /no route/.test(failedWithHtlc.detail), 'an ok:false poll WITH a funded HTLC stays SETTLING (refund path preserved) and records the error');
+// Only a failure with NOTHING locked is a clean terminal FAILED.
+let bare = newSwap({ side: 'buy', asset: GOLD, amount: 5, payRail: 'ln', recvRail: 'chain', payIsBtc: true });
+let failedBare = applyStatus(bare, { ok: false, error: 'no route' });
+assert.ok(failedBare.state === ST.FAILED && /no route/.test(failedBare.detail), 'an ok:false poll with nothing locked fails terminally with its error');
 // applyStatus can DISCOVER the on-chain leg a server-side-started swap only later exposes.
 let discovered = applyStatus(newSwap({ side: 'sell', asset: GOLD, amount: 1, payRail: 'chain', recvRail: 'ln', payIsBtc: false }),
   { status: 'confirming', onchain_leg: { htlc_address: 'tsq1qlate', locktime: 500 } });

@@ -1368,7 +1368,23 @@ async function resumeFunding(){
       }
     } catch { /* not indexed yet — the leg is still refundable after T_btc; a later reload retries */ }
   } else if (!leg){
-    clearSwap(); renderStepper();   // pre-broadcast stub that never funded — safe to drop (no BTC locked)
+    // F-FS2: "no leg" does NOT prove "nothing funded". fund() persists btc_leg via onBroadcast the instant
+    // it broadcasts, so btc_leg is null here only if fund() threw BEFORE that — which includes the node
+    // ACCEPTING the tx but the response being lost. btc_redeem_script + btc_amount were persisted before the
+    // broadcast (the saveSwap above the fund), so scan the HTLC address: if a funding output exists, ADOPT
+    // it (vout/height/amount fill on the next pass via the branch above) rather than discarding the reclaim
+    // material of a leg that is actually locked on-chain. Only clear when nothing is on-chain.
+    let recovered = false;
+    if (SWAP.btc_redeem_script){
+      try {
+        const f = await C.btcLeg.findFundingByAddress(SWAP.btc_redeem_script);
+        if (f && f.txid){
+          SWAP.btc_leg = { txid: f.txid, vout: null, height: null, amount: big(SWAP.btc_amount || 0), asset_id: '', redeem_script: SWAP.btc_redeem_script };
+          saveSwap(); renderStepper(); recovered = true;
+        }
+      } catch { /* not indexed yet — keep the record; a later reload retries the scan (still refundable) */ }
+    }
+    if (!recovered){ clearSwap(); renderStepper(); }   // truly never funded — safe to drop (no BTC locked)
   }
 }
 // CLTV-gate a refund button: a refund tx sets nLockTime and is non-final (network-rejected) until the

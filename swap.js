@@ -963,9 +963,20 @@ function renderRailNote(ra){
     // provisionable: a channel is arranged for you when you place the order, JIT + 0-conf (near-instant).
     // Per-leg: a PAY leg opens spendable capacity from YOUR balance; a RECEIVE leg is fronted by the
     // service (inbound). Optional "Set it up now" shortcut to the Balance tab.
-    html = pick.direction === 'pay'
-      ? `<span>A Lightning channel for ${nm} opens from your balance when you place the order · near-instant (0-conf).</span>`
-      : `<span>Inbound ${nm} Lightning liquidity is fronted for you when you place the order · near-instant, nothing to set up.</span>`;
+    // F-R2 honesty: in a CROSS swap (BTC on one leg) the rail is a preference — findRoute routes this leg
+    // over Lightning only when a Lightning COUNTERPARTY is resting (sell_available for a pay-asset leg,
+    // buy_available for a recv-asset leg) and otherwise bridges to the on-chain book at the SAME price. So
+    // don't promise Lightning unconditionally when no LN counterparty is known; state the on-chain fallback.
+    const legAsset = pick.direction === 'pay' ? S.payAsset : S.receiveAsset;
+    const crossFallback = (S.payAsset === 'BTC' || S.receiveAsset === 'BTC')
+      && !(pick.direction === 'pay' ? sellCapable(legAsset) : subassetCapable(legAsset));
+    if (crossFallback){
+      html = `<span>Settles over Lightning for ${nm} when a Lightning counterparty is resting, otherwise on-chain at the same price · nothing to set up.</span>`;
+    } else {
+      html = pick.direction === 'pay'
+        ? `<span>A Lightning channel for ${nm} opens from your balance when you place the order · near-instant (0-conf).</span>`
+        : `<span>Inbound ${nm} Lightning liquidity is fronted for you when you place the order · near-instant, nothing to set up.</span>`;
+    }
   }
   note.innerHTML = html + (withBtn ? ` <button type="button" class="swfix" id="swRailMove">${btnLabel}</button>` : '');
   const b = C.$('swRailMove');
@@ -1068,6 +1079,14 @@ function setRail(leg, r){
   const cur = leg === 'pay' ? S.payRail : S.recvRail;
   if (cur === r) return;
   if (leg === 'pay') S.payRail = r; else S.recvRail = r;
+  // Same-chain asset<->asset has NO mixed-rail settlement path: both legs go over Lightning (pure-LN,
+  // two asset-LN HTLCs bound by one preimage) OR both on-chain (the covenant book). A split (one LN, one
+  // chain) has no bridge, so findRoute silently falls through to the on-chain 'same' route while the UI
+  // has frozen the fee "over Lightning" — a no-op that mis-settles. Couple the rails: setting one leg sets
+  // the other. BTC pairs are genuinely rail-independent (the LSP bridges rails at settlement), so this is
+  // scoped to same-chain, where no such bridge exists.
+  const sameChain = !!(S.payAsset && S.receiveAsset && S.payAsset !== 'BTC' && S.receiveAsset !== 'BTC');
+  if (sameChain){ S.payRail = r; S.recvRail = r; }
   LAST_QUOTE = null; setReviewEnabled(false);
   const ra = lnDeployed() ? railAvail(S.payAsset, S.receiveAsset) : null;
   paintRailSegs(ra);
@@ -1182,7 +1201,7 @@ async function requote(){
   try {
     // Only the same-chain path has the live WS book; other rails render XBOOK/UBOOK, so tear the
     // same-chain stream down when routing away (else a stale subscription keeps patching a hidden BOOK).
-    if (route.kind === 'ln')         { stopLiveBook(); await requoteLn(route, amtStr); }
+    if (route.kind === 'ln')         { if (!route.assetAsset) stopLiveBook(); await requoteLn(route, amtStr); }  // asset<->asset LN: keep the same-chain covenant book live (it's the on-chain alternative the note points at); asset<->BTC LN uses the cross book, so drop the same-chain stream
     else if (route.kind === 'cross') { stopLiveBook(); await requoteCross(route, amtStr); }
     else if (route.kind === 'mixed') { stopLiveBook(); await requoteMixed(route, amtStr); }
     else                             await requoteSame(route, amtStr);
@@ -2893,6 +2912,34 @@ function isPeggedFillToRedeem(m){
   return advertisedBtc;                                          // received SBTC on a BTC-advertised market -> redeem
 }
 
+// SBTC peg-OUT resume (F-FS3). pegOutReceivedSbtc broadcasts (sendSeqAsset), so a failure can leave the
+// received SBTC un-redeemed with no follow-up — the old "auto-redeem will retry" toast promised a retry
+// that did not exist. Persist the pending amount and retry it ONCE on next load, guarded by the LIVE SBTC
+// balance so a strand (broadcast-then-throw) can never double-send: if the balance no longer covers the
+// amount, the SBTC already left, so skip. One-shot (cleared up front) so a mid-retry reload can't re-fire.
+const PEGOUT_PENDING_KEY = 'swk.sequentia.pegoutpending';
+function loadPegOutPending(){ try { return JSON.parse(localStorage.getItem(PEGOUT_PENDING_KEY) || '[]'); } catch { return []; } }
+function savePegOutPending(list){ try { localStorage.setItem(PEGOUT_PENDING_KEY, JSON.stringify(list)); } catch {} }
+function recordPendingPegOut(atoms){
+  try { const l = loadPegOutPending(); l.push({ id: 'po:' + Date.now() + ':' + Math.random().toString(36).slice(2, 8), atoms: String(atoms) }); savePegOutPending(l); } catch {}
+}
+export async function resumePegOuts(){
+  const list = loadPegOutPending();
+  if (!list.length) return;
+  savePegOutPending([]);                                          // one-shot: clear up front so a reload mid-retry can't double-fire
+  const sbtcHex = (sbtcAssetId() || '').toLowerCase();
+  for (const rec of list){
+    try {
+      const atoms = BigInt(rec.atoms || 0);
+      if (atoms <= 0n) continue;
+      try { if (C.refreshBalances) await C.refreshBalances(); } catch {}
+      if (!sbtcHex || balAtoms(sbtcHex) < atoms) continue;        // already redeemed/spent -> never double-send
+      await pegOutReceivedSbtc(atoms); await C.sync();
+    } catch { /* still redeemable from the Balance tab; not re-queued, to avoid an unbounded double-send loop */ }
+  }
+  try { renderSwap(); } catch {}
+}
+
 // The taker FILL hooks for an inbound match: the credit asset is asset B, so the fee
 // is paid in B too (never asset A — the covenant-fill host rejects that). Amounts are
 // coin-selected from THIS wallet's own B + fee UTXOs by the wasm assembler.
@@ -2998,7 +3045,7 @@ async function onCovMatched(m){
     if (isPeggedFillToRedeem(m)){
       const got = BigInt(m.fill_base_amount || m.fillBaseAmount || m.covenant_locked || m.covenantLocked || 0);
       try { await pegOutReceivedSbtc(got); await C.sync(); try { renderSwap(); } catch {} }
-      catch (e){ try { C.toast && C.toast('Received SBTC (redeemable to BTC); auto-redeem will retry.'); } catch {} }
+      catch (e){ recordPendingPegOut(got); try { C.toast && C.toast('Received SBTC · redeeming it to BTC didn\'t go through. It\'s safe and redeemable from the Balance tab, and we\'ll retry automatically next time you open the wallet.'); } catch {} }
     }
   } catch (e){ try { C.toast && C.toast('Fill could not settle: ' + C.prettyErr(e)); } catch {} }
 }
@@ -4336,7 +4383,7 @@ async function requoteLn(route, amtStr){
   if (!lnOffer){
     LAST_QUOTE = null; setReviewEnabled(false);
     paintFee(route.quoteAsset || 'BTC', null, null);
-    $('swRate').textContent = `No resting Lightning offer for ${am.ticker}/${qtk} yet · use the on-chain book above.`;
+    $('swRate').textContent = `No resting Lightning offer for ${am.ticker}/${qtk} yet · switch to the on-chain rail to trade the book above.`;
     return;
   }
   LAST_QUOTE = { kind: 'ln', side, seqAsset: route.seqAsset, payIsBtc: route.payIsBtc,
@@ -4428,8 +4475,10 @@ async function reviewLn(q){
         maker_pubkey: (q.lnOffer && q.lnOffer.maker_pubkey) || undefined });
       const bm = C.assetMeta(r.asset || q.seqAsset);
       const qtkR = r.quote_asset_label || qtk;   // the LSP echoes the real quote label (BTC or the asset)
-      const got = (r.direction === 'sold') ? `${r.quote_amount} ${qtkR}`
-        : `${r.base_amount} ${bm.ticker}`;
+      // Format the settled amount into human units (fmtAtoms), never raw atoms: base uses the asset
+      // precision (aprec), quote uses the counter-leg precision (qprec = BTC's 8 or the quote asset's).
+      const got = (r.direction === 'sold') ? `${C.fmtAtoms(big(r.quote_amount), qprec)} ${qtkR}`
+        : `${C.fmtAtoms(big(r.base_amount), aprec)} ${bm.ticker}`;
       modal.remove();
       // Receipt into the persistent history (W6); no on-chain txid on this rail, so key by the
       // payment hash. Drop the raw preimage from the toast — it is protocol jargon, not user info (C-7).
@@ -4954,7 +5003,7 @@ async function renderMyOrders(){
           C.toast('Order cancelled · reclaimed on-chain (' + String(out.refundTxid).slice(0,12) + '…).');
           // SBTC silent peg: the reclaimed asset is SBTC, but the maker paid BTC and expects BTC back.
           // Redeem it (best-effort; on failure the user simply holds redeemable SBTC — fund-safe).
-          if (rec.pegged){ try { await C.sync(); await pegOutReceivedSbtc(BigInt(rec.sellAtoms)); } catch {} }
+          if (rec.pegged){ try { await C.sync(); await pegOutReceivedSbtc(BigInt(rec.sellAtoms)); } catch { recordPendingPegOut(BigInt(rec.sellAtoms)); } }
         } else if (out.reclaimable){
           const meta = C.assetMeta(rec.pay);
           C.toast('Order delisted. The locked ' + esc(meta.ticker) + ' is reclaimable on-chain after block ' + out.reclaimable.afterHeight + '.');
