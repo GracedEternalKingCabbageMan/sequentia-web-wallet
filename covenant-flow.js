@@ -112,16 +112,23 @@ export function fillRestSplit(requestedAtoms, fillableAtoms, dustDen = 200n){
 //   nowUnix/ttl    created/expires timestamps
 export function buildCovenantOffer({ assetA, assetB, sellAtoms, recvAtoms, covenant,
                                      makerPubkey, recvAddress, offerId, nowUnix, ttlSecs,
-                                     allowPartial, minLot }){
+                                     allowPartial, minLot, advertiseOfferAssetAs }){
   const now = Number(nowUnix != null ? nowUnix : Math.floor(Date.now() / 1000));
   const ttl = Number(ttlSecs || 3600);
+  // The SETTLEMENT asset (what the covenant actually locks) is always assetA. The ADVERTISED asset
+  // differs ONLY for the SBTC silent peg: a covenant that locks SBTC advertises itself as BTC so it
+  // rests in the asset/BTC market — routing by the SELECTED asset, not the locked one (see
+  // sbtc-peg-design.md §5.1). SBTC == BTC 1:1, so the advertised amount equals the locked amount, and
+  // the relay accepts it (the covenant validator skips the BTC sentinel and never binds offer_asset
+  // to covenant.asset_a). Defaults to assetA, so every existing same-chain caller is unchanged.
+  const advOffer = advertiseOfferAssetAs || assetA;
   return {
     offer_id: offerId,
     schema_version: 1,
-    pair: { base_asset: assetA, quote_asset: assetB },
-    trade_dir: 1,                                   // SELL: maker gives base (= asset A)
+    pair: { base_asset: advOffer, quote_asset: assetB },
+    trade_dir: 1,                                   // SELL: maker gives base (= the advertised asset)
     base_amount: String(BigInt(sellAtoms)),
-    offer_amount: String(BigInt(sellAtoms)), offer_asset: assetA,
+    offer_amount: String(BigInt(sellAtoms)), offer_asset: advOffer,
     want_amount: String(BigInt(recvAtoms)),  want_asset: assetB,
     // allow_partial + min_lot let the matcher cross what's available now and leave the covenant's
     // self-replicating remainder resting (a market order bigger than the book fills the book, rests
