@@ -1425,6 +1425,21 @@ async function requoteSame(route, amtStr){
       setReviewEnabled(true);
       return;
     }
+    if (S.mode === 'take'){
+      // MARKET (spec line 177): a market order is a TAKER — WALK the book now and never rest a
+      // remainder. Route to the walk when something crosses the price; otherwise say so plainly
+      // (no silent rest). crossableDepthAtoms measures the resting depth that meets the order price.
+      const depth = crossableDepthAtoms(liftable, payAtoms, recvAtoms);
+      if (depth <= 0n){
+        LAST_QUOTE = null; setReviewEnabled(false);
+        $('swErr').textContent = `Nothing is resting that crosses your price for ${rm.ticker}/${pm.ticker}. A market order only fills against resting orders · switch to Limit to rest an order at your price.`;
+        return;
+      }
+      LAST_QUOTE = { kind:'same', takeMkt:true, pay, receive, payAtoms, recvAtoms };
+      setReviewEnabled(true);
+      return;
+    }
+    // LIMIT (post): rest a covenant at the user's price (offline-liftable passive CLOB).
     LAST_QUOTE = { kind:'same', place:true, pay, receive, payAtoms, recvAtoms };
     setReviewEnabled(true);
   } catch (e){
@@ -2516,7 +2531,8 @@ async function onReview(){
   if (q.kind === 'ln') return reviewLn(q);
   if (q.kind === 'mixed') return reviewMixed(q);
   if (q.kind === 'cross') return reviewCross(q);
-  if (q.kind === 'same' && q.place) return placeCovenantReview(q);
+  if (q.kind === 'same' && q.takeMkt) return takeCovenantWalkReview(q);   // MARKET: walk the book, never rest
+  if (q.kind === 'same' && q.place) return placeCovenantReview(q);        // LIMIT: rest a covenant
   return reviewSame(q);
 }
 
@@ -3003,6 +3019,111 @@ async function scripthashOf(spkHex){
   const digest = new Uint8Array(await crypto.subtle.digest('SHA-256', bytes));
   digest.reverse();
   return [...digest].map(b => b.toString(16).padStart(2, '0')).join('');
+}
+
+// ===========================================================================
+// MARKET take — WALK the book (spec line 177: a market order is a TAKER)
+// ---------------------------------------------------------------------------
+// A market order crosses the resting offers that meet its price, best price first,
+// and NEVER rests a remainder (that is the maker's LIMIT path). The same-chain book
+// holds TWO kinds of resting liquidity and the walk fills BOTH:
+//   • covenant offers (funded, self-enforcing, offline) → settleFill DIRECTLY from
+//     the covenant's own terms (no maker round-trip, no relay match, nothing that
+//     could itself rest); the pay per fill is planFill'd from the committed rate, so
+//     it is consensus-exact (on-chain rejects any underpay/redirect).
+//   • interactive maker offers (the seqob-maker fleet; the LIVE fillable depth) →
+//     seqob.lift, co-signed by the online maker.
+// executableQuote maps our remaining PAY budget onto each offer's own orientation +
+// rounding, so amounts are exact and a single fill never over-takes the offer. The
+// unfilled budget simply does not fill — a market order leaves NOTHING resting.
+// Slippage is bounded: stop walking once an ask is worse than MARKET_SLIP below best.
+const MARKET_SLIP = 0.15;   // walk down to 15% below top-of-book, then stop (partial fill, never rest)
+async function takeMarketWalk(pay, receive, payAtoms, recvAtoms, onStatus){
+  payAtoms = BigInt(payAtoms);
+  // Re-fetch BOTH orientations so we cross the CURRENT resting offers, not a stale compose snapshot.
+  const [b1, b2] = await Promise.all([
+    seqob.fetchBook(receive, pay, { confidential: false }).catch(() => ({ offers: [] })),
+    seqob.fetchBook(pay, receive, { confidential: false }).catch(() => ({ offers: [] })),
+  ]);
+  const mine = (makerPubHex() || '').toLowerCase();
+  const asks = applyOffersToBook([...(b1.offers || []), ...(b2.offers || [])], pay, receive)
+    .filter((o) => String(o.maker_pubkey || o.makerPubkey || '').toLowerCase() !== mine);   // never self-fill
+  if (!asks.length) throw new Error('No resting orders are on the book to fill right now. Switch to Limit to rest an order.');
+  const bestPrice = Number(big(asks[0].offer_amount || asks[0].offerAmount || 0)) / Number(big(asks[0].want_amount || asks[0].wantAmount || 1));
+  const floor = bestPrice * (1 - MARKET_SLIP);   // receive-per-pay we refuse to go below
+  let paidPay = 0n, gotRecv = 0n; const txids = []; const seen = new Set(); let idx = 0;
+  for (const o of asks){
+    if (paidPay >= payAtoms) break;
+    const oid = String(o.offer_id || o.offerId || '');
+    if (oid && seen.has(oid)) continue; if (oid) seen.add(oid);
+    const oRecv = big(o.offer_amount || o.offerAmount || 0);   // asset A offered = what we RECEIVE
+    const oPay  = big(o.want_amount  || o.wantAmount  || 0);   // asset B wanted  = what we PAY
+    if (oPay <= 0n || oRecv <= 0n) continue;
+    if (Number(oRecv) / Number(oPay) + 1e-9 < floor) break;    // asks are best-first: once past the slippage floor, stop
+    const payLeft = payAtoms - paidPay;
+    const typedPay = payLeft < oPay ? payLeft : oPay;          // take at most this offer's full pay, bounded by the budget
+    if (typedPay <= 0n) break;
+    // executableQuote turns our pay budget into this offer's exact take (base atoms) + the pay/recv it costs,
+    // in the offer's own base/quote orientation. It caps the take at the offer's size, so one fill never over-lifts.
+    const q = executableQuote(o, pay, receive, pay, typedPay);
+    if (q.takeBase <= 0n || q.amountR <= 0n || q.amountP <= 0n) continue;
+    idx++; onStatus && onStatus(`Filling against resting order ${idx}…`);
+    if (o.covenant || o.Covenant){
+      // fill_base_amount is in asset A (what we RECEIVE) = q.amountR; covenant_locked is the offer's full asset-A.
+      const synth = { resting_is_covenant: true, covenant: (o.covenant || o.Covenant),
+        covenant_locked: String(oRecv), fill_base_amount: String(q.amountR), offer_id: oid, pair: o.pair };
+      const { txid } = await covSettleFill(synth, fillHooksFor(synth));
+      txids.push(txid);
+    } else {
+      // Interactive maker offer: co-sign lift q.takeBase of the base with the online maker.
+      const txid = await liftOffer(q, onStatus);
+      txids.push(txid);
+    }
+    paidPay += q.amountP; gotRecv += q.amountR;
+    try { await C.sync(); } catch {}   // reflect the spent UTXOs before the next fill
+  }
+  if (!txids.length) throw new Error('Nothing on the book crossed your price. Switch to Limit to rest an order at your price.');
+  return { txids, paidPay, gotRecv, full: paidPay >= payAtoms };
+}
+
+// Review a MARKET order (same-chain): confirm, then walk the book.
+async function takeCovenantWalkReview(q){
+  const { $ } = C;
+  const pay = q.pay, receive = q.receive, payAtoms = BigInt(q.payAtoms), recvAtoms = BigInt(q.recvAtoms);
+  const pm = C.assetMeta(pay), rm = C.assetMeta(receive);
+  const feeAsset = S.feeAsset || defaultFeeAsset();
+  const kv = [
+    ['You pay', 'up to ' + amtRow(pay, payAtoms) + refSuffix(pay, payAtoms)],
+    ['You receive', '~' + amtRow(receive, recvAtoms) + refSuffix(receive, recvAtoms)],
+    ['Price', payAtoms > 0n ? 'Market · ' + ratePerPayToLine(pay, receive, Number(recvAtoms) / Number(payAtoms)).str : '-'],
+    ['Network fee', amtRow(feeAsset, covFeeAtoms(feeAsset)) + '  (estimate, per fill)'],
+    ['How it fills', `Walks the order book now and fills what crosses your price, best price first. Any part that can't fill is NOT rested — a market order never leaves a resting order behind (switch to Limit for that). Each fill settles on-chain; consensus rejects any underpay or redirect.`],
+    ['Finality', 'Each fill settles in ~1 block · anchor-bound to Bitcoin (reverts only if Bitcoin reverts).'],
+    ['Settlement', 'Atomic per fill - each settles in full or not at all.'],
+  ];
+  const { m: modal, ok, st } = C.modalRows({ title: 'Review market order', kv });
+  if (ok) ok.textContent = 'Place market order';
+  ok.onclick = async () => {
+    ok.disabled = true; st.className = 'status'; st.innerHTML = '<span class="spin"></span>Walking the order book…';
+    try {
+      const res = await takeMarketWalk(pay, receive, payAtoms, recvAtoms,
+        (msg) => { st.innerHTML = '<span class="spin"></span>' + esc(msg); });
+      modal.remove();
+      for (const txid of res.txids)
+        logTrade({ id: 'covfill:' + txid, title: 'Swapped ' + pm.ticker + ' for ' + rm.ticker, status: 'settled', txid });
+      const gotStr = C.fmtAtoms(res.gotRecv, rm.precision);
+      if (res.full)
+        C.toast(`Market order filled · received ${gotStr} ${rm.ticker}.`,
+          res.txids[0] ? { href: '/explorer/tx/' + res.txids[0], label: String(res.txids[0]).slice(0, 18) + '…' } : undefined);
+      else
+        C.toast(`Filled what the book had · received ${gotStr} ${rm.ticker}. The rest did not fill (thin book) and was NOT rested — switch to Limit to rest an order.`);
+      resetComposer();
+      await C.sync();
+      renderSwap();
+    } catch (e){
+      st.className = 'status err'; st.textContent = 'Could not fill: ' + C.prettyErr(e); ok.disabled = false;
+    }
+  };
 }
 
 async function placeCovenantReview(q){
@@ -4309,7 +4430,7 @@ function fmtPrice(n){
 // The taker builds its half (seqdexSwapRequest), the maker co-signs over the
 // relay, then the taker signs + self-broadcasts (the proven 6d-1 finalize path)
 // and couriers the SwapComplete receipt back.
-async function liftOffer(q, st){
+async function liftOffer(q, onStatusArg){
   const { wasm } = C;
   // Receive TRANSPARENTLY by default (principle #6: transparent-by-default). Only a confidential
   // swap (q.confidential — the opt-in Confidential sub-tab) receives to the blinded blech32 address;
@@ -4338,7 +4459,10 @@ async function liftOffer(q, st){
     const txid = await C.client.broadcast(finalized);
     return { transaction: strippedB64, txid: (txid && txid.toString) ? txid.toString() : String(txid) };
   };
-  const onStatus = (msg) => { st.innerHTML = '<span class="spin"></span>' + msg; };
+  // onStatus may be a DOM status element (legacy reviewSame call) or a plain callback (the market walk).
+  const onStatus = (typeof onStatusArg === 'function')
+    ? onStatusArg
+    : (msg) => { if (onStatusArg) onStatusArg.innerHTML = '<span class="spin"></span>' + msg; };
   return seqob.lift(q.offer, q.takeBase, q.feeAsset, { buildRequest, finalizeAccept, onStatus });
 }
 
