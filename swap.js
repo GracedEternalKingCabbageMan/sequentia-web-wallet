@@ -3071,7 +3071,7 @@ async function takeMarketWalk(pay, receive, payAtoms, recvAtoms, onStatus){
   if (!asks.length) throw new Error('No resting orders are on the book to fill right now. Switch to Limit to rest an order.');
   const bestPrice = Number(big(asks[0].offer_amount || asks[0].offerAmount || 0)) / Number(big(asks[0].want_amount || asks[0].wantAmount || 1));
   const floor = bestPrice * (1 - MARKET_SLIP);   // receive-per-pay we refuse to go below
-  let paidPay = 0n, gotRecv = 0n; const txids = []; const seen = new Set(); let idx = 0;
+  let paidPay = 0n, gotRecv = 0n; const txids = []; const seen = new Set(); let idx = 0, lastErr = null;
   for (const o of asks){
     if (paidPay >= payAtoms) break;
     const oid = String(o.offer_id || o.offerId || '');
@@ -3088,21 +3088,28 @@ async function takeMarketWalk(pay, receive, payAtoms, recvAtoms, onStatus){
     const q = executableQuote(o, pay, receive, pay, typedPay);
     if (q.takeBase <= 0n || q.amountR <= 0n || q.amountP <= 0n) continue;
     idx++; onStatus && onStatus(`Filling against resting order ${idx}…`);
-    if (o.covenant || o.Covenant){
-      // fill_base_amount is in asset A (what we RECEIVE) = q.amountR; covenant_locked is the offer's full asset-A.
-      const synth = { resting_is_covenant: true, covenant: (o.covenant || o.Covenant),
-        covenant_locked: String(oRecv), fill_base_amount: String(q.amountR), offer_id: oid, pair: o.pair };
-      const { txid } = await covSettleFill(synth, fillHooksFor(synth));
+    // A single offer failing (a covenant just taken by someone else, or an interactive maker gone
+    // offline) must NOT abort the whole market order — skip it and walk on. Nothing is committed for a
+    // failed fill (covSettleFill/lift either broadcast atomically or throw), so skipping strands nothing.
+    try {
+      let txid;
+      if (o.covenant || o.Covenant){
+        // fill_base_amount is in asset A (what we RECEIVE) = q.amountR; covenant_locked is the offer's full asset-A.
+        const synth = { resting_is_covenant: true, covenant: (o.covenant || o.Covenant),
+          covenant_locked: String(oRecv), fill_base_amount: String(q.amountR), offer_id: oid, pair: o.pair };
+        ({ txid } = await covSettleFill(synth, fillHooksFor(synth)));
+      } else {
+        // Interactive maker offer: co-sign lift q.takeBase of the base with the online maker.
+        txid = await liftOffer(q, onStatus);
+      }
       txids.push(txid);
-    } else {
-      // Interactive maker offer: co-sign lift q.takeBase of the base with the online maker.
-      const txid = await liftOffer(q, onStatus);
-      txids.push(txid);
-    }
-    paidPay += q.amountP; gotRecv += q.amountR;
-    try { await C.sync(); } catch {}   // reflect the spent UTXOs before the next fill
+      paidPay += q.amountP; gotRecv += q.amountR;
+      try { await C.sync(); } catch {}   // reflect the spent UTXOs before the next fill
+    } catch (e){ lastErr = e; /* skip this offer, try the next crossable one */ }
   }
-  if (!txids.length) throw new Error('Nothing on the book crossed your price. Switch to Limit to rest an order at your price.');
+  if (!txids.length) throw new Error(lastErr
+    ? ('Could not fill against the resting orders: ' + C.prettyErr(lastErr))
+    : 'Nothing on the book crossed your price. Switch to Limit to rest an order at your price.');
   return { txids, paidPay, gotRecv, full: paidPay >= payAtoms };
 }
 
