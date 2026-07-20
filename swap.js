@@ -4406,23 +4406,54 @@ async function reviewLn(q){
   // BOTH legs (findRoute already gates this; this catches a stale quote). Fail CLOSED
   // with a clear message + a route to Move-to-Lightning — never a silent flash.
   let ra = railAvail(S.payAsset, S.receiveAsset);
+  // SELF-CUSTODY (Phoenix-style, LSP-supported): this swap runs on the USER's OWN per-asset Lightning
+  // nodes (see node_key/counter_node_key at L.swap below), and the device co-signs every commitment over
+  // the wss link during the call — the keys never leave the device. So BOTH node signers must be ONLINE
+  // first, EVEN when the channels already exist (a per-user node's signer is not auto-connected on load).
+  // connectNode is idempotent (re-attaches without re-funding). BTC legs connect via their own provision
+  // flow, so this only pre-connects the Sequentia-asset legs.
+  if (L.connectNode){
+    try {
+      if (S.payAsset !== 'BTC')     await L.connectNode(S.payAsset);
+      if (S.receiveAsset !== 'BTC') await L.connectNode(S.receiveAsset);
+    } catch (e){ $('swErr').textContent = 'Could not bring your Lightning node signer online: ' + (e && e.message || e); return; }
+  }
   if (!ra.pureLnOk){
-    // No usable channel on one/both legs. Instead of BLOCKING and sending the user to the Balance
-    // tab, OPEN the missing channel(s) INLINE now (the same non-custodial provision+fund flow), then
-    // continue the swap. Honest, bounded progress; a clear failure — never a silent hang.
+    // No usable channel on one/both legs. Instead of BLOCKING and sending the user to the Balance tab,
+    // OPEN the missing channel(s) INLINE on the user's OWN nodes, then continue. Per-leg DIRECTION matters:
+    // the PAY leg needs spendable OUTBOUND capacity (provisionChannel funds it from the user's balance);
+    // the RECEIVE leg needs INBOUND capacity the user CANNOT self-fund — the LSP FRONTS it toward the
+    // user's node (channelInbound). The old code opened OUTBOUND for both, so a channel-less receive leg
+    // got capacity it could never receive over. Honest, bounded progress; a clear failure — never a hang.
     if (!L.provisionChannel){ $('swErr').textContent = 'Opening a channel is unavailable in this build · open one from the Balance tab first.'; return; }
-    const provLeg = async (hexOrBtc, amtEl) => {
-      const chain = hexOrBtc === 'BTC' ? 'btc' : 'seq';
+    const sizeLeg = (hexOrBtc, amtEl) => {
       const m = metaOf(hexOrBtc);
       const atoms = safeAtoms(C.$(amtEl).value, m.precision || 0);
       if (atoms <= 0n) throw new Error('Enter an amount so the Lightning channel can be sized.');
+      return { m, atoms };
+    };
+    const provPayOutbound = async (hexOrBtc, amtEl) => {   // PAY leg: spendable OUTBOUND from the user's balance
+      const { m, atoms } = sizeLeg(hexOrBtc, amtEl);
+      const chain = hexOrBtc === 'BTC' ? 'btc' : 'seq';
       await L.provisionChannel({ chain, asset: chain === 'seq' ? hexOrBtc : undefined, ticker: m.ticker,
         amount: Number(atoms), onProgress: (t) => { $('swStatus').className = 'status'; $('swStatus').innerHTML = '<span class="spin"></span>' + t; } });
     };
+    const provRecvInbound = async (hexOrBtc, amtEl) => {   // RECEIVE leg: the LSP FRONTS inbound to the user's OWN node
+      const { m, atoms } = sizeLeg(hexOrBtc, amtEl);
+      if (hexOrBtc === 'BTC' || !L.channelInbound || !L.assetNodeKey){
+        // BTC-inbound fronting isn't wired (the LSP fronts asset inbound only). Fall back to the outbound
+        // provision so the leg still comes up on the user's node — self-custody holds; the LP just can't
+        // pre-fill BTC inbound here (asset<->BTC receive-BTC is the pre-existing limitation).
+        await provPayOutbound(hexOrBtc, amtEl); return;
+      }
+      $('swStatus').className = 'status'; $('swStatus').innerHTML = '<span class="spin"></span>Fronting inbound ' + m.ticker + ' Lightning liquidity to your node…';
+      const nodeKey = await L.assetNodeKey(hexOrBtc);
+      await L.channelInbound({ node_key: nodeKey, asset: hexOrBtc, amount: Number(atoms) });
+    };
     try {
       $('swErr').textContent = '';
-      if (!ra.payLn.ok)  await provLeg(S.payAsset,     'swPayAmt');
-      if (!ra.recvLn.ok) await provLeg(S.receiveAsset, 'swRecvAmt');
+      if (!ra.payLn.ok)  await provPayOutbound(S.payAsset,     'swPayAmt');
+      if (!ra.recvLn.ok) await provRecvInbound(S.receiveAsset, 'swRecvAmt');
       LNSTATUS = await L.status();   // refresh so railAvail sees the freshly-opened channel(s)
       $('swStatus').textContent = '';
     } catch (e){
@@ -4467,10 +4498,18 @@ async function reviewLn(q){
   ok.onclick = async () => {
     ok.disabled = true; st.className = 'status'; st.innerHTML = '<span class="spin"></span>Settling over Lightning…';
     try {
+      // SELF-CUSTODY: name the user's OWN per-asset nodes so the LSP drives the swap on THEM (the device
+      // co-signs over the wss link), not on the LSP's shared node. node_key = the base <asset> node;
+      // counter_node_key = the <quote_asset> node for asset<->asset, or the user's BTC node for asset<->BTC.
+      const baseNodeKey = L.assetNodeKey ? await L.assetNodeKey(q.seqAsset) : undefined;
+      const counterNodeKey = q.assetAsset
+        ? (L.assetNodeKey ? await L.assetNodeKey(q.quoteAsset) : undefined)
+        : (L.btcNodeKey ? await L.btcNodeKey() : undefined);
       // PIN the exact offer the user just reviewed: the LSP forwards offer_id/maker_pubkey to xpln so
       // it lifts THIS resting offer, not a relay-arbitrary one at a different price.
       const r = await L.swap({ side: q.side, asset: q.seqAsset, amount: q.amount,
         quote_asset: q.assetAsset ? q.quoteAsset : undefined,   // asset<->asset: the real counter asset (BTC implied otherwise)
+        node_key: baseNodeKey, counter_node_key: counterNodeKey,
         offer_id: (q.lnOffer && q.lnOffer.offer_id) || undefined,
         maker_pubkey: (q.lnOffer && q.lnOffer.maker_pubkey) || undefined });
       const bm = C.assetMeta(r.asset || q.seqAsset);

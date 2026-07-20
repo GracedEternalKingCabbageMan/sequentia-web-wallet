@@ -440,7 +440,7 @@ export function closeChannelLsp({ chain = 'seq', asset, node, scid, destination,
 //     over Lightning). Anchor-gated; returns finality:'confirming' (anchor-bound).
 // Rails are only serialized when present, so the pure-LN call is byte-identical to
 // before (the LSP treats a missing rail as ln/ln).
-export function seqlnSwap({ side, asset, amount, quote_asset, payRail, recvRail, node_key, btc_claim_pub, offer_id, maker_pubkey, swap_nonce, hodl, payment_hash, asset_amount, btc_htlc }) {
+export function seqlnSwap({ side, asset, amount, quote_asset, payRail, recvRail, node_key, counter_node_key, btc_claim_pub, offer_id, maker_pubkey, swap_nonce, hodl, payment_hash, asset_amount, btc_htlc }) {
   const body = { side, asset, amount };
   // asset<->asset pure-LN: the counter (quote) asset id. Omitted (or 'BTC') => the classic asset<->BTC
   // pure-LN, so the pure-LN body stays byte-identical to before for every existing asset<->BTC swap.
@@ -451,6 +451,11 @@ export function seqlnSwap({ side, asset, amount, quote_asset, payRail, recvRail,
   // from the user's OWN hosted node (`node_key`) and returns P + the BTC HTLC terms WITHOUT
   // claiming — the wallet then claims on-chain with the device key matching `btc_claim_pub`.
   if (node_key) body.node_key = node_key;
+  // Pure-LN self-custody: the COUNTER (quote/BTC) leg's own user node. Nodes are keyed per-asset, so a
+  // pure-LN swap runs on TWO of the user's own nodes — node_key (base asset) + counter_node_key (the quote
+  // asset, or the user's BTC node for asset<->BTC). Only serialized when present, so every existing
+  // asset<->BTC / sub-asset body that omits it stays byte-identical.
+  if (counter_node_key) body.counter_node_key = counter_node_key;
   if (btc_claim_pub) body.btc_claim_pub = btc_claim_pub;
   // Forward the SPECIFIC reviewed offer so the LSP lifts THAT resting sell (its btc_sats is what
   // claimSell's economic gate checks) rather than an arbitrary one — matching Ambra's swapSub.
