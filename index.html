@@ -130,7 +130,7 @@
   .swdesk-book #swBook .swladder,.swdesk-book #swBook .swbook{margin-top:0}
   /* The composer (you pay/receive) is the focus: put it FIRST, so the order book, resting orders,
      stats and recent trades all sit BELOW it rather than pushing it down the page. */
-  .swdesk-compose{min-width:0;display:flex;flex-direction:column;gap:14px;order:-1}
+  .swdesk-compose{min-width:0;display:flex;flex-direction:column;gap:14px}
   .swdesk-compose>.card{margin-top:0}
   /* Take (lift the book at its price) vs Post (rest a limit order at your own price). */
   .swmode{display:flex;align-items:center;gap:12px;flex-wrap:wrap}
@@ -528,10 +528,11 @@
           <!-- LEFT: the SeqOB order book for the selected pair (resting offers; click a
                level to price) + your own resting orders. ONE book, always rendered — the
                same offers on every rail; no on-chain/LN distinction. Rendered by swap.js. -->
+          <!-- The order book is the ONE card that sits ABOVE the composer, and only once a
+               pair is selected (empty => zero height). Your in-flight/history + resting orders
+               go BELOW the composer (after its close), so the composer stays the top card. -->
           <div class="swdesk-book">
             <div id="swBook"></div>
-            <div id="swInFlight"></div>
-            <div id="swMyOrders"></div>
           </div>
 
           <!-- RIGHT: the composer (the signature). -->
@@ -668,6 +669,10 @@
         </div>
 
           </div><!-- /.swdesk-compose -->
+
+          <!-- BELOW the composer: your in-flight swaps (action may be needed) + your resting orders. -->
+          <div id="swInFlight"></div>
+          <div id="swMyOrders"></div>
         </div><!-- /.swdesk -->
 
         <!-- 24h stats + price sparkline, and recent trades — the price-history surfaces live at the
