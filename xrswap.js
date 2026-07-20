@@ -326,6 +326,17 @@ export function renderReverse(){
       // idempotent (reuses seq_fund_txid, never re-funds), waits for the confirmation, sets seq_leg,
       // resubmits to the maker, then settles. Now the asset is always resumable AND refundable.
       fundSeq().then(() => driveSettle()).catch(() => { /* surfaced on the stepper; the CLTV refund off-ramp appears once seq_leg is set */ });
+    } else if (SWAP.seq_redeem && SWAP.taker_seq_refund_secret){
+      // STRAND RECOVERY: seq_redeem was persisted the same synchronous tick BEFORE seqLeg.fund
+      // broadcasts, but fund() threw after the node accepted the tx (a lost response) — so neither
+      // seq_fund_txid nor seq_leg was ever set and both branches above miss it. NEVER call fundSeq
+      // here directly: with seq_fund_txid null it would RE-FUND (double-spend the asset). Instead scan
+      // the HTLC address for the already-broadcast funding output, ADOPT its txid, then resume via
+      // fundSeq (which now reuses seq_fund_txid). If nothing is found the fund never landed and the
+      // record is safely abandonable — until then onAbandon keeps the reclaim material.
+      C.seqLeg.findFundingByAddress(SWAP.seq_redeem).then((f) => {
+        if (f && f.txid){ SWAP.seq_fund_txid = f.txid; saveSwap(); fundSeq().then(() => driveSettle()).catch(() => {}); }
+      }).catch(() => {});
     }
   }
 }
@@ -849,11 +860,14 @@ function takerDestSpkHex(){
 
 function onAbandon(){
   loadSwap();
-  // NEVER discard a reverse swap that still holds a locked ASSET leg: clearSwap() drops the
-  // seq_leg outpoint (txid/vout/redeem/block) needed to build the CLTV asset refund, stranding
-  // it. Keep the record + point at the Refund off-ramp until the asset is refunded or the taker
-  // has already claimed the maker's BTC (terminal — nothing of ours left locked).
-  const lockedUnrefunded = !!(SWAP && SWAP.seq_leg && SWAP.seq_leg.txid)
+  // NEVER discard a reverse swap that still holds (or MIGHT hold) a locked ASSET leg: clearSwap()
+  // drops the reclaim material (the seq_leg outpoint OR the seq_redeem + taker_seq_refund_secret needed
+  // to re-derive the CLTV refund), stranding it. Key on seq_redeem, not just seq_leg: seq_redeem is
+  // persisted the SAME synchronous tick BEFORE seqLeg.fund broadcasts, so if fund() throws AFTER the
+  // node accepted the tx (a lost response), the asset is locked on-chain yet seq_fund_txid/seq_leg are
+  // never set — the old seq_leg-only guard let Abandon delete the refund key and the maker sweep the
+  // asset. renderReverse's seq_redeem recovery below resolves funded-vs-not; until then, keep the record.
+  const lockedUnrefunded = !!(SWAP && ((SWAP.seq_leg && SWAP.seq_leg.txid) || (SWAP.seq_redeem && SWAP.taker_seq_refund_secret)))
     && !SWAP.btc_claim_txid && SWAP.state !== ST.REFUNDED && SWAP.state !== ST.BTC_CLAIMED;
   if (lockedUnrefunded){
     try { C.toast && C.toast('Your asset is still locked in this swap. Refund it (after the timeout) before clearing — otherwise the reclaim data is lost.'); } catch {}

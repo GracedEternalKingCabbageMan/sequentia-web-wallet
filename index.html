@@ -905,7 +905,7 @@ import init, { Mnemonic, Network, Signer, Wollet, Update, EsploraClient, Address
   openampComputeAid, enclaveSighash, decodeEnclaveSpend, stringToQr }
   from './pkg/lwk_wasm.js';
 import { HDKey, mnemonicToSeedSync, btc, schnorr } from './btc.js';
-import { initSwap, renderSwap, resumeCrossMakers, resumeCovenantOrders, resumePegIns, resumeMixedSwap, resumeSell, resumeBuy, hasBuyInFlight, scanCovenantCompanion, setConfidentialReceive, confidentialReceive, logTrade } from './swap.js';
+import { initSwap, renderSwap, resumeCrossMakers, resumeCovenantOrders, resumePegIns, resumePegOuts, resumeMixedSwap, resumeSell, resumeBuy, hasBuyInFlight, scanCovenantCompanion, setConfidentialReceive, confidentialReceive, logTrade } from './swap.js';
 import { initXswap, renderXswap, fetchXmarkets, fetchXquote, fetchXbook, openFromComposer, hasInFlight } from './xswap.js';
 import { initXrswap, fetchRQuote, openReverseFromComposer, hasInFlight as hasReverseInFlight, renderReverse } from './xrswap.js';
 import { initXmaker, startForwardMaker, startReverseMaker, liveMakerOffers, resumeMakerSwaps } from './xmaker.js';
@@ -1738,6 +1738,20 @@ const btcLeg = {
     if(vout<0) throw new Error('maker BTC leg output not found in '+String(txid).slice(0,18)+'…');
     return { vout, value, confirmed: !!(tx.status && tx.status.confirmed), height: tx.status && tx.status.block_height };
   },
+  // STRAND RECOVERY (forward): find OUR funded BTC HTLC when fund() threw before onBroadcast could persist
+  // the txid (node accepted the tx, response lost). btc_redeem_script was persisted before the broadcast,
+  // so scan the HTLC address's live UTXO set; return { txid, vout } or null. Lets resumeFunding ADOPT the
+  // outpoint instead of auto-clearing the reclaim material of a leg that is actually locked on-chain.
+  async findFundingByAddress(redeemHex){
+    const address = btc.p2sh({ script: bytesOfHex(redeemHex) }, btc.TEST_NETWORK).address;
+    try {
+      const utxos = await fetch(`${T4_API}/address/${address}/utxo`).then(r=>r.json());
+      if (Array.isArray(utxos)){
+        for (const u of utxos){ if (u && u.txid) return { txid: u.txid, vout: (u.vout==null?0:u.vout) }; }
+      }
+    } catch {}
+    return null;
+  },
   // Is an HTLC outpoint already spent (e.g. the counterparty refunded it after CLTV)? Returns
   // { spent, by }: `by` is the spending txid when known. Used to terminalise a sub-asset sell whose
   // BTC the maker reclaimed, so it stops wedging the rail. Best-effort: treats an error as unknown.
@@ -1827,6 +1841,21 @@ const seqLeg = {
       await new Promise(r=>setTimeout(r,3000));
     }
     throw new Error('Sequentia HTLC funding tx did not confirm in time');
+  },
+  // STRAND RECOVERY: find a funded HTLC output when the broadcast RESPONSE was lost (so no txid was
+  // ever persisted) but the redeem script was (persisted the same tick, before fund() broadcasts). Scan
+  // the HTLC address's live UTXO set for the funding output; return { txid, vout } or null. Lets
+  // renderReverse ADOPT the txid and resume via fundSeq (which reuses it, never re-funds) instead of
+  // stranding the asset. The redeem's hash_hex is per-swap, so the address is unique — no cross-swap mixup.
+  async findFundingByAddress(redeemHex){
+    const addr = this.htlcAddress(redeemHex);
+    try {
+      const utxos = await fetch(`${ESPLORA}/address/${addr}/utxo`).then(r=>r.json());
+      if (Array.isArray(utxos)){
+        for (const u of utxos){ if (u && u.txid) return { txid: u.txid, vout: (u.vout==null?0:u.vout) }; }
+      }
+    } catch {}
+    return null;
   },
   // Refund the SEQ leg via the CLTV/ELSE branch after T_seq (a Sequentia tx). The
   // refund key is the canonical HTLC key (re-derived; secret passed for parity).
@@ -2043,6 +2072,9 @@ async function openWallet(phrase){
   // SBTC silent peg: a BUY-with-BTC bid mid peg-in when the wallet last closed resumes to post its
   // covenant once the SBTC credit lands (funds are safe at the bridge meanwhile — see resumePegIns).
   try{ resumePegIns(); }catch(e){ console.warn('[resume] peg-in resume failed:', e?.message??e); }
+  // Peg-OUT (F-FS3): a received-SBTC redemption that failed last session retries once here, balance-guarded
+  // so it can never double-send (the SBTC stays redeemable from Balance either way).
+  try{ resumePegOuts(); }catch(e){ console.warn('[resume] peg-out resume failed:', e?.message??e); }
   // Mixed-rail (submarine) swap: its asset leg is an on-chain HTLC recoverable only via
   // its CLTV timeout, so a persisted in-flight swap MUST resume its trade-process view +
   // Refund off-ramp after a reload (fund-safety).
