@@ -936,11 +936,10 @@ function renderRailNote(ra){
   const legs = [];
   if (ra && S.payRail  === 'ln' && ra.payLn)  legs.push(ra.payLn);
   if (ra && S.recvRail === 'ln' && ra.recvLn) legs.push(ra.recvLn);
-  const unavail = legs.find(l => l.unfrontable);            // real blocker: no channel + LSP can't front
+  const unavail = legs.find(l => l.unfrontable);            // real blocker: no channel + LSP can't front -> LN disabled
   const addliq  = legs.find(l => !l.ok && l.cta === 'add'); // own channel exists but lacks this side
-  const provis  = legs.find(l => l.provisionable);          // no frontable data -> assume inline provision
-  const fronted = legs.find(l => l.ok && l.fronted);        // LSP fronts it -> near-instant heads-up
-  const pick = unavail || addliq || provis || fronted;
+  const provis  = legs.find(l => l.provisionable);          // no own channel but provisionable -> opened/fronted for you
+  const pick = unavail || addliq || provis;
   if (!pick){ note.innerHTML = ''; note.classList.add('hide'); return; }
   note.classList.remove('hide');
   const nm = esc(pick.name || 'this asset');
@@ -950,10 +949,9 @@ function renderRailNote(ra){
   } else if (pick === addliq){
     html = `<span>${esc(pick.reason)} ${esc(pick.hint || '')}</span>`; btnLabel = esc(pick.ctaLabel || 'Add liquidity');
   } else {
-    // provisionable OR fronted: a channel is arranged for you when you place the order, JIT + 0-conf
-    // (near-instant). Per-leg: a PAY leg opens spendable capacity from YOUR balance; a RECEIVE leg is
-    // fronted by the service (inbound, nothing to set up). Fronted needs no button (truly nothing to do).
-    withBtn = (pick === provis);
+    // provisionable: a channel is arranged for you when you place the order, JIT + 0-conf (near-instant).
+    // Per-leg: a PAY leg opens spendable capacity from YOUR balance; a RECEIVE leg is fronted by the
+    // service (inbound). Optional "Set it up now" shortcut to the Balance tab.
     html = pick.direction === 'pay'
       ? `<span>A Lightning channel for ${nm} opens from your balance when you place the order · near-instant (0-conf).</span>`
       : `<span>Inbound ${nm} Lightning liquidity is fronted for you when you place the order · near-instant, nothing to set up.</span>`;
