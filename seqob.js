@@ -601,6 +601,10 @@ export function openRelay(markets, handlers){
   return {
     ws,
     subscribe: (pair) => send({ market_subscribe: { base_asset: O(pair,'base_asset','baseAsset'), quote_asset: O(pair,'quote_asset','quoteAsset') } }),
+    // Post an offer over THIS WS (relay To.offer_submit = 102). A resulting match routes From.matched
+    // back to this connection, so a taker crossing a resting covenant receives the terms + settles via
+    // the onMatched handler. Used by the wallet taker path (takePeggedCovenant).
+    post: (offer) => send({ offer_submit: offer }),
     close: () => { try { ws.close(); } catch {} },
   };
 }

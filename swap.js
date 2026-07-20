@@ -43,6 +43,9 @@ import { railAvailability } from './ln-rail.js';
 // The mixed-rail (submarine) swap state machine + localStorage resume (fund-safety:
 // an in-flight on-chain HTLC leg must survive a reload so it can be refunded).
 import * as sub from './submarine.js';
+// The SBTC bridge client (the silent peg for resting on-chain-BTC LIMIT orders). Allocates
+// peg-in/peg-out addresses only; the wallet's own signed sends move the funds. See sbtc.js.
+import * as sbtc from './sbtc.js';
 
 let C = null;            // injected app context (see index.html initSwapTab)
 let X = null;            // the cross-chain route handle ({ openFromComposer, renderXswap, hasInFlight })
@@ -164,20 +167,24 @@ const S = {
   edited: 'pay',          // which side the user last typed ('pay' | 'receive')
   feeAsset: null,         // chosen fee asset hex (defaults to POLICY_HEX)
   quoting: false,
-  // TWO independent settlement rails, one per leg. Each is 'ln' (instant Lightning)
-  // or 'chain' (on-chain). ln+ln -> pure-LN LSP route; chain+chain -> on-chain
-  // cross-chain HTLC; a MIXED pair (one leg each) needs the submarine backend (not
-  // yet wired) and fails closed with an honest message. Only meaningful on a
-  // BTC<->asset pair; forced to chain/chain otherwise so an LN-unconfigured wallet
-  // behaves exactly as before.
-  payRail: 'chain', recvRail: 'chain',
-  railsTouched: false,    // true once the user (or a "fix" link) picks a rail -> stop auto-defaulting
-  // TAKE = lift resting offers (fields LINKED via the book price; today's behavior).
-  // POST = rest a LIMIT order at your OWN price (fields INDEPENDENT; pay÷receive IS the
-  // price). Auto-defaults to 'post' for a pair with no resting orders so the market can be
-  // started; 'take' when there is a book to lift. modeTouched stops the auto-default once
-  // the user picks a mode. Only 'same' + 'cross' routes can be posted (LN/mixed are take-only).
-  mode: 'take', modeTouched: false,
+  // TWO independent settlement PREFERENCES the user sets per order: how they PAY and how
+  // they RECEIVE, each 'ln' (Lightning) or 'chain' (on-chain). RAIL-BLIND MODEL (spec §5):
+  // these NEVER touch the book or matching — the book matches on price/asset/size only.
+  // They are honored at settlement per leg (P2P when both sides agree, else the atomic
+  // seqob-bridge). They start NULL — there is NO default (spec §6.5): an order cannot be
+  // placed until both are chosen, on EVERY pair (same-chain assets can move over SeqLN too).
+  payRail: null, recvRail: null,
+  // MARKET = walk the book at the best executable price, partial-fill what's there, cancel
+  // any remainder (taker). LIMIT = rest a signed order at YOUR price until crossed (maker);
+  // the two amounts are independent, their ratio is the price. Always available on every
+  // pair (spec §4/§6.3). Default MARKET; the toggle never disappears.
+  mode: 'take',
+  // KEEP RESTING WHILE OFFLINE (spec §5 / SBTC design §5). Relevant ONLY for an on-chain-BTC-pay
+  // LIMIT order: ON -> silently peg the maker's BTC to SBTC and rest it in a covenant (survives
+  // the wallet going offline), peg back out to real BTC on fill; OFF -> a native-BTC HTLC (needs
+  // the wallet online). Default ON. Market orders and any Lightning leg IGNORE this — pure native
+  // BTC. The placement path reads keepResting only when payingBtcOnChain(route) && S.mode==='post'.
+  keepResting: true,
 };
 let INSTANT = {};    // ticker -> { spendable, receivable } atoms (best-effort from the LSP /status)
 let LAST_MID = null; // { price, cross, base, quote } for the current pair — feeds the pair bar + cost line
@@ -391,27 +398,11 @@ export async function renderSwap(){
   if (!hasMixedInFlight()) _dismissed.delete('mixed');
   if (!(X && X.hasInFlight && X.hasInFlight())) _dismissed.delete('cross');
   if (!(X && X.hasReverseInFlight && X.hasReverseInFlight())) _dismissed.delete('reverse');
-  // A persisted mixed-rail (submarine) swap owns the tab until it is terminal or
-  // dismissed: its on-chain HTLC leg is recoverable only via the Refund off-ramp, so
-  // the trade-process view (not the composer) must show on entry — including after a reload.
-  if (hasMixedInFlight() && !_dismissed.has('mixed')){
-    showMixed(true); renderMixedSwap();
-    return;
-  }
-  // If a cross-chain swap is already in flight, jump straight to its stepper —
-  // the composer's single entry point also resumes an interrupted BTC swap. Two
-  // directions, two wizards: forward (pay BTC, get asset) and reverse (sell asset).
-  // Skipped if the user DISMISSED it this session — the Active-trades card reopens it.
-  if (X && X.hasInFlight && X.hasInFlight() && !_dismissed.has('cross')){
-    showCross(true);
-    X.renderXswap();
-    return;
-  }
-  if (X && X.hasReverseInFlight && X.hasReverseInFlight() && !_dismissed.has('reverse')){
-    showReverse(true);
-    X.renderReverse();
-    return;
-  }
+  // In-flight swaps NEVER hijack the tab (spec §7): the composer stays up and every in-flight/pending
+  // trade lives in the COMPACT "Active trades" card (renderInFlightCard) beside it, so you keep trading
+  // while they settle — essential for rapid/HFT use. The full-screen stepper is opt-in: the card's
+  // "View" button reopens it for detail or a refund off-ramp. (This replaces the old auto-takeover that
+  // jumped into a mixed/cross/reverse stepper on entry and owned the whole tab.)
   showCross(false); showReverse(false); showMixed(false);
   const _bh = C.$('swBook'); if (_bh) _bh.innerHTML = '';   // cleared; requote re-renders for the selected pair
   renderInFlightCard();   // any dismissed / background in-flight trade, reopenable
@@ -762,7 +753,15 @@ function paintPanes(){
   paintModeSeg();
   paintBookSeg();
   paintConfControl();
-  const cta = $('swReview'); if (cta) cta.textContent = 'Place order';   // one CTA, always
+  paintOfflineToggle();
+  // One CTA. When a pair is chosen but the settlement rails aren't both set, the CTA prompts for them
+  // (and setReviewEnabled keeps it disabled) — no order can be placed on an unstated settlement choice.
+  const cta = $('swReview');
+  if (cta){
+    const needRails = !!(S.payAsset && S.receiveAsset) && !(S.payRail && S.recvRail);
+    cta.textContent = needRails ? 'Choose how you pay & receive' : 'Place order';
+    if (needRails) cta.disabled = true;
+  }
 }
 
 // The opt-in confidential-RECEIVE control shows ONLY when you are receiving a Sequentia-issued asset
@@ -780,6 +779,29 @@ function paintConfControl(){
   const wizardOwns = !!(comp && comp.classList.contains('hide'));
   const hide = wizardOwns || !S.receiveAsset || S.receiveAsset === 'BTC' || isConfBook() || recvOverLn;
   wrap.style.display = hide ? 'none' : 'flex';
+}
+
+// TRUE when the user is PAYING real Bitcoin ON-CHAIN (as opposed to over Lightning, or paying a
+// Sequentia asset). The "keep resting while offline" peg is relevant ONLY for this pay leg.
+function payingBtcOnChain(){ return S.payAsset === 'BTC' && S.payRail === 'chain'; }
+
+// The "Keep resting while offline" opt-out (spec §5, SBTC design §5). It is the ONE place SBTC
+// touches the DEX, and it appears in exactly one situation: paying on-chain BTC AND a LIMIT
+// (resting) order. In every other case (market orders, any Lightning leg, or paying an asset) it
+// is HIDDEN and irrelevant — those are pure native BTC. Default ON; the placement path reads
+// S.keepResting only when payingBtcOnChain() && S.mode === 'post'.
+function paintOfflineToggle(){
+  const wrap = C.$('swOfflineWrap'); if (!wrap) return;
+  const comp = C.$('swComposer');
+  const wizardOwns = !!(comp && comp.classList.contains('hide'));
+  const show = !wizardOwns && payingBtcOnChain() && S.mode === 'post';
+  wrap.style.display = show ? 'flex' : 'none';
+  if (!show) return;
+  const chk = C.$('swOfflineChk');
+  if (chk){
+    chk.checked = !!S.keepResting;
+    if (!chk._wired){ chk._wired = true; chk.onchange = () => { S.keepResting = !!chk.checked; }; }
+  }
 }
 
 // --- Unblinded / Blinded book toggle -------------------------------------------
@@ -809,7 +831,7 @@ function setBook(next){
   // Fresh namespace: drop the stale book/quote and re-derive defaults + pickers.
   BOOK = { offers: [], pair: null };
   LAST_QUOTE = null; setReviewEnabled(false);
-  S.railsTouched = false; S.modeTouched = false;
+  S.payRail = null; S.recvRail = null;   // rails are unselected until the user picks (no default)
   ensureDefaults();
   paintPanes();
   requote().catch(()=>{});
@@ -823,39 +845,26 @@ function setBook(next){
 // (postCrossOfferReview -> X.makerStart/makerStartReverse). LN + mixed rails are
 // taker-only (LP fixed terms / submarine), so they stay in Take.
 function postSupported(route){ return !!route && (route.kind === 'same' || route.kind === 'cross'); }
-// After the book is known, pick the default mode for a fresh pair: Post when there is
-// nothing resting to lift (start the market), Take when there is. Once the user picks a
-// mode (modeTouched) we stop overriding it. Unsupported routes are forced to Take.
+// Market is the default order type; the Market/Limit toggle is always shown and the user switches
+// freely. No auto-override (kept as a no-op reconciler so existing callers stay valid).
 function applyAutoMode(bookLen, route){
-  // Default MARKET (S.mode='take') always: type one amount, the other auto-fills at the best
-  // executable price. The user can switch to LIMIT (S.mode='post') to set their own price
-  // (independent fields). Unsupported routes are forced to take. (bookLen kept for callers.)
-  if (!postSupported(route)) S.mode = 'take';
-  else if (!S.modeTouched) S.mode = 'take';
+  // Market is the default; the user switches to Limit to rest at their own price. No auto-override:
+  // the Market/Limit toggle is available on every pair and never disappears. (args kept for callers.)
   paintModeSeg();
 }
 function wireModeSeg(){
   const seg = C.$('swModeSeg'); if (!seg || seg._wired) return; seg._wired = true;
   seg.querySelectorAll('button[data-m]').forEach(b => b.onclick = () => { if (!b.disabled) setMode(b.dataset.m); });
 }
-// The visible Take vs Post distinction is DELETED (project directive): every order
-// is just "Place order", and whether it lifts the book, rests a covenant, or posts
-// a cross offer is a backend decision. The segmented control stays hidden; the
-// internal S.mode is still used by the cross-chain route to pick take-vs-post
-// automatically (never surfaced). The CTA label is fixed to "Place order" in
-// paintPanes. paintModeSeg is now just the internal auto-mode reconciler.
+// Market / Limit is a first-class control on EVERY pair (spec §4/§6.3): MARKET walks the book at the
+// best executable price now (partial-filling what's there); LIMIT rests a signed order at YOUR price.
+// The toggle never disappears once a pair is chosen — no per-rail hiding.
 function paintModeSeg(){
   if (!C) return;
   const wrap = C.$('swModeWrap'), seg = C.$('swModeSeg');
-  const route = findRoute(S.payAsset, S.receiveAsset);
-  if (!postSupported(route)) S.mode = 'take';
-  // Market/Limit is only meaningful where a limit order can rest (same-chain + cross); LN/mixed are
-  // market-only, so the toggle hides there. Shows once a limit-capable pair is chosen.
-  const show = !!(S.payAsset && S.receiveAsset && postSupported(route));
+  const show = !!(S.payAsset && S.receiveAsset);
   if (wrap) wrap.classList.toggle('hide', !show);
   if (seg) seg.querySelectorAll('button[data-m]').forEach(b => b.classList.toggle('on', b.dataset.m === S.mode));
-  // Keep the mode hint in lockstep: it references "Switch to Limit", which is wrong when there's no Limit
-  // control (LN/mixed/no pair) — hide it there; when shown, phrase it for the current mode (C-8).
   const hint = C.$('swModeHint');
   if (hint){
     hint.classList.toggle('hide', !show);
@@ -864,60 +873,32 @@ function paintModeSeg(){
       : 'Type an amount; the other fills at the best price. Switch to Limit to set your own.';
   }
 }
-// Switch mode by hand (marks it touched so the auto-default stops). Take re-links the
-// fields (requote re-derives the opposite); Post leaves both fields independent.
+// Switch mode by hand. Market re-links the fields (requote re-derives the opposite at the book price);
+// Limit leaves both fields independent (their ratio is the price).
 function setMode(m){
   if (m !== 'take' && m !== 'post') return;
-  S.mode = m; S.modeTouched = true;
+  S.mode = m;
   LAST_QUOTE = null; setReviewEnabled(false);
   paintModeSeg();
   requote().catch(()=>{});
 }
 
-// Show BOTH rail choosers (Pay from / Receive to) only for a BTC<->asset pair when
-// the on-device signer is live; otherwise hide them and force both legs on-chain so
-// an LN-unconfigured wallet behaves exactly as before.
+// Rail choosers (Pay via / Receive via) for EVERY pair (spec §5). RAIL-BLIND: the rails are
+// SETTLEMENT preferences, never a route selector or a book filter. They start UNSELECTED — there
+// is NO default (spec §6.5) — and an order cannot be placed until BOTH are chosen (gated in
+// paintPanes). We never auto-select or force a rail; we only surface an honest LN-readiness note
+// for a leg the user actually set to Lightning. Shown for same-chain pairs too: a Sequentia asset
+// can settle over SeqLN, so "pay/receive over Lightning" is a real choice on every pair.
 function updateRails(){
   const box = C.$('swRailPicks'); if (!box) return;
   const pay = S.payAsset, receive = S.receiveAsset;
-  const btcPair = pay && receive && pay !== receive
-    && ((pay === 'BTC') !== (receive === 'BTC'));   // exactly one side is BTC
-  if (btcPair && lnDeployed()){
-    box.classList.remove('hide');
-    // Probe the sub-asset order book for this pair's asset (async, cached) so the sub-asset
-    // BUY/SELL rails light from LIVE liquidity, not a hardcoded list. When it lands it may
-    // re-run updateRails to reflect a flipped availability.
-    try { refreshSubassetBook(pay === 'BTC' ? receive : pay); } catch {}
-    // HONEST per-asset gating: a leg may sit on Lightning ONLY when THAT asset (or BTC)
-    // has a real, usable channel with the liquidity the leg's direction needs. There is
-    // no silent submarine-funding of a cold channel — a leg with no channel defaults to
-    // (and is pinned to) on-chain, and the LN button is disabled with a Move-to-Lightning
-    // explanation. This kills the old "LSP configured => flash the LN rail" bug.
-    const ra = railAvail(pay, receive);
-    if (!S.railsTouched){
-      // Auto-default a BTC<->asset trade to the on-chain CROSS ORDER BOOK (chain+chain). It is the one
-      // rail with deep, always-on liquidity for every asset (the cross maker fleet), and it is the path
-      // the order-book architecture points at. Lightning rails (pure-LN, submarine, sub-asset) are an
-      // explicit opt-in via the toggle: auto-selecting LN merely because a channel exists routed a BUY
-      // into the submarine (asset-on-chain <-> BTC-LN), which has no maker, and stranded the trade with
-      // "did not settle". The cross book always has a counterparty, so it is the correct default.
-      S.payRail  = 'chain';
-      S.recvRail = 'chain';
-    }
-    // If the user chose Lightning for a leg with no channel yet, KEEP it — the channel is opened
-    // inline on Place-order (reviewLn). We no longer force it back to on-chain. (The unsupported
-    // mixed shape is still corrected below via railSupported.)
-    // Never sit on the undeployed mixed shape (asset over LN + BTC on-chain): if the
-    // channel-reconciled combo is unsupported, fall all the way back to the proven
-    // on-chain cross route (both legs on-chain), which is always available.
-    if (!railSupported(S.payRail, S.recvRail)){ S.payRail = 'chain'; S.recvRail = 'chain'; }
-    paintRailSegs(ra);
-    renderRailNote(ra);
-  } else {
-    box.classList.add('hide');
-    renderRailNote(null);
-    S.payRail = 'chain'; S.recvRail = 'chain'; S.railsTouched = false;
-  }
+  if (!(pay && receive && pay !== receive)){ box.classList.add('hide'); renderRailNote(null); return; }
+  box.classList.remove('hide');
+  // Probe the sub-asset book (async, cached) so the LN-readiness note reflects live liquidity.
+  if (pay === 'BTC' || receive === 'BTC'){ try { refreshSubassetBook(pay === 'BTC' ? receive : pay); } catch {} }
+  const ra = lnDeployed() ? railAvail(pay, receive) : null;
+  paintRailSegs(ra);
+  renderRailNote(ra);
 }
 // An honest inline note under the rail choosers when the Lightning option is NOT
 // offerable for a leg (no channel / wrong-side liquidity): says why + links to
@@ -1031,20 +1012,20 @@ function paintRailSegs(ra){
   paint('swPayRailSeg', 'pay');
   paint('swRecvRailSeg', 'recv');
 }
-// Set ONE leg's rail (leg = 'pay' | 'recv'); marks the rails as user-chosen so the
-// auto-default stops overriding them. Changing rails can change the route kind, so the
-// Take/Post default is re-armed too.
+// Set ONE leg's settlement rail (leg = 'pay' | 'recv'). Rail-blind model: the choice is a
+// SETTLEMENT preference only — it never re-selects a route or reshapes the book. It does gate
+// placement (both rails must be chosen) and drive the honest LN-readiness note + fee freeze.
 function setRail(leg, r){
   const cur = leg === 'pay' ? S.payRail : S.recvRail;
   if (cur === r) return;
   if (leg === 'pay') S.payRail = r; else S.recvRail = r;
-  S.railsTouched = true; S.modeTouched = false;
   LAST_QUOTE = null; setReviewEnabled(false);
-  const ra = railAvail(S.payAsset, S.receiveAsset);
+  const ra = lnDeployed() ? railAvail(S.payAsset, S.receiveAsset) : null;
   paintRailSegs(ra);
   try { renderRailNote(ra); } catch {}   // refresh/clear the LN-channel note for the newly-selected rail
   try { renderFeePicker(); } catch {}   // reflect the pay-from-Lightning fee freeze immediately
   try { paintConfControl(); } catch {}  // the confidential-receive toggle depends on the receive rail (on-chain only)
+  try { paintPanes(); } catch {}        // re-evaluate the place-CTA gate (both rails now required)
   requote().catch(()=>{});
 }
 function paintRefHints(){
@@ -1097,14 +1078,10 @@ function onFlip(){
   [pa.value, ra.value] = [ra.value, pa.value];
   [pa._userTyped, ra._userTyped] = [ra._userTyped, pa._userTyped];   // keep the anti-clobber flags with their values
   [pa._refMode, ra._refMode] = [ra._refMode, pa._refMode];           // ref-input mode rides with its value too
-  // Flip the per-leg rails WITH the legs (pay-leg rail follows the asset that is now the pay leg),
-  // and re-arm the auto-rail so the flipped pair re-derives honestly. Without this, flipping turned
-  // an honest "pay on-chain / receive LN" into a mislabeled route while the toggles showed the old,
-  // now-wrong rail selection.
+  // Flip the per-leg rails WITH the legs (the pay-leg rail follows the asset that is now the pay leg).
+  // They stay whatever the user chose (or null if unchosen) — no auto-default.
   [S.payRail, S.recvRail] = [S.recvRail, S.payRail];
-  S.railsTouched = false;
   S.edited = S.edited === 'pay' ? 'receive' : 'pay';
-  S.modeTouched = false;   // re-arm the Take/Post default for the flipped pair
   S.feeAsset = null; S.feeAssetTouched = false;   // fee default re-follows the flipped pay asset (D2/C-11)
   LAST_QUOTE = null; setReviewEnabled(false);
   paintPanes();
@@ -1142,43 +1119,11 @@ async function requote(){
   $('swErr').textContent = '';
   LAST_MID = null;
   paintRouteLine();
-  // Rail-blind take (Stage 3): default the rails to the BEST-PRICE offer's rail across ALL rails,
-  // so a market take gets the best price whichever rail carries it — the taker matches on price, not
-  // rail. The user's explicit rail choice (railsTouched) always wins; then the rail is a settlement
-  // preference and the LSP bridges the difference. Only for a BTC<->asset pair (the one with a rail
-  // choice); the on-chain offer -> both legs on-chain (cross), an LN offer -> the ASSET leg over LN
-  // (recv for a buy, pay for a sell) + BTC on-chain (sub-asset). Cached, so it costs no extra fetch.
-  const oneBtc = (S.payAsset === 'BTC') !== (S.receiveAsset === 'BTC');
-  if (oneBtc && !S.railsTouched && S.payAsset && S.receiveAsset){
-    const seqAsset = S.payAsset === 'BTC' ? S.receiveAsset : S.payAsset;
-    const side = S.payAsset === 'BTC' ? 'buy' : 'sell';
-    try {
-      const ub = await getUnifiedBook(seqAsset);
-      const best = ub && (side === 'buy' ? (ub.best_ask || (ub.asks || [])[0]) : (ub.best_bid || (ub.bids || [])[0]));
-      if (best && best.rail){
-        if (best.rail === 'onchain'){ S.payRail = 'chain'; S.recvRail = 'chain'; }
-        else if (side === 'buy'){ S.payRail = 'chain'; S.recvRail = 'ln'; }
-        // Sell over LN only if a sub-asset sell offer is actually takeable; else keep the pay leg on
-        // chain (postable cross rail) so the LN best-bid doesn't strand the user. Upgrades to LN on a
-        // later requote once the sub-asset book loads.
-        else                    { S.payRail = sellCapable(seqAsset) ? 'ln' : 'chain'; S.recvRail = 'chain'; }
-        try { paintRailSegs(); } catch {}
-      }
-    } catch {}
-  }
+  // RAIL-BLIND: the rails NEVER change the book, the matching, or the quoted price. They are the user's
+  // settlement preference (set by hand, no default). So requote does not touch S.payRail/S.recvRail at
+  // all — it fetches the ONE book for the pair and quotes the market/limit against it, rail-blind.
   const route = findRoute(S.payAsset, S.receiveAsset);
-  // Keep the DISPLAYED rails in sync with what findRoute actually routes: the auto-select above is a
-  // heuristic from the best offer, but findRoute downgrades an unserviceable LN leg (no channel / no
-  // sub-asset maker) to on-chain. Without this the toggle could show "Lightning" while the trade settles
-  // on-chain (a cross HTLC) — a false rail display. Only sync when the user hasn't touched the rails.
-  if (route && !S.railsTouched && (route.payRail || route.recvRail)){
-    if (route.payRail) S.payRail = route.payRail;
-    if (route.recvRail) S.recvRail = route.recvRail;
-    try { paintRailSegs(); } catch {}
-  }
-  renderTiming(route);   // timing banner reflects the rails immediately, before amounts
-  // LN / mixed / no-route are take-only; keep the mode control honest before we quote.
-  if (!postSupported(route)) S.mode = 'take';
+  renderTiming(route);   // timing banner reflects the pair
   paintModeSeg();
   if (!route){ setReviewEnabled(false); clearOpposite(); clearBook(); paintCostLine(); stopLiveBook(); return; }
   const amtStr = typedAmount(S.edited);
@@ -1262,7 +1207,13 @@ function clearOpposite(){
   const other = S.edited === 'pay' ? C.$('swRecvAmt') : C.$('swPayAmt');
   clearDerived(other);   // never stomp a value the user typed or is editing on the OTHER side
 }
-function setReviewEnabled(on){ const b = C.$('swReview'); if (b) b.disabled = !on; }
+function setReviewEnabled(on){
+  const b = C.$('swReview'); if (!b) return;
+  // RAIL-BLIND gate (spec §6.5): never enable placement until BOTH settlement rails are chosen — there
+  // is NO default. A ready quote is necessary but not sufficient. paintPanes labels the CTA to prompt.
+  const railsChosen = !!(S.payRail && S.recvRail);
+  b.disabled = !(on && railsChosen);
+}
 
 // Build BOOK (asks/bids split by trade direction, expiry- and signature-filtered, best-price-first)
 // from a flat offer list, then render the ladder. Shared by the REST quote path (requoteSame) and
@@ -2441,7 +2392,7 @@ function openPicker(side){
     // If the other side no longer trades against the new pick, clear it.
     const o = side === 'pay' ? S.receiveAsset : S.payAsset;
     if (o && !counterpartsOf(hex).includes(o)){ if (side === 'pay') S.receiveAsset = null; else S.payAsset = null; }
-    S.railsTouched = false; S.modeTouched = false;   // re-arm rail + Take/Post defaults for the new pair
+    S.payRail = null; S.recvRail = null;   // rails reset to unselected for the new pair (no default; user must pick)
     S.feeAsset = null; S.feeAssetTouched = false; S.priceFlip = false;   // fee default re-follows the new pay asset; a manual pick + display flip are per-pair, not global (D2/C-11)
     LAST_QUOTE = null; setReviewEnabled(false);
     paintPanes();
@@ -2542,7 +2493,14 @@ async function onReview(){
   const { $ } = C; $('swErr').textContent = '';
   const q = LAST_QUOTE;
   if (!q){ $('swErr').textContent = 'Enter an amount to get a quote first.'; return; }
-  if (q.kind === 'cross-make') return postCrossOfferReview(q);
+  if (q.kind === 'cross-make'){
+    // BUY-with-BTC LIMIT + "keep resting while offline" ON -> the SBTC silent peg: rest as a covenant
+    // that survives the wallet closing (spec §5). `reverse` = BUY the asset with BTC (the only side
+    // that PAYS BTC). Everything else (SELL for BTC, toggle OFF, or no SBTC on this network) stays on
+    // the interactive HTLC maker path.
+    if (q.reverse && S.keepResting && payingBtcOnChain() && sbtcAssetId()) return postPeggedBtcReview(q);
+    return postCrossOfferReview(q);
+  }
   if (q.kind === 'ln') return reviewLn(q);
   if (q.kind === 'mixed') return reviewMixed(q);
   if (q.kind === 'cross') return reviewCross(q);
@@ -2625,7 +2583,8 @@ async function resolveVout(txid, spkHex){
 // almost all of the available book, coarse enough that no dust remainder is ever left.
 function covenantMinLot(sellAtoms){ const s = BigInt(sellAtoms); const f = s / 1000n; return f > 0n ? f : 1n; }
 
-async function placeCovenant(pay, receive, payAtoms, recvAtoms, onStatus){
+async function placeCovenant(pay, receive, payAtoms, recvAtoms, onStatus, opts){
+  opts = opts || {};
   const tip = C.wollet.tip().height();
   const { rateNum, rateDen } = computeRate(payAtoms, recvAtoms);
   const idx = nextMakerIndex();
@@ -2653,6 +2612,10 @@ async function placeCovenant(pay, receive, payAtoms, recvAtoms, onStatus){
     sellAtoms: String(payAtoms), recvAtoms: String(recvAtoms),
     makerIndex: idx, covTxid: null, covVout: null, spkHex: plan.spkHex,
     expiry: params.expiryLocktime, created: Date.now(), posted: false,
+    // SBTC silent peg: the covenant locks `pay` (SBTC) but was ADVERTISED as `advertiseOfferAssetAs`
+    // (BTC). Tag it so the cancel/refund path knows to peg the reclaimed SBTC back OUT to real BTC
+    // (the user paid BTC and expects BTC back). Absent for ordinary same-chain orders.
+    ...(opts.advertiseOfferAssetAs ? { pegged: true, advertiseAs: opts.advertiseOfferAssetAs } : {}),
   };
   PLACED.push(rec); savePlaced();
   onStatus && onStatus('Funding the order on-chain…');
@@ -2663,12 +2626,201 @@ async function placeCovenant(pay, receive, payAtoms, recvAtoms, onStatus){
     assetA: pay, assetB: receive, sellAtoms: BigInt(payAtoms), recvAtoms: BigInt(recvAtoms),
     covenant, makerPubkey: makerPubHex(), recvAddress: payout.address, offerId,
     allowPartial: true, minLot,                           // fill what crosses now; the covenant's remainder rests on
+    advertiseOfferAssetAs: opts.advertiseOfferAssetAs,     // SBTC peg: advertise BTC while the covenant locks SBTC
   });
   onStatus && onStatus('Posting your resting order…');
   await seqob.postCovenantOffer(offer, makerPriv());
   rec.posted = true; savePlaced();   // the relay accepted it; it is now a live resting order
   ensureCovenantRelay();   // watch for a match so we can settle / reflect a fill
   return rec;
+}
+
+// ---------------------------------------------------------------------------
+// SBTC silent peg — rest an on-chain-BTC LIMIT order while the wallet is offline
+// ---------------------------------------------------------------------------
+// The ONE place SBTC touches the DEX (spec §5, sbtc-peg-design.md). Used ONLY for BUY-with-BTC LIMIT
+// orders with "keep resting while offline" ON. Everything else (market orders, any Lightning leg,
+// selling an asset for BTC) stays pure native BTC on the interactive cross rail.
+
+// The SBTC asset id, resolved from the registry (ticker SBTC), or null if the bridge asset isn't
+// registered on this network — then the silent peg is simply unavailable and we fall back to native.
+function sbtcAssetId(){
+  try { return sbtc.resolveSbtcAsset((C.registryAssets && C.registryAssets()) || [], (h) => (C.assetMeta(h) || {}).ticker); }
+  catch { return null; }
+}
+
+// Persisted pending peg-ins so a BUY-with-BTC resting order survives the wallet closing during the
+// (multi-block) peg-in wait and resumes to post its covenant on reopen. FUND-SAFETY: the bridge
+// credits SBTC to `seqAddr` regardless of this wallet, so a crash never loses funds — worst case the
+// user simply holds SBTC to reconcile, and resumePegIns finishes the covenant post next load.
+const PEGPENDING_KEY = 'swk.sequentia.pegpending';
+function loadPegPending(){ try { return JSON.parse(localStorage.getItem(PEGPENDING_KEY) || '[]'); } catch { return []; } }
+function savePegPending(list){ try { localStorage.setItem(PEGPENDING_KEY, JSON.stringify(list)); } catch {} }
+function upsertPegPending(rec){ const l = loadPegPending().filter((r) => r.id !== rec.id); l.push(rec); savePegPending(l); }
+function dropPegPending(id){ savePegPending(loadPegPending().filter((r) => r.id !== id)); }
+
+// Poll THIS wallet's SBTC balance until it has risen by >= `amount` (the bridge minted the peg-in).
+// Generous timeout: a peg-in needs BTC confirmations. The caller shows a waiting status; on timeout
+// the funds are safe (SBTC will still arrive) and the order can be re-opened once credited.
+async function awaitSbtcCredit(sbtcHex, before, amount, timeoutMs){
+  const deadline = Date.now() + (timeoutMs || 45 * 60 * 1000);
+  while (Date.now() < deadline){
+    try { if (C.refreshBalances) await C.refreshBalances(); } catch {}
+    if (balAtoms(sbtcHex) - before >= amount) return true;
+    await new Promise((r) => setTimeout(r, 15000));
+  }
+  throw new Error('The peg-in hasn’t been credited yet. Your BTC is safe at the bridge and your SBTC will arrive; re-open the order once it does.');
+}
+
+// Maker flow: peg the maker's real BTC IN to SBTC, then rest that SBTC in a covenant ADVERTISED as a
+// BTC offer on the asset/BTC market (advertiseOfferAssetAs='BTC') so BTC takers find + fill it (and
+// peg out to real BTC). btcSats = BTC paid; assetHex/assetAtoms = the asset + amount wanted.
+async function placePeggedBtcCovenant(assetHex, btcSats, assetAtoms, onStatus){
+  const sbtcHex = sbtcAssetId();
+  if (!sbtcHex) throw new Error('SBTC (the pegged-BTC asset) isn’t available on this network, so an offline-resting BTC order can’t be placed. Turn off “keep resting while offline” to rest as native BTC.');
+  if (BigInt(btcSats) <= 0n || BigInt(assetAtoms) <= 0n) throw new Error('Enter both the BTC you pay and the amount you want.');
+  const haveBtc = balAtoms('BTC');
+  if (BigInt(btcSats) > haveBtc) throw new Error(`You only hold ${C.fmtAtoms(haveBtc, 8)} BTC.`);
+
+  // A fresh TRANSPARENT Sequentia address of THIS wallet to receive the minted SBTC (principle #6).
+  const seqAddrRaw = C.wollet.address(C.addrIndex == null ? undefined : C.addrIndex).address();
+  const seqAddr = (seqAddrRaw.toUnconfidential ? seqAddrRaw.toUnconfidential() : seqAddrRaw).toString();
+
+  onStatus && onStatus('Preparing the peg-in…');
+  const depositAddr = await sbtc.requestPegIn(seqAddr);
+
+  // Persist the intent BEFORE broadcasting the BTC deposit, so a crash after broadcast can resume.
+  const rec = { id: seqob.randHex(8), seqAddr, depositAddr, btcSats: String(btcSats),
+                assetHex, assetAtoms: String(assetAtoms), sbtcHex, btcTxid: null,
+                beforeSbtc: String(balAtoms(sbtcHex)), phase: 'depositing', created: Date.now() };
+  upsertPegPending(rec);
+
+  onStatus && onStatus('Sending your BTC to the peg…');
+  await C.btcLeg.payAddress(depositAddr, Number(btcSats), (txid) => {
+    rec.btcTxid = txid; rec.phase = 'minting'; upsertPegPending(rec);
+  });
+
+  onStatus && onStatus('Waiting for the bridge to mint SBTC (this can take a few blocks)…');
+  await awaitSbtcCredit(sbtcHex, BigInt(rec.beforeSbtc), BigInt(btcSats));
+
+  onStatus && onStatus('Resting your order…');
+  const posted = await placeCovenant(sbtcHex, assetHex, BigInt(btcSats), BigInt(assetAtoms), onStatus,
+    { advertiseOfferAssetAs: 'BTC' });
+  dropPegPending(rec.id);   // peg-in complete + order resting
+  return posted;
+}
+
+// Resume any peg-in that was mid-flight when the wallet last closed: if its SBTC has since been
+// credited, finish by posting the covenant; otherwise leave it pending (it will credit and resume
+// later). Called on load, alongside resumeCovenantOrders. Never re-sends BTC (idempotent by record).
+export async function resumePegIns(){
+  for (const rec of loadPegPending()){
+    try {
+      if (!rec.btcTxid) { dropPegPending(rec.id); continue; }   // never broadcast; nothing pegged in
+      const have = balAtoms(rec.sbtcHex) - BigInt(rec.beforeSbtc || '0');
+      if (have < BigInt(rec.btcSats)) continue;                 // not yet credited; leave it pending
+      await placeCovenant(rec.sbtcHex, rec.assetHex, BigInt(rec.btcSats), BigInt(rec.assetAtoms), null,
+        { advertiseOfferAssetAs: 'BTC' });
+      dropPegPending(rec.id);
+    } catch (e){ /* leave pending; a later load retries */ }
+  }
+}
+
+// TAKER path: fill a resting pegged-BTC covenant (a bid advertised as BTC, locking SBTC) by posting a
+// crossing order over the covenant relay WS. The relay matches it against the covenant and hands us
+// the terms; onCovMatched settles the fill (we pay `assetHex`, receive SBTC) and then pegs the SBTC
+// out to real BTC. assetHex/assetAtoms = what we pay; btcSats = the BTC we're buying.
+async function takePeggedCovenant(assetHex, assetAtoms, btcSats, onStatus){
+  if (BigInt(assetAtoms) <= 0n || BigInt(btcSats) <= 0n) throw new Error('Enter both amounts.');
+  const m = C.assetMeta(assetHex);
+  const have = balAtoms(assetHex);
+  if (BigInt(assetAtoms) > have) throw new Error(`You only hold ${C.fmtAtoms(have, m.precision)} ${m.ticker}.`);
+  // Watch the covenant's market (BTC/asset shelf) so onCovMatched fires + settles when we cross it.
+  if (!EXTRA_COV_MARKETS.some((x) => x.base_asset === 'BTC' && x.quote_asset === assetHex))
+    EXTRA_COV_MARKETS.push({ base_asset: 'BTC', quote_asset: assetHex });
+  ensureCovenantRelay();
+  const raw = C.wollet.address(C.addrIndex == null ? undefined : C.addrIndex).address();
+  const recvAddr = (raw.toUnconfidential ? raw.toUnconfidential() : raw).toString();
+  const now = Math.floor(Date.now() / 1000);
+  // BUY base=BTC with quote=asset on the BTC/asset shelf — the counter-side of the covenant's SELL of
+  // BTC (validator BUY: offer_asset==quote, want_asset==base, want_amount==base_amount).
+  const offer = {
+    offer_id: seqob.randHex(16), schema_version: 1,
+    pair: { base_asset: 'BTC', quote_asset: assetHex },
+    trade_dir: 2,                                    // BUY
+    base_amount: String(btcSats),
+    offer_amount: String(assetAtoms), offer_asset: assetHex,
+    want_amount: String(btcSats),  want_asset: 'BTC',
+    allow_partial: true,
+    created_at_unix: String(now), expires_at_unix: String(now + 3600),
+    fee_asset_hint: assetHex,
+    same_chain: { maker_recv_address: recvAddr },    // for any resting remainder
+  };
+  seqob.signOffer(offer, makerPriv());
+  onStatus && onStatus('Posting your order to cross the resting bid…');
+  await postToCovRelay(offer);
+  return { offerId: offer.offer_id };
+}
+
+// Post an offer over the covenant relay WS (so a resulting match routes back to onCovMatched). Waits
+// briefly for the WS to open. Reuses the shared COVRELAY (already carrying the onMatched -> settle +
+// peg-out wiring); the market must already be subscribed (takePeggedCovenant adds it).
+async function postToCovRelay(offer){
+  ensureCovenantRelay();
+  if (!COVRELAY) throw new Error('order-book relay unavailable');
+  const ws = COVRELAY.ws;
+  if (!(ws && ws.readyState === 1)){
+    await new Promise((resolve, reject) => {
+      const t = setTimeout(() => reject(new Error('the order-book relay did not open in time')), 8000);
+      const tick = () => {
+        if (ws && ws.readyState === 1){ clearTimeout(t); resolve(); }
+        else if (!ws || ws.readyState >= 2){ clearTimeout(t); reject(new Error('relay connection closed')); }
+        else setTimeout(tick, 150);
+      };
+      tick();
+    });
+  }
+  COVRELAY.post(offer);
+}
+
+// Send `atoms` of a Sequentia asset to `toAddr` (a plain transfer; fee in the chosen fee asset).
+// Used by the taker peg-OUT to hand the just-received SBTC back to the bridge.
+async function sendSeqAsset(toAddr, assetHex, atoms){
+  const addr = new C.wasm.Address(toAddr);
+  const b = C.network.txBuilder().addExplicitRecipient(addr, BigInt(atoms), new C.wasm.AssetId(assetHex));
+  const pset = C.applyFee(b, S.feeAsset || defaultFeeAsset()).finish(C.wollet);
+  const signed = C.signer.sign(pset);
+  const finalized = C.wollet.finalize(signed);
+  const t = await C.client.broadcast(finalized);
+  return (t && t.toString) ? t.toString() : String(t);
+}
+
+// Peg the taker's just-received SBTC back OUT to real BTC. When a taker fills a covenant that was
+// ADVERTISED as BTC (the SBTC silent peg), the on-chain fill pays them in SBTC — but they were buying
+// BTC, so the wallet immediately redeems it: ask the bridge for a peg-out address bound to a wallet
+// BTC address, send the SBTC there, and the bridge releases real BTC. Best-effort + safe: on any
+// failure the user simply holds redeemable SBTC (never lost). `atoms` = the SBTC just received.
+async function pegOutReceivedSbtc(atoms){
+  if (BigInt(atoms) <= 0n) return;
+  const btcDest = C.btcLeg && C.btcLeg.receiveAddress ? C.btcLeg.receiveAddress() : null;
+  if (!btcDest) throw new Error('no BTC address to redeem to');
+  const sbtcAddr = await sbtc.requestPegOut(btcDest);
+  await sendSeqAsset(sbtcAddr, sbtcAssetId(), BigInt(atoms));
+  try { C.toast && C.toast('Redeeming your SBTC to BTC at the bridge…'); } catch {}
+}
+
+// TRUE if an inbound covenant match paid us in SBTC for what we were buying as BTC — i.e. we lifted a
+// silent-peg bid (advertised BTC, locks SBTC) and must peg the SBTC out. Distinguished from a genuine
+// SBTC trade (where the market itself is SBTC/…, so the advertised pair carries no BTC sentinel).
+function isPeggedFillToRedeem(m){
+  const ct = m.covenant || m.Covenant || {};
+  const gotAsset = String(ct.asset_a || ct.assetA || '').toLowerCase();
+  const sbtcHex = (sbtcAssetId() || '').toLowerCase();
+  if (!sbtcHex || gotAsset !== sbtcHex) return false;           // we didn't receive SBTC
+  const pair = m.pair || m.Pair || {};
+  const advertisedBtc = String(pair.base_asset || pair.baseAsset || '') === 'BTC'
+    || String(pair.quote_asset || pair.quoteAsset || '') === 'BTC';
+  return advertisedBtc;                                          // received SBTC on a BTC-advertised market -> redeem
 }
 
 // The taker FILL hooks for an inbound match: the credit asset is asset B, so the fee
@@ -2738,9 +2890,15 @@ function refundHooksFor(){
 // The persistent relay watcher over every market this wallet has a resting order on.
 // onMatched -> this wallet is the taker: verify + FILL + broadcast. onOrderStatus ->
 // our resting order was filled by someone else: rescan so the credit shows up.
+// Extra markets the covenant relay must also watch even without a resting order of ours on them:
+// when we are the TAKER crossing someone's covenant (e.g. lifting a pegged-BTC bid), we must be
+// subscribed so onCovMatched fires and we settle the fill. Added by takePeggedCovenant.
+let EXTRA_COV_MARKETS = [];
 function covMarkets(){
   const seen = new Set(), out = [];
-  for (const r of PLACED){ const k = r.pay+'/'+r.receive; if (!seen.has(k)){ seen.add(k); out.push({ base_asset: r.pay, quote_asset: r.receive }); } }
+  const add = (base, quote) => { const k = base+'/'+quote; if (!seen.has(k)){ seen.add(k); out.push({ base_asset: base, quote_asset: quote }); } };
+  for (const r of PLACED){ add(r.pay, r.receive); }
+  for (const m of EXTRA_COV_MARKETS){ add(m.base_asset, m.quote_asset); }
   return out;
 }
 function ensureCovenantRelay(){
@@ -2764,6 +2922,14 @@ async function onCovMatched(m){
     C.toast && C.toast('Fill settled · anchor-bound to Bitcoin.',
       txid ? { href:'/explorer/tx/'+txid, label:String(txid).slice(0,18)+'…' } : undefined);
     await C.sync(); await scanCompanion(); try { renderSwap(); } catch {}
+    // SBTC silent peg (taker side): if this fill paid us SBTC on a BTC-advertised market, we were
+    // buying real BTC — peg the received SBTC back OUT. Best-effort: on failure we simply hold
+    // redeemable SBTC (fund-safe). The amount received is the covenant fill's base (asset_a) amount.
+    if (isPeggedFillToRedeem(m)){
+      const got = BigInt(m.fill_base_amount || m.fillBaseAmount || m.covenant_locked || m.covenantLocked || 0);
+      try { await pegOutReceivedSbtc(got); await C.sync(); try { renderSwap(); } catch {} }
+      catch (e){ try { C.toast && C.toast('Received SBTC (redeemable to BTC); auto-redeem will retry.'); } catch {} }
+    }
   } catch (e){ try { C.toast && C.toast('Fill could not settle: ' + C.prettyErr(e)); } catch {} }
 }
 async function onCovOrderStatus(s){
@@ -3706,6 +3872,88 @@ async function postCrossOfferReview(q){
   };
 }
 
+// Review + confirm for a BUY-with-BTC LIMIT order that rests via the SBTC silent peg (keepResting ON).
+// Mirrors postCrossOfferReview's reverse (bid) modal, but on confirm pegs the BTC in and rests an SBTC
+// covenant advertised as BTC (placePeggedBtcCovenant) instead of the interactive, wallet-must-stay-open
+// HTLC maker. This is the ONLY place the peg is entered from the composer.
+async function postPeggedBtcReview(q){
+  const { $ } = C;
+  const assetHex = q.assetHex;
+  const am = C.assetMeta(assetHex);
+  let btcSats, assetAtoms;
+  try {
+    btcSats    = fieldAtoms($('swPayAmt'), 'BTC');
+    assetAtoms = fieldAtoms($('swRecvAmt'), assetHex);
+    if (btcSats <= 0n || assetAtoms <= 0n) throw 0;
+  } catch { $('swErr').textContent = `Enter both the BTC and the ${am.ticker}.`; return; }
+  const haveBtc = balAtoms('BTC');
+  if (btcSats > haveBtc){ $('swErr').textContent = `You only hold ${C.fmtAtoms(haveBtc, 8)} BTC.`; return; }
+  const assetU = Number(assetAtoms)/Math.pow(10, am.precision||0), btcU = Number(btcSats)/1e8;
+  const kv = [
+    ['Posting', `A resting BID that stays live while you're offline — you become a maker of the ${am.ticker}/BTC market`],
+    ['You pay', C.fmtAtoms(btcSats, 8) + ' BTC'],
+    ['You buy', amtRow(assetHex, assetAtoms) + refSuffix(assetHex, assetAtoms)],
+    ['Price', assetU>0 ? `1 ${am.ticker} = ${trim(btcU/assetU)} BTC` : '-'],
+    ['How it rests', `Your BTC is pegged to SBTC and locked in a covenant that fills even while your wallet is closed. On a fill the taker receives real BTC and you receive the ${am.ticker}.`],
+    ['If it cancels', 'Cancel anytime — your funds return to you as regular BTC.'],
+    ['Heads up', 'Pegging in needs a few Bitcoin confirmations before the bid goes live; you can close the wallet and it resumes.'],
+    ['Finality', 'Anchor-bound to Bitcoin (reverts only if Bitcoin reverts).'],
+  ];
+  const { m: modal, ok, st } = C.modalRows({ title: 'Buy with BTC — rest this bid offline', kv });
+  if (ok) ok.textContent = 'Peg in & rest bid';
+  ok.onclick = async () => {
+    ok.disabled = true; st.className = 'status'; st.innerHTML = '<span class="spin"></span>Pegging in…';
+    try {
+      await placePeggedBtcCovenant(assetHex, btcSats, assetAtoms, (m) => { st.innerHTML = '<span class="spin"></span>' + esc(m); });
+      modal.remove();
+      C.toast('Your BTC bid is resting — it stays live even if you close the wallet.');
+      resetComposer();
+      renderSwap();
+    } catch (e){
+      st.className = 'status err'; st.textContent = 'Could not place: ' + C.prettyErr(e); ok.disabled = false;
+    }
+  };
+}
+
+// Review + confirm for filling a resting pegged-BTC covenant bid (taker sells the asset for BTC). On
+// confirm we post a crossing order (takePeggedCovenant); the relay matches it, we settle the covenant
+// fill on-chain (receiving SBTC), and the SBTC is auto-redeemed to real BTC — all handled by
+// onCovMatched. `offer` is the resting covenant we detected in the reverse book.
+async function takePeggedCovenantReview(q, offer){
+  const { $ } = C;
+  const assetHex = q.seqAsset;
+  const am = C.assetMeta(assetHex);
+  let assetAtoms, btcSats;
+  try {
+    assetAtoms = fieldAtoms($('swPayAmt'), assetHex);
+    btcSats    = fieldAtoms($('swRecvAmt'), 'BTC');
+    if (assetAtoms <= 0n || btcSats <= 0n) throw 0;
+  } catch { $('swErr').textContent = `Enter both the ${am.ticker} and the BTC.`; return; }
+  const assetU = Number(assetAtoms)/Math.pow(10, am.precision||0), btcU = Number(btcSats)/1e8;
+  const kv = [
+    ['Filling', `A resting BTC bid — you sell ${am.ticker} for BTC`],
+    ['You pay', amtRow(assetHex, assetAtoms) + refSuffix(assetHex, assetAtoms)],
+    ['You receive', C.fmtAtoms(btcSats, 8) + ' BTC'],
+    ['Price', assetU>0 ? `1 ${am.ticker} = ${trim(btcU/assetU)} BTC` : '-'],
+    ['How it settles', 'You fill the covenant on-chain (permissionless) and receive SBTC, which is automatically redeemed to real BTC at the bridge.'],
+    ['Finality', 'Anchor-bound to Bitcoin (reverts only if Bitcoin reverts).'],
+  ];
+  const { m: modal, ok, st } = C.modalRows({ title: `Sell ${am.ticker} for BTC`, kv });
+  if (ok) ok.textContent = 'Fill bid';
+  ok.onclick = async () => {
+    ok.disabled = true; st.className = 'status'; st.innerHTML = '<span class="spin"></span>Crossing the bid…';
+    try {
+      await takePeggedCovenant(assetHex, assetAtoms, btcSats, (msg) => { st.innerHTML = '<span class="spin"></span>' + esc(msg); });
+      modal.remove();
+      C.toast('Order posted to cross the bid; settlement and BTC redemption happen automatically.');
+      resetComposer();
+      renderSwap();
+    } catch (e){
+      st.className = 'status err'; st.textContent = 'Could not fill: ' + C.prettyErr(e); ok.disabled = false;
+    }
+  };
+}
+
 // Settlement-progress callback for a live wallet-made cross offer (drives the
 // resting-order panel through lift -> lock -> settled).
 function onCrossMakeState(mst){
@@ -3848,6 +4096,11 @@ async function reviewCross(q){
     }
   }
   if (q.reverse){
+    // A pegged-BTC covenant bid (advertised as BTC, locking SBTC) among the reverse offers settles as
+    // a COVENANT, not an HTLC — cross it and peg out (spec §5) rather than the xrswap wizard. Detected
+    // by the presence of covenant settlement terms on the best takeable reverse offer.
+    const best = (XBOOK.offers || [])[0];
+    if (best && (best.covenant || best.Covenant)) return takePeggedCovenantReview(q, best);
     // Reverse (sell asset for BTC): the xrswap.js wizard takes over (its own review
     // modals, leg verification, fund/claim/poll, and localStorage resume).
     if (!X.openReverseFromComposer){ $('swErr').textContent = 'Selling an asset for BTC is unavailable in this build.'; return; }
@@ -4504,6 +4757,9 @@ async function renderMyOrders(){
           { relayCancel: async (offerId) => seqob.signAndCancel(offerId, makerPriv()), ...refundHooksFor() });
         if (out.refundTxid){
           C.toast('Order cancelled · reclaimed on-chain (' + String(out.refundTxid).slice(0,12) + '…).');
+          // SBTC silent peg: the reclaimed asset is SBTC, but the maker paid BTC and expects BTC back.
+          // Redeem it (best-effort; on failure the user simply holds redeemable SBTC — fund-safe).
+          if (rec.pegged){ try { await C.sync(); await pegOutReceivedSbtc(BigInt(rec.sellAtoms)); } catch {} }
         } else if (out.reclaimable){
           const meta = C.assetMeta(rec.pay);
           C.toast('Order delisted. The locked ' + esc(meta.ticker) + ' is reclaimable on-chain after block ' + out.reclaimable.afterHeight + '.');

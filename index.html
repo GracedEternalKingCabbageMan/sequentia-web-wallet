@@ -630,6 +630,18 @@
                 </div>
               </div>
 
+              <!-- KEEP RESTING WHILE OFFLINE: shown ONLY for an on-chain-BTC-pay LIMIT order — the
+                   one case that needs a peg, because Bitcoin has no covenants and a resting order
+                   must survive while the wallet is offline. Default ON: the order rests as pegged
+                   BTC (SBTC) so it stays live without the wallet; funds return as regular BTC on
+                   fill/cancel. OFF: a native-BTC HTLC (trustless, but needs the wallet online).
+                   Market orders and any Lightning leg never see this — they are pure native BTC.
+                   Toggled by paintOfflineToggle(); the placement path reads S.keepResting. -->
+              <label class="swconf hide" id="swOfflineWrap" style="align-items:center;gap:9px;margin-top:2px;font-size:12.5px;color:var(--dim);cursor:pointer">
+                <input type="checkbox" id="swOfflineChk" checked style="width:16px;height:16px;flex:0 0 auto">
+                <span id="swOfflineTx">Keep this order <b style="color:var(--txt);font-weight:650">resting while you're offline</b>. It rests as pegged BTC (SBTC) so it stays live without your wallet open; your funds return as regular BTC if it fills or is cancelled. Turn off to rest as native BTC (keeps your wallet online for the trade).</span>
+              </label>
+
               <!-- FEE: pay the network fee in any asset a producer prices (open fee market). -->
               <div class="swsec swfee" id="swFeeRow">
                 <div class="swfee-head">
@@ -883,7 +895,7 @@ import init, { Mnemonic, Network, Signer, Wollet, EsploraClient, Address, AssetI
   openampComputeAid, enclaveSighash, decodeEnclaveSpend, stringToQr }
   from './pkg/lwk_wasm.js';
 import { HDKey, mnemonicToSeedSync, btc, schnorr } from './btc.js';
-import { initSwap, renderSwap, resumeCrossMakers, resumeCovenantOrders, resumeMixedSwap, resumeSell, resumeBuy, hasBuyInFlight, scanCovenantCompanion, setConfidentialReceive, confidentialReceive, logTrade } from './swap.js';
+import { initSwap, renderSwap, resumeCrossMakers, resumeCovenantOrders, resumePegIns, resumeMixedSwap, resumeSell, resumeBuy, hasBuyInFlight, scanCovenantCompanion, setConfidentialReceive, confidentialReceive, logTrade } from './swap.js';
 import { initXswap, renderXswap, fetchXmarkets, fetchXquote, fetchXbook, openFromComposer, hasInFlight } from './xswap.js';
 import { initXrswap, fetchRQuote, openReverseFromComposer, hasInFlight as hasReverseInFlight, renderReverse } from './xrswap.js';
 import { initXmaker, startForwardMaker, startReverseMaker, liveMakerOffers, resumeMakerSwaps } from './xmaker.js';
@@ -1682,6 +1694,24 @@ const btcLeg = {
     const { vout, height } = await btcWaitConf(txid, spkHex);
     return { txid, vout, height, amount: BigInt(amountAtoms), asset_id: '' };
   },
+  // Plain send: pay `amountAtoms` sats of BTC to a normal address on testnet4 (NOT an HTLC). Used by
+  // the SBTC peg-in to deposit the maker's real BTC to the bridge. Hands the caller the txid the
+  // instant it broadcasts (onBroadcast) so the peg-in intent can be persisted before returning — the
+  // bridge will credit SBTC to the bound Sequentia address regardless of whether this wallet stays
+  // open, so a crash after broadcast never loses funds (worst case the user holds SBTC to reconcile).
+  async payAddress(address, amountAtoms, onBroadcast){
+    const built = await btcBuildTx([{ address, amount: BigInt(amountAtoms) }], btcFeeRate());
+    const r = await fetch(`${T4_API}/tx`, { method:'POST', body: built.hex });
+    const txt = (await r.text()).trim();
+    if(!r.ok) throw new Error(txt || ('HTTP '+r.status));
+    if(!/^[0-9a-fA-F]{64}$/.test(txt)) throw new Error('unexpected broadcast response: '+txt.slice(0,80));
+    if(built.changeIndex!=null) btcChangeNext = Math.max(btcChangeNext, built.changeIndex+1);
+    if(typeof onBroadcast==='function'){ try{ onBroadcast(txt); }catch{} }
+    return txt;   // txid
+  },
+  // A wallet BTC receive address (testnet4, the shared tb1 keychain — same as the Receive tab). Used
+  // as the peg-OUT destination when a taker redeems just-received SBTC back to real BTC.
+  receiveAddress(){ return btcAddr(false, 0); },
   // The taker's dedicated BTC-leg CLAIM keypair (reverse swap: the taker claims the
   // maker's funded BTC leg with the revealed preimage).
   claimKey(){
@@ -1965,6 +1995,9 @@ async function openWallet(phrase){
   // Passive-CLOB covenant orders rest ON-CHAIN and can fill while the tab is closed;
   // rehydrate them, rescan the maker-credit companion wollet, and re-arm the fill watcher.
   try{ resumeCovenantOrders(); }catch(e){ console.warn('[resume] covenant-order resume failed:', e?.message??e); }
+  // SBTC silent peg: a BUY-with-BTC bid mid peg-in when the wallet last closed resumes to post its
+  // covenant once the SBTC credit lands (funds are safe at the bridge meanwhile — see resumePegIns).
+  try{ resumePegIns(); }catch(e){ console.warn('[resume] peg-in resume failed:', e?.message??e); }
   // Mixed-rail (submarine) swap: its asset leg is an on-chain HTLC recoverable only via
   // its CLTV timeout, so a persisted in-flight swap MUST resume its trade-process view +
   // Refund off-ramp after a reload (fund-safety).
