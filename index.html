@@ -529,7 +529,6 @@
                same offers on every rail; no on-chain/LN distinction. Rendered by swap.js. -->
           <div class="swdesk-book">
             <div id="swBook"></div>
-            <div id="swTrades"></div>
             <div id="swInFlight"></div>
             <div id="swMyOrders"></div>
           </div>
@@ -669,6 +668,10 @@
 
           </div><!-- /.swdesk-compose -->
         </div><!-- /.swdesk -->
+
+        <!-- Recent trades for the pair — a full-width history strip at the BOTTOM of the terminal
+             (below the composer + book), so it doesn't compete with the swap card for attention. -->
+        <div id="swTrades" style="margin-top:18px"></div>
 
         <!-- Confidential-receive toggle: shown ONLY when receiving a Sequentia-issued asset ON-CHAIN
              (blinded addresses don't apply to BTC or to a Lightning receive). Gated by updateConfToggle(). -->
