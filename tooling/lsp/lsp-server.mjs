@@ -471,14 +471,50 @@ async function nodeStatus(rpc, leg) {
     blockheight: info.blockheight, channels };
 }
 
+// What the LSP can JIT-FRONT for a wallet that holds NO channel of its own, per leg. The wallet's
+// rail readiness (ln-rail.js) reads this so a leg with no own channel is still Lightning-ready when
+// the LSP can front it — and HONESTLY unavailable when it cannot (no own channel AND no LP inventory),
+// instead of promising an instant fronted leg that would then fail at settlement. Asset legs front
+// from the LP node's (ln-asset) on-chain inventory of that asset (provisionInbound opens a JIT channel
+// funded from it — needs CONFIRMED asset UTXOs, since fundchannel uses mindepth=0 but not minconf=0).
+// The BTC leg fronts over the BTC-LN node's (btc-taker) OWN channels: spendable = the LSP can DELIVER
+// BTC-LN (user receives), receivable = the LSP can RECEIVE it (user pays). Fully best-effort: a down LP
+// or BTC node simply advertises no fronting for its leg (the wallet then offers on-chain, honestly).
+async function frontableInventory() {
+  const assets = {}; const btc = { out_sat: 0, in_sat: 0 };
+  if (CFG.subasLpRpc) {
+    try {
+      const lf = await lnrpc('listfunds', [], CFG.subasLpRpc, STATUS_RPC_TIMEOUT_MS);
+      for (const o of (lf.outputs || [])) {
+        if (o.status !== 'confirmed' || o.reserved) continue;                 // confirmed + unreserved only
+        const a = (o.asset || 'policy').toLowerCase();
+        const sat = Math.round(Number(o.amount_msat ?? 0) / 1000);
+        if (sat > 0) assets[a] = (assets[a] || 0) + sat;
+      }
+    } catch { /* LP down -> no asset-leg fronting advertised */ }
+  }
+  if (CFG.mixedBtcRpc) {
+    try {
+      const pc = await lnrpc('listpeerchannels', [], CFG.mixedBtcRpc, STATUS_RPC_TIMEOUT_MS);
+      for (const c of (pc.channels || [])) {
+        if (!String(c.state || '').startsWith('CHANNELD_NORMAL')) continue;   // only live channels can route now
+        btc.out_sat += Math.round((c.spendable_msat ?? c.to_us_msat ?? 0) / 1000);
+        btc.in_sat  += Math.round((c.receivable_msat ?? ((c.total_msat ?? 0) - (c.to_us_msat ?? 0))) / 1000);
+      }
+    } catch { /* BTC-LN node down -> no BTC-leg fronting advertised */ }
+  }
+  return { assets, btc };
+}
+
 async function status(deviceKeys = []) {
   // Aggregate BOTH hosted nodes: the asset (GOLD) node and the BTC node.
   // In one-node fallback mode both sockets are identical and return the same data.
   // Per-node catch: a down/hung demo node must NOT fail the whole /status (which would blank the
   // wallet's LN badge + balance for everyone). It drops to null; the response omits its channels.
-  const [assetNode, btcNode] = await Promise.all([
+  const [assetNode, btcNode, frontable] = await Promise.all([
     nodeStatus(CFG.hostedAssetRpc, 'asset').catch(() => null),
     nodeStatus(CFG.hostedBtcRpc, 'btc').catch(() => null),
+    frontableInventory().catch(() => ({ assets: {}, btc: { out_sat: 0, in_sat: 0 } })),
   ]);
   // Include the REQUESTING DEVICE's OWN provisioned-node channels, so the wallet reads back its
   // LN balance right after a "Move to Lightning" (else a just-created channel on the user's own
@@ -519,6 +555,7 @@ async function status(deviceKeys = []) {
     btc_node: btcNode,
     provisioned_nodes: provNodes,                                       // the device's own nodes it named
     channels: [...(assetNode?.channels || []), ...(btcNode?.channels || []), ...provChannels], // merged, leg-tagged; a down node contributes none
+    frontable,   // what the LSP can JIT-front for a channel-less wallet (ln-rail.js: a leg is LN-ready if own channel OR frontable covers it)
     // Which chains/assets "Move to Lightning" can fund on THIS LSP. SeqLN nodes are
     // single-asset, so each Sequentia asset needs its OWN hosted node; `assets` lists
     // the demo GOLD node PLUS every asset the provisioner has booted a node for, and
