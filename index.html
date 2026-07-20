@@ -2888,6 +2888,16 @@ function initSwapTab(){
         const pub = await deviceTransportPubkey(id.transportPrivkey);
         return 'seq:' + assetHex.toLowerCase() + ':' + String(pub).toLowerCase();
       },
+      // The user's OWN hosted BTC Lightning node key (`btc:<devicepub>`), the counterpart of assetNodeKey
+      // for the BTC leg of an asset<->BTC pure-LN swap. Same device-derived identity the BTC Move-to-Lightning
+      // and rail-candidate paths use (index.html: lnNodeIdentity(phrase,'btc')).
+      btcNodeKey: async () => {
+        const phrase = (localStorage.getItem(KEY) || '').trim();
+        if (!phrase) throw new Error('Your wallet is locked; unlock it and try again.');
+        const k = lnNodeIdentity(phrase, 'btc');
+        const pub = await deviceTransportPubkey(k.deviceTransportPrivkey);
+        return 'btc:' + String(pub).toLowerCase();
+      },
       // Bring the on-device signer for the user's OWN hosted asset node ONLINE (idempotent —
       // re-attaches to the existing provisioned node without re-funding). A per-user node's signer
       // is NOT auto-connected on load, so this is required before a sub-asset SELL: the LSP commands

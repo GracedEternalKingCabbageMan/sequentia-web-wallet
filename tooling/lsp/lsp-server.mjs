@@ -1071,7 +1071,7 @@ async function closeChannel(body) {
     scid: ch.short_channel_id || null, destination: dest, asset_label: assetId ? assetLabel(assetId) : 'BTC' };
 }
 
-function runSwap({ side, asset, amount, offer_id, maker_pubkey, quote_asset }) {
+function runSwap({ side, asset, amount, offer_id, maker_pubkey, quote_asset, node_key, counter_node_key }) {
   return new Promise((resolve) => {
     const assetId = resolveAsset(asset);
     if (side !== 'buy' && side !== 'sell') return resolve({ ok: false, error: "side must be 'buy' or 'sell'" });
@@ -1081,12 +1081,17 @@ function runSwap({ side, asset, amount, offer_id, maker_pubkey, quote_asset }) {
     // that actually hold those assets. Empty/BTC quote = the classic asset<->BTC (counter leg = BTC-LN).
     const quoteId = quote_asset && String(quote_asset).toUpperCase() !== 'BTC' ? resolveAsset(quote_asset) : null;
     const assetAsset = !!quoteId;
-    // Resolve EACH leg's node with NO hostedAssetRpc fallback: targetFor already returns the GOLD node
-    // for GOLD (line 607) and the provisioned node otherwise, so a fallback here only ever fired for a
-    // non-GOLD, unprovisioned asset — silently collapsing BOTH legs onto the GOLD demo node (wrong asset)
-    // AND making the guard below dead code. Without it an unresolved asset yields null -> honest failure.
-    const baseSock = targetFor('seq', assetId, null).rpc;
-    const quoteSock = assetAsset ? targetFor('seq', quoteId, null).rpc : CFG.hostedBtcRpc;
+    // PHOENIX-STYLE SELF-CUSTODY: each leg runs on the USER's OWN provisioned node (nodes are keyed
+    // per-asset, so `node_key` = the user's <asset> node and `counter_node_key` = the user's <quote_asset>
+    // node for asset<->asset, or the user's BTC node for asset<->BTC). The device co-signs every
+    // commitment over the wss link during the swap — the user's keys never leave the device. targetFor
+    // routes an explicit provisioned key to the user's own node (line 601); it falls back to the shared
+    // hosted node ONLY when the user has none (e.g. the GOLD demo), never silently for a real user asset.
+    // Passing null (a wallet that omits the keys) reverts to the shared node — so the wallet MUST send them.
+    const baseSock = targetFor('seq', assetId, node_key || null).rpc;
+    const quoteSock = assetAsset
+      ? targetFor('seq', quoteId, counter_node_key || null).rpc
+      : targetFor('btc', null, counter_node_key || null).rpc;
     if (!baseSock || !quoteSock) return resolve({ ok: false, error: `no hosted Lightning node for ${assetAsset ? assetLabel(assetId) + '/' + assetLabel(quoteId) : assetLabel(assetId) + '/BTC'}` });
     const args = [
       'xpln', '-side', side, '-relay', CFG.relay,
