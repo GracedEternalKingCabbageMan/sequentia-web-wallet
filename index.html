@@ -899,7 +899,7 @@
   window.SEQ_LSP_HOST_PUBKEY_BTC   = '020a749af93e2a5a4d67ad28585cec31b55a146969eb77ca3d076eb59ff111ed51';
 </script>
 <script type="module">
-import init, { Mnemonic, Network, Signer, Wollet, EsploraClient, Address, AssetId, Txid, Contract, Pset, Transaction,
+import init, { Mnemonic, Network, Signer, Wollet, Update, EsploraClient, Address, AssetId, Txid, Contract, Pset, Transaction,
   generateSwapSecret, buildSeqHtlcRedeemScript, buildSeqHtlcClaimTx, buildSeqHtlcRefundTx,
   scriptToAddress, buildCovenantFillTx,
   openampComputeAid, enclaveSighash, decodeEnclaveSpend, stringToQr }
@@ -1991,9 +1991,44 @@ function buildWollet(phrase){
   wollet = new Wollet(network, signer.wpkhSlip77Descriptor());
   btcInit(phrase);   // same BIP84 keychain drives the Bitcoin testnet4 side
 }
+
+// ---- wollet scan-state cache (fast reload) --------------------------------
+// A fresh Wollet holds no UTXOs until a full scan completes, so a cold reload
+// blocks ~a minute before the wallet is usable. We persist the last scan Update
+// and re-apply it on load: the balance + spendable UTXOs are then available
+// INSTANTLY, and the following full scan just refreshes in the background. The
+// update blob can exceed localStorage's ~5MB, so it lives in IndexedDB, keyed by
+// the wallet descriptor (so switching wallets never crosses states). Best-effort
+// throughout: any failure falls back to the normal (correct) full scan.
+const IDB_NAME='swk-wallet', IDB_STORE='scan';
+function idbOpen(){ return new Promise((resolve,reject)=>{ const r=indexedDB.open(IDB_NAME,1);
+  r.onupgradeneeded=()=>{ try{ r.result.createObjectStore(IDB_STORE); }catch{} };
+  r.onsuccess=()=>resolve(r.result); r.onerror=()=>reject(r.error); }); }
+async function idbGet(key){ try{ const db=await idbOpen(); return await new Promise((res)=>{
+  const q=db.transaction(IDB_STORE,'readonly').objectStore(IDB_STORE).get(key);
+  q.onsuccess=()=>res(q.result||null); q.onerror=()=>res(null); }); }catch{ return null; } }
+async function idbPut(key,val){ try{ const db=await idbOpen(); await new Promise((res)=>{
+  const q=db.transaction(IDB_STORE,'readwrite').objectStore(IDB_STORE).put(val,key);
+  q.onsuccess=()=>res(); q.onerror=()=>res(); }); }catch{} }
+function wolletKey(){ try{ return 'upd:'+wollet.descriptor().toString(); }catch{ return 'upd:default'; } }
+async function restoreWolletState(){
+  try{
+    const b64=await idbGet(wolletKey()); if(!b64) return false;
+    wollet.applyUpdate(Update.deserializeDecryptedBase64(b64, wollet.descriptor()));
+    return true;
+  }catch(e){ console.warn('[scan-cache] restore failed:', e?.message??e); return false; }
+}
+async function persistWolletState(update){
+  try{ if(update) await idbPut(wolletKey(), update.serializeEncryptedBase64(wollet.descriptor())); }
+  catch(e){ console.warn('[scan-cache] persist failed:', e?.message??e); }
+}
+
 async function openWallet(phrase){
   buildWollet(phrase);
   localStorage.setItem(KEY, phrase.trim().replace(/\s+/g,' '));
+  // Restore the last scan BEFORE first render, so the balance + UTXOs are live immediately
+  // (the wallet is usable while sync() below just refreshes). Best-effort; falls back to a full scan.
+  await restoreWolletState();
   addrIndex=null; views('app'); tab('balance'); addRecipientRow(); initAppRefUI(); initSwapTab();
   // Register the OpenAMP identity + load restricted-asset metadata before the first sync, so
   // restricted rows/balances can render in the same pass. Non-fatal if the enclave is unreachable.
@@ -2882,7 +2917,7 @@ async function _syncImpl(){
   try{
     // scan both chains + refresh fee-asset rates + restricted-asset balances in parallel
     const [update] = await Promise.all([client.fullScan(wollet), btcScan(), fetchFeeRates(), oampRefreshBalances(), oampRefreshUser()]);
-    if(update) wollet.applyUpdate(update);
+    if(update){ wollet.applyUpdate(update); persistWolletState(update); }   // cache the scan so the next load is instant (best-effort, non-blocking)
     _scannedOnce = true;   // the live balance is now authoritative — stop showing the cached snapshot
     // Rescan the covenant maker-credit companion wollet AFTER the main scan: it shares the same esplora
     // client, and wasm-bindgen forbids re-entrant &mut use of one object (a concurrent fullScan throws
