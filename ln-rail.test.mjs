@@ -5,7 +5,7 @@
 import assert from 'node:assert';
 import {
   channelMatches, channelActive, legLiquidity, hasChannel, canPayFrom, canReceiveTo,
-  legOption, railAvailability,
+  legOption, railAvailability, lspCanFront,
 } from './ln-rail.js';
 
 const GOLD = 'aa'.repeat(32);
@@ -77,5 +77,27 @@ assert.ok(!sellGold.payLn.ok && sellGold.recvLn.ok && !sellGold.pureLnOk, 'selli
 const none = railAvailability({ channels: [], payTarget: 'BTC', recvTarget: goldT });
 assert.ok(!none.payLn.ok && !none.recvLn.ok && !none.pureLnOk, 'no channels => the LN rail is offered for NEITHER leg');
 console.log('ok: railAvailability reflects real per-leg channel liquidity, not "LSP configured"');
+
+// --- LSP-frontable gating: a channel-LESS wallet is still LN-ready when the LSP can front the leg
+//     (reads /status.frontable), and HONESTLY unavailable when it can't -----------------------------
+const FRONT = { assets: { [USDX]: 5_000_000, [GOLD]: 0 }, btc: { out_sat: 300_000, in_sat: 0 } };
+// receive USDX with NO own channel: the LSP has USDX inventory -> FRONTED (LN-ready), not a blocker.
+const fUsdxRecv = legOption([], usdxT, 'recv', {}, FRONT);
+assert.ok(fUsdxRecv.ok && fUsdxRecv.fronted && !fUsdxRecv.unfrontable, 'no channel + LSP USDX inventory -> receive is FRONTED (ready)');
+// receive GOLD: the LSP has frontable DATA but ZERO GOLD inventory -> honestly UNavailable.
+const fGoldRecv = legOption([], goldT, 'recv', {}, FRONT);
+assert.ok(!fGoldRecv.ok && fGoldRecv.unfrontable && /isn't available for GOLD/.test(fGoldRecv.reason), 'no channel + no GOLD inventory -> receive is honestly UNavailable');
+// PAY any asset: the user funds their OWN JIT channel, so the LP being up (any inventory) is enough.
+assert.ok(legOption([], goldT, 'pay', {}, FRONT).fronted, 'no channel + LP up -> PAY leg is frontable (user funds own JIT channel)');
+// BTC: receive needs outbound (has it) -> fronted; pay needs inbound (zero) -> unavailable.
+assert.ok(legOption([], 'BTC', 'recv', {}, FRONT).ok, 'no channel + BTC outbound -> receive BTC over LN is fronted');
+assert.ok(legOption([], 'BTC', 'pay', {}, FRONT).unfrontable, 'no channel + zero BTC inbound -> pay BTC over LN is honestly unavailable');
+// NO frontable data at all -> PROVISIONABLE fallback (selectable, never pessimistically disabled).
+const noData = legOption([], usdxT, 'recv', {}, null);
+assert.ok(!noData.ok && noData.provisionable && !noData.unfrontable, 'no frontable data -> provisionable fallback (not disabled)');
+// lspCanFront direction/leg logic direct.
+assert.ok(lspCanFront(usdxT, 'recv', FRONT) && !lspCanFront(goldT, 'recv', FRONT), 'lspCanFront: recv needs THAT asset inventory');
+assert.ok(lspCanFront('BTC', 'recv', FRONT) && !lspCanFront('BTC', 'pay', FRONT), 'lspCanFront: BTC recv=outbound, pay=inbound');
+console.log('ok: legOption factors LSP-frontable inventory (fronted / unfrontable / provisionable) — honest gating');
 
 console.log('\nALL PASS');

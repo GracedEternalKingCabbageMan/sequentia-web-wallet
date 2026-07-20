@@ -82,23 +82,60 @@ function legName(target) { return target === 'BTC' ? 'BTC' : (target.ticker || '
 //   cta       'move' -> route the user to Move-to-Lightning (no channel at all)
 //             'add'  -> a channel exists but this side has no room (add / rebalance)
 //   ctaLabel  a short button/link label for that action
-export function legOption(channels, target, direction, provisioned) {
+// Can the LSP JIT-FRONT this leg for a wallet that holds NO channel of its own? Reads
+// /status.frontable (the LP's live inventory). This is what lets a channel-less wallet trade over
+// Lightning at all — the whole point of the LSP — so the readiness verdict must see it, not only the
+// wallet's own channels. Direction- and leg-aware, mirroring how the LSP actually fronts each leg:
+//   • RECEIVE asset X -> the LP opens INBOUND to the user, funded from ITS X inventory -> needs frontable.assets[X].
+//   • RECEIVE BTC     -> the LSP DELIVERS BTC over LN from its own outbound              -> needs frontable.btc.out_sat.
+//   • PAY asset X     -> the user funds their OWN JIT channel (they hold X); the LP need only be UP to
+//                        service an asset LN leg (one node fronts every asset)            -> LP has ANY inventory.
+//   • PAY BTC         -> the user pays INTO the LSP, which RECEIVES it                    -> needs frontable.btc.in_sat.
+// Any positive amount qualifies (the JIT channel is sized at trade time); we only decide can-it-at-all.
+export function lspCanFront(target, direction, frontable) {
+  if (!frontable) return false;
+  if (target === 'BTC') {
+    const b = frontable.btc || {};
+    return direction === 'pay' ? big(b.in_sat) > 0n : big(b.out_sat) > 0n;
+  }
+  const assets = frontable.assets || {};
+  if (direction === 'recv') return big(assets[String(target.hex || '').toLowerCase()]) > 0n;
+  return Object.values(assets).some((v) => big(v) > 0n);   // pay: the LP being up (any inventory) is enough
+}
+
+export function legOption(channels, target, direction, provisioned, frontable) {
   const l = legLiquidity(channels, target);
   const name = legName(target);
+  const fronts = lspCanFront(target, direction, frontable);
   if (!l.active) {
+    // No own channel. If the LSP can front this leg, it IS Lightning-ready (near-instant, provisioned
+    // when the order is placed) — flagged `fronted` so the composer says so instead of nagging.
+    if (fronts) return { ok: true, fronted: true, name, direction, reason: '', cta: null, ctaLabel: '', hint: '', liquidity: l };
     const key = target === 'BTC' ? null : String(target.hex || '').toLowerCase();
     const nodeUp = !!(key && provisioned && provisioned[key] && provisioned[key].connected);
+    if (frontable == null) {
+      // No frontable DATA (the LSP /status didn't carry it, or is briefly unreachable) -> do NOT
+      // pessimise: keep the prior assumption that a channel is provisioned INLINE on Place-order
+      // (selectable, not blocked). We only gate honestly when we actually KNOW the LSP can't front.
+      return { ok: false, provisionable: true, name, direction, reason: `No Lightning channel for ${name} yet.`,
+        cta: 'move', ctaLabel: `Move ${name} to Lightning`,
+        hint: nodeUp ? `Your ${name} Lightning node is ready. Open a channel from the Balance tab.`
+                     : `A ${name} Lightning channel is opened for you when you place the order.`, liquidity: l };
+    }
+    // No own channel AND the LSP genuinely can't front it -> honestly UNavailable over Lightning.
     return {
-      ok: false, name, direction, reason: `No Lightning channel for ${name} yet.`,
+      ok: false, unfrontable: true, name, direction, reason: `Lightning isn't available for ${name} right now.`,
       cta: 'move', ctaLabel: `Move ${name} to Lightning`,
       hint: nodeUp
-        ? `Your ${name} Lightning node is ready. Open a channel from the Balance tab to trade it instantly.`
-        : `Move ${name} into a Lightning channel from the Balance tab first, then this rail turns on.`,
+        ? `Your ${name} Lightning node is ready. Open a channel from the Balance tab to trade ${name} over Lightning.`
+        : `The service has no ${name} Lightning liquidity to front right now — use on-chain, or move ${name} into a channel from the Balance tab.`,
       liquidity: l,
     };
   }
   const enough = direction === 'pay' ? l.spendable > 0n : l.receivable > 0n;
   if (!enough) {
+    // Own channel is short this side — but the LSP can still front it, so it's ready (fronted).
+    if (fronts) return { ok: true, fronted: true, name, direction, reason: '', cta: null, ctaLabel: '', hint: '', liquidity: l };
     return direction === 'pay'
       ? { ok: false, name, direction, reason: `Your ${name} Lightning channel has no spendable balance to pay from.`,
           cta: 'add', ctaLabel: `Add ${name} to Lightning`, hint: `Top up the ${name} channel from the Balance tab.`, liquidity: l }
@@ -111,13 +148,13 @@ export function legOption(channels, target, direction, provisioned) {
 // The composite verdict for a BTC<->asset pair: whether EACH leg's LN option is real,
 // and whether the pure-LN (both legs on Lightning) route is genuinely available.
 //   payTarget  / recvTarget : 'BTC' | { hex, ticker } — the composer's pay/receive legs
-export function railAvailability({ channels, provisioned, payTarget, recvTarget }) {
-  const payLn = legOption(channels, payTarget, 'pay', provisioned);
-  const recvLn = legOption(channels, recvTarget, 'recv', provisioned);
+export function railAvailability({ channels, provisioned, payTarget, recvTarget, frontable }) {
+  const payLn = legOption(channels, payTarget, 'pay', provisioned, frontable);
+  const recvLn = legOption(channels, recvTarget, 'recv', provisioned, frontable);
   return { payLn, recvLn, pureLnOk: payLn.ok && recvLn.ok };
 }
 
 export default {
   channelMatches, channelActive, legLiquidity, hasChannel, canPayFrom, canReceiveTo,
-  legOption, railAvailability,
+  lspCanFront, legOption, railAvailability,
 };

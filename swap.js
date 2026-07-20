@@ -672,7 +672,7 @@ async function refreshInstant(){
   try {
     const st = await L.status();
     const chans = (st && (st.channels || st.channel_balances)) || [];
-    LNSTATUS = { channels: chans, funding: (st && st.funding) || null };   // ground truth for rail gating
+    LNSTATUS = { channels: chans, funding: (st && st.funding) || null, frontable: (st && st.frontable) || null };   // ground truth for rail gating (own channels + LSP-frontable inventory)
     for (const c of chans){
       if (!c.node_key) continue;   // ONLY the wallet's own channels count as its Lightning balance
                                    // (never shared/demo) — consistent with the Balance tab + railAvail
@@ -706,7 +706,7 @@ function railTarget(hexOrBtc){ return hexOrBtc === 'BTC' ? 'BTC' : { hex: hexOrB
 // direction-aware). Safe to call any time; reads the last /status snapshot synchronously.
 function railAvail(payHex, receiveHex){
   return railAvailability({
-    channels: LNSTATUS.channels || [], provisioned: LNPROV,
+    channels: LNSTATUS.channels || [], provisioned: LNPROV, frontable: LNSTATUS.frontable || null,
     payTarget: railTarget(payHex), recvTarget: railTarget(receiveHex),
   });
 }
@@ -930,26 +930,35 @@ function renderRailNote(ra){
   // Only nag about a missing/insufficient Lightning channel for a leg the user is ACTUALLY
   // routing over Lightning. A leg switched back to on-chain needs no channel, so its note
   // must clear (this is the fix for the note persisting after flipping a leg to on-chain).
-  const payBad  = ra && S.payRail  === 'ln' && !ra.payLn.ok  ? ra.payLn  : null;
-  const recvBad = ra && S.recvRail === 'ln' && !ra.recvLn.ok ? ra.recvLn : null;
-  const bad = payBad || recvBad;   // surface the first LN-selected leg that isn't LN-ready
-  if (!bad){ note.innerHTML = ''; note.classList.add('hide'); return; }
+  // Only the legs the user is actually routing over Lightning; ln-rail.js now factors in LSP-frontable
+  // liquidity, so a leg is one of: ready(own channel) | fronted(LSP fronts it) | provisionable(no data
+  // -> assume inline) | add(own channel short) | unfrontable(genuinely unavailable). Surface honestly.
+  const legs = [];
+  if (ra && S.payRail  === 'ln' && ra.payLn)  legs.push(ra.payLn);
+  if (ra && S.recvRail === 'ln' && ra.recvLn) legs.push(ra.recvLn);
+  const unavail = legs.find(l => l.unfrontable);            // real blocker: no channel + LSP can't front
+  const addliq  = legs.find(l => !l.ok && l.cta === 'add'); // own channel exists but lacks this side
+  const provis  = legs.find(l => l.provisionable);          // no frontable data -> assume inline provision
+  const fronted = legs.find(l => l.ok && l.fronted);        // LSP fronts it -> near-instant heads-up
+  const pick = unavail || addliq || provis || fronted;
+  if (!pick){ note.innerHTML = ''; note.classList.add('hide'); return; }
   note.classList.remove('hide');
-  if (bad.cta === 'move'){
-    // No channel yet is NOT a blocker — the Lightning leg is provisioned INLINE when you place the
-    // order, JIT and 0-conf (near-instant), so it is never gated on a confirmation. Honest, per-leg
-    // wording: a PAY leg opens spendable capacity from your own balance; a RECEIVE leg is fronted by
-    // the service providing inbound liquidity (no channel for you to set up). Optional Balance shortcut.
-    const nm = esc(bad.name || 'this asset');
-    note.innerHTML = (bad.direction === 'pay'
-      ? `<span>A Lightning channel for ${nm} opens from your balance the moment you place the order · near-instant (0-conf), no waiting on a confirmation.</span>`
-      : `<span>Inbound ${nm} Lightning liquidity is provided for you when you place the order · near-instant, nothing to set up.</span>`)
-      + ` <button type="button" class="swfix" id="swRailMove">Set it up now</button>`;
+  const nm = esc(pick.name || 'this asset');
+  let html, withBtn = true, btnLabel = esc(pick.ctaLabel || 'Set it up now');
+  if (pick === unavail){
+    html = `<span>Lightning isn't available for ${nm} right now · ${esc(pick.hint || 'use on-chain instead.')}</span>`;
+  } else if (pick === addliq){
+    html = `<span>${esc(pick.reason)} ${esc(pick.hint || '')}</span>`; btnLabel = esc(pick.ctaLabel || 'Add liquidity');
   } else {
-    // Channel exists but this side lacks liquidity (cta 'add') — the honest add-liquidity note stays.
-    note.innerHTML = `<span>${esc(bad.reason)} ${esc(bad.hint || '')}</span>`
-      + ` <button type="button" class="swfix" id="swRailMove">${esc(bad.ctaLabel || 'Add liquidity')}</button>`;
+    // provisionable OR fronted: a channel is arranged for you when you place the order, JIT + 0-conf
+    // (near-instant). Per-leg: a PAY leg opens spendable capacity from YOUR balance; a RECEIVE leg is
+    // fronted by the service (inbound, nothing to set up). Fronted needs no button (truly nothing to do).
+    withBtn = (pick === provis);
+    html = pick.direction === 'pay'
+      ? `<span>A Lightning channel for ${nm} opens from your balance when you place the order · near-instant (0-conf).</span>`
+      : `<span>Inbound ${nm} Lightning liquidity is fronted for you when you place the order · near-instant, nothing to set up.</span>`;
   }
+  note.innerHTML = html + (withBtn ? ` <button type="button" class="swfix" id="swRailMove">${btnLabel}</button>` : '');
   const b = C.$('swRailMove');
   if (b) b.onclick = () => { if (C.gotoLightning) C.gotoLightning(); else try { C.toast('Open a Lightning channel from the Balance tab.'); } catch {} };
 }
@@ -1030,6 +1039,10 @@ function paintRailSegs(ra){
           ? `Receiving ${C.assetMeta(S.receiveAsset).ticker} over Lightning needs inbound Lightning liquidity for it (coming soon). For now, receive it on-chain.`
           : badTip;
       }
+      else if (r === 'ln' && legLn.unfrontable){
+        // Honest gating: the user has no channel AND the LSP genuinely can't front this leg (no
+        // inventory) -> Lightning can't work here, so disable it and point to on-chain.
+        bad = true; tip = legLn.hint || `Lightning isn't available for ${legLn.name} right now · use on-chain.`; }
       else if (r === 'ln' && !legLn.ok){ tip = legLn.cta === 'add'
         ? (legLn.reason + (legLn.hint ? ' ' + legLn.hint : ''))
         : 'No channel yet · one is opened for you when you place the order.'; }
