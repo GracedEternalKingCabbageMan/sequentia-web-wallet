@@ -2726,6 +2726,63 @@ export async function resumePegIns(){
   }
 }
 
+// TAKER path: fill a resting pegged-BTC covenant (a bid advertised as BTC, locking SBTC) by posting a
+// crossing order over the covenant relay WS. The relay matches it against the covenant and hands us
+// the terms; onCovMatched settles the fill (we pay `assetHex`, receive SBTC) and then pegs the SBTC
+// out to real BTC. assetHex/assetAtoms = what we pay; btcSats = the BTC we're buying.
+async function takePeggedCovenant(assetHex, assetAtoms, btcSats, onStatus){
+  if (BigInt(assetAtoms) <= 0n || BigInt(btcSats) <= 0n) throw new Error('Enter both amounts.');
+  const m = C.assetMeta(assetHex);
+  const have = balAtoms(assetHex);
+  if (BigInt(assetAtoms) > have) throw new Error(`You only hold ${C.fmtAtoms(have, m.precision)} ${m.ticker}.`);
+  // Watch the covenant's market (BTC/asset shelf) so onCovMatched fires + settles when we cross it.
+  if (!EXTRA_COV_MARKETS.some((x) => x.base_asset === 'BTC' && x.quote_asset === assetHex))
+    EXTRA_COV_MARKETS.push({ base_asset: 'BTC', quote_asset: assetHex });
+  ensureCovenantRelay();
+  const raw = C.wollet.address(C.addrIndex == null ? undefined : C.addrIndex).address();
+  const recvAddr = (raw.toUnconfidential ? raw.toUnconfidential() : raw).toString();
+  const now = Math.floor(Date.now() / 1000);
+  // BUY base=BTC with quote=asset on the BTC/asset shelf — the counter-side of the covenant's SELL of
+  // BTC (validator BUY: offer_asset==quote, want_asset==base, want_amount==base_amount).
+  const offer = {
+    offer_id: seqob.randHex(16), schema_version: 1,
+    pair: { base_asset: 'BTC', quote_asset: assetHex },
+    trade_dir: 2,                                    // BUY
+    base_amount: String(btcSats),
+    offer_amount: String(assetAtoms), offer_asset: assetHex,
+    want_amount: String(btcSats),  want_asset: 'BTC',
+    allow_partial: true,
+    created_at_unix: String(now), expires_at_unix: String(now + 3600),
+    fee_asset_hint: assetHex,
+    same_chain: { maker_recv_address: recvAddr },    // for any resting remainder
+  };
+  seqob.signOffer(offer, makerPriv());
+  onStatus && onStatus('Posting your order to cross the resting bid…');
+  await postToCovRelay(offer);
+  return { offerId: offer.offer_id };
+}
+
+// Post an offer over the covenant relay WS (so a resulting match routes back to onCovMatched). Waits
+// briefly for the WS to open. Reuses the shared COVRELAY (already carrying the onMatched -> settle +
+// peg-out wiring); the market must already be subscribed (takePeggedCovenant adds it).
+async function postToCovRelay(offer){
+  ensureCovenantRelay();
+  if (!COVRELAY) throw new Error('order-book relay unavailable');
+  const ws = COVRELAY.ws;
+  if (!(ws && ws.readyState === 1)){
+    await new Promise((resolve, reject) => {
+      const t = setTimeout(() => reject(new Error('the order-book relay did not open in time')), 8000);
+      const tick = () => {
+        if (ws && ws.readyState === 1){ clearTimeout(t); resolve(); }
+        else if (!ws || ws.readyState >= 2){ clearTimeout(t); reject(new Error('relay connection closed')); }
+        else setTimeout(tick, 150);
+      };
+      tick();
+    });
+  }
+  COVRELAY.post(offer);
+}
+
 // Send `atoms` of a Sequentia asset to `toAddr` (a plain transfer; fee in the chosen fee asset).
 // Used by the taker peg-OUT to hand the just-received SBTC back to the bridge.
 async function sendSeqAsset(toAddr, assetHex, atoms){
@@ -2833,9 +2890,15 @@ function refundHooksFor(){
 // The persistent relay watcher over every market this wallet has a resting order on.
 // onMatched -> this wallet is the taker: verify + FILL + broadcast. onOrderStatus ->
 // our resting order was filled by someone else: rescan so the credit shows up.
+// Extra markets the covenant relay must also watch even without a resting order of ours on them:
+// when we are the TAKER crossing someone's covenant (e.g. lifting a pegged-BTC bid), we must be
+// subscribed so onCovMatched fires and we settle the fill. Added by takePeggedCovenant.
+let EXTRA_COV_MARKETS = [];
 function covMarkets(){
   const seen = new Set(), out = [];
-  for (const r of PLACED){ const k = r.pay+'/'+r.receive; if (!seen.has(k)){ seen.add(k); out.push({ base_asset: r.pay, quote_asset: r.receive }); } }
+  const add = (base, quote) => { const k = base+'/'+quote; if (!seen.has(k)){ seen.add(k); out.push({ base_asset: base, quote_asset: quote }); } };
+  for (const r of PLACED){ add(r.pay, r.receive); }
+  for (const m of EXTRA_COV_MARKETS){ add(m.base_asset, m.quote_asset); }
   return out;
 }
 function ensureCovenantRelay(){
@@ -3852,6 +3915,45 @@ async function postPeggedBtcReview(q){
   };
 }
 
+// Review + confirm for filling a resting pegged-BTC covenant bid (taker sells the asset for BTC). On
+// confirm we post a crossing order (takePeggedCovenant); the relay matches it, we settle the covenant
+// fill on-chain (receiving SBTC), and the SBTC is auto-redeemed to real BTC — all handled by
+// onCovMatched. `offer` is the resting covenant we detected in the reverse book.
+async function takePeggedCovenantReview(q, offer){
+  const { $ } = C;
+  const assetHex = q.seqAsset;
+  const am = C.assetMeta(assetHex);
+  let assetAtoms, btcSats;
+  try {
+    assetAtoms = fieldAtoms($('swPayAmt'), assetHex);
+    btcSats    = fieldAtoms($('swRecvAmt'), 'BTC');
+    if (assetAtoms <= 0n || btcSats <= 0n) throw 0;
+  } catch { $('swErr').textContent = `Enter both the ${am.ticker} and the BTC.`; return; }
+  const assetU = Number(assetAtoms)/Math.pow(10, am.precision||0), btcU = Number(btcSats)/1e8;
+  const kv = [
+    ['Filling', `A resting BTC bid — you sell ${am.ticker} for BTC`],
+    ['You pay', amtRow(assetHex, assetAtoms) + refSuffix(assetHex, assetAtoms)],
+    ['You receive', C.fmtAtoms(btcSats, 8) + ' BTC'],
+    ['Price', assetU>0 ? `1 ${am.ticker} = ${trim(btcU/assetU)} BTC` : '-'],
+    ['How it settles', 'You fill the covenant on-chain (permissionless) and receive SBTC, which is automatically redeemed to real BTC at the bridge.'],
+    ['Finality', 'Anchor-bound to Bitcoin (reverts only if Bitcoin reverts).'],
+  ];
+  const { m: modal, ok, st } = C.modalRows({ title: `Sell ${am.ticker} for BTC`, kv });
+  if (ok) ok.textContent = 'Fill bid';
+  ok.onclick = async () => {
+    ok.disabled = true; st.className = 'status'; st.innerHTML = '<span class="spin"></span>Crossing the bid…';
+    try {
+      await takePeggedCovenant(assetHex, assetAtoms, btcSats, (msg) => { st.innerHTML = '<span class="spin"></span>' + esc(msg); });
+      modal.remove();
+      C.toast('Order posted to cross the bid; settlement and BTC redemption happen automatically.');
+      resetComposer();
+      renderSwap();
+    } catch (e){
+      st.className = 'status err'; st.textContent = 'Could not fill: ' + C.prettyErr(e); ok.disabled = false;
+    }
+  };
+}
+
 // Settlement-progress callback for a live wallet-made cross offer (drives the
 // resting-order panel through lift -> lock -> settled).
 function onCrossMakeState(mst){
@@ -3994,6 +4096,11 @@ async function reviewCross(q){
     }
   }
   if (q.reverse){
+    // A pegged-BTC covenant bid (advertised as BTC, locking SBTC) among the reverse offers settles as
+    // a COVENANT, not an HTLC — cross it and peg out (spec §5) rather than the xrswap wizard. Detected
+    // by the presence of covenant settlement terms on the best takeable reverse offer.
+    const best = (XBOOK.offers || [])[0];
+    if (best && (best.covenant || best.Covenant)) return takePeggedCovenantReview(q, best);
     // Reverse (sell asset for BTC): the xrswap.js wizard takes over (its own review
     // modals, leg verification, fund/claim/poll, and localStorage resume).
     if (!X.openReverseFromComposer){ $('swErr').textContent = 'Selling an asset for BTC is unavailable in this build.'; return; }
