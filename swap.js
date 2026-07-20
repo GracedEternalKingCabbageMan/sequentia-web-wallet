@@ -359,15 +359,27 @@ function applyComposeDerivation(pay, receive, price){
   const payEl = C.$('swPayAmt'), recvEl = C.$('swRecvAmt');
   const editedEl = S.edited === 'pay' ? payEl : recvEl;
   const otherEl  = S.edited === 'pay' ? recvEl : payEl;
+  const editedAsset = S.edited === 'pay' ? pay : receive;
+  const otherAsset  = S.edited === 'pay' ? receive : pay;
   if (document.activeElement === otherEl) return;   // never fight the field being typed in
-  if (editedEl._refMode || otherEl._refMode) return; // ref-currency input mode: don't derive across units
+  // Derive across the two fields even when one/both are in ref-currency (USD) input mode. Read the
+  // edited field in NATIVE units (fieldUnits converts a USD number back to native via the asset's ref
+  // price), derive the other field's native value from the book price, and write it back HONORING the
+  // other field's display mode (converting native->ref when it shows USD). The old early-return in ref
+  // mode was the bug where switching an input to USD stopped the auto-fill entirely.
   const r = deriveOtherField({
-    edited: S.edited, editedVal: numVal(editedEl),
+    edited: S.edited, editedVal: fieldUnits(editedEl, editedAsset),
     otherUserTyped: !!otherEl._userTyped, price,
   });
   if (!r) return;                                    // no derivation -> leave both fields untouched
-  const meta = C.assetMeta(r.side === 'pay' ? pay : receive);
-  setDerived(otherEl, C.fmtAtoms(C.parseAtoms(String(trim(r.value)), meta.precision || 0), meta.precision || 0));
+  const meta = C.assetMeta(otherAsset);
+  const otherAtoms = C.parseAtoms(String(trim(r.value)), meta.precision || 0);
+  if (otherEl._refMode && C.refValue){
+    const rv = C.refValue(otherAsset, otherAtoms);   // native -> ref number for a USD-mode field
+    setDerived(otherEl, rv ? String(trim(rv.v)) : C.fmtAtoms(otherAtoms, meta.precision || 0));
+  } else {
+    setDerived(otherEl, C.fmtAtoms(otherAtoms, meta.precision || 0));
+  }
   paintRefHints();
 }
 

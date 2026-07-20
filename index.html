@@ -2714,7 +2714,7 @@ function initSwapTab(){
     esploraFetch: (path, opts) => fetch(ESPLORA + path, opts),
     el, $, assetMeta, balObj, fmtAtoms, parseAtoms,
     assetVerified, assetRegistered, assetDomain, trustBadge,   // E1: asset trust signals in the picker
-    refValueStr, attachRefHint, assetAmountOf, feeRateFor, prettyErr,
+    refValueStr, refValue, attachRefHint, assetAmountOf, feeRateFor, prettyErr,   // refValue: numeric native->ref (for USD-mode field derivation)
     DEFAULT_FEERATE, EXCHANGE_RATE_SCALE, applyFee,   // open-fee-market fee estimate + real any-asset covenant funding fee
     get feeRates(){ return feeRates; },   // reassigned by fetchFeeRates — read fresh
     modalRows, toast, sync,
