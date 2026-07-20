@@ -926,9 +926,14 @@ function renderRailNote(ra){
   if (!bad){ note.innerHTML = ''; note.classList.add('hide'); return; }
   note.classList.remove('hide');
   if (bad.cta === 'move'){
-    // No channel yet is NOT a blocker any more — a channel is opened for you INLINE when you place
-    // the order. Say so honestly; offer an optional "set it up now" shortcut to the Balance tab.
-    note.innerHTML = `<span>No Lightning channel for this leg yet · one is opened for you when you place the order (this can take a couple of minutes).</span>`
+    // No channel yet is NOT a blocker — the Lightning leg is provisioned INLINE when you place the
+    // order, JIT and 0-conf (near-instant), so it is never gated on a confirmation. Honest, per-leg
+    // wording: a PAY leg opens spendable capacity from your own balance; a RECEIVE leg is fronted by
+    // the service providing inbound liquidity (no channel for you to set up). Optional Balance shortcut.
+    const nm = esc(bad.name || 'this asset');
+    note.innerHTML = (bad.direction === 'pay'
+      ? `<span>A Lightning channel for ${nm} opens from your balance the moment you place the order · near-instant (0-conf), no waiting on a confirmation.</span>`
+      : `<span>Inbound ${nm} Lightning liquidity is provided for you when you place the order · near-instant, nothing to set up.</span>`)
       + ` <button type="button" class="swfix" id="swRailMove">Set it up now</button>`;
   } else {
     // Channel exists but this side lacks liquidity (cta 'add') — the honest add-liquidity note stays.
@@ -2284,13 +2289,17 @@ function feeAssetSubline(hex){
 // honest, actionable timing banner (keyed off the RECEIVE leg)
 // ---------------------------------------------------------------------------
 // The LP instant-front CAP (how much on-chain PAY the LP will front so you receive
-// on Lightning NOW). Read from window.SEQ_LSP_FRONT_CAP (BTC, e.g. 0.0005); default
-// 0.0005 BTC. Compared against the BTC leg of the trade in BTC atoms.
+// on Lightning NOW). Read from window.SEQ_LSP_FRONT_CAP (BTC, e.g. 0.002); default
+// MUST track the deployed LSP's MIXED_MAX_0CONF (currently 200000 sat = 0.002 BTC) —
+// a smaller default under-advertises the instant range and needlessly warns "~1
+// confirmation" on trades the LSP would in fact front instantly. Compared against the
+// BTC leg of the trade in BTC atoms. (Ideally surfaced by the LSP /status; until then
+// this default is kept in lockstep with the box config.)
 function frontCapAtoms(){
   const w = (typeof window !== 'undefined') ? window : {};
   const c = w.SEQ_LSP_FRONT_CAP;
   if (c != null){ try { return C.parseAtoms(String(c), 8); } catch {} }
-  return 50000n;   // 0.0005 BTC
+  return 200000n;   // 0.002 BTC — matches the live LSP MIXED_MAX_0CONF
 }
 // The BTC leg amount of the current composer state, in BTC atoms (the on-chain PAY
 // exposure the CAP governs). Exactly one side of a BTC pair is BTC.

@@ -89,7 +89,7 @@ export function legOption(channels, target, direction, provisioned) {
     const key = target === 'BTC' ? null : String(target.hex || '').toLowerCase();
     const nodeUp = !!(key && provisioned && provisioned[key] && provisioned[key].connected);
     return {
-      ok: false, reason: `No Lightning channel for ${name} yet.`,
+      ok: false, name, direction, reason: `No Lightning channel for ${name} yet.`,
       cta: 'move', ctaLabel: `Move ${name} to Lightning`,
       hint: nodeUp
         ? `Your ${name} Lightning node is ready. Open a channel from the Balance tab to trade it instantly.`
@@ -100,12 +100,12 @@ export function legOption(channels, target, direction, provisioned) {
   const enough = direction === 'pay' ? l.spendable > 0n : l.receivable > 0n;
   if (!enough) {
     return direction === 'pay'
-      ? { ok: false, reason: `Your ${name} Lightning channel has no spendable balance to pay from.`,
+      ? { ok: false, name, direction, reason: `Your ${name} Lightning channel has no spendable balance to pay from.`,
           cta: 'add', ctaLabel: `Add ${name} to Lightning`, hint: `Top up the ${name} channel from the Balance tab.`, liquidity: l }
-      : { ok: false, reason: `Your ${name} Lightning channel has no inbound room to receive.`,
+      : { ok: false, name, direction, reason: `Your ${name} Lightning channel has no inbound room to receive.`,
           cta: 'add', ctaLabel: `Rebalance ${name}`, hint: `Receive to on-chain, or rebalance the ${name} channel.`, liquidity: l };
   }
-  return { ok: true, reason: '', cta: null, ctaLabel: '', hint: '', liquidity: l };
+  return { ok: true, name, direction, reason: '', cta: null, ctaLabel: '', hint: '', liquidity: l };
 }
 
 // The composite verdict for a BTC<->asset pair: whether EACH leg's LN option is real,
