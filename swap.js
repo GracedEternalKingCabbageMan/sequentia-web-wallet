@@ -327,10 +327,20 @@ function wireAmount(input, side){
     }
     LAST_QUOTE = null;
     setReviewEnabled(false);
+    // Instant auto-fill: derive the other leg NOW from the last-known book price (no network), so it
+    // fills as you type instead of after the debounce + fetch. TAKE only (LIMIT's two sides are the
+    // user's own independent price). The debounced requote below then refreshes the book and finalizes
+    // the quote — this is just a snappy preview that the requote corrects if the book moved.
+    if (S.mode !== 'post' && _composeBest && _composeBest.pay === S.payAsset && _composeBest.receive === S.receiveAsset && _composeBest.best){
+      try { applyComposeDerivation(S.payAsset, S.receiveAsset, _composeBest.best); } catch {}
+    }
     clearTimeout(_quoteTimer);
-    _quoteTimer = setTimeout(() => requote().catch(()=>{}), 350);
+    _quoteTimer = setTimeout(() => requote().catch(()=>{}), 220);
   });
 }
+// The last book best-price (receive-per-pay), cached per pair by requoteSame so a keystroke can
+// derive the opposite leg instantly (see wireAmount) without waiting for the debounced re-fetch.
+let _composeBest = null;
 // Programmatically set a field's value and mark it NOT user-typed (so the other
 // side's derivation may overwrite this one; the user's own input is protected).
 function setDerived(input, value){ if (!input) return; input.value = value; input._userTyped = false; }
@@ -1378,6 +1388,7 @@ async function requoteSame(route, amtStr){
     // user input. LIMIT (S.mode==='post'): the two fields are independent — the user sets their own
     // price, so we never auto-derive. (Empty market: best is null -> no derivation either way.)
     const best = bestReceivePerPay(liftable, pay, receive);
+    _composeBest = { pay, receive, best };   // cache for the instant per-keystroke auto-fill (wireAmount)
     if (S.mode === 'take') applyComposeDerivation(pay, receive, best);
     paintPlaceRate(pay, receive, best, liftable.length);
     if (!S.feeAsset) S.feeAsset = defaultFeeAsset();
