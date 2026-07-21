@@ -95,6 +95,7 @@ import { acceptUpgrade, bridgeWsToTcp } from './ws-bridge.mjs';
 import { settlementPlanForSide, planExecutionName, planSettlement } from './settlement-router.mjs';
 import { buildUnifiedBook } from './unified-book.mjs';
 import { runBridgedSwap, matchFromTake, describeBridge, classifyLegs } from './bridge-driver.mjs';
+import { runReverseBridgeTerms, openReverseBridgeSession, newBridgeClaimKeypair, relayTakerAssetLeg } from './bridge-maker.mjs';
 import { hashPreimageOk, subasSellStateFileForNonce, subasSellGuardVerdict, assembleSubasSellSettled } from './subas-sell-recovery.mjs';
 
 function reqEnv(name) {
@@ -1789,13 +1790,16 @@ function refundBridgeHtlcBtc({ htlc, refundPriv }) {
   });
 }
 
-// prepareBridgeLegs populates job.legState[unit] for every leg: the TAKER side from the body (its node,
-// H, amount, CLTV), and the MAKER side by lifting the resting offer (offer_id/maker_pubkey -> the maker's
-// claim pub / LN node / HTLC terms). The taker side is wired here; the maker-side offer lift + the H /
-// invoice handshake is the E2E-completion (it needs a LIVE maker + the relay lift the box runs), so this
-// leaves those fields UNSET, which makes every value move fail closed (stall, never mis-front) until the
-// live path fills them. Returns the plan.
-function prepareBridgeLegs({ match, body, job }) {
+// prepareBridgeLegs populates job.legState[unit] for every leg: the per-leg RPCs + amounts from the body,
+// and — for the ONE fund-safe rail crossing the io wires (a taker that SELLS the asset and RECEIVES BTC
+// over Lightning, against a REVERSE (buy) cross maker whose BTC leg is on-chain) — the MAKER SIDE via the
+// real courier handshake (bridge-maker.runReverseBridgeTerms). That handshake hands the maker the LSP's
+// OWN btc-claim pubkey, so the maker locks a real on-chain BTC HTLC paying the LSP on the maker's H; we
+// parse+verify that HTLC (claim==LSP, H, refund, CLTV) BEFORE recording it, so leg-bridge only ever fronts
+// once the recoup is provably locked to the LSP. Any other crossing shape (or a missing taker key) leaves
+// the maker side UNSET, so every value move fails closed (stall, never mis-front). Async (opens a relay
+// WS). Records the outcome on job.bridgeHandshake and the taker-facing terms on job.bridge_terms.
+async function prepareBridgeLegs({ match, body, job }) {
   const plan = planSettlement(match);
   const { bridged, native } = classifyLegs(plan);
   job.legState = job.legState || {};
@@ -1808,10 +1812,74 @@ function prepareBridgeLegs({ match, body, job }) {
     s.onchainRpc = isBtc ? CFG.subasBtcRpc : CFG.seqRpc;
     s.onchainWallet = isBtc ? CFG.subasBtcWallet : CFG.seqWallet;
     s.tipRpc = s.onchainRpc;
-    // TAKER-side LN node (for the leg the taker holds over LN). E2E: the taker's device mints the hold
-    // invoice on H + shares H; the maker offer lift fills receiverClaimPub / recvBolt11 / cltv.
+    // The LN end of the leg lives on the TAKER's hosted node (its hold on H); the LSP pays it from its own
+    // node (see makeBridgeIo's lspRpc). observe reads the hold via this rpc.
     s.lnRpc = s.lnRpc || (isBtc ? targetFor('btc', null, body.btc_node_key || null).rpc
                                 : targetFor('seq', resolveAsset(body.asset), body.node_key || null).rpc);
+  }
+
+  // The maker handshake — ONLY for the proven, io-supported crossing: BTC leg bridged, lnSide 'receiver'
+  // (taker sells the asset, receives BTC over LN), against a reverse maker. Everything else stays unwired
+  // (fail closed). Never throws out of the job: a failure records job.bridgeHandshake.error and leaves the
+  // maker side unset, so the driver fails closed rather than the job crashing.
+  const btcLeg = plan.btcLeg;
+  const canBridge = btcLeg && btcLeg.bridge && btcLeg.lnSide === 'receiver'
+    && (!plan.assetLeg || !plan.assetLeg.bridge);   // asset leg must be native (direct taker<->maker)
+  if (!canBridge) {
+    job.bridgeHandshake = { ok: false, error: 'this crossing shape is not wired (only taker-sells-asset / receives-BTC-over-LN vs a reverse maker is)' };
+    return plan;
+  }
+  const takerSeqRefundPub = body.taker_seq_refund_pub || body.takerSeqRefundPub || '';
+  if (!/^[0-9a-fA-F]{66}$/.test(takerSeqRefundPub)) {
+    job.bridgeHandshake = { ok: false, error: 'bridged sell needs taker_seq_refund_pub (the taker\'s OWN asset-refund key; the LSP never holds a taker key) — fail closed' };
+    return plan;
+  }
+  if (!body.offer_id || !body.maker_pubkey) {
+    job.bridgeHandshake = { ok: false, error: 'bridged take needs offer_id + maker_pubkey to lift the reverse maker' };
+    return plan;
+  }
+  if (!CFG.subasBtcRpc || !CFG.subasBtcWallet) {
+    job.bridgeHandshake = { ok: false, error: 'BTC on-chain backend (SUBAS_BTC_RPC + SUBAS_BTC_WALLET) not configured — cannot recoup the bridged BTC leg' };
+    return plan;
+  }
+  const lspClaim = newBridgeClaimKeypair();   // the LSP's BTC claim key; its priv bounds the recoup
+  let session = null;
+  try {
+    session = await openReverseBridgeSession({
+      offer: { offer_id: body.offer_id, maker_pubkey: body.maker_pubkey },
+      relayBase: CFG.crossRelay,
+      takeAtoms: BigInt(Number(body.asset_atoms) || 0),
+    });
+    const hs = await runReverseBridgeTerms({ session,
+      lspBtcClaimPubHex: lspClaim.pubHex, takerSeqRefundPubHex: takerSeqRefundPub,
+      expect: { btcSats: Number(body.btc_sats) || 0, seqAtoms: Number(body.asset_atoms) || 0 } });
+
+    // BRIDGED BTC leg (receiver): the maker's real on-chain BTC HTLC, verified locked to the LSP on H.
+    const sb = job.legState.btc;
+    sb.hashH = hs.hashHex;
+    sb.htlc = { txid: hs.btcHtlc.txid, vout: hs.btcHtlc.vout, amount: hs.btcHtlc.amount,
+      script: hs.btcHtlc.redeemScriptHex, cltv: hs.btcHtlc.cltv, lockedTo: 'lsp', refundPub: hs.btcHtlc.refundPubHex };
+    sb.lspClaimPriv = lspClaim.privHex;      // LSP-held; the claim key that recoups exactly this HTLC
+    sb.verifiedClaimLsp = true;              // parse-verified at handshake (P2SH binding re-checked in observe)
+    sb.amountSat = hs.btcAmount;             // front the LN for exactly what the recoup pays
+    // recvBolt11 / the taker's hold on H is filled by the taker's follow-up (it can only mint the hold
+    // AFTER it learns H below); until then frontLn fails closed. lnExpiryBlocks irrelevant for a receiver leg.
+
+    // NATIVE asset leg (direct taker<->maker): the terms the taker needs to fund its OWN asset HTLC.
+    const sa = job.legState.asset;
+    if (sa) { sa.makerSeqClaimPub = hs.makerSeqClaimPubHex; sa.seqLocktime = hs.seqLocktime; sa.seqAmount = hs.seqAmount; }
+
+    job._bridgeSession = session;            // kept alive so the taker's funded asset leg can be relayed in
+    job.bridge_terms = { hash_h: hs.hashHex, maker_seq_claim_pub: hs.makerSeqClaimPubHex,
+      seq_locktime: hs.seqLocktime, seq_amount: hs.seqAmount, btc_amount: hs.btcAmount,
+      btc_htlc_txid: hs.btcHtlc.txid, btc_htlc_cltv: hs.btcHtlc.cltv };
+    job.bridgeHandshake = { ok: true };
+    persistJobs();
+    console.error('[bridge] maker locked BTC HTLC to the LSP:', hs.btcHtlc.txid, 'on H', hs.hashHex);
+  } catch (e) {
+    try { session && session.close(); } catch {}
+    job._bridgeSession = null;
+    job.bridgeHandshake = { ok: false, error: `maker handshake failed (nothing fronted): ${scrubDetail(String((e && e.message) || e))}` };
   }
   return plan;
 }
@@ -1823,10 +1891,16 @@ async function runBridgedSwapJob(body, job) {
   let match;
   try { match = buildBridgeMatchFromBody(body); }
   catch (e) { return { ok: false, error: `bridged take: ${scrubDetail(String((e && e.message) || e))}` }; }
-  const plan = prepareBridgeLegs({ match, body, job });
+  const plan = await prepareBridgeLegs({ match, body, job });
   if (plan.happyCoincidence) {
     return { ok: false, handled_by: 'native',
       error: 'this match is a happy coincidence (rails coincide) — settle it natively, not via the bridge' };
+  }
+  // The maker handshake must have secured the recoup (BTC HTLC locked to the LSP) before we drive any
+  // value move — else the driver would only stall. Fail closed here with the exact reason.
+  if (job.bridgeHandshake && job.bridgeHandshake.ok === false) {
+    return { ok: false, rail: 'bridged', settlement_plan: bridgeplanSummary(plan),
+      error: `bridged take not settled: ${job.bridgeHandshake.error}` };
   }
   const io = makeBridgeIo({ match, body, job });
   const r = await runBridgedSwap({ match, io, driverCfg: { pollMs: 3000, maxTicks: Math.ceil(CFG.mixedTimeoutMs / 3000) } });
