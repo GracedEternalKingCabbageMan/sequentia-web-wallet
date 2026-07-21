@@ -145,6 +145,10 @@ const CFG = {
   subasRelay: process.env.SUBAS_RELAY || process.env.RELAY || 'http://127.0.0.1:9955',
   subasBtcRpc: process.env.SUBAS_BTC_RPC || '',            // bitcoind RPC http://user:pass@host:port
   subasBtcWallet: process.env.SUBAS_BTC_WALLET || '',      // bitcoind wallet funding the BTC HTLC
+  // The LSP's OWN bitcoind wallet that RECEIVES a bridged-leg recoup (claiming the maker's BTC HTLC). Kept
+  // distinct from subasBtcWallet so the recoup lands in the LSP's wallet, not the maker's funding wallet —
+  // making the LSP's net (paid LN, recouped on-chain) unambiguous. Falls back to subasBtcWallet if unset.
+  bridgeRecoupWallet: process.env.BRIDGE_RECOUP_WALLET || '',
   subasBtcChain: process.env.SUBAS_BTC_CHAIN || 'testnet4',
   subasAssetLn: process.env.SUBAS_ASSET_LN || process.env.HOSTED_ASSET_RPC || hostedRpcFallback,
   subasMinBtcConf: Number(process.env.SUBAS_MIN_BTC_CONF || 0), // 0 = LP fronts the reorg risk (instant)
@@ -1795,7 +1799,8 @@ function claimBridgeHtlcBtc({ htlc, preimage, claimPriv, refundPub }) {
       '-txid', String(htlc.txid), '-vout', String(htlc.vout), '-amount', String(htlc.amount),
       '-redeem-script', String(htlc.script), '-t-btc', String(htlc.cltv),
       '-refund-pub', String(refundPub || htlc.refundPub || ''), '-preimage', String(preimage), '-claim-priv', String(claimPriv)];
-    if (CFG.subasBtcWallet) args.push('-btc-wallet', CFG.subasBtcWallet);
+    const recoupWallet = CFG.bridgeRecoupWallet || CFG.subasBtcWallet;   // the LSP's own wallet receives the recoup
+    if (recoupWallet) args.push('-btc-wallet', recoupWallet);
     execFile(CFG.seqobCli, args, { timeout: CFG.mixedTimeoutMs, maxBuffer: 4 << 20 }, (err, stdout) => {
       if (err) return reject(new Error(`claim BTC HTLC: ${scrubDetail(err.message)}`));
       resolve(String(stdout || '').trim());
