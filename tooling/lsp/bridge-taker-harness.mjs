@@ -44,30 +44,32 @@ async function main() {
   const takerPub = kg.match(/pub\s+([0-9a-f]{66})/)[1];
   log('taker asset-refund key pub', takerPub);
 
-  // 1. Pick a resting REVERSE cross offer (maker offers BTC for the asset -> we SELL the asset, receive BTC).
+  // 1-3. Pick a resting REVERSE cross offer (maker offers BTC for the asset -> we SELL, receive BTC) and
+  // run the handshake, trying the next maker if one is busy (whole-HTLC, one lift at a time).
   setSeqobBase(RELAY);
   const bk = await fetchBook(ASSET, 'BTC');
-  const offer = (bk.offers || []).find((o) => (o.offer_asset || o.offerAsset) === 'BTC' && o._verified !== false);
-  if (!offer) throw new Error('no verified reverse cross offer');
-  const offerId = offer.offer_id || offer.offerId, makerPub = offer.maker_pubkey || offer.makerPubkey;
-  const seqAtoms = Number(offer.want_amount || offer.wantAmount);   // asset atoms we sell
-  const btcSats = Number(offer.offer_amount || offer.offerAmount);  // sats we receive
-  log('offer', offerId, 'sell', seqAtoms, 'atoms for', btcSats, 'sats');
-
-  // 2. POST the bridged SELL: recv BTC over LN (crosses the maker's on-chain BTC leg).
-  const nonce = 'bridge-full-' + Date.now();
-  const started = await http('POST', '/swap', { side: 'sell', bridge: true, payRail: 'chain', recvRail: 'ln',
-    maker_btc_rail: 'chain', maker_asset_rail: 'chain', taker_btc_inbound: true, asset: ASSET,
-    offer_id: offerId, maker_pubkey: makerPub, btc_sats: btcSats, asset_atoms: seqAtoms,
-    taker_seq_refund_pub: takerPub, swap_nonce: nonce });
-  const jobId = started.job_id;
-  if (!jobId) throw new Error('no job_id: ' + JSON.stringify(started));
-  log('POST /swap ->', jobId);
-
-  // 3. Wait for the maker handshake (the maker locks its BTC HTLC to the LSP on H).
-  let terms = null;
-  for (let i = 0; i < 40 && !terms; i++) { await sleep(1500); const j = await http('GET', '/swap/' + jobId); if (j.bridge_terms && j.bridge_terms.hash_h) terms = j.bridge_terms; if (j.bridgeHandshake && j.bridgeHandshake.ok === false) throw new Error('handshake failed: ' + j.bridgeHandshake.error); }
-  if (!terms) throw new Error('no bridge_terms (handshake timed out)');
+  const reverse = (bk.offers || []).filter((o) => (o.offer_asset || o.offerAsset) === 'BTC' && o._verified !== false);
+  if (!reverse.length) throw new Error('no verified reverse cross offer');
+  log(reverse.length, 'reverse offers resting');
+  let jobId = null, terms = null, seqAtoms = 0, btcSats = 0, offerId = null;
+  for (const offer of reverse) {
+    offerId = offer.offer_id || offer.offerId; const makerPub = offer.maker_pubkey || offer.makerPubkey;
+    seqAtoms = Number(offer.want_amount || offer.wantAmount);   // asset atoms we sell
+    btcSats = Number(offer.offer_amount || offer.offerAmount);  // sats we receive
+    const started = await http('POST', '/swap', { side: 'sell', bridge: true, payRail: 'chain', recvRail: 'ln',
+      maker_btc_rail: 'chain', maker_asset_rail: 'chain', taker_btc_inbound: true, asset: ASSET,
+      offer_id: offerId, maker_pubkey: makerPub, btc_sats: btcSats, asset_atoms: seqAtoms,
+      taker_seq_refund_pub: takerPub, swap_nonce: 'bridge-full-' + Date.now() });
+    if (!started.job_id) { log('offer', offerId, 'POST rejected:', started.error); continue; }
+    let failed = false;
+    for (let i = 0; i < 30 && !terms && !failed; i++) {
+      await sleep(1500); const j = await http('GET', '/swap/' + started.job_id);
+      if (j.bridge_terms && j.bridge_terms.hash_h) { terms = j.bridge_terms; jobId = started.job_id; }
+      else if (j.bridgeHandshake && j.bridgeHandshake.ok === false) { failed = true; log('offer', offerId, 'handshake:', j.bridgeHandshake.error); }
+    }
+    if (terms) { log('offer', offerId, 'sell', seqAtoms, 'atoms for', btcSats, 'sats -> job', jobId); break; }
+  }
+  if (!terms) throw new Error('no free maker completed the handshake (all busy?)');
   const H = terms.hash_h;
   log('handshake OK. H=', H, '| maker BTC HTLC', terms.btc_htlc_txid, '| T_seq', terms.seq_locktime, '| maker asset-claim', terms.maker_seq_claim_pub);
 
