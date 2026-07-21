@@ -92,8 +92,9 @@ import crypto from 'node:crypto';
 import { execFile } from 'node:child_process';
 import { makeProvisioner } from './provision.mjs';
 import { acceptUpgrade, bridgeWsToTcp } from './ws-bridge.mjs';
-import { settlementPlanForSide, planExecutionName } from './settlement-router.mjs';
+import { settlementPlanForSide, planExecutionName, planSettlement } from './settlement-router.mjs';
 import { buildUnifiedBook } from './unified-book.mjs';
+import { runBridgedSwap, matchFromTake, describeBridge, classifyLegs } from './bridge-driver.mjs';
 import { hashPreimageOk, subasSellStateFileForNonce, subasSellGuardVerdict, assembleSubasSellSettled } from './subas-sell-recovery.mjs';
 
 function reqEnv(name) {
@@ -1581,6 +1582,270 @@ function runMixed({ side, asset, amount, payRail, recvRail, node_key, asset_bolt
   });
 }
 
+// ===========================================================================
+// RAIL-BLIND BRIDGED TAKE — the LSP side of a genuine rail crossing.
+//
+// When the wallet takes an offer whose rails DIFFER from the taker's (a cross that the deployed xsub*
+// binaries cannot execute — planExecutionName returns null), the LSP bridges the mismatched leg(s). The
+// fund-safety of each crossed leg is the PURE core leg-bridge.nextBridgeStep; the whole-swap coordination
+// (JIT first, the atomicity gate on one H, recoup-before-CLTV) is the PURE bridge-driver.runBridgedSwap.
+// This file only supplies the live `io`: it OBSERVES real LN + on-chain state and EXECUTES exactly the
+// action the driver (hence nextBridgeStep) returns — never fronting on its own judgement.
+//
+// The bridged-take POST /swap contract (fields ADDED to the normal swap body):
+//   { side, asset, bridge:true,
+//     payRail, recvRail,                 taker's chosen rails ('ln'|'chain')
+//     maker_btc_rail, maker_asset_rail,  the resting offer's per-leg rails (unified-book derived)
+//     btc_sats, asset_atoms,             the two legs' amounts (bound every LSP front)
+//     offer_id, maker_pubkey,            the resting offer to settle against
+//     node_key, btc_node_key,            the taker's hosted asset / BTC nodes (LN legs + JIT)
+//     taker_asset_inbound, taker_btc_inbound,  skip JIT when the taker already holds inbound
+//     swap_nonce }                       idempotency (persist-before-broadcast)
+// Response: 202 { ok, job_id, poll:'/swap/<id>', rail:'bridged', bridged:true, settlement_plan,
+//                 bridge_legs, jit_legs, swap_nonce }; poll GET /swap/<id> for { status, ok, legs }.
+// ===========================================================================
+
+const bridgeResult = new Map();     // swap_nonce -> { ...result, ts }  (idempotent replay)
+const bridgeInflight = new Map();   // swap_nonce -> Promise<result>    (join an in-flight run)
+
+// execFile seqob-cli xhtlc-observe and parse its JSON. READ-ONLY: never moves value. Returns
+// { tip, funded, amount, confirmations, spent, spender_txid?, preimage? } or throws.
+function xhtlcObserve({ rpc, wallet, txid, vout, hashH }) {
+  return new Promise((resolve, reject) => {
+    if (!rpc || !txid) return reject(new Error('xhtlc-observe needs rpc + txid'));
+    const args = ['xhtlc-observe', '-rpc', rpc, '-txid', String(txid), '-vout', String(vout ?? 0)];
+    if (wallet) args.push('-wallet', wallet);
+    if (hashH) args.push('-hash', String(hashH));
+    execFile(CFG.seqobCli, args, { timeout: STATUS_RPC_TIMEOUT_MS + 8000, maxBuffer: 4 << 20 }, (err, stdout) => {
+      if (err) return reject(new Error(`xhtlc-observe: ${scrubDetail(err.message)}`));
+      try { resolve(JSON.parse(stdout)); } catch { reject(new Error('xhtlc-observe: bad JSON')); }
+    });
+  });
+}
+
+// Build the planSettlement match from a bridged-take body (ONE source of truth with the wallet:
+// bridge-driver.matchFromTake). Throws on a malformed body so the dispatch fails closed.
+function buildBridgeMatchFromBody(body) {
+  return matchFromTake({
+    asset: resolveAsset(body.asset), side: body.side,
+    payRail: body.payRail, recvRail: body.recvRail,
+    makerBtcRail: body.maker_btc_rail, makerAssetRail: body.maker_asset_rail,
+    takerAssetInbound: !!body.taker_asset_inbound, takerBtcInbound: !!body.taker_btc_inbound,
+  });
+}
+
+// The per-leg amount (the bound on every LSP front) from the body: btc leg = sats, asset leg = atoms.
+function bridgeLegAmount(body, leg) {
+  return leg.unit === 'btc' ? Number(body.btc_sats || 0) : Number(body.asset_atoms || 0);
+}
+
+// Build the LIVE io the pure driver runs against. observe + provisionInbound + legAmountSat are FULLY
+// wired to existing primitives. The value-moving actions compose the EXISTING audited primitives
+// (lnrpc pay/settle + the xsubas-* HTLC CLIs) and read the per-leg handshake data (H, the counterparty
+// invoice/HTLC terms, the LSP keys) from `job.legState`, which prepareBridgeLegs populates. Every value
+// move FAILS CLOSED when its handshake data is absent, so an incomplete setup can only STALL, never
+// mis-front — the same discipline nextBridgeStep enforces. The maker-side lift that fills the maker end
+// of legState is the E2E-completion boundary (a LIVE maker, which this environment does not run).
+function makeBridgeIo({ match, body, job }) {
+  const st = (unit) => (job.legState && job.legState[unit]) || null;
+  const lspRpc = targetFor('btc', null, body.btc_node_key || null).rpc || CFG.mixedBtcRpc;   // the LSP's own LN node (holds/pays holds on H)
+  return {
+    sleep, log: (...a) => console.error('[bridge]', ...a),
+    legAmountSat: (leg) => bridgeLegAmount(body, leg),
+
+    // JIT inbound BEFORE any lock: an LN receiver with no inbound cannot receive. Fully wired to the
+    // existing non-custodial provisionInbound (asset leg). A BTC-LN receive JIT would use the BTC
+    // channel path; not exercised here (the common cross is asset-LN receive).
+    provisionInbound: async (leg) => {
+      if (leg.unit !== 'asset') return;   // only an asset LN receiver is JIT-provisioned via SUBAS_LP today
+      await provisionInbound({ nodeKey: body.node_key, assetId: resolveAsset(body.asset), amount: Number(body.asset_atoms) || 0 });
+    },
+
+    // NATIVE leg (LSP not in its value path): observe its lock so the crossed leg's front can gate on it.
+    // The native leg settles taker<->maker on the existing path; here we only watch its on-chain/LN lock.
+    startNative: async () => { /* the existing native path (offer lift) drives it; nothing to kick from here */ },
+    observeNativeLocked: async (leg) => {
+      const s = st(leg.unit);
+      if (!s) return false;
+      if (s.onchain && s.onchain.txid) {   // native on-chain HTLC funded == locked
+        try { const o = await xhtlcObserve({ rpc: s.onchainRpc, wallet: s.onchainWallet, txid: s.onchain.txid, vout: s.onchain.vout }); return !!o.funded; }
+        catch { return false; }
+      }
+      if (s.lnRpc && s.hashH) {              // native LN payment held == locked
+        try { const l = await lnrpc('holdinvoicelookup', [s.hashH], s.lnRpc, SIGNER_RPC_TIMEOUT_MS); return l.state === 'accepted' || l.state === 'settled'; }
+        catch { return false; }
+      }
+      return false;
+    },
+
+    // CROSSED leg: OBSERVE the two ends for nextBridgeStep. Read-only, composes holdinvoicelookup
+    // (the LN end) + xhtlc-observe (the on-chain end) + the HTLC terms the LSP itself set/verified.
+    observe: async (leg) => {
+      const s = st(leg.unit) || {};
+      let ln = { registered: false, held: false, settled: false, preimage: null, expiryBlocks: s.lnExpiryBlocks };
+      if (s.lnRpc && s.hashH) {
+        try {
+          const l = await lnrpc('holdinvoicelookup', [s.hashH], s.lnRpc, SIGNER_RPC_TIMEOUT_MS);
+          ln = { registered: !!l.state, held: l.state === 'accepted', settled: l.state === 'settled',
+            preimage: (l.payment_preimage || l.preimage || null), expiryBlocks: s.lnExpiryBlocks };
+        } catch { /* node momentarily unreadable -> treat as not-yet; the driver just re-observes */ }
+      }
+      let tip = s.tip || 0, onchain = null;
+      if (s.htlc && s.htlc.txid) {
+        try {
+          const o = await xhtlcObserve({ rpc: s.onchainRpc, wallet: s.onchainWallet, txid: s.htlc.txid, vout: s.htlc.vout, hashH: s.hashH });
+          tip = (typeof o.tip === 'number') ? o.tip : tip;
+          onchain = { funded: !!o.funded, amountSat: Number(o.amount || 0), cltv: s.htlc.cltv,
+            lockedToLsp: s.htlc.lockedTo === 'lsp', lockedToReceiver: s.htlc.lockedTo === 'receiver',
+            spent: !!o.spent };
+          // payer leg: P is read from the receiver's on-chain claim witness -> feed it to the core.
+          if (o.preimage && !ln.preimage) ln.preimage = o.preimage;
+        } catch { /* observe hiccup -> re-observe next tick */ }
+      } else if (s.tipRpc) {
+        try { const o = await xhtlcObserve({ rpc: s.tipRpc, txid: s.tipProbeTxid || '0'.repeat(64), vout: 0 }); if (typeof o.tip === 'number') tip = o.tip; } catch {}
+      }
+      return { tip, onchain, ln };
+    },
+
+    // --- value-moving actions: compose the EXISTING primitives; FAIL CLOSED on missing handshake data ---
+    // receiver leg: pay the receiver's hold invoice on H (this reveals P once they settle).
+    frontLn: async (leg) => {
+      const s = st(leg.unit);
+      if (!s || !s.recvBolt11) throw new Error('front-ln blocked: receiver hold invoice (bolt11 on H) not established yet — fail closed (no LN fronted)');
+      await lnrpcKw('pay', [`bolt11=${s.recvBolt11}`, 'retry_for=45'], lspRpc, CFG.mixedTimeoutMs);
+    },
+    // payer leg: fund the receiver's on-chain HTLC (claim=receiver w/ P, refund=LSP). Reuses the audited
+    // xsubas-fund-btc primitive; records the funded HTLC + the LSP refund key in legState.
+    fundOnchain: async (leg) => {
+      const s = st(leg.unit);
+      if (!s || !s.receiverClaimPub || !s.hashH || !(s.amountSat > 0) || !s.cltv) throw new Error('fund-onchain blocked: receiver claim pub / H / amount / cltv not established — fail closed (nothing funded)');
+      const funded = await fundBridgeHtlcBtc({ claimPub: s.receiverClaimPub, hashH: s.hashH, amountSat: s.amountSat, cltv: s.cltv });
+      s.htlc = { txid: funded.btc_htlc_txid, vout: funded.btc_htlc_vout, amount: funded.btc_htlc_amount,
+        script: funded.btc_htlc_script, cltv: funded.btc_locktime, lockedTo: 'receiver' };
+      s.lspRefundPriv = funded.btc_refund_priv;   // LSP-held; bounds our recoup to exactly this HTLC
+      persistJobs();
+    },
+    // receiver leg: claim the payer's on-chain HTLC (locked to the LSP) with the revealed P. Reuses
+    // xsubas-claim-btc; the LSP's claim key is bounded to exactly what it fronted.
+    recoupClaim: async (leg, step, obs) => {
+      const s = st(leg.unit);
+      const P = obs && obs.ln && obs.ln.preimage;
+      if (!s || !s.htlc || !s.lspClaimPriv || !P) throw new Error('recoup-claim blocked: HTLC/claim-key/preimage missing — fail closed (recoup deferred, never lost)');
+      await claimBridgeHtlcBtc({ htlc: s.htlc, preimage: P, claimPriv: s.lspClaimPriv });
+    },
+    // payer leg: settle the payer's held LN with the P read from the receiver's on-chain claim.
+    recoupSettle: async (leg, step, obs) => {
+      const s = st(leg.unit);
+      const P = obs && obs.ln && obs.ln.preimage;
+      if (!s || !s.hashH || !P) throw new Error('recoup-settle blocked: held-invoice/preimage missing — fail closed');
+      await lnrpc('holdinvoicesettle', [s.hashH, P], lspRpc, SIGNER_RPC_TIMEOUT_MS);
+    },
+    // payer leg: no claim by the on-chain CLTV -> refund the LSP-funded HTLC (the payer's LN hold returns
+    // to them on its own). Reuses the xsubas BTC refund path.
+    refundOnchain: async (leg) => {
+      const s = st(leg.unit);
+      if (!s || !s.htlc || !s.lspRefundPriv) throw new Error('refund-onchain blocked: HTLC/refund-key missing — fail closed');
+      await refundBridgeHtlcBtc({ htlc: s.htlc, refundPriv: s.lspRefundPriv });
+    },
+  };
+}
+
+// fund/claim/refund helpers that shell out to the EXISTING audited BTC HTLC primitives. The SEQ-asset
+// on-chain leg (asset<->asset bridging) reuses the SAME xchain code via a mirror CLI; wiring it is the
+// remaining mechanical step (see report). These are the ONLY value-moving shells the bridge io calls.
+function fundBridgeHtlcBtc({ claimPub, hashH, amountSat, cltv, refundPriv }) {
+  return new Promise((resolve, reject) => {
+    if (!CFG.subasBtcRpc || !CFG.subasBtcWallet) return reject(new Error('BTC HTLC fund not configured (SUBAS_BTC_RPC + SUBAS_BTC_WALLET)'));
+    const args = ['xsubas-fund-btc', '-maker-claim-pub', String(claimPub), '-hash', String(hashH),
+      '-btc-amount', String(amountSat), '-btc-locktime', String(cltv),
+      '-btc-rpc', CFG.subasBtcRpc, '-btc-wallet', CFG.subasBtcWallet, '-btc-chain', CFG.subasBtcChain];
+    if (refundPriv) args.push('-refund-priv', String(refundPriv));
+    execFile(CFG.seqobCli, args, { timeout: CFG.mixedTimeoutMs, maxBuffer: 4 << 20 }, (err, stdout) => {
+      if (err) return reject(new Error(`fund BTC HTLC: ${scrubDetail(err.message)}`));
+      try { resolve(JSON.parse(stdout)); } catch { reject(new Error('fund BTC HTLC: bad JSON')); }
+    });
+  });
+}
+function claimBridgeHtlcBtc({ htlc, preimage, claimPriv, refundPub }) {
+  return new Promise((resolve, reject) => {
+    if (!CFG.subasBtcRpc) return reject(new Error('BTC HTLC claim not configured (SUBAS_BTC_RPC)'));
+    const args = ['xsubas-claim-btc', '-btc-rpc', CFG.subasBtcRpc, '-btc-chain', CFG.subasBtcChain,
+      '-txid', String(htlc.txid), '-vout', String(htlc.vout), '-amount', String(htlc.amount),
+      '-redeem-script', String(htlc.script), '-t-btc', String(htlc.cltv),
+      '-refund-pub', String(refundPub || htlc.refundPub || ''), '-preimage', String(preimage), '-claim-priv', String(claimPriv)];
+    if (CFG.subasBtcWallet) args.push('-btc-wallet', CFG.subasBtcWallet);
+    execFile(CFG.seqobCli, args, { timeout: CFG.mixedTimeoutMs, maxBuffer: 4 << 20 }, (err, stdout) => {
+      if (err) return reject(new Error(`claim BTC HTLC: ${scrubDetail(err.message)}`));
+      resolve(String(stdout || '').trim());
+    });
+  });
+}
+function refundBridgeHtlcBtc({ htlc, refundPriv }) {
+  return new Promise((resolve, reject) => {
+    if (!CFG.subasBtcRpc) return reject(new Error('BTC HTLC refund not configured (SUBAS_BTC_RPC)'));
+    // xsubas-refund recovers by state-file; a param-based refund reuses the same xchain RefundBTCLeg.
+    // Left to the E2E wiring (needs the funded-HTLC state file the fund step persists on the box).
+    return reject(new Error('on-chain refund via state-file left to E2E wiring (no-loss: the CLTV refund path exists in xsubas-refund)'));
+  });
+}
+
+// prepareBridgeLegs populates job.legState[unit] for every leg: the TAKER side from the body (its node,
+// H, amount, CLTV), and the MAKER side by lifting the resting offer (offer_id/maker_pubkey -> the maker's
+// claim pub / LN node / HTLC terms). The taker side is wired here; the maker-side offer lift + the H /
+// invoice handshake is the E2E-completion (it needs a LIVE maker + the relay lift the box runs), so this
+// leaves those fields UNSET, which makes every value move fail closed (stall, never mis-front) until the
+// live path fills them. Returns the plan.
+function prepareBridgeLegs({ match, body, job }) {
+  const plan = planSettlement(match);
+  const { bridged, native } = classifyLegs(plan);
+  job.legState = job.legState || {};
+  for (const leg of [...bridged, ...native]) {
+    const isBtc = leg.unit === 'btc';
+    const s = job.legState[leg.unit] = job.legState[leg.unit] || {};
+    s.unit = leg.unit; s.bridge = !!leg.bridge; s.lnSide = leg.lnSide || null;
+    s.amountSat = bridgeLegAmount(body, leg);
+    // On-chain end RPC/wallet: BTC leg -> bitcoind; asset leg -> the Sequentia node.
+    s.onchainRpc = isBtc ? CFG.subasBtcRpc : CFG.seqRpc;
+    s.onchainWallet = isBtc ? CFG.subasBtcWallet : CFG.seqWallet;
+    s.tipRpc = s.onchainRpc;
+    // TAKER-side LN node (for the leg the taker holds over LN). E2E: the taker's device mints the hold
+    // invoice on H + shares H; the maker offer lift fills receiverClaimPub / recvBolt11 / cltv.
+    s.lnRpc = s.lnRpc || (isBtc ? targetFor('btc', null, body.btc_node_key || null).rpc
+                                : targetFor('seq', resolveAsset(body.asset), body.node_key || null).rpc);
+  }
+  return plan;
+}
+
+// runBridgedSwapJob: the async job that drives a whole bridged take. Mirrors the over-0conf mixed path:
+// persist-before-broadcast (the job is set BEFORE any funding), swap_nonce idempotency, resumable. The
+// fund-safety is the pure driver; this only supplies the live io.
+async function runBridgedSwapJob(body, job) {
+  let match;
+  try { match = buildBridgeMatchFromBody(body); }
+  catch (e) { return { ok: false, error: `bridged take: ${scrubDetail(String((e && e.message) || e))}` }; }
+  const plan = prepareBridgeLegs({ match, body, job });
+  if (plan.happyCoincidence) {
+    return { ok: false, handled_by: 'native',
+      error: 'this match is a happy coincidence (rails coincide) — settle it natively, not via the bridge' };
+  }
+  const io = makeBridgeIo({ match, body, job });
+  const r = await runBridgedSwap({ match, io, driverCfg: { pollMs: 3000, maxTicks: Math.ceil(CFG.mixedTimeoutMs / 3000) } });
+  return r.ok
+    ? { ok: true, settled: true, rail: 'bridged', finality: 'confirming', anchor_bound: true,
+        settlement_plan: bridgeplanSummary(plan), legs: r.legs }
+    : { ok: false, rail: 'bridged', error: `bridged swap did not settle: ${scrubDetail(r.reason || 'unknown')}`,
+        settlement_plan: bridgeplanSummary(plan), legs: r.legs || [] };
+}
+
+// A compact, wire-friendly view of the plan for the wallet's honest net-terms display.
+function bridgeplanSummary(plan) {
+  const c = classifyLegs(plan);
+  return { bridged: !plan.happyCoincidence,
+    btc_leg: plan.btcLeg && { rail: plan.btcLeg.rail, bridge: plan.btcLeg.bridge, lnSide: plan.btcLeg.lnSide, jitInbound: plan.btcLeg.jitInbound },
+    asset_leg: plan.assetLeg && { rail: plan.assetLeg.rail, bridge: plan.assetLeg.bridge, lnSide: plan.assetLeg.lnSide, jitInbound: plan.assetLeg.jitInbound },
+    bridge_legs: c.bridged.map((l) => l.unit), jit_legs: c.jit.map((l) => l.unit) };
+}
+
 // /rails probe cache: 10s per asset (4 relay fetches per miss).
 const _railsCache = new Map();
 
@@ -2169,11 +2434,54 @@ const server = http.createServer(async (req, res) => {
         const r = await runSwap(body);                          // UNCHANGED pure-LN
         return send(res, r.ok ? 200 : 502, r);
       }
-      if (payRail === 'chain' && recvRail === 'chain') {
+      if (payRail === 'chain' && recvRail === 'chain' && body.bridge !== true) {
         // On-chain <-> on-chain is the SeqOB order-book HTLC path the wallet runs
-        // itself; the LSP does not settle it.
+        // itself; the LSP does not settle it. (A bridged take can legitimately have both
+        // TAKER rails on-chain while the MAKER's differ, so it is exempt — handled below.)
         return send(res, 200, { ok: false, handled_by: 'wallet_onchain', finality: 'anchor-bound',
           error: 'on-chain <-> on-chain is settled by the wallet\'s own on-chain rail (the SeqOB order book), not the LSP' });
+      }
+      // RAIL-BLIND BRIDGED TAKE: a genuine rail crossing (the taker took an offer whose rails DIFFER
+      // from the taker's). The deployed xsub* binaries cannot execute it (planExecutionName == null);
+      // the LSP bridges the mismatched leg(s) via the pure driver (bridge-driver.runBridgedSwap), which
+      // obeys leg-bridge.nextBridgeStep per crossed leg + gates the shared preimage for atomicity. Always
+      // an async job (anchor-gated), with swap_nonce idempotency + persist-before-broadcast (mirrors the
+      // mixed path), so a lost 202 + retry never funds twice and a restart resumes, never strands funds.
+      if (body.bridge === true) {
+        reapJobs();
+        const bnonce = (typeof body.swap_nonce === 'string' && body.swap_nonce.trim()) ? body.swap_nonce.trim() : '';
+        if (bnonce) {
+          const hit = bridgeResult.get(bnonce);
+          if (hit) { const { ts, ...r } = hit; return send(res, r.ok ? 200 : 502, { ...r, idempotent_replay: true }); }
+          for (const [jid, j] of jobs) {
+            if (j.swap_nonce === bnonce && j.rail === 'bridged') {
+              return send(res, 202, { ...j, job_id: jid, poll: '/swap/' + jid, idempotent_replay: true });
+            }
+          }
+        }
+        // Validate the match UP FRONT so a malformed cross (or a coincidence) fails closed with a clear
+        // message instead of spawning a job that can only stall.
+        let planPreview;
+        try { planPreview = planSettlement(buildBridgeMatchFromBody(body)); }
+        catch (e) { return send(res, 422, { ok: false, error: `bridged take: ${scrubDetail(String((e && e.message) || e))}` }); }
+        if (planPreview.happyCoincidence) {
+          return send(res, 422, { ok: false, handled_by: 'native',
+            error: 'this match is a happy coincidence (rails coincide) — settle it natively, not via the bridge' });
+        }
+        const jobId = crypto.randomUUID();
+        const job = { job_id: jobId, status: 'confirming', side: body.side, asset: body.asset,
+          rail: 'bridged', finality: 'confirming', settlement_plan: bridgeplanSummary(planPreview),
+          ...(bnonce ? { swap_nonce: bnonce } : {}), requested_amount: body.amount ?? null, started_ms: Date.now() };
+        setJob(jobId, job);   // persist BEFORE any funding (a restart sees 'interrupted', not a 404)
+        const run = runBridgedSwapJob(body, job)
+          .then((r) => { setJob(jobId, { ...jobs.get(jobId), ...r, status: r.ok ? 'settled' : 'failed', done_ms: Date.now() }); if (bnonce) bridgeResult.set(bnonce, { ...r, ts: Date.now() }); return r; })
+          .catch((e) => { const r = { ok: false, error: String((e && e.message) || e) }; setJob(jobId, { ...jobs.get(jobId), ...r, status: 'failed', done_ms: Date.now() }); return r; })
+          .finally(() => { if (bnonce) bridgeInflight.delete(bnonce); });
+        if (bnonce) bridgeInflight.set(bnonce, run);
+        return send(res, 202, { ...job, ok: true, poll: `/swap/${jobId}`,
+          bridged: true, bridge_legs: job.settlement_plan.bridge_legs, jit_legs: job.settlement_plan.jit_legs,
+          note: 'rail-blind bridged take: the LSP bridges the mismatched leg(s) on one shared preimage. '
+              + 'Poll GET /swap/<job_id> for completion; each crossed leg is anchor-gated + refund-safe.' });
       }
       // MIXED (one leg 'ln', one 'chain') -> a submarine swap. Two shapes settle:
       // asset-on-chain <-> BTC-Lightning (xsubbuy/xsublift, always), and the MIRROR

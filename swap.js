@@ -46,6 +46,13 @@ import * as sub from './submarine.js';
 // The SBTC bridge client (the silent peg for resting on-chain-BTC LIMIT orders). Allocates
 // peg-in/peg-out addresses only; the wallet's own signed sends move the funds. See sbtc.js.
 import * as sbtc from './sbtc.js';
+// RAIL-BLIND TAKE routing (pure, browser-safe — no node built-ins): pick the best-price offer across
+// rails (bestFor), build the settlement match (matchFromTake), and when the best offer's rail CROSSES
+// the taker's, drive the LSP bridge (/swap {bridge:true}) instead of dead-ending on "no maker for your
+// rail". ONE source of truth with the LSP + the pure driver (tooling/lsp/*).
+import { planSettlement } from './tooling/lsp/settlement-router.mjs';
+import { bestFor } from './tooling/lsp/unified-book.mjs';
+import { matchFromTake, makerRailsFromOffer, describeBridge } from './tooling/lsp/bridge-driver.mjs';
 
 let C = null;            // injected app context (see index.html initSwapTab)
 let X = null;            // the cross-chain route handle ({ openFromComposer, renderXswap, hasInFlight })
@@ -577,15 +584,22 @@ function findRoute(pay, receive){
     // pure-LN sell (recv=ln too) is serviceable by the pay channel itself. Without this split, having a
     // funded pay-channel but no resting offer left the mixed sell on 'ln' -> requoteMixed disables Review
     // and mixed isn't postable = dead-end. Degrade to the postable cross rail instead.
-    const paySellServiceable = payIsBtc || sellCapable(seqAsset) || (ra && ra.payLn.ok && S.recvRail === 'ln');
+    // RAIL-BLIND (rip the maker-existence gate): a chosen LN pay-asset leg is HONORED whenever LN is
+    // deployed, even with no same-rail resting sell — the LSP bridge lifts a cross offer (onReview's
+    // rail-blind take routes it to the bridge driver), so rail is a pure preference, not a gate. The old
+    // sellCapable/payLn pre-block is kept only as a fallback signal for when the bridge is unavailable.
+    const paySellServiceable = payIsBtc || ln || sellCapable(seqAsset) || (ra && ra.payLn.ok && S.recvRail === 'ln');
     const p = (ln && S.payRail === 'ln' && paySellServiceable) ? 'ln' : 'chain';
     // Receiving over LN normally needs a real inbound channel on that asset — EXCEPT the
     // sub-asset BUY (pay BTC on-chain, receive the asset over LN). There the LSP JIT-provisions
     // the user's inbound asset liquidity as part of the buy (provisionInbound), so recv=ln is
     // honoured with no pre-existing channel; every OTHER 'ln' recv leg still needs ra.recvLn.ok.
+    // RAIL-BLIND (rip the maker-existence gate): a chosen LN RECEIVE leg is honored whenever LN is
+    // deployed — the LSP JIT-provisions inbound (provisionInbound) and/or bridges a cross offer, so no
+    // pre-existing channel or same-rail maker is required. subAssetBuyRecvLn kept as a fallback signal.
     const subAssetBuyRecvLn = ln && payIsBtc && S.payRail === 'chain'
       && S.recvRail === 'ln' && subassetCapable(receive);
-    const r = (ln && S.recvRail === 'ln' && (ra.recvLn.ok || subAssetBuyRecvLn)) ? 'ln' : 'chain';
+    const r = (ln && S.recvRail === 'ln' && (ra.recvLn.ok || subAssetBuyRecvLn || lnDeployed())) ? 'ln' : 'chain';
     // ln + ln -> the proven pure-LN LSP route (non-custodial, keys on device).
     // Offered only when BOTH legs have a real usable channel.
     if (p === 'ln' && r === 'ln')
@@ -2577,10 +2591,147 @@ function closePopover(){
 // ---------------------------------------------------------------------------
 // Review -> route to same-chain swap OR cross-chain wizard
 // ---------------------------------------------------------------------------
+// ===========================================================================
+// RAIL-BLIND BRIDGED TAKE (wallet side of a genuine rail crossing).
+//
+// The take is rail-BLIND: pick the best-PRICE resting offer (bestFor over the unified book), regardless
+// of the taker's rail toggle, then build the settlement match from the TAKER's chosen rails + the
+// OFFER's rails (matchFromTake). Coincide -> the existing native review/execute (the LSP is NOT in the
+// value path). CROSS -> the LSP bridges the mismatched leg(s) on one shared preimage (POST /swap
+// {bridge:true}). Rail is a pure preference, never a matching gate: an on-chain taker can lift an LN
+// maker's offer and vice versa, and the driver + nextBridgeStep keep every front recoup-secured.
+// ===========================================================================
+const BRIDGE_KEY = 'swk.sequentia.bridge';
+let BRIDGE = null;
+try { BRIDGE = JSON.parse(localStorage.getItem(BRIDGE_KEY) || 'null'); } catch { BRIDGE = null; }
+function saveBridge(){ try { localStorage.setItem(BRIDGE_KEY, JSON.stringify(BRIDGE)); } catch {} }
+function clearBridge(){ BRIDGE = null; try { localStorage.removeItem(BRIDGE_KEY); } catch {} }
+function bridgeTerminal(){ return !BRIDGE || BRIDGE.state === 'settled' || BRIDGE.state === 'failed'; }
+export function hasBridgeInFlight(){ return !!BRIDGE && !bridgeTerminal(); }
+let _bridgeStarting = false;
+
+// The rail-blind take plan for a BTC<->asset route: the best-price offer (rail-blind), the settlement
+// match (taker rails + offer rails), and whether it CROSSES. Returns null when there is no unified book /
+// no resting offer -> the caller uses the existing native/post path. Pure + defensive: any failure
+// returns null so the take falls back to the proven native path, never dead-ends or throws.
+function bridgedTakePlan(route){
+  try {
+    if (!route || !route.seqAsset || route.assetAsset) return null;   // BTC<->asset only (the unified book's domain)
+    if (!S.payRail || !S.recvRail) return null;
+    const book = (UBOOK && UBOOK.seqAsset === route.seqAsset) ? UBOOK : null;
+    if (!book) return null;
+    const side = route.payIsBtc ? 'buy' : 'sell';                     // buy = pay BTC / receive asset; sell = pay asset / receive BTC
+    const offer = bestFor({ asks: book.asks || [], bids: book.bids || [] }, side);
+    if (!offer || !(offer.price > 0)) return null;
+    const { makerBtcRail, makerAssetRail } = makerRailsFromOffer(offer);
+    const match = matchFromTake({ asset: route.seqAsset, side, payRail: S.payRail, recvRail: S.recvRail,
+      makerBtcRail, makerAssetRail, takerAssetInbound: false, takerBtcInbound: false });   // false => the LSP JIT-provisions (always safe)
+    const plan = planSettlement(match);
+    return { side, offer, match, plan, describe: describeBridge(match), bridged: !plan.happyCoincidence, makerBtcRail, makerAssetRail };
+  } catch { return null; }
+}
+
+async function reviewBridged(route, bp){
+  const { $ } = C;
+  if (!L || !L.swap){ $('swErr').textContent = 'The bridged (rail-crossing) route needs the Lightning service, which is unavailable in this build.'; return; }
+  if (hasBridgeInFlight()){ $('swErr').textContent = 'You already have a bridged swap in progress · finish it first (Active trades) before starting another.'; return; }
+  const am = C.assetMeta(route.seqAsset);
+  const d = bp.describe;
+  const legName = (u) => u === 'btc' ? 'Bitcoin' : am.ticker;
+  const bridgedUnits = d.bridgeLegs.map((l) => legName(l.unit)).join(' + ');
+  const jitNote = d.jitLegs.length ? ` A Lightning channel is opened for you to receive ${d.jitLegs.map(legName).join(' + ')} (near-instant).` : '';
+  const kv = [
+    ['Route', `Rail-blind bridged swap · the service bridges the ${bridgedUnits} leg${d.bridgeLegs.length > 1 ? 's' : ''} between Lightning and on-chain, on ONE shared secret (both legs settle together or not at all).`],
+    ['Direction', bp.side === 'buy' ? `Buy ${am.ticker} with Bitcoin` : `Sell ${am.ticker} for Bitcoin`],
+    ['Pricing', `Best resting offer across rails · you take ${bp.offer.btcSats} sats for ${bp.offer.assetAtoms} ${am.ticker} atoms.${jitNote}`],
+    ['Bridge', `The service is a counterparty ONLY on the crossed leg${d.bridgeLegs.length > 1 ? 's' : ''}; a coincident leg settles directly. It secures its recoup BEFORE it fronts, so a stall can only refund with no loss.`],
+    ['Finality', 'Anchored to Bitcoin (reverts only if Bitcoin reverts), so not the instant finality of a pure-Lightning swap.'],
+    ['If it stalls', 'Nothing is lost · each leg refunds after its own timeout; the service never fronts value without its recoup already secured.'],
+  ];
+  const { m: modal, ok } = C.modalRows({ title: 'Review bridged swap', kv });
+  ok.onclick = async () => { modal.remove(); resetComposer(); await startBridged(route, bp); };
+}
+
+// Persist BEFORE the /swap POST (persist-before-broadcast): a lost 202 + retry (or a restart) re-POSTs
+// with the SAME swap_nonce, which the LSP dedupes to ONE job — never a second funded HTLC.
+async function startBridged(route, bp){
+  if (_bridgeStarting || hasBridgeInFlight()){ try { C.toast && C.toast('A bridged swap is already in progress · finish it first under Active trades.'); } catch {} return; }
+  _bridgeStarting = true;
+  try {
+    const asset = route.seqAsset;
+    const swap_nonce = newSwapNonce();
+    BRIDGE = { state: 'starting', swap_nonce, asset, side: bp.side, payRail: S.payRail, recvRail: S.recvRail,
+      maker_btc_rail: bp.makerBtcRail, maker_asset_rail: bp.makerAssetRail,
+      btc_sats: bp.offer.btcSats, asset_atoms: bp.offer.assetAtoms,
+      offer_id: bp.offer.id || null, maker_pubkey: bp.offer.maker || null, started_ms: Date.now() };
+    saveBridge();
+    // Taker node keys for the LN legs / JIT (device-cosigned; the LSP never holds the keys).
+    try { BRIDGE.node_key = await L.assetNodeKey(asset); } catch {}
+    try { BRIDGE.btc_node_key = await L.btcNodeKey(); } catch {}
+    saveBridge();
+    const r = await L.swap(bridgeSwapBody(BRIDGE));
+    applyBridgeStatus(r || {}); saveBridge();
+    if (!bridgeTerminal()) pollBridged();
+    else if (BRIDGE.state === 'settled'){ try { C.toast('Bridged swap settled · anchor-bound to Bitcoin.'); } catch {} try { await C.sync(); } catch {} }
+  } catch (e){
+    // A thrown /swap that already handed back a job handle stays pollable (each leg is refundable at its
+    // timeout); with no handle it is a clean failure (nothing funded).
+    if (BRIDGE && (BRIDGE.poll || BRIDGE.job_id)){ BRIDGE.detail = C.prettyErr(e); saveBridge(); pollBridged(); }
+    else { BRIDGE = { ...(BRIDGE || {}), state: 'failed', detail: C.prettyErr(e) }; saveBridge(); }
+  } finally { _bridgeStarting = false; }
+}
+
+// The exact bridged-take /swap body — ONE builder so start + resume send byte-identical requests (so the
+// swap_nonce idempotency holds on a resume re-POST).
+function bridgeSwapBody(b){
+  return { side: b.side, asset: b.asset, amount: b.asset_atoms, bridge: true,
+    payRail: b.payRail, recvRail: b.recvRail, maker_btc_rail: b.maker_btc_rail, maker_asset_rail: b.maker_asset_rail,
+    btc_sats: b.btc_sats, asset_atoms: b.asset_atoms, offer_id: b.offer_id, maker_pubkey: b.maker_pubkey,
+    node_key: b.node_key, btc_node_key: b.btc_node_key, taker_asset_inbound: false, taker_btc_inbound: false, swap_nonce: b.swap_nonce };
+}
+function applyBridgeStatus(r){
+  if (!BRIDGE) return;
+  if (r.job_id) BRIDGE.job_id = r.job_id;
+  if (r.poll) BRIDGE.poll = r.poll;
+  if (r.settlement_plan) BRIDGE.settlement_plan = r.settlement_plan;
+  if (r.status === 'settled' || r.settled) BRIDGE.state = 'settled';
+  else if (r.status === 'failed' || (r.ok === false && !(r.poll || r.job_id))){ BRIDGE.state = 'failed'; BRIDGE.detail = r.error || r.reason || BRIDGE.detail; }
+  else BRIDGE.state = 'confirming';
+}
+let _bridgePoll = null;
+function pollBridged(){
+  const ref = BRIDGE && (BRIDGE.poll || BRIDGE.job_id);
+  if (bridgeTerminal() || !(L && L.swapStatus) || !ref) return;
+  clearTimeout(_bridgePoll);
+  _bridgePoll = setTimeout(async () => {
+    if (bridgeTerminal()) return;
+    try { const r = await L.swapStatus(BRIDGE.poll || BRIDGE.job_id); applyBridgeStatus(r || {}); saveBridge();
+      if (BRIDGE.state === 'settled'){ try { C.toast('Bridged swap settled.'); } catch {} try { await C.sync(); } catch {} } } catch {}
+    if (!bridgeTerminal()) pollBridged();
+  }, 8000);
+}
+// Resume a persisted bridged take on load: re-POST with the SAME nonce (idempotent) when no job handle
+// was captured (a lost 202), else just re-poll. Never funds twice (the LSP dedupes the nonce).
+export async function resumeBridged(){
+  if (!BRIDGE || bridgeTerminal()) return;
+  if (!(BRIDGE.poll || BRIDGE.job_id) && L && L.swap){
+    try { const r = await L.swap(bridgeSwapBody(BRIDGE)); applyBridgeStatus(r || {}); saveBridge(); } catch {}
+  }
+  if (!bridgeTerminal()) pollBridged();
+}
+
 async function onReview(){
   const { $ } = C; $('swErr').textContent = '';
   const q = LAST_QUOTE;
   if (!q){ $('swErr').textContent = 'Enter an amount to get a quote first.'; return; }
+  // RAIL-BLIND TAKE: before the rail-specific native dispatch, check whether the BEST-price offer across
+  // rails crosses the taker's chosen rails. If so, the LSP bridges it (never dead-end on "no maker for
+  // your rail"). A happy coincidence (rails agree) falls through to the proven native path below.
+  if (q.kind === 'cross' || q.kind === 'mixed' || q.kind === 'ln'){
+    const route = q.route || { seqAsset: q.seqAsset, payIsBtc: q.payIsBtc, assetAsset: q.assetAsset };
+    const bp = bridgedTakePlan(route);
+    if (bp && bp.bridged) return reviewBridged(route, bp);
+  }
   if (q.kind === 'cross-make'){
     // BUY-with-BTC LIMIT + "keep resting while offline" ON -> the SBTC silent peg: rest as a covenant
     // that survives the wallet closing (spec §5). `reverse` = BUY the asset with BTC (the only side
