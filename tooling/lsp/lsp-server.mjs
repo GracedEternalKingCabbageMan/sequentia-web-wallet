@@ -283,7 +283,9 @@ function persistJobs() {
   // window where a hard restart loses a just-created job (which is exactly what we must NOT lose).
   try {
     const tmp = JOBS_FILE + '.tmp';
-    fs.writeFileSync(tmp, JSON.stringify({ jobs: Object.fromEntries(jobs) }));
+    // Drop transient `_`-prefixed fields (e.g. job._bridgeSession, a live courier WebSocket): they are not
+    // serialisable and are re-established, not restored. Everything durable is a plain field.
+    fs.writeFileSync(tmp, JSON.stringify({ jobs: Object.fromEntries(jobs) }, (k, v) => (k.startsWith('_') ? undefined : v)));
     fs.renameSync(tmp, JOBS_FILE);
   } catch (e) { console.error('[lsp] failed to persist jobs.json:', e && e.message); }
 }
@@ -1611,12 +1613,13 @@ const bridgeInflight = new Map();   // swap_nonce -> Promise<result>    (join an
 
 // execFile seqob-cli xhtlc-observe and parse its JSON. READ-ONLY: never moves value. Returns
 // { tip, funded, amount, confirmations, spent, spender_txid?, preimage? } or throws.
-function xhtlcObserve({ rpc, wallet, txid, vout, hashH }) {
+function xhtlcObserve({ rpc, wallet, txid, vout, hashH, redeem }) {
   return new Promise((resolve, reject) => {
     if (!rpc || !txid) return reject(new Error('xhtlc-observe needs rpc + txid'));
     const args = ['xhtlc-observe', '-rpc', rpc, '-txid', String(txid), '-vout', String(vout ?? 0)];
     if (wallet) args.push('-wallet', wallet);
     if (hashH) args.push('-hash', String(hashH));
+    if (redeem) args.push('-redeem', String(redeem));   // -> script_bound: is the funded output P2SH(redeem)?
     execFile(CFG.seqobCli, args, { timeout: STATUS_RPC_TIMEOUT_MS + 8000, maxBuffer: 4 << 20 }, (err, stdout) => {
       if (err) return reject(new Error(`xhtlc-observe: ${scrubDetail(err.message)}`));
       try { resolve(JSON.parse(stdout)); } catch { reject(new Error('xhtlc-observe: bad JSON')); }
@@ -1684,7 +1687,14 @@ function makeBridgeIo({ match, body, job }) {
     observe: async (leg) => {
       const s = st(leg.unit) || {};
       let ln = { registered: false, held: false, settled: false, preimage: null, expiryBlocks: s.lnExpiryBlocks };
-      if (s.lnRpc && s.hashH) {
+      if (leg.lnSide === 'receiver') {
+        // RECEIVER leg: the LSP PAYS the taker's hold on H out of its OWN node. The LN state is that
+        // outgoing pay, captured by frontLn (a successful pay to a hold invoice returns P once the taker
+        // settles). There is no hold at the LSP to look up, and the taker's node is self-custody.
+        ln = { registered: !!s.frontAttempted, held: false, settled: !!s.frontPreimage,
+          preimage: s.frontPreimage || null, expiryBlocks: s.lnExpiryBlocks };
+      } else if (s.lnRpc && s.hashH) {
+        // PAYER leg: the LSP HOLDS the taker's incoming LN on H at its own node -> holdinvoicelookup.
         try {
           const l = await lnrpc('holdinvoicelookup', [s.hashH], s.lnRpc, SIGNER_RPC_TIMEOUT_MS);
           ln = { registered: !!l.state, held: l.state === 'accepted', settled: l.state === 'settled',
@@ -1694,10 +1704,15 @@ function makeBridgeIo({ match, body, job }) {
       let tip = s.tip || 0, onchain = null;
       if (s.htlc && s.htlc.txid) {
         try {
-          const o = await xhtlcObserve({ rpc: s.onchainRpc, wallet: s.onchainWallet, txid: s.htlc.txid, vout: s.htlc.vout, hashH: s.hashH });
+          const o = await xhtlcObserve({ rpc: s.onchainRpc, wallet: s.onchainWallet, txid: s.htlc.txid, vout: s.htlc.vout, hashH: s.hashH, redeem: s.htlc.script });
           tip = (typeof o.tip === 'number') ? o.tip : tip;
+          // FUND-SAFETY: lockedToLsp is TRUE only when the handshake PARSED claim==LSP on H (verifiedClaimLsp)
+          // AND xhtlc-observe confirms the funded output pays P2SH(this redeemScript) (script_bound). Either
+          // missing -> false -> leg-bridge fails closed and the LSP never fronts. (A maker HTLC we funded
+          // ourselves — payer leg — is trusted via lockedTo:'receiver' as before.)
+          const lspBound = s.htlc.lockedTo === 'lsp' && !!s.verifiedClaimLsp && o.script_bound === true;
           onchain = { funded: !!o.funded, amountSat: Number(o.amount || 0), cltv: s.htlc.cltv,
-            lockedToLsp: s.htlc.lockedTo === 'lsp', lockedToReceiver: s.htlc.lockedTo === 'receiver',
+            lockedToLsp: lspBound, lockedToReceiver: s.htlc.lockedTo === 'receiver',
             spent: !!o.spent };
           // payer leg: P is read from the receiver's on-chain claim witness -> feed it to the core.
           if (o.preimage && !ln.preimage) ln.preimage = o.preimage;
@@ -1713,7 +1728,13 @@ function makeBridgeIo({ match, body, job }) {
     frontLn: async (leg) => {
       const s = st(leg.unit);
       if (!s || !s.recvBolt11) throw new Error('front-ln blocked: receiver hold invoice (bolt11 on H) not established yet — fail closed (no LN fronted)');
-      await lnrpcKw('pay', [`bolt11=${s.recvBolt11}`, 'retry_for=45'], lspRpc, CFG.mixedTimeoutMs);
+      s.frontAttempted = true; persistJobs();
+      // Pay the taker's hold on H from the LSP's own node. A hold invoice keeps the payment IN-FLIGHT until
+      // the taker settles with P; the successful pay then RETURNS P, which is how the LSP learns it to
+      // recoup. (retry_for spans the taker learning P from the maker's on-chain asset claim.)
+      const r = await lnrpcKw('pay', [`bolt11=${s.recvBolt11}`, 'retry_for=600'], lspRpc, CFG.mixedTimeoutMs);
+      const p = r && (r.payment_preimage || r.preimage);
+      if (p && /^[0-9a-f]{64}$/i.test(String(p))) { s.frontPreimage = String(p).toLowerCase(); persistJobs(); }
     },
     // payer leg: fund the receiver's on-chain HTLC (claim=receiver w/ P, refund=LSP). Reuses the audited
     // xsubas-fund-btc primitive; records the funded HTLC + the LSP refund key in legState.
@@ -2479,7 +2500,38 @@ const server = http.createServer(async (req, res) => {
       const id = url.pathname.slice('/swap/'.length);
       const job = jobs.get(id);
       if (!job) return send(res, 404, { ok: false, error: 'unknown job id' });
-      return send(res, 200, { ok: true, ...job });
+      const { _bridgeSession, ...pub } = job;   // never serialize the live WS session
+      return send(res, 200, { ok: true, ...pub });
+    }
+    // BRIDGE PHASE 2 (rail-crossing SELL): the taker, having learned H + the maker's asset-claim pubkey +
+    // T_seq from POST /swap's bridge_terms, funds its OWN asset HTLC self-custody (seqob-cli xfund-seq) and
+    // registers a hold on H at its OWN BTC-LN node, then hands the funded asset outpoint + the hold bolt11
+    // here. The LSP records them (so the native asset leg reads as LOCKED and the front has a target) and
+    // RELAYS the taker's asset leg to the maker over the kept-alive courier session (maker claims it,
+    // revealing P). The pure driver — already running for this job — then fronts the taker's hold (only once
+    // swapLocked) and recoups the maker's BTC HTLC with P. The LSP never holds a taker key.
+    if (req.method === 'POST' && url.pathname === '/bridge/asset') {
+      const body = await readBody(req);
+      if (!body || !body.job_id) return send(res, 400, { ok: false, error: 'need { job_id, taker_seq_leg, recv_bolt11 }' });
+      const job = jobs.get(body.job_id);
+      if (!job) return send(res, 404, { ok: false, error: 'unknown bridge job id' });
+      if (!job._bridgeSession) return send(res, 409, { ok: false, error: 'bridge session not open (handshake not completed / already relayed / restarted)' });
+      const leg = body.taker_seq_leg || {};
+      if (!leg.txid || !leg.redeem_script || !body.recv_bolt11)
+        return send(res, 400, { ok: false, error: 'taker_seq_leg{txid,vout,amount,redeem_script,locktime,asset[,block_hash]} + recv_bolt11 required' });
+      job.legState = job.legState || {};
+      const sa = job.legState.asset = job.legState.asset || {};
+      sa.onchain = { txid: leg.txid, vout: Number(leg.vout || 0) };   // the native lock the front gates on
+      const sb = job.legState.btc; if (sb) sb.recvBolt11 = body.recv_bolt11;   // the front's target (taker's hold on H)
+      persistJobs();
+      // Relay the taker's asset leg -> the maker claims it (reveals P). Fire-and-forget: the maker's claim
+      // is anchor-gated (can take minutes) and the driver reads P from the front's pay result, not this.
+      const session = job._bridgeSession; job._bridgeSession = null;   // one relay per session
+      relayTakerAssetLeg({ session, takerSeqLeg: leg })
+        .then((r) => { job.relay_preimage = r && r.preimageHex ? r.preimageHex : null; persistJobs(); })
+        .catch((e) => { console.error('[bridge] relay asset leg:', e && e.message); })
+        .finally(() => { try { session.close(); } catch {} });
+      return send(res, 202, { ok: true, relayed: true, note: 'asset leg relayed to the maker; poll GET /swap/' + body.job_id + ' for settlement' });
     }
     if (req.method === 'POST' && url.pathname === '/swap') {
       const body = await readBody(req);
