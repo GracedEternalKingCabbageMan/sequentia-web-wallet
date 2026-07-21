@@ -1656,7 +1656,9 @@ function bridgeLegAmount(body, leg) {
 // of legState is the E2E-completion boundary (a LIVE maker, which this environment does not run).
 function makeBridgeIo({ match, body, job }) {
   const st = (unit) => (job.legState && job.legState[unit]) || null;
-  const lspRpc = targetFor('btc', null, body.btc_node_key || null).rpc || CFG.mixedBtcRpc;   // the LSP's own LN node (holds/pays holds on H)
+  // The LSP's OWN BTC-LN node — it pays the taker's hold on H from here. Prefer the configured bridge/mixed
+  // node (MIXED_BTC_RPC = the LSP's btc-taker) over a body-named node, and never a bare 'lightning-rpc'.
+  const lspRpc = CFG.mixedBtcRpc || (targetFor('btc', null, body.btc_node_key || null).rpc);
   return {
     sleep, log: (...a) => console.error('[bridge]', ...a),
     legAmountSat: (leg) => bridgeLegAmount(body, leg),
@@ -2856,6 +2858,31 @@ server.on('upgrade', (req, socket) => {
 
 server.listen(CFG.port, '127.0.0.1', () => {
   console.error(`[lsp] listening http://127.0.0.1:${CFG.port}  asset-rpc ${CFG.hostedAssetRpc}  btc-rpc ${CFG.hostedBtcRpc}  relay ${CFG.relay}`);
+  // RESUME in-flight BRIDGE jobs (persist-before-broadcast + resumable). A bridged swap whose driver died
+  // with the old process is recovered by re-running ONLY the pure driver against its persisted legState —
+  // NOT the maker handshake (the maker already locked its BTC HTLC; re-handshaking would lock another). We
+  // resume only jobs past the taker's /bridge/asset handoff (the maker has the asset leg + will claim it,
+  // and the front/recoup need no live courier session), so the LSP still fronts the taker + recoups after a
+  // restart instead of stranding the taker's already-committed asset. Fund-safety is unchanged: the driver
+  // obeys nextBridgeStep exactly. Best-effort + guarded; never fail the boot.
+  for (const [id, job] of jobs) {
+    try {
+      if (job.rail !== 'bridged' || !job.interrupted) continue;
+      const s = job.legState || {};
+      if (!(s.btc && s.btc.htlc && s.btc.verifiedClaimLsp && s.asset && s.asset.onchain && s.btc.recvNodeId)) continue;   // only past-handoff jobs
+      const bt = job.bridge_terms || {};
+      const rbody = { side: job.side, asset: job.asset, payRail: 'chain', recvRail: 'ln',
+        maker_btc_rail: 'chain', maker_asset_rail: 'chain', taker_btc_inbound: true,
+        btc_sats: bt.btc_amount, asset_atoms: bt.seq_amount };
+      const match = buildBridgeMatchFromBody(rbody);
+      const io = makeBridgeIo({ match, body: rbody, job });
+      job.status = 'confirming'; job.interrupted = false; job.error = null; persistJobs();
+      console.error('[lsp] resuming bridged job', id, '(re-driving front+recoup on the persisted maker HTLC)');
+      runBridgedSwap({ match, io, driverCfg: { pollMs: 3000, maxTicks: Math.ceil(CFG.mixedTimeoutMs / 3000) } })
+        .then((r) => { setJob(id, { ...jobs.get(id), ...(r.ok ? { ok: true, settled: true, status: 'settled' } : { ok: false, status: 'failed', error: `resumed bridged swap did not settle: ${r.reason || 'unknown'}` }), legs: r.legs, done_ms: Date.now() }); })
+        .catch((e) => { setJob(id, { ...jobs.get(id), ok: false, status: 'failed', error: String((e && e.message) || e), done_ms: Date.now() }); });
+    } catch (e) { console.error('[lsp] bridge resume skipped for', id, e && e.message); }
+  }
   // T10 restart-invisibility: the per-user lightningd nodes are spawned DETACHED, so they SURVIVE an
   // LSP restart — only our in-process view of them is lost. Proactively re-attach on boot (getinfo is a
   // read, no signer needed) so /status + /node/list report them `running` immediately, and a wallet
