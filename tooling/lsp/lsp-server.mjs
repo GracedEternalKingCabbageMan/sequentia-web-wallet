@@ -1731,13 +1731,18 @@ function makeBridgeIo({ match, body, job }) {
     // receiver leg: pay the receiver's hold invoice on H (this reveals P once they settle).
     frontLn: async (leg) => {
       const s = st(leg.unit);
-      if (!s || !s.recvBolt11) throw new Error('front-ln blocked: receiver hold invoice (bolt11 on H) not established yet — fail closed (no LN fronted)');
+      if (!s || !s.recvNodeId || !s.hashH || !(s.amountSat > 0)) throw new Error('front-ln blocked: taker node id / H / amount not established yet — fail closed (no LN fronted)');
       s.frontAttempted = true; persistJobs();
-      // Pay the taker's hold on H from the LSP's own node. A hold invoice keeps the payment IN-FLIGHT until
-      // the taker settles with P; the successful pay then RETURNS P, which is how the LSP learns it to
-      // recoup. (retry_for spans the taker learning P from the maker's on-chain asset claim.)
-      const r = await lnrpcKw('pay', [`bolt11=${s.recvBolt11}`, 'retry_for=600'], lspRpc, CFG.mixedTimeoutMs);
-      const p = r && (r.payment_preimage || r.preimage);
+      const amtMsat = s.amountSat * 1000;
+      // The seqln holdinvoice has NO bolt11 — pay it by BARE HASH: route to the taker's node, sendpay keyed
+      // on H, and waitsendpay BLOCKS until the taker settles the hold with P and returns it. That returned P
+      // is exactly how the LSP learns the preimage to recoup — and, being a hold, the payment stays in-flight
+      // (the taker paid nothing until it settles), so this is a true front, not a fire-and-forget.
+      const route = await lnrpc('getroute', [String(s.recvNodeId), String(amtMsat), '10'], lspRpc, SIGNER_RPC_TIMEOUT_MS);
+      if (!route || !Array.isArray(route.route) || !route.route.length) throw new Error('front-ln: no route to the taker node — fail closed');
+      await lnrpc('sendpay', [JSON.stringify(route.route), String(s.hashH)], lspRpc, SIGNER_RPC_TIMEOUT_MS);
+      const w = await lnrpc('waitsendpay', [String(s.hashH)], lspRpc, CFG.mixedTimeoutMs);
+      const p = w && (w.payment_preimage || w.preimage);
       if (p && /^[0-9a-f]{64}$/i.test(String(p))) { s.frontPreimage = String(p).toLowerCase(); persistJobs(); }
     },
     // payer leg: fund the receiver's on-chain HTLC (claim=receiver w/ P, refund=LSP). Reuses the audited
@@ -2522,12 +2527,12 @@ const server = http.createServer(async (req, res) => {
       if (!job) return send(res, 404, { ok: false, error: 'unknown bridge job id' });
       if (!job._bridgeSession) return send(res, 409, { ok: false, error: 'bridge session not open (handshake not completed / already relayed / restarted)' });
       const leg = body.taker_seq_leg || {};
-      if (!leg.txid || !leg.redeem_script || !body.recv_bolt11)
-        return send(res, 400, { ok: false, error: 'taker_seq_leg{txid,vout,amount,redeem_script,locktime,asset[,block_hash]} + recv_bolt11 required' });
+      if (!leg.txid || !leg.redeem_script || !body.recv_node_id)
+        return send(res, 400, { ok: false, error: 'taker_seq_leg{txid,vout,amount,redeem_script,locktime,asset[,block_hash]} + recv_node_id (the taker BTC-LN node holding the hold on H) required' });
       job.legState = job.legState || {};
       const sa = job.legState.asset = job.legState.asset || {};
       sa.onchain = { txid: leg.txid, vout: Number(leg.vout || 0) };   // the native lock the front gates on
-      const sb = job.legState.btc; if (sb) sb.recvBolt11 = body.recv_bolt11;   // the front's target (taker's hold on H)
+      const sb = job.legState.btc; if (sb) sb.recvNodeId = body.recv_node_id;   // the front's target (taker node holding the hold on H)
       persistJobs();
       // Relay the taker's asset leg -> the maker claims it (reveals P). Fire-and-forget: the maker's claim
       // is anchor-gated (can take minutes) and the driver reads P from the front's pay result, not this.

@@ -80,17 +80,19 @@ async function main() {
   const fund = JSON.parse(fundOut);
   log('asset HTLC funded (self-custody):', fund.seq_htlc_txid, 'vout', fund.seq_htlc_vout, 'block', fund.block_hash || '(pending)');
 
-  // 5. Register a hold invoice on H at OUR BTC-LN node — the LSP pays this; we settle it with P.
+  // 5. Register a hold on H at OUR BTC-LN node (bare-hash; the seqln holdinvoice has no bolt11). The LSP
+  // pays it by routing to our node id + sendpay on H; we settle it with P.
   const label = 'bridge-recv-' + jobId.slice(0, 8);
-  const holdOut = await run(LNCLI, [...TAKER_LN, 'holdinvoice', H, String(btcSats * 1000), label, 'bridge BTC receive', '600']);
-  const bolt11 = JSON.parse(holdOut).bolt11;
-  log('BTC-LN hold invoice on H registered at our node');
+  await run(LNCLI, [...TAKER_LN, 'holdinvoice', H, String(btcSats * 1000), label, 'bridge BTC receive', '600']);
+  const takerNodeId = JSON.parse(await run(LNCLI, [...TAKER_LN, 'getinfo'])).id;
+  log('BTC-LN hold on H registered at our node', takerNodeId);
 
-  // 6. Hand the funded asset leg + the hold bolt11 to the LSP -> it relays to the maker (maker claims -> P).
-  const relayResp = await http('POST', '/bridge/asset', { job_id: jobId, recv_bolt11: bolt11,
+  // 6. Hand the funded asset leg + our node id to the LSP -> it relays to the maker (maker claims -> P).
+  const relayResp = await http('POST', '/bridge/asset', { job_id: jobId, recv_node_id: takerNodeId,
     taker_seq_leg: { txid: fund.seq_htlc_txid, vout: fund.seq_htlc_vout, amount: fund.amount,
       redeem_script: fund.redeem_script, locktime: terms.seq_locktime, asset: ASSET, block_hash: fund.block_hash } });
   log('POST /bridge/asset ->', JSON.stringify(relayResp));
+  if (!relayResp.ok) throw new Error('bridge/asset rejected: ' + relayResp.error);
 
   // 7. Watch OUR asset HTLC for the maker's claim (it reveals P on-chain). This spans the maker's anchor gate.
   let P = null;
@@ -107,7 +109,11 @@ async function main() {
   log('P revealed by the maker:', P, '| sha256(P)==H ?', sha256(P) === H);
   if (sha256(P) !== H) throw new Error('sha256(P) != H — refuse to settle');
 
-  // 8. Settle our BTC-LN hold with P -> we RECEIVE the BTC over Lightning.
+  // 8. Wait for the LSP's payment to be HELD (accepted) at our node, then settle with P -> we RECEIVE BTC-LN.
+  for (let i = 0; i < 120; i++) {
+    try { const l = JSON.parse(await run(LNCLI, [...TAKER_LN, 'holdinvoicelookup', H])); if (l.state === 'accepted' || l.state === 'settled') { log('  hold state', l.state); break; } } catch {}
+    await sleep(2000);
+  }
   try { await run(LNCLI, [...TAKER_LN, 'holdinvoicesettle', H, P]); log('BTC-LN hold SETTLED with P — taker received BTC over Lightning'); }
   catch (e) { log('holdinvoicesettle:', e.message, '(may already be settled by the pay resolving)'); }
 
