@@ -83,7 +83,10 @@ async function main() {
   // 5. Register a hold on H at OUR BTC-LN node (bare-hash; the seqln holdinvoice has no bolt11). The LSP
   // pays it by routing to our node id + sendpay on H; we settle it with P.
   const label = 'bridge-recv-' + jobId.slice(0, 8);
-  await run(LNCLI, [...TAKER_LN, 'holdinvoice', H, String(btcSats * 1000), label, 'bridge BTC receive', '600']);
+  // Expiry must comfortably exceed the maker's anchor-gate latency (confirm the BTC HTLC, then wait for a SEQ
+  // block anchored ABOVE it) PLUS any Bitcoin reorg recovery — otherwise the hold lapses before P arrives and
+  // the swap fails no-loss but never settles. 2h stays well inside the maker's btc/seq locktime deltas.
+  await run(LNCLI, [...TAKER_LN, 'holdinvoice', H, String(btcSats * 1000), label, 'bridge BTC receive', '7200']);
   const takerNodeId = JSON.parse(await run(LNCLI, [...TAKER_LN, 'getinfo'])).id;
   log('BTC-LN hold on H registered at our node', takerNodeId);
 
@@ -94,9 +97,12 @@ async function main() {
   log('POST /bridge/asset ->', JSON.stringify(relayResp));
   if (!relayResp.ok) throw new Error('bridge/asset rejected: ' + relayResp.error);
 
-  // 7. Watch OUR asset HTLC for the maker's claim (it reveals P on-chain). This spans the maker's anchor gate.
+  // 7. Watch OUR asset HTLC for the maker's claim (it reveals P on-chain). This spans the maker's anchor gate:
+  // the maker will not claim until our asset HTLC is anchored ABOVE its confirmed BTC HTLC (Bitcoin-anchoring
+  // supremacy), which is BTC-block-gated and, during a testnet4 reorg, spans a full cross-chain reorg recovery.
+  // 75 min of patience keeps a normal anchor wait (and a modest reorg) from tripping a premature no-P failure.
   let P = null;
-  for (let i = 0; i < 240 && !P; i++) {
+  for (let i = 0; i < 900 && !P; i++) {
     await sleep(5000);
     try {
       const o = JSON.parse(await run(SEQOB, ['xhtlc-observe', '-rpc', SEQ_RPC_FOR_OBSERVE, '-txid', fund.seq_htlc_txid, '-vout', String(fund.seq_htlc_vout), '-hash', H]));
