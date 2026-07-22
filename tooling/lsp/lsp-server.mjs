@@ -1678,14 +1678,20 @@ function makeBridgeIo({ match, body, job }) {
       const s = st(leg.unit);
       if (!s) return false;
       if (s.onchain && s.onchain.txid) {   // native on-chain HTLC funded == locked
-        // FUND-SAFETY FOLLOWUP (review Finding 4, LOW / defense-in-depth): this lock oracle binds only
-        // "some funded UTXO exists" for the taker-supplied txid:vout — NOT H, amount, claim/refund pubkeys,
-        // locktime, or ASSET ID. Harmless for the ONE wired shape (the LSP's receiver-leg recoup is the
-        // maker's BTC HTLC, independent of this native asset leg; its front is a hold that returns if P never
-        // arrives). It becomes load-bearing the moment an ASSET-leg bridge fronts against an asset HTLC —
-        // wire xhtlcObserve to take + verify the asset id + H + amount there before that path goes live.
-        try { const o = await xhtlcObserve({ rpc: s.onchainRpc, wallet: s.onchainWallet, txid: s.onchain.txid, vout: s.onchain.vout }); return !!o.funded; }
-        catch { return false; }
+        // FUND-SAFETY (review Finding 4): the whole-swap atomicity gate opens on THIS leg being locked, so
+        // BIND it — don't front on merely "some funded UTXO exists" at the taker-supplied txid:vout. Verify
+        // the funded output carries the AGREED asset id and pays AT LEAST the AGREED amount (from the offer
+        // terms the maker signed, NOT the taker's self-reported leg). A mismatch — or an unreadable observe —
+        // reports NOT locked, so the LSP never fronts against a bogus / underfunded / wrong-asset leg. When
+        // the expected asset/amount are absent (an unwired shape) it degrades to the funded check, so it can
+        // never falsely stall a correct front.
+        try {
+          const o = await xhtlcObserve({ rpc: s.onchainRpc, wallet: s.onchainWallet, txid: s.onchain.txid, vout: s.onchain.vout });
+          if (!o.funded) return false;
+          if (s.seqAmount != null && Number(s.seqAmount) > 0 && Number(o.amount || 0) < Number(s.seqAmount)) return false;
+          if (s.seqAsset && o.asset_id && String(o.asset_id).toLowerCase() !== String(s.seqAsset).toLowerCase()) return false;
+          return true;
+        } catch { return false; }
       }
       if (s.lnRpc && s.hashH) {              // native LN payment held == locked
         try { const l = await lnrpc('holdinvoicelookup', [s.hashH], s.lnRpc, SIGNER_RPC_TIMEOUT_MS); return l.state === 'accepted' || l.state === 'settled'; }
@@ -1743,23 +1749,26 @@ function makeBridgeIo({ match, body, job }) {
       if (!s || !s.recvNodeId || !s.hashH || !(s.amountSat > 0)) throw new Error('front-ln blocked: taker node id / H / amount not established yet — fail closed (no LN fronted)');
       s.frontAttempted = true; persistJobs();
       const amtMsat = s.amountSat * 1000;
+      const adoptP = (p) => { if (p && /^[0-9a-f]{64}$/i.test(String(p))) { s.frontPreimage = String(p).toLowerCase(); persistJobs(); return true; } return false; };
+      // FUND-SAFETY (idempotent front across a resume — review Finding 5): observe reports ln.held:false for
+      // this receiver leg, so the state machine relies on the in-process waitsendpay below. On a restart
+      // mid-front (frontAttempted persisted, frontPreimage not yet), re-entering here must NOT issue a
+      // duplicate sendpay CLN may reject — that would leave us paid but unable to re-learn P and recoup.
+      // So ADOPT any prior attempt on H first: a COMPLETE pay already carries P; a PENDING pay is in flight,
+      // so waitsendpay blocks for the taker to settle it. Only a genuine no-pay funds a fresh sendpay.
+      // paymentStatusForHash THROWS if the node is unreadable, so we never re-pay on an uncertain "no pay".
+      const prior = await paymentStatusForHash(lspRpc, s.hashH);
+      if (prior.preimage) { adoptP(prior.preimage); return; }
+      if (prior.pending) { const w = await lnrpc('waitsendpay', [String(s.hashH)], lspRpc, CFG.mixedTimeoutMs); adoptP(w && (w.payment_preimage || w.preimage)); return; }
       // The seqln holdinvoice has NO bolt11 — pay it by BARE HASH: route to the taker's node, sendpay keyed
       // on H, and waitsendpay BLOCKS until the taker settles the hold with P and returns it. That returned P
       // is exactly how the LSP learns the preimage to recoup — and, being a hold, the payment stays in-flight
       // (the taker paid nothing until it settles), so this is a true front, not a fire-and-forget.
       const route = await lnrpc('getroute', [String(s.recvNodeId), String(amtMsat), '10'], lspRpc, SIGNER_RPC_TIMEOUT_MS);
       if (!route || !Array.isArray(route.route) || !route.route.length) throw new Error('front-ln: no route to the taker node — fail closed');
-      // FUND-SAFETY FOLLOWUP (review Finding 5, LOW / plausible-unproven): observe hardcodes ln.held:false for
-      // the receiver leg, so the state machine relies on THIS waitsendpay blocking in-process. On a restart
-      // mid-front (frontAttempted persisted, frontPreimage not yet), the resumed driver re-enters here and
-      // issues a FRESH sendpay on the same H; if CLN rejects that as a duplicate, waitsendpay is never reached
-      // and frontPreimage is never repopulated -> recoup stays blocked though we already paid. Harden by
-      // reattaching first: listsendpays/waitsendpay on H to adopt the in-flight pay (and read P if it already
-      // settled) BEFORE re-issuing sendpay. Needs confirming CLN's exact sendpay/waitsendpay idempotency.
       await lnrpc('sendpay', [JSON.stringify(route.route), String(s.hashH)], lspRpc, SIGNER_RPC_TIMEOUT_MS);
       const w = await lnrpc('waitsendpay', [String(s.hashH)], lspRpc, CFG.mixedTimeoutMs);
-      const p = w && (w.payment_preimage || w.preimage);
-      if (p && /^[0-9a-f]{64}$/i.test(String(p))) { s.frontPreimage = String(p).toLowerCase(); persistJobs(); }
+      adoptP(w && (w.payment_preimage || w.preimage));
     },
     // payer leg: fund the receiver's on-chain HTLC (claim=receiver w/ P, refund=LSP). Reuses the audited
     // xsubas-fund-btc primitive; records the funded HTLC + the LSP refund key in legState.
@@ -1914,7 +1923,7 @@ async function prepareBridgeLegs({ match, body, job }) {
 
     // NATIVE asset leg (direct taker<->maker): the terms the taker needs to fund its OWN asset HTLC.
     const sa = job.legState.asset;
-    if (sa) { sa.makerSeqClaimPub = hs.makerSeqClaimPubHex; sa.seqLocktime = hs.seqLocktime; sa.seqAmount = hs.seqAmount; }
+    if (sa) { sa.makerSeqClaimPub = hs.makerSeqClaimPubHex; sa.seqLocktime = hs.seqLocktime; sa.seqAmount = hs.seqAmount; sa.seqAsset = resolveAsset(body.asset); }
 
     job._bridgeSession = session;            // kept alive so the taker's funded asset leg can be relayed in
     job.bridge_terms = { hash_h: hs.hashHex, maker_seq_claim_pub: hs.makerSeqClaimPubHex,
