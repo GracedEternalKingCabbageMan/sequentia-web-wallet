@@ -24,6 +24,7 @@ const TAKER_LN = ['--lightning-dir=/root/sequentia/lsp/btc-maker', '--network=te
 const SEQ_RPC = 'http://seq:seq@127.0.0.1:18300';
 const TAKER_SEQ_WALLET = 'bridge-taker';
 const SEQ_RPC_FOR_OBSERVE = 'http://seq:seq@127.0.0.1:18300';
+const BTC_RPC = 'http://seq:seq@127.0.0.1:48332';   // testnet4 node — poll the maker's BTC HTLC confirmations
 
 const sha256 = (hex) => createHash('sha256').update(Buffer.from(hex, 'hex')).digest('hex');
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -36,6 +37,14 @@ async function http(method, path, body) {
   return j;
 }
 const log = (...a) => console.log('[taker]', ...a);
+async function btcConfs(txid) {
+  const u = new URL(BTC_RPC);
+  const r = await fetch(`${u.protocol}//${u.host}/`, { method: 'POST',
+    headers: { authorization: 'Basic ' + Buffer.from(`${u.username}:${u.password}`).toString('base64'), 'content-type': 'text/plain' },
+    body: JSON.stringify({ jsonrpc: '1.0', method: 'getrawtransaction', params: [txid, true] }) });
+  const j = await r.json().catch(() => ({}));
+  return (j && j.result && j.result.confirmations) || 0;
+}
 
 async function main() {
   // 0. Mint the taker's OWN asset-refund keypair (never shared with the LSP as a secret; only the pubkey is).
@@ -72,6 +81,24 @@ async function main() {
   if (!terms) throw new Error('no free maker completed the handshake (all busy?)');
   const H = terms.hash_h;
   log('handshake OK. H=', H, '| maker BTC HTLC', terms.btc_htlc_txid, '| T_seq', terms.seq_locktime, '| maker asset-claim', terms.maker_seq_claim_pub);
+
+  // 3.5 ANCHOR ORDERING: WAIT for the maker's BTC HTLC to confirm BEFORE funding our asset, so our asset's
+  //     SEQ block anchors AT/ABOVE the maker's BTC-leg height (the maker's VerifySeqLegSafe gate). Funding
+  //     earlier lets the fast SEQ chain anchor the asset BELOW the slow testnet4 BTC leg — the maker can then
+  //     never safely claim. This is exactly what the maker code expects (the taker "waits for OUR confirmation
+  //     first"); the relay session's 3h cross-chain deadline covers this wait.
+  log('waiting for the maker BTC HTLC to confirm before funding the asset (anchor ordering)...');
+  {
+    let confd = 0;
+    for (let i = 0; i < 300 && confd < 1; i++) {
+      confd = await btcConfs(terms.btc_htlc_txid).catch(() => 0);
+      if (confd >= 1) break;
+      if (i % 4 === 0) log('  maker BTC HTLC still 0-conf...', i * 15, 's');
+      await sleep(15000);
+    }
+    if (confd < 1) throw new Error('maker BTC HTLC never confirmed within the wait — abort before funding (no asset committed, no loss)');
+    log('maker BTC HTLC confirmed (', confd, 'conf) — funding the asset now so it anchors above the BTC leg');
+  }
 
   // 4. Fund our OWN asset HTLC (claim = the maker's pub with P, refund = OUR key after T_seq), self-custody.
   //    -no-wait: return at 0-conf so we relay the leg to the maker IMMEDIATELY (step 6), before the LSP's
