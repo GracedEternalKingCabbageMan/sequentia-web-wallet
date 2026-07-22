@@ -1718,6 +1718,7 @@ function makeBridgeIo({ match, body, job }) {
           // ourselves — payer leg — is trusted via lockedTo:'receiver' as before.)
           const lspBound = s.htlc.lockedTo === 'lsp' && !!s.verifiedClaimLsp && o.script_bound === true;
           onchain = { funded: !!o.funded, amountSat: Number(o.amount || 0), cltv: s.htlc.cltv,
+            confs: Number(o.confirmations || 0),   // fed to leg-bridge's minRecoupConf gate (no fronting a 0-conf, RBF-able recoup target)
             lockedToLsp: lspBound, lockedToReceiver: s.htlc.lockedTo === 'receiver',
             spent: !!o.spent };
           // payer leg: P is read from the receiver's on-chain claim witness -> feed it to the core.

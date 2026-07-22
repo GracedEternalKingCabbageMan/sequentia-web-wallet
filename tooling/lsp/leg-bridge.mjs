@@ -45,6 +45,11 @@ export const BRIDGE_DEFAULTS = Object.freeze({
   // lnSide='payer': the on-chain HTLC CLTV must be at least this many blocks INSIDE the LN hold's
   // remaining lifetime, so an unclaimed on-chain HTLC refunds to the LSP before the LN hold is at risk.
   holdBuffer: 6,
+  // lnSide='receiver': the COUNTERPARTY's on-chain HTLC (the LSP's recoup target) must have at least this
+  // many confirmations before the LSP fronts irreversible LN against it. A 0-conf recoup target can be
+  // RBF'd / double-spent out from under the front by a malicious counterparty (who mints P), letting them
+  // take the fronted LN AND reclaim their on-chain funds. 1 confirmation removes the fee-bump/RBF path.
+  minRecoupConf: 1,
 });
 
 /**
@@ -68,6 +73,12 @@ export function nextBridgeStep(leg, obs, cfg = {}) {
     throw new Error("nextBridgeStep: leg.lnSide must be 'receiver' or 'payer'");
   if (!obs || !obs.ln || typeof obs.tip !== 'number')
     throw new Error('nextBridgeStep: obs needs {tip, onchain, ln}');
+  // FUND-SAFETY: the whole point of this core is "never front more than we recoup". That check compares the
+  // recoup HTLC amount against leg.amountSat, so an absent/invalid leg.amountSat silently DEFEATS it
+  // (`realAmount < undefined` is false). Refuse to decide at all without a real positive bound — the caller
+  // MUST supply the leg's amount. Fail closed (not throw) so a wiring bug becomes a no-loss stall, not a crash.
+  if (!Number.isFinite(leg.amountSat) || leg.amountSat <= 0)
+    return { action: 'fail-closed', reason: `INVARIANT: leg.amountSat must be a positive number to bound the front (got ${JSON.stringify(leg.amountSat)}) — refuse to front an unbounded amount (caller wiring bug)` };
   const c = { ...BRIDGE_DEFAULTS, ...cfg };
   return leg.lnSide === 'receiver'
     ? stepReceiverLn(leg, obs, c)
@@ -92,6 +103,12 @@ function stepReceiverLn(leg, obs, c) {
   if (oc.amountSat < leg.amountSat) return { action: 'fail-closed', reason: 'on-chain HTLC amount is below the leg amount — refuse to front (would front more than we recoup)' };
   if (oc.cltv - obs.tip < c.frontRunway) return { action: 'fail-closed', reason: 'on-chain HTLC CLTV runway too short to recoup after the reveal — refuse to front (fail closed, no exposure)' };
   if (!obs.ln.held) {
+    // The recoup target is the COUNTERPARTY's on-chain HTLC. While it is unconfirmed it can be RBF'd /
+    // double-spent away, so fronting irreversible LN against it is unsafe: a malicious maker (who mints P)
+    // would front-run the reveal, take the LN, and reclaim its on-chain funds. Wait for it to bury first.
+    // This gates ONLY the front; once fronted (ln.held) confs are moot, and a settle recoups at the top.
+    // Transient wait (re-observe until confirmed), NOT a fail — the recoup is otherwise secured.
+    if ((oc.confs || 0) < c.minRecoupConf) return { action: 'wait', reason: `recoup HTLC has only ${oc.confs || 0} confirmation(s) (need ${c.minRecoupConf}) — wait for it to bury before fronting (an unconfirmed recoup target can be replaced out from under the front)` };
     // WHOLE-SWAP ATOMICITY: fronting the LN (paying the receiver's hold on H) is the action that lets
     // the receiver settle and REVEAL P. Withhold it until every OTHER leg of the swap is locked, or a
     // partial (this leg reveals + settles while another leg never locks) becomes possible. A stall here

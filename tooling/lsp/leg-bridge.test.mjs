@@ -30,9 +30,15 @@ test('receiver-LN: REFUSES to front if CLTV runway is too short to recoup after 
   assert.equal(s.action, 'fail-closed');
 });
 
-test('receiver-LN: fronts ONLY once the HTLC is locked to us, amount ok, runway ok', () => {
-  const s = nextBridgeStep({ lnSide: 'receiver', amountSat: A }, { tip: 100, onchain: { funded: true, amountSat: A, cltv: 100 + R, lockedToLsp: true }, ln: { registered: true, held: false, settled: false, preimage: null } });
+test('receiver-LN: fronts ONLY once the HTLC is locked to us, amount ok, runway ok, and CONFIRMED', () => {
+  const s = nextBridgeStep({ lnSide: 'receiver', amountSat: A }, { tip: 100, onchain: { funded: true, amountSat: A, cltv: 100 + R, lockedToLsp: true, confs: 1 }, ln: { registered: true, held: false, settled: false, preimage: null } });
   assert.equal(s.action, 'front-ln');
+});
+
+test('receiver-LN: REFUSES to front while the recoup HTLC is still 0-conf (RBF-able) — waits, no loss', () => {
+  const s = nextBridgeStep({ lnSide: 'receiver', amountSat: A }, { tip: 100, onchain: { funded: true, amountSat: A, cltv: 100 + R, lockedToLsp: true, confs: 0 }, ln: { registered: true, held: false, settled: false, preimage: null } });
+  assert.equal(s.action, 'wait');
+  assert.match(s.reason, /confirmation/i);
 });
 
 test('receiver-LN: after fronting, a non-settling receiver just waits (no-loss stall)', () => {
@@ -107,14 +113,14 @@ test('payer-LN: settled LN is terminal done', () => {
 //      (front-ln for a receiver leg; fund-onchain for a payer leg) until every OTHER leg is locked,
 //      so a partial (this leg reveals P while another never locks) is impossible on the shared H. ----
 test('receiver-LN: WITHHOLDS the LN front while the other leg is not yet locked (atomicity)', () => {
-  // Same state that fronts above, but swapLocked=false -> wait, never front.
-  const s = nextBridgeStep({ lnSide: 'receiver', amountSat: A }, { tip: 100, onchain: { funded: true, amountSat: A, cltv: 100 + R, lockedToLsp: true }, ln: { registered: true, held: false, settled: false, preimage: null }, swapLocked: false });
+  // Same state that fronts above (confirmed recoup), but swapLocked=false -> wait, never front.
+  const s = nextBridgeStep({ lnSide: 'receiver', amountSat: A }, { tip: 100, onchain: { funded: true, amountSat: A, cltv: 100 + R, lockedToLsp: true, confs: 1 }, ln: { registered: true, held: false, settled: false, preimage: null }, swapLocked: false });
   assert.equal(s.action, 'wait');
   assert.match(s.reason, /atomicity/i);
 });
 
 test('receiver-LN: swapLocked:true (explicit) fronts, identical to undefined', () => {
-  const s = nextBridgeStep({ lnSide: 'receiver', amountSat: A }, { tip: 100, onchain: { funded: true, amountSat: A, cltv: 100 + R, lockedToLsp: true }, ln: { registered: true, held: false, settled: false, preimage: null }, swapLocked: true });
+  const s = nextBridgeStep({ lnSide: 'receiver', amountSat: A }, { tip: 100, onchain: { funded: true, amountSat: A, cltv: 100 + R, lockedToLsp: true, confs: 1 }, ln: { registered: true, held: false, settled: false, preimage: null }, swapLocked: true });
   assert.equal(s.action, 'front-ln');
 });
 
@@ -149,3 +155,15 @@ test('payer-LN: the gate NEVER overrides fail-closed — hold too close to expir
 test('rejects an invalid lnSide', () => {
   assert.throws(() => nextBridgeStep({ lnSide: 'both', amountSat: A }, { tip: 1, onchain: null, ln: {} }));
 });
+
+// FUND-SAFETY REGRESSION: an absent/invalid leg amount silently defeats the "never front more than we
+// recoup" check (`realAmount < undefined === false`), which is exactly how the live driver-wiring bug let
+// the LSP front full value against a 1-sat recoup. The core must fail closed rather than decide against an
+// unbounded amount — even when the on-chain HTLC looks perfect (locked, funded, deep confs, long runway).
+for (const bad of [undefined, null, 0, -1, NaN, '100000']) {
+  test(`fails closed when leg.amountSat is invalid (${JSON.stringify(bad)}) — never front unbounded`, () => {
+    const s = nextBridgeStep({ lnSide: 'receiver', amountSat: bad }, { tip: 100, onchain: { funded: true, amountSat: 100000, cltv: 200, lockedToLsp: true, confs: 6 }, ln: { registered: true, held: false, settled: false, preimage: null } });
+    assert.equal(s.action, 'fail-closed');
+    assert.match(s.reason, /amountSat|unbounded/i);
+  });
+}

@@ -16,7 +16,7 @@ const nap1 = () => new Promise((r) => setTimeout(r, 1));
 // ---------- a fake single-leg "world" for runBridgedLeg ----------
 // receiver-LN: the LSP pays the receiver's hold, then claims the payer's on-chain HTLC.
 function receiverWorld({ lockedToLsp = true, amount = A, cltv = 200, gate = () => true } = {}) {
-  const w = { tip: 100, onchain: { funded: true, amountSat: amount, cltv, lockedToLsp, spent: false },
+  const w = { tip: 100, onchain: { funded: true, amountSat: amount, cltv, lockedToLsp, spent: false, confs: 6 },
     ln: { registered: true, held: false, settled: false, preimage: null }, _heldTicks: 0, calls: [] };
   return {
     world: w, swapLocked: gate, sleep: nap1, log: () => {},
@@ -193,7 +193,7 @@ test('runBridgedSwap: JIT first, native drives, bridged leg gated until native l
   const events = [];
   let nativeChecks = 0;
   // asset leg (bridged, receiver): reuse the receiver world but attach amount + gate wiring via the swap io.
-  const assetW = { tip: 100, onchain: { funded: true, amountSat: A, cltv: 200, lockedToLsp: true, spent: false },
+  const assetW = { tip: 100, onchain: { funded: true, amountSat: A, cltv: 200, lockedToLsp: true, spent: false, confs: 6 },
     ln: { registered: true, held: false, settled: false, preimage: null }, _h: 0 };
   const io = {
     sleep: nap1, log: () => {},
@@ -249,6 +249,26 @@ test('runBridgedSwap: BOTH legs bridged does not deadlock (gate on the other leg
   const r = await runBridgedSwap({ match, io, driverCfg: { pollMs: 1, maxTicks: 800 } });
   assert.equal(r.ok, true, r.reason);
   assert.deepEqual(fronted.sort(), ['fund:asset', 'fund:btc'], 'both legs funded — no deadlock');
+});
+
+test('runBridgedSwap: binds the amount from io.legAmountSat — refuses an UNDERFUNDED recoup (Finding 1 regression)', async () => {
+  // The live fund-loss bug: the driver passed leg.amountSat === undefined (router legs carry no amount),
+  // so the core's "never front more than we recoup" check (oc.amountSat < leg.amountSat) was always false.
+  // Here io.legAmountSat says the asset leg is worth A, but the maker's on-chain HTLC holds only 1 sat. The
+  // driver MUST bind A into the core (via withAmt) so 1 < A fails closed — never front A against a 1-sat recoup.
+  const events = [];
+  const io = {
+    sleep: nap1, log: () => {}, legAmountSat: () => A,
+    provisionInbound: async () => {}, startNative: async () => {}, observeNativeLocked: async () => true,
+    observe: async (leg) => leg.unit === 'asset'
+      ? { tip: 100, onchain: { funded: true, amountSat: 1, cltv: 200, lockedToLsp: true, spent: false, confs: 6 }, ln: { registered: true, held: false, settled: false, preimage: null } }
+      : { tip: 100, onchain: null, ln: {} },
+    frontLn: async () => { events.push('front'); },
+  };
+  const match = { asset: 'OILX', buyer: { btcRail: 'chain', assetRail: 'ln', assetInbound: true }, seller: { assetRail: 'chain', btcRail: 'chain' } };
+  const r = await runBridgedSwap({ match, io, driverCfg: { pollMs: 0, maxTicks: 50 } });
+  assert.equal(r.ok, false, 'must fail — the recoup HTLC is underfunded');
+  assert.deepEqual(events, [], 'NEVER fronted A against a 1-sat recoup');
 });
 
 test('runBridgedSwap: a bridged-leg fail-closed fails the whole swap', async () => {

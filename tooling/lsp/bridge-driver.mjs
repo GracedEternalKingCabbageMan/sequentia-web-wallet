@@ -178,7 +178,7 @@ export async function runBridgedSwap({ match, io, cfg = {}, driverCfg = {} }) {
       // and treat a front/recoup/done as "locked"; a wait-for-recoup or fail as "not locked".
       let obs;
       try { obs = await io.observe(leg); } catch { return false; }
-      const s = nextBridgeStep(withAmount(leg), { ...obs, swapLocked: true }, cfg);
+      const s = nextBridgeStep(withAmt(leg), { ...obs, swapLocked: true }, cfg);
       return s.action === 'front-ln' || s.action === 'fund-onchain'
           || s.action === 'recoup-claim' || s.action === 'recoup-settle' || s.action === 'done';
     }
@@ -209,7 +209,7 @@ export async function runBridgedSwap({ match, io, cfg = {}, driverCfg = {} }) {
   })();
 
   const bridgedRuns = bridged.map((leg) => runBridgedLeg({
-    leg: withAmount(leg),
+    leg: withAmt(leg),
     io: legIoFor(io, leg, () => !!gate.get(legKey(leg))),
     cfg, driverCfg,
   }).then((r) => ({ leg, r })));
@@ -225,12 +225,6 @@ export async function runBridgedSwap({ match, io, cfg = {}, driverCfg = {} }) {
     return { ok: false, plan, legs, reason: failed.map((f) => `${f.leg.unit}: ${f.r.reason}`).join('; ') };
   }
   return { ok: true, plan, legs };
-}
-
-// Attach the leg amount the router leg does not carry (the match supplies it via io.legAmountSat).
-// Kept tiny + explicit so the amount a front is bounded to is never guessed.
-function withAmount(leg) {
-  return { lnSide: leg.lnSide, amountSat: leg.amountSat, unit: leg.unit };
 }
 
 // Build the per-leg io view runBridgedLeg expects from the whole-swap io, binding the swapLocked gate.
