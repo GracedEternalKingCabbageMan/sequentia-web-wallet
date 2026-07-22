@@ -1678,6 +1678,12 @@ function makeBridgeIo({ match, body, job }) {
       const s = st(leg.unit);
       if (!s) return false;
       if (s.onchain && s.onchain.txid) {   // native on-chain HTLC funded == locked
+        // FUND-SAFETY FOLLOWUP (review Finding 4, LOW / defense-in-depth): this lock oracle binds only
+        // "some funded UTXO exists" for the taker-supplied txid:vout — NOT H, amount, claim/refund pubkeys,
+        // locktime, or ASSET ID. Harmless for the ONE wired shape (the LSP's receiver-leg recoup is the
+        // maker's BTC HTLC, independent of this native asset leg; its front is a hold that returns if P never
+        // arrives). It becomes load-bearing the moment an ASSET-leg bridge fronts against an asset HTLC —
+        // wire xhtlcObserve to take + verify the asset id + H + amount there before that path goes live.
         try { const o = await xhtlcObserve({ rpc: s.onchainRpc, wallet: s.onchainWallet, txid: s.onchain.txid, vout: s.onchain.vout }); return !!o.funded; }
         catch { return false; }
       }
@@ -1743,6 +1749,13 @@ function makeBridgeIo({ match, body, job }) {
       // (the taker paid nothing until it settles), so this is a true front, not a fire-and-forget.
       const route = await lnrpc('getroute', [String(s.recvNodeId), String(amtMsat), '10'], lspRpc, SIGNER_RPC_TIMEOUT_MS);
       if (!route || !Array.isArray(route.route) || !route.route.length) throw new Error('front-ln: no route to the taker node — fail closed');
+      // FUND-SAFETY FOLLOWUP (review Finding 5, LOW / plausible-unproven): observe hardcodes ln.held:false for
+      // the receiver leg, so the state machine relies on THIS waitsendpay blocking in-process. On a restart
+      // mid-front (frontAttempted persisted, frontPreimage not yet), the resumed driver re-enters here and
+      // issues a FRESH sendpay on the same H; if CLN rejects that as a duplicate, waitsendpay is never reached
+      // and frontPreimage is never repopulated -> recoup stays blocked though we already paid. Harden by
+      // reattaching first: listsendpays/waitsendpay on H to adopt the in-flight pay (and read P if it already
+      // settled) BEFORE re-issuing sendpay. Needs confirming CLN's exact sendpay/waitsendpay idempotency.
       await lnrpc('sendpay', [JSON.stringify(route.route), String(s.hashH)], lspRpc, SIGNER_RPC_TIMEOUT_MS);
       const w = await lnrpc('waitsendpay', [String(s.hashH)], lspRpc, CFG.mixedTimeoutMs);
       const p = w && (w.payment_preimage || w.preimage);
@@ -2539,6 +2552,15 @@ const server = http.createServer(async (req, res) => {
       persistJobs();
       // Relay the taker's asset leg -> the maker claims it (reveals P). Fire-and-forget: the maker's claim
       // is anchor-gated (can take minutes) and the driver reads P from the front's pay result, not this.
+      // FUND-SAFETY FOLLOWUP (review Finding 3, MEDIUM, availability-conditioned): this relays BEFORE the
+      // LSP fronts the taker's hold. A malicious maker that claims at 0 anchor depth (unsafe for ITSELF) the
+      // instant it gets this relay, AND a PERMANENT LSP death before the driver's next front tick, would
+      // leave the taker having given its asset with no incoming LN and a void refund. Mitigated in practice
+      // by (a) the anchor gate delaying an honest maker's claim until after the front, and (b) resume-on-boot
+      // re-driving the front on any non-permanent restart. Proper fix = front-then-relay (relay only once the
+      // front's sendpay is dispatched — the maker cannot claim without this relay, so gating it closes the
+      // window), which needs the courier session to survive to the front (keepalive) or be re-establishable.
+      // Scoped as a follow-up rather than rushed into the value-move path.
       const session = job._bridgeSession; job._bridgeSession = null;   // one relay per session
       relayTakerAssetLeg({ session, takerSeqLeg: leg })
         .then((r) => { job.relay_preimage = r && r.preimageHex ? r.preimageHex : null; persistJobs(); })
