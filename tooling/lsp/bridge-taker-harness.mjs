@@ -74,11 +74,13 @@ async function main() {
   log('handshake OK. H=', H, '| maker BTC HTLC', terms.btc_htlc_txid, '| T_seq', terms.seq_locktime, '| maker asset-claim', terms.maker_seq_claim_pub);
 
   // 4. Fund our OWN asset HTLC (claim = the maker's pub with P, refund = OUR key after T_seq), self-custody.
+  //    -no-wait: return at 0-conf so we relay the leg to the maker IMMEDIATELY (step 6), before the LSP's
+  //    courier session idles through a SEQ block and drops the relay (the maker polls until the leg confirms).
   const fundOut = await run(SEQOB, ['xfund-seq', '-asset', ASSET, '-maker-claim-pub', terms.maker_seq_claim_pub,
     '-hash', H, '-seq-amount', String(seqAtoms), '-seq-locktime', String(terms.seq_locktime),
-    '-seq-rpc', SEQ_RPC, '-seq-wallet', TAKER_SEQ_WALLET, '-refund-priv', takerPriv], 300000);
+    '-seq-rpc', SEQ_RPC, '-seq-wallet', TAKER_SEQ_WALLET, '-refund-priv', takerPriv, '-no-wait'], 300000);
   const fund = JSON.parse(fundOut);
-  log('asset HTLC funded (self-custody):', fund.seq_htlc_txid, 'vout', fund.seq_htlc_vout, 'block', fund.block_hash || '(pending)');
+  log('asset HTLC funded (self-custody, 0-conf):', fund.seq_htlc_txid, 'vout', fund.seq_htlc_vout, 'block', fund.block_hash || '(0-conf; maker polls to confirm)');
 
   // 5. Register a hold on H at OUR BTC-LN node (bare-hash; the seqln holdinvoice has no bolt11). The LSP
   // pays it by routing to our node id + sendpay on H; we settle it with P.
