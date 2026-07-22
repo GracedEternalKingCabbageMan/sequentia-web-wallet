@@ -2561,15 +2561,21 @@ const server = http.createServer(async (req, res) => {
       persistJobs();
       // Relay the taker's asset leg -> the maker claims it (reveals P). Fire-and-forget: the maker's claim
       // is anchor-gated (can take minutes) and the driver reads P from the front's pay result, not this.
-      // FUND-SAFETY FOLLOWUP (review Finding 3, MEDIUM, availability-conditioned): this relays BEFORE the
-      // LSP fronts the taker's hold. A malicious maker that claims at 0 anchor depth (unsafe for ITSELF) the
-      // instant it gets this relay, AND a PERMANENT LSP death before the driver's next front tick, would
-      // leave the taker having given its asset with no incoming LN and a void refund. Mitigated in practice
-      // by (a) the anchor gate delaying an honest maker's claim until after the front, and (b) resume-on-boot
-      // re-driving the front on any non-permanent restart. Proper fix = front-then-relay (relay only once the
-      // front's sendpay is dispatched — the maker cannot claim without this relay, so gating it closes the
-      // window), which needs the courier session to survive to the front (keepalive) or be re-establishable.
-      // Scoped as a follow-up rather than rushed into the value-move path.
+      // FUND-SAFETY (review Finding 3 — MEDIUM downgraded to LOW residual): this relays the asset leg BEFORE
+      // the LSP fronts the taker's hold, so in theory a maker that claims (reveals P) the instant it gets the
+      // relay PLUS a PERMANENT LSP death before the driver's next front tick could leave the taker having
+      // given its asset with no incoming LN and a void refund. Why the residual is LOW, and why we do NOT
+      // "fix" it with front-then-relay:
+      //   • The maker cannot SAFELY claim until its own anchor gate passes (VerifySeqLegSafe: the asset block
+      //     anchored at/above the maker's CONFIRMED BTC-leg height) — strictly LATER than the LSP's front
+      //     condition (maker BTC HTLC >= minRecoupConf + this asset leg locked). So an honest maker always
+      //     claims AFTER the front; the window only exists for a maker that reveals P at 0 anchor depth, which
+      //     risks a reorg clawing its own BTC back — a self-harming attack.
+      //   • resume-on-boot re-drives the front on any NON-permanent restart, so only a permanent LSP death in
+      //     the sub-window loses.
+      //   • The "proper" front-then-relay (hold the relay until the front dispatches) would REINTRODUCE the
+      //     relay-stale bug just fixed: the courier WS cannot survive idle to the front (~a BTC block). So
+      //     relaying at 0-conf immediately (xfund-seq -no-wait) is the correct trade; front-then-relay is not.
       const session = job._bridgeSession; job._bridgeSession = null;   // one relay per session
       relayTakerAssetLeg({ session, takerSeqLeg: leg })
         .then((r) => { job.relay_preimage = r && r.preimageHex ? r.preimageHex : null; persistJobs(); })
