@@ -2986,6 +2986,11 @@ async function startBridged(route, bp){
       maker_btc_rail: bp.makerBtcRail, maker_asset_rail: bp.makerAssetRail,
       btc_sats: String(bp.takeBtc), asset_atoms: String(bp.takeAtoms), partial: !!bp.partial,
       offer_id: bp.offer.id || null, maker_pubkey: bp.offer.maker || null, started_ms: Date.now() };
+    // W2 FRONT-BEFORE-FUND — mint the taker's OWN asset-refund key NOW (self-custody): only its PUBKEY goes
+    // to the LSP (in the /swap handshake, so the maker binds it); the SECRET never leaves the device and is
+    // what refunds the asset at T_seq if the swap stalls. Deterministic (the canonical HTLC key), so a
+    // resume re-derives the same key.
+    try { const rk = C.seqLeg.refundKey(); BRIDGE.taker_seq_refund_pub = rk.public_key; BRIDGE.taker_seq_refund_secret = rk.secret_hex; } catch {}
     saveBridge();
     // Taker node keys for the LN legs / JIT (device-cosigned; the LSP never holds the keys).
     try { BRIDGE.node_key = await L.assetNodeKey(asset); } catch {}
@@ -2993,23 +2998,26 @@ async function startBridged(route, bp){
     saveBridge();
     const r = await L.swap(bridgeSwapBody(BRIDGE));
     applyBridgeStatus(r || {}); saveBridge();
-    if (!bridgeTerminal()) pollBridged();
+    if (!bridgeTerminal()) driveBridged();
     else if (BRIDGE.state === 'settled'){ try { C.toast('Bridged swap settled · anchor-bound to Bitcoin.'); } catch {} try { await C.sync(); } catch {} }
   } catch (e){
-    // A thrown /swap that already handed back a job handle stays pollable (each leg is refundable at its
+    // A thrown /swap that already handed back a job handle stays drivable (each leg is refundable at its
     // timeout); with no handle it is a clean failure (nothing funded).
-    if (BRIDGE && (BRIDGE.poll || BRIDGE.job_id)){ BRIDGE.detail = C.prettyErr(e); saveBridge(); pollBridged(); }
+    if (BRIDGE && (BRIDGE.poll || BRIDGE.job_id)){ BRIDGE.detail = C.prettyErr(e); saveBridge(); driveBridged(); }
     else { BRIDGE = { ...(BRIDGE || {}), state: 'failed', detail: C.prettyErr(e) }; saveBridge(); }
   } finally { _bridgeStarting = false; }
 }
 
 // The exact bridged-take /swap body — ONE builder so start + resume send byte-identical requests (so the
-// swap_nonce idempotency holds on a resume re-POST).
+// swap_nonce idempotency holds on a resume re-POST). taker_seq_refund_pub is the taker's OWN asset-refund
+// KEY (pubkey only) — the maker binds it at handshake and the taker later funds its asset HTLC refundable
+// to it. Byte-identical across start + resume (the key is deterministic + persisted).
 function bridgeSwapBody(b){
   return { side: b.side, asset: b.asset, amount: b.asset_atoms, bridge: true,
     payRail: b.payRail, recvRail: b.recvRail, maker_btc_rail: b.maker_btc_rail, maker_asset_rail: b.maker_asset_rail,
     btc_sats: b.btc_sats, asset_atoms: b.asset_atoms, offer_id: b.offer_id, maker_pubkey: b.maker_pubkey,
-    node_key: b.node_key, btc_node_key: b.btc_node_key, taker_asset_inbound: false, taker_btc_inbound: false, swap_nonce: b.swap_nonce };
+    node_key: b.node_key, btc_node_key: b.btc_node_key, taker_asset_inbound: false, taker_btc_inbound: false,
+    taker_seq_refund_pub: b.taker_seq_refund_pub, swap_nonce: b.swap_nonce };
 }
 function applyBridgeStatus(r){
   if (!BRIDGE) return;
@@ -3018,28 +3026,245 @@ function applyBridgeStatus(r){
   if (r.settlement_plan) BRIDGE.settlement_plan = r.settlement_plan;
   if (r.status === 'settled' || r.settled) BRIDGE.state = 'settled';
   else if (r.status === 'failed' || (r.ok === false && !(r.poll || r.job_id))){ BRIDGE.state = 'failed'; BRIDGE.detail = r.error || r.reason || BRIDGE.detail; }
-  else BRIDGE.state = 'confirming';
+  else if (BRIDGE.state === 'starting') BRIDGE.state = 'confirming';
 }
+
+// ===========================================================================
+// W2 FRONT-BEFORE-FUND — the wallet driver for a bridged SELL (taker sells the asset, receives BTC over
+// Lightning). The LSP fronts the taker's BTC-LN hold BEFORE the taker exposes any asset, so a declined or
+// undriven front strands NOTHING (the taker funds its asset only after it is guaranteed payment).
+//
+//   0. POST /swap {bridge:true, taker_seq_refund_pub}                (handshake; persist-before-broadcast)
+//   1. poll GET /swap/<id> -> learn H + maker asset-claim pub + T_seq (bridge_terms)
+//   2. register a HODL hold on H at our OWN BTC-LN node (recv_node_id) — nothing exposed yet
+//   3. POST /bridge/front (hold-ready) -> the LSP fronts as soon as its recoup is secured
+//   4. poll GET /swap/<id> until status 'fronted' AND our hold is 'accepted' (verified on OUR node)
+//   5. ONLY THEN fund our OWN asset HTLC self-custody (claim=maker-with-P, refund=us-after-T_seq)
+//   6. POST /bridge/asset -> the LSP relays it (it REJECTS unless already fronted)
+//   7. read P off the maker's on-chain claim (trustless), verify sha256(P)==H, settle our hold -> receive BTC
+//
+// Every step is idempotent + persisted, so a reload re-enters at the right step. Each internal poll is
+// bounded and returns to the re-drive scheduler, so long anchor-gated waits never block a single call.
+// ===========================================================================
 let _bridgePoll = null;
-function pollBridged(){
-  const ref = BRIDGE && (BRIDGE.poll || BRIDGE.job_id);
-  if (bridgeTerminal() || !(L && L.swapStatus) || !ref) return;
-  clearTimeout(_bridgePoll);
-  _bridgePoll = setTimeout(async () => {
-    if (bridgeTerminal()) return;
-    try { const r = await L.swapStatus(BRIDGE.poll || BRIDGE.job_id); applyBridgeStatus(r || {}); saveBridge();
-      if (BRIDGE.state === 'settled'){ try { C.toast('Bridged swap settled.'); } catch {} try { await C.sync(); } catch {} } } catch {}
-    if (!bridgeTerminal()) pollBridged();
-  }, 8000);
+let _bridgeDriving = false;
+const bsleep = (ms) => new Promise((r) => setTimeout(r, ms));
+// Pre-front budget: nothing of the taker's is committed before the front, so if the LSP never fronts
+// within this (the maker BTC HTLC never confirms, or the locktime gate refuses), give up NO-LOSS.
+const BRIDGE_FRONT_TIMEOUT_MS = 45 * 60 * 1000;
+
+async function driveBridged(){
+  if (!BRIDGE || bridgeTerminal() || _bridgeDriving) return;
+  if (!(L && L.swap && L.swapStatus)){ clearTimeout(_bridgePoll); _bridgePoll = setTimeout(driveBridged, 15000); return; }
+  _bridgeDriving = true;
+  try { await bridgedSteps(); }
+  catch (e){ if (BRIDGE && !bridgeTerminal()){ BRIDGE.detail = C.prettyErr(e); saveBridge(); } }
+  finally { _bridgeDriving = false; }
+  if (BRIDGE && bridgeTerminal()){
+    if (BRIDGE.state === 'settled'){ try { C.toast('Bridged swap settled · you received BTC over Lightning.'); } catch {} try { await C.sync(); } catch {} }
+  } else if (BRIDGE){
+    clearTimeout(_bridgePoll); _bridgePoll = setTimeout(driveBridged, 8000);   // self-heal a transient gap / advance a long wait
+  }
 }
-// Resume a persisted bridged take on load: re-POST with the SAME nonce (idempotent) when no job handle
-// was captured (a lost 202), else just re-poll. Never funds twice (the LSP dedupes the nonce).
+
+async function bridgedSteps(){
+  const b = BRIDGE, asset = b.asset;
+  const status = () => L.swapStatus(b.poll || b.job_id).catch(() => null);
+
+  // 0. Ensure the handshake job exists (nonce idempotency dedupes a lost 202 to ONE job — never a 2nd HTLC).
+  if (!b.job_id){
+    const r = await L.swap(bridgeSwapBody(b)); applyBridgeStatus(r || {}); saveBridge();
+    if (bridgeTerminal() || !b.job_id) return;
+  }
+
+  // 1. Learn H + the maker's asset-claim terms + T_seq from the LSP handshake (bridge_terms).
+  if (!b.hash_h){
+    for (let i = 0; i < 40 && !b.hash_h; i++){
+      const j = await status();
+      if (j && j.bridge_terms && j.bridge_terms.hash_h){
+        const t = j.bridge_terms;
+        b.hash_h = String(t.hash_h).toLowerCase(); b.maker_seq_claim_pub = t.maker_seq_claim_pub;
+        b.seq_locktime = Number(t.seq_locktime); b.seq_amount = String(t.seq_amount ?? b.asset_atoms);
+        b.btc_amount = String(t.btc_amount ?? b.btc_sats); b.btc_htlc_txid = t.btc_htlc_txid || null;
+        // W2 HOLD-LIFE vs T_seq — the LSP sized (and bounded) how long our BTC-LN hold must stay settleable
+        // (hold_expiry_secs) and how much CLTV runway the front HTLC needs (hold_min_final_cltv), from T_seq +
+        // the live seq tip. We mint the hold with that expiry (step 2) and hand the CLTV to /bridge/front (step
+        // 3) so our hold cannot lapse before the maker's latest asset claim (which would strand us — dead hold,
+        // asset gone). seq_tip is the tip these were sized against.
+        b.hold_expiry_secs = Number(t.hold_expiry_secs) || 0; b.hold_min_final_cltv = Number(t.hold_min_final_cltv) || 0;
+        b.seq_tip = Number(t.seq_tip) || 0;
+        b.state = 'confirming'; saveBridge(); break;
+      }
+      if (j && (j.status === 'failed' || (j.bridgeHandshake && j.bridgeHandshake.ok === false))){
+        b.state = 'failed'; b.detail = (j.bridgeHandshake && j.bridgeHandshake.error) || j.error || 'the maker handshake failed'; saveBridge(); return;
+      }
+      await bsleep(3000);
+    }
+    if (!b.hash_h) return;   // still confirming -> the scheduler re-enters
+  }
+
+  // 2. Register a HODL hold on H at our OWN BTC-LN node so the LSP's front lands HELD; capture recv_node_id.
+  //    Nothing of ours is exposed by this (an unused hold just expires). Bring the BTC node online + best-
+  //    effort inbound first (we RECEIVE BTC over Lightning).
+  if (!b.recv_node_id){
+    // FUND-SAFETY (hold-life vs T_seq): mint the hold with an expiry that keeps it SETTLEABLE until strictly
+    // AFTER the maker's latest possible asset claim (T_seq) + reorg/settle margin. The LSP sized + bounded this
+    // from T_seq at handshake (bridge_terms.hold_expiry_secs). If it is absent or non-positive we have no safe
+    // hold life -> FAIL CLOSED (nothing of ours is exposed yet: an under-sized hold would let the maker wait
+    // for it to lapse, then reveal P and take the asset while our dead hold collects nothing).
+    if (!(Number(b.hold_expiry_secs) > 0)){ b.state = 'failed'; b.detail = 'The service did not size your Bitcoin hold to the swap timeout · your asset was NOT exposed and nothing was committed. Try again shortly.'; saveBridge(); return; }
+    if (L.connectBtcNode){ const prov = await L.connectBtcNode(); if (!(prov && prov.connected)) throw new Error('Could not bring your Bitcoin Lightning node online · reopen the wallet and try again.'); }
+    if (L.channelInbound){ try { await L.channelInbound({ node_key: b.btc_node_key, amount: Number(b.btc_amount) }); } catch {} }
+    const inv = await L.nodeInvoice({ node_key: b.btc_node_key, amount: Number(b.btc_amount), payment_hash: b.hash_h, expiry: Math.ceil(Number(b.hold_expiry_secs)) });
+    if (!(inv && inv.node_id)) throw new Error('Could not register the Bitcoin Lightning hold invoice on your node.');
+    b.recv_node_id = inv.node_id; saveBridge();
+  }
+
+  // 3. Arm the LSP front (hold-ready). Idempotent — a re-post just re-affirms the node id. Hand the front HTLC
+  //    min-final-CLTV so the CLTV carrying the LSP's payment also spans the hold life to T_seq (FIX 1/3).
+  if (!b.front_armed){
+    const r = await L.bridgeFront({ job_id: b.job_id, recv_node_id: b.recv_node_id, recv_min_final_cltv: Number(b.hold_min_final_cltv) || undefined });
+    if (!(r && r.ok)) throw new Error('The service refused to arm the front: ' + ((r && r.error) || 'unknown'));
+    b.front_armed = true; saveBridge();
+  }
+
+  // 4. WAIT for the LSP to actually front: status 'fronted' AND our OWN hold is 'accepted' (we verify on our
+  //    node, never trusting the status alone). Only when BOTH hold do we expose the asset. Pre-front budget:
+  //    if it never fronts (maker BTC HTLC never confirms / locktime gate refuses), give up NO-LOSS.
+  if (!b.fronted){
+    for (let i = 0; i < 40 && !b.fronted; i++){
+      const j = await status();
+      if (j && (j.status === 'settled' || j.settled)){ b.fronted = true; b.state = 'fronted'; saveBridge(); break; }
+      if (j && j.status === 'failed'){ b.state = 'failed'; b.detail = j.error || 'the front failed'; saveBridge(); return; }
+      const fronted = j && (j.status === 'fronted');
+      let held = false;
+      try { const s = await L.invoiceStatus({ node_key: b.btc_node_key, payment_hash: b.hash_h }); held = !!(s && (s.held || s.settled)); } catch {}
+      if (fronted && held){ b.fronted = true; b.state = 'fronted'; saveBridge(); break; }
+      if (Date.now() - (b.started_ms || 0) > BRIDGE_FRONT_TIMEOUT_MS){ b.state = 'failed'; b.detail = 'the service did not front your Bitcoin in time · nothing was committed, nothing lost. Try again shortly.'; saveBridge(); return; }
+      await bsleep(3000);
+    }
+    if (!b.fronted) return;   // not fronted yet -> the scheduler re-enters (still within budget)
+  }
+
+  // 4.5 FUND-SAFETY — verify the ACTUAL committed front HTLC CLTV covers T_seq (never trust the value we
+  //     REQUESTED). The LSP routes our front by BARE HASH; getroute may commit a SHORTER final CLTV than we
+  //     asked for (route ceilings / intermediate policy). Before exposing ANY asset, read the real incoming
+  //     hold-HTLC expiry (block height) off OUR OWN node (via the LSP's invoice-status, which surfaces it from
+  //     listhtlcs) and require its wall-clock runway to reach past the maker's LATEST asset claim (T_seq) +
+  //     reorg/settle margin. If it is short (or unreadable), FAIL CLOSED — nothing of ours is exposed yet, so
+  //     refusing is no-loss; an under-covered front would let the maker wait for it to lapse then claim our
+  //     asset (dead hold, asset gone). The independent requirement is sized here from T_seq with the SAME
+  //     constants leg-bridge.js HOLD_LIFE_DEFAULTS uses (seq 90s/block slow, front 150s/block FAST, reorg 2h,
+  //     settle 30m, +6 CLTV margin), and we also demand at least the LSP-committed hold_min_final_cltv.
+  if (!b.front_cltv_ok){
+    let s = null; try { s = await L.invoiceStatus({ node_key: b.btc_node_key, payment_hash: b.hash_h }); } catch {}
+    const inCltv = Number(s && s.htlc_expiry), btcTip = Number(s && s.btc_tip);
+    if (!(Number.isFinite(inCltv) && Number.isFinite(btcTip))){
+      b.state = 'failed'; b.detail = 'Could not read the committed Bitcoin front runway on your node · your asset was NOT exposed and nothing was committed. Try again shortly.'; saveBridge(); return;
+    }
+    const actualCltvBlocks = inCltv - btcTip;
+    // Independent requirement from T_seq (a stale handshake tip only makes the window LARGER = more conservative);
+    // if the tip is somehow absent, fall back to the LSP-committed hold_min_final_cltv (still an actual-vs-committed
+    // check, never blind trust). We demand the MAX of our own sizing and the LSP's committed runway.
+    const haveTip = Number(b.seq_tip) > 0;
+    const seqBlocks = haveTip ? Math.max(0, Number(b.seq_locktime) - Number(b.seq_tip)) : 0;
+    const requiredSecs = seqBlocks * 90 + 7200 + 1800;   // HOLD_LIFE_DEFAULTS: seq 90s/block, reorg 2h, settle 30m
+    const requiredBlocks = Math.max(haveTip ? Math.ceil(requiredSecs / 150) + 6 : 0, Number(b.hold_min_final_cltv) || 0);
+    if (!(requiredBlocks > 0) || !(actualCltvBlocks >= requiredBlocks)){
+      b.state = 'failed'; b.detail = 'The Bitcoin the service fronted expires too soon to cover the swap timeout · your asset was NOT exposed and nothing was committed. Try again shortly.'; saveBridge(); return;
+    }
+    b.front_cltv_ok = true; saveBridge();
+  }
+
+  // 5. NOW fund our OWN asset HTLC self-custody (claim=maker-with-P, refund=us-after-T_seq) — the asset is
+  //    exposed only AFTER the front, so a failure here strands nothing beyond a refundable-at-T_seq HTLC.
+  if (!(b.seq_leg && b.seq_leg.txid)){
+    await fundBridgedAssetLeg();
+    if (!(b.seq_leg && b.seq_leg.txid)) return;
+  }
+
+  // 6. Hand the FUNDED asset leg to the LSP -> it relays to the maker (it REJECTS unless already fronted).
+  if (!b.relayed){
+    const r = await L.bridgeAsset({ job_id: b.job_id, recv_node_id: b.recv_node_id,
+      taker_seq_leg: { txid: b.seq_leg.txid, vout: b.seq_leg.vout, amount: b.seq_leg.amount,
+        redeem_script: b.seq_leg.redeem_script, locktime: b.seq_locktime, asset, block_hash: b.seq_leg.block_hash || null } });
+    if (!(r && r.ok)) throw new Error('The service refused to relay your asset: ' + ((r && r.error) || 'unknown'));
+    b.relayed = true; b.state = 'relaying'; saveBridge();
+  }
+
+  // 7. Settle: read P off the maker's on-chain claim (trustless), verify sha256(P)==H, settle our hold ->
+  //    receive the BTC over Lightning. P is also surfaced by the LSP (public_preimage) as a fallback.
+  await settleBridged();
+}
+
+// Fund the asset HTLC (claim=maker-with-P, refund=us-after-T_seq) — the SAME construction the native
+// cross-chain reverse flow (xrswap.js/fundSeq) uses (C.seqLeg + buildSeqHtlcRedeemScript). Persist-before-
+// broadcast: the redeem + refund key are persisted BEFORE the funding tx, so a lost broadcast never strands
+// the asset (findFundingByAddress recovers the outpoint on the next drive).
+async function fundBridgedAssetLeg(){
+  const b = BRIDGE;
+  if (!(C.seqLeg && C.seqLeg.fund && C.seqLeg.waitConf && C.seqLeg.findFundingByAddress && C.wasm && C.wasm.buildSeqHtlcRedeemScript))
+    throw new Error('The Sequentia HTLC service is unavailable in this build.');
+  if (!b.taker_seq_refund_pub){ const rk = C.seqLeg.refundKey(); b.taker_seq_refund_pub = rk.public_key; b.taker_seq_refund_secret = rk.secret_hex; saveBridge(); }
+  const redeem = C.wasm.buildSeqHtlcRedeemScript(b.hash_h, b.maker_seq_claim_pub, b.taker_seq_refund_pub, b.seq_locktime);
+  b.seq_redeem = redeem; b.state = 'funding_asset'; saveBridge();   // persist reclaim material BEFORE broadcasting
+  let txid = b.seq_fund_txid;
+  if (!txid){
+    const found = await C.seqLeg.findFundingByAddress(redeem).catch(() => null);   // strand-recovery for a lost broadcast
+    txid = (found && found.txid) ? found.txid : (await C.seqLeg.fund(redeem, b.asset, BigInt(b.seq_amount))).txid;
+    b.seq_fund_txid = txid; saveBridge();
+  }
+  const conf = await C.seqLeg.waitConf(txid, redeem);
+  b.seq_leg = { txid, vout: conf.vout, redeem_script: redeem, amount: String(b.seq_amount),
+    asset_id: b.asset, block_hash: conf.block_hash, height: conf.height };
+  b.state = 'asset_funded'; saveBridge();
+}
+
+// Read P (trustless, off the maker's on-chain claim; LSP public_preimage as a fallback), verify sha256(P)==H,
+// then settle our already-fronted hold with P -> we receive the BTC over Lightning. Bounded per call; the
+// scheduler re-enters for the anchor-gated wait. On a resume where the LSP already recouped, short-circuit.
+async function settleBridged(){
+  const b = BRIDGE;
+  if (b.state === 'relaying' || b.state === 'asset_funded') { b.state = 'settling'; saveBridge(); }
+  const wantH = String(b.hash_h).toLowerCase();
+  if (!b.preimage){
+    for (let i = 0; i < 24 && !b.preimage; i++){
+      const j = await L.swapStatus(b.poll || b.job_id).catch(() => null);
+      if (j && (j.status === 'settled' || j.settled)){ /* the LSP recouped; still settle our hold below if needed */ }
+      // Trustless: read P off our asset HTLC's on-chain spend (the maker's claim).
+      let p = null;
+      try { if (C.seqLeg.readSpendPreimage && b.seq_leg) p = await C.seqLeg.readSpendPreimage(b.seq_leg.txid, b.seq_leg.vout, wantH); } catch {}
+      // Fallback: the LSP surfaces the on-chain-public P.
+      if (!p && j){ const cand = j.public_preimage || j.relay_preimage || j.preimage; if (cand && await sha256HexHex(cand) === wantH) p = String(cand).toLowerCase(); }
+      if (p && await sha256HexHex(p) === wantH){ b.preimage = String(p).toLowerCase(); saveBridge(); break; }
+      await bsleep(5000);
+    }
+    if (!b.preimage) return;   // the maker has not claimed yet -> the scheduler re-enters
+  }
+  // Settle our BTC-LN hold with P (idempotent; a re-settle on an already-settled hold is a no-op) -> BTC in.
+  try { await L.nodeSettle({ node_key: b.btc_node_key, payment_hash: b.hash_h, preimage: b.preimage }); } catch {}
+  // Confirm receipt: our hold reads 'settled' (WE got the BTC). The LSP's own recoup is its concern, not ours.
+  try { const s = await L.invoiceStatus({ node_key: b.btc_node_key, payment_hash: b.hash_h }); if (s && s.settled){ b.state = 'settled'; saveBridge(); return; } } catch {}
+  const j = await L.swapStatus(b.poll || b.job_id).catch(() => null);
+  if (j && (j.status === 'settled' || j.settled)){ b.state = 'settled'; saveBridge(); return; }
+  // We have P and issued the settle; treat as settled (we hold P and the BTC HTLC is ours to collect).
+  b.state = 'settled'; saveBridge();
+}
+
+// sha256 over a hex string -> hex (browser subtle crypto). Used to verify sha256(P)==H before settling.
+async function sha256HexHex(hex){
+  if (!/^[0-9a-fA-F]+$/.test(String(hex || '')) || String(hex).length % 2) return '';
+  const bytes = new Uint8Array(String(hex).match(/.{2}/g).map((x) => parseInt(x, 16)));
+  const d = await crypto.subtle.digest('SHA-256', bytes);
+  return [...new Uint8Array(d)].map((x) => x.toString(16).padStart(2, '0')).join('');
+}
+
+// Resume a persisted bridged take on load: re-enter the driver, which re-derives the current step from the
+// persisted BRIDGE and continues (re-POST is nonce-idempotent; every value-move step is guarded). Never
+// funds twice; never re-exposes an asset before the front.
 export async function resumeBridged(){
   if (!BRIDGE || bridgeTerminal()) return;
-  if (!(BRIDGE.poll || BRIDGE.job_id) && L && L.swap){
-    try { const r = await L.swap(bridgeSwapBody(BRIDGE)); applyBridgeStatus(r || {}); saveBridge(); } catch {}
-  }
-  if (!bridgeTerminal()) pollBridged();
+  driveBridged();
 }
 
 async function onReview(){

@@ -322,22 +322,37 @@ export function bridgeAssetHandoffAdmissible(job) {
   return !!(job && job._driverLive === true && job._bridgeSession);
 }
 
+// W2 — FRONT-BEFORE-FUND admission. The reordered (fund-safe) flow fronts the taker's BTC-LN hold BEFORE the
+// taker exposes its asset, so /bridge/asset must REJECT any asset hand-off that arrives BEFORE the front is
+// confirmed — otherwise a taker could fund + relay its asset (exposing it to the maker's P-claim) while the
+// LSP has not yet paid, reintroducing the exact hole this fixes (asset gone, no incoming LN = taker loss).
+// "Fronted" == the LSP's pay on H is committed toward the taker's hold (job.legState.btc.frontHeld) or the
+// front has already settled (frontPreimage learned). Absent both -> not fronted -> refuse the relay (fail
+// closed; the taker has funded nothing it cannot refund). Pure; shared by the handler and its test.
+export function bridgeFrontConfirmed(job) {
+  const sb = job && job.legState && job.legState.btc;
+  if (!sb) return false;
+  if (sb.frontHeld === true) return true;
+  return typeof sb.frontPreimage === 'string' && /^[0-9a-f]{64}$/i.test(sb.frontPreimage);
+}
+
 // W2(a) — the RELAY-time LOCKTIME verdict for /bridge/asset. The taker's asset leg becomes EXPOSED to the
 // maker's claim the INSTANT it is relayed (the maker can then claim it with P and reveal P; the taker can
-// no longer be protected by anything but its own T_seq asset refund). So the SAME wall-clock locktime
+// no longer be protected by anything but its own T_seq asset refund). So the SAME block-based locktime
 // ordering the front enforces MUST also gate the relay — and against LIVE tips, because a short T_btc may
 // have DRIFTED into the danger window since the handshake gate passed. This reads the two CLTV refund
 // heights from the SAME job fields the front-time gate uses (the maker BTC HTLC's CLTV; the taker asset
-// HTLC's refund height T_seq) and defers the wall-clock decision to checkBridgeLocktimeOrdering against the
-// LIVE btc + seq tips the handler just read. A refusal => DO NOT relay (fail closed): the taker keeps its
-// asset and refunds at T_seq. Pure (the handler does the I/O of reading tips); shared with its test. An
-// unreadable tip arrives here as NaN and the gate fails closed — never relay on an unverifiable ordering.
-export function bridgeAssetRelayLocktimeVerdict({ job, btcTip, seqTip, holdInvoiceLifeSecs, cfg } = {}) {
+// HTLC's refund height T_seq) and defers the decision to checkBridgeLocktimeOrdering against the LIVE btc +
+// seq tips the handler just read — one BTC-time assumption, requiredTakerBlocks vs recoupDeadlineBlocks. A
+// refusal => DO NOT relay (fail closed): the taker keeps its asset and refunds at T_seq. Pure (the handler
+// does the I/O of reading tips); shared with its test. An unreadable tip arrives here as NaN and the gate
+// fails closed — never relay on an unverifiable ordering.
+export function bridgeAssetRelayLocktimeVerdict({ job, btcTip, seqTip, cfg } = {}) {
   const sbHtlc = (job && job.legState && job.legState.btc && job.legState.btc.htlc) || {};
   const saState = (job && job.legState && job.legState.asset) || {};
   const btcRefundHeight = Number(sbHtlc.cltv);
   const seqRefundHeight = Number(saState.seqLocktime ?? (job && job.bridge_terms && job.bridge_terms.seq_locktime));
-  return checkBridgeLocktimeOrdering({ btcTip, btcRefundHeight, seqTip, seqRefundHeight, holdInvoiceLifeSecs, cfg });
+  return checkBridgeLocktimeOrdering({ btcTip, btcRefundHeight, seqTip, seqRefundHeight, cfg });
 }
 
 // W3(c) — a ln/ln take is the UNCHANGED pure-LN route ONLY when it is NOT a bridged take. A genuine

@@ -94,8 +94,8 @@ import { makeProvisioner } from './provision.mjs';
 import { acceptUpgrade, bridgeWsToTcp } from './ws-bridge.mjs';
 import { settlementPlanForSide, planExecutionName, planSettlement } from './settlement-router.mjs';
 import { buildUnifiedBook } from './unified-book.mjs';
-import { runBridgedSwap, matchFromTake, describeBridge, classifyLegs, takeRailsCrossed, bridgeAssetHandoffAdmissible, bridgeAssetRelayLocktimeVerdict, isPureLnTake, crossingShapeSupported, describeCrossingSupport } from './bridge-driver.mjs';
-import { checkBridgeLocktimeOrdering } from './leg-bridge.mjs';
+import { runBridgedSwap, matchFromTake, describeBridge, classifyLegs, takeRailsCrossed, bridgeAssetHandoffAdmissible, bridgeAssetRelayLocktimeVerdict, bridgeFrontConfirmed, isPureLnTake, crossingShapeSupported, describeCrossingSupport } from './bridge-driver.mjs';
+import { checkBridgeLocktimeOrdering, requiredTakerHold, frontHtlcMintTarget, verifyFrontRouteExpiry } from './leg-bridge.mjs';
 import { runReverseBridgeTerms, openReverseBridgeSession, newBridgeClaimKeypair, relayTakerAssetLeg } from './bridge-maker.mjs';
 import { hashPreimageOk, subasSellStateFileForNonce, subasSellGuardVerdict, assembleSubasSellSettled } from './subas-sell-recovery.mjs';
 
@@ -1719,12 +1719,18 @@ function makeBridgeIo({ match, body, job }) {
     observe: async (leg) => {
       const s = st(leg.unit) || {};
       let ln = { registered: false, held: false, settled: false, preimage: null, expiryBlocks: s.lnExpiryBlocks };
+      let recvReady;
       if (leg.lnSide === 'receiver') {
         // RECEIVER leg: the LSP PAYS the taker's hold on H out of its OWN node. The LN state is that
         // outgoing pay, captured by frontLn (a successful pay to a hold invoice returns P once the taker
         // settles). There is no hold at the LSP to look up, and the taker's node is self-custody.
         ln = { registered: !!s.frontAttempted, held: false, settled: !!s.frontPreimage,
           preimage: s.frontPreimage || null, expiryBlocks: s.lnExpiryBlocks };
+        // W2 FRONT-BEFORE-FUND — the front is gated on the taker being HOLD-READY: it has registered its
+        // BTC-LN hold on H and handed its recv_node_id (via POST /bridge/front), recorded as s.recvNodeId.
+        // Until then recvReady:false withholds the front in nextBridgeStep (no-loss; nothing paid into a
+        // void hold). frontLn itself also fails closed without recvNodeId — this just avoids the spin.
+        recvReady = !!s.recvNodeId;
       } else if (s.lnRpc && s.hashH) {
         // PAYER leg: the LSP HOLDS the taker's incoming LN on H at its own node -> holdinvoicelookup.
         try {
@@ -1768,6 +1774,9 @@ function makeBridgeIo({ match, body, job }) {
         let seqTip = NaN;
         try { const so = await xhtlcObserve({ rpc: CFG.seqRpc, txid: '0'.repeat(64), vout: 0 }); seqTip = Number(so && so.tip); }
         catch { /* seq node momentarily unreadable -> seqTip stays NaN -> the gate fails closed (no front) */ }
+        // FRONT-TIME re-check (against the live BTC + seq tips) — the gate derives the taker's required front-HTLC
+        // survival from T_seq itself (requiredTakerHold), so a BTC tip that drifted toward a short/self-traded
+        // T_btc now fails closed at front time too (not just handshake). Just the two cross-leg heights are needed.
         crossLock = { seqTip, seqRefundHeight };
         // W2(b) — surface a top-level PUBLIC preimage P so the front-time locktime gate can ALLOW a front that
         // is IMMEDIATELY recoupable (P known, recoup HTLC still unspent -> front + claim, zero exposure) rather
@@ -1784,8 +1793,14 @@ function makeBridgeIo({ match, body, job }) {
             if (ao && ao.preimage && /^[0-9a-f]{64}$/i.test(ao.preimage)) publicP = String(ao.preimage).toLowerCase();
           } catch { /* asset-leg observe hiccup -> no public P this tick -> gate stays fail-closed */ }
         }
+        // W2 taker-liveness: surface the PUBLIC preimage (the maker's on-chain asset claim, or its courtesy
+        // reveal) on the job so GET /swap/<id> hands P to the TAKER. P is on-chain-public once the maker
+        // claims, so this leaks nothing — it just lets the taker settle its already-fronted hold even when a
+        // non-cooperative maker skips the courtesy reveal. Persist once; the taker verifies sha256(P)==H itself.
+        if (publicP && job.public_preimage !== publicP) { job.public_preimage = publicP; persistJobs(); }
       }
-      return crossLock ? { tip, onchain, ln, crossLock, ...(publicP ? { preimage: publicP } : {}) } : { tip, onchain, ln };
+      const base = (recvReady !== undefined) ? { tip, onchain, ln, recvReady } : { tip, onchain, ln };
+      return crossLock ? { ...base, crossLock, ...(publicP ? { preimage: publicP } : {}) } : base;
     },
 
     // --- value-moving actions: compose the EXISTING primitives; FAIL CLOSED on missing handshake data ---
@@ -1796,6 +1811,12 @@ function makeBridgeIo({ match, body, job }) {
       s.frontAttempted = true; persistJobs();
       const amtMsat = s.amountSat * 1000;
       const adoptP = (p) => { if (p && /^[0-9a-f]{64}$/i.test(String(p))) { s.frontPreimage = String(p).toLowerCase(); persistJobs(); return true; } return false; };
+      // W2 FRONT-BEFORE-FUND — mark the front CONFIRMED (committed toward the taker's hold on H) so the
+      // taker can learn it (GET /swap/<id> status 'fronted') and ONLY THEN fund + relay its asset. This is
+      // the gate /bridge/asset checks (bridgeFrontConfirmed): the taker never exposes its asset before the
+      // LSP has actually paid. Set on any live/settled pay on H — a committed sendpay, an adopted prior
+      // pending pay, or an already-complete one. Idempotent; persisted before waitsendpay blocks.
+      const markFronted = () => { if (s.frontHeld !== true) { s.frontHeld = true; if (job.status === 'confirming') job.status = 'fronted'; persistJobs(); } };
       // FUND-SAFETY (idempotent front across a resume — review Finding 5): observe reports ln.held:false for
       // this receiver leg, so the state machine relies on the in-process waitsendpay below. On a restart
       // mid-front (frontAttempted persisted, frontPreimage not yet), re-entering here must NOT issue a
@@ -1804,15 +1825,69 @@ function makeBridgeIo({ match, body, job }) {
       // so waitsendpay blocks for the taker to settle it. Only a genuine no-pay funds a fresh sendpay.
       // paymentStatusForHash THROWS if the node is unreadable, so we never re-pay on an uncertain "no pay".
       const prior = await paymentStatusForHash(lspRpc, s.hashH);
-      if (prior.preimage) { adoptP(prior.preimage); return; }
-      if (prior.pending) { const w = await lnrpc('waitsendpay', [String(s.hashH)], lspRpc, CFG.mixedTimeoutMs); adoptP(w && (w.payment_preimage || w.preimage)); return; }
+      if (prior.preimage) { markFronted(); adoptP(prior.preimage); return; }
+      if (prior.pending) { markFronted(); const w = await lnrpc('waitsendpay', [String(s.hashH)], lspRpc, CFG.mixedTimeoutMs); adoptP(w && (w.payment_preimage || w.preimage)); return; }
+      // W1-MINT — COUPLE the front HTLC's minted expiry to an ABSOLUTE Bitcoin height at PAY time, NOT the stale
+      // handshake delta. getroute's final-cltv is a DELTA from the PAY-time tip, so minting with the
+      // handshake-sized s.frontMinFinalCltv would land the incoming HTLC's absolute expiry at payTip + staleDelta,
+      // which FLOATS UP as the BTC tip advances between handshake and pay: it could OVERSHOOT T_btc - claimMargin
+      // (the maker refunds its BTC before the LSP recoups with P = full-front loss) or, if stale-short, die before
+      // T_seq (the maker waits it out, then reveals P = taker's dead hold, asset gone). So re-read the LIVE BTC +
+      // SEQ tips HERE and compute the mint target fresh: frontHtlcMintTarget pins the absolute expiry to
+      // H = T_btc - claimMargin (LSP always recoups) and returns the getroute DELTA = H - payTip so the minted
+      // expiry == H EXACTLY, independent of later drift. It re-runs the SAME locktime gate at the live tip
+      // (gated == minted by construction) and FAILS CLOSED if T_btc has drifted so the window is empty (H no
+      // longer covers T_seq under conservative-fast BTC). Fail closed = no front; in FRONT-BEFORE-FUND the taker
+      // has exposed nothing, so it is a no-loss terminal (falls back to native). s.frontMinFinalCltv stays an
+      // EARLY handshake reject only — it is NEVER the minted value now. The taker independently re-verifies the
+      // ACTUAL minted incoming-HTLC expiry against T_seq (swap.js step-4.5 via listhtlcs), backstopping this.
+      const seqLegForMint = st('asset') || {};
+      const tSeqForMint = Number(seqLegForMint.seqLocktime ?? (job.bridge_terms && job.bridge_terms.seq_locktime));
+      const tBtcForMint = Number(s.htlc && s.htlc.cltv);
+      let payBtcTip = NaN, paySeqTip = NaN;
+      try { const bo = await xhtlcObserve({ rpc: CFG.subasBtcRpc, wallet: CFG.subasBtcWallet, txid: s.htlc.txid, vout: s.htlc.vout }); payBtcTip = Number(bo && bo.tip); } catch { /* unreadable BTC tip -> NaN -> mint target fails closed (no front) */ }
+      try { const so = await xhtlcObserve({ rpc: CFG.seqRpc, txid: '0'.repeat(64), vout: 0 }); paySeqTip = Number(so && so.tip); } catch { /* unreadable SEQ tip -> NaN -> mint target fails closed (no front) */ }
+      const mint = frontHtlcMintTarget({ btcTip: payBtcTip, btcRefundHeight: tBtcForMint, seqTip: paySeqTip, seqRefundHeight: tSeqForMint });
+      if (!mint.ok) throw new Error(`front-ln blocked (fail closed, no LN fronted): ${mint.reason}`);
+      // VERIFY-NOT-TRUST the ACTUAL committed final-hop CLTV — never the intended delta. frontHtlcMintTarget
+      // pins the INTENDED absolute expiry to H = T_btc - claimMargin, but it computed its delta against
+      // BITCOIND's tip (payBtcTip). getroute/sendpay run on the CLN node and commit the final-hop HTLC's
+      // absolute expiry as (the CLN node's OWN blockheight) + (the route's final-hop delay). Two ways the
+      // ACTUAL minted expiry drifts off H even after a clean mint: (i) CHAIN-VIEW SKEW — if CLN's height leads
+      // bitcoind's by δ, a delta off payBtcTip lands the real expiry at H + δ, which for δ>0 overshoots
+      // T_btc - claimMargin so the LSP can't recoup (a maker/self-trader waits past T_btc, refunds its BTC,
+      // THEN settles the still-live front with P = full-front loss); (ii) ROUTE PADDING — getroute may pad the
+      // final delay (shadow-routing / recipient min_final_cltv) above what we asked, independently overshooting.
+      // FIX: (1) base the getroute DELTA on CLN's OWN blockheight (the value it adds the final delay to), so a
+      // clean route lands the ACTUAL expiry at H in CLN's view irrespective of δ; (2) AFTER getroute, BEFORE
+      // sendpay, re-derive the ACTUAL absolute expiry from CLN's OWN tip + the route's OWN final-hop delay and
+      // require it inside [T_seq cover, T_btc - claimMargin] (verifyFrontRouteExpiry) — fail closed on any
+      // overshoot. Front-before-fund => a fail-closed here exposes nothing (native fallback). The taker
+      // independently verifies the ACTUAL LOWER bound via listhtlcs (swap.js step-4.5); this is the LSP-side
+      // ACTUAL UPPER bound, so the minted HTLC is verified on BOTH bounds off ACTUAL values by the party each protects.
+      let clnBlockheight = NaN;
+      try { const gi = await lnrpc('getinfo', [], lspRpc, SIGNER_RPC_TIMEOUT_MS); clnBlockheight = Number(gi && gi.blockheight); } catch { /* unreadable CLN tip -> NaN -> fails closed just below */ }
+      if (!Number.isFinite(clnBlockheight)) throw new Error('front-ln blocked (fail closed, no LN fronted): the CLN node blockheight is unreadable — cannot verify the actual committed front-HTLC expiry');
+      // The getroute DELTA that lands the ACTUAL absolute expiry at H in the CLN node's OWN view (the base
+      // getroute adds the final delay to), NOT bitcoind's — so chain-view skew δ cannot float the real expiry.
+      const finalCltv = mint.absoluteExpiryHeight - clnBlockheight;
+      if (!Number.isFinite(finalCltv) || finalCltv <= 0) throw new Error(`front-ln blocked (fail closed, no LN fronted): degenerate final-CLTV delta ${finalCltv} (H ${mint.absoluteExpiryHeight} <= CLN tip ${clnBlockheight})`);
       // The seqln holdinvoice has NO bolt11 — pay it by BARE HASH: route to the taker's node, sendpay keyed
       // on H, and waitsendpay BLOCKS until the taker settles the hold with P and returns it. That returned P
       // is exactly how the LSP learns the preimage to recoup — and, being a hold, the payment stays in-flight
       // (the taker paid nothing until it settles), so this is a true front, not a fire-and-forget.
-      const route = await lnrpc('getroute', [String(s.recvNodeId), String(amtMsat), '10'], lspRpc, SIGNER_RPC_TIMEOUT_MS);
+      const route = await lnrpc('getroute', [String(s.recvNodeId), String(amtMsat), '10', String(finalCltv)], lspRpc, SIGNER_RPC_TIMEOUT_MS);
       if (!route || !Array.isArray(route.route) || !route.route.length) throw new Error('front-ln: no route to the taker node — fail closed');
+      // Re-read the ACTUAL final-hop CLTV the route WILL commit (its own last-hop delay) and verify it against
+      // reality on BOTH bounds BEFORE any value moves. This — not the intended delta — is what actually bounds
+      // the LSP's recoup and the taker's hold; a skew/padding overshoot fails closed here, no LN fronted.
+      const actualDelay = Number(route.route[route.route.length - 1] && route.route[route.route.length - 1].delay);
+      const routeCheck = verifyFrontRouteExpiry({ clnBlockheight, actualDelay, tSeqCoverHeight: mint.tSeqCoverHeight, absoluteExpiryHeight: mint.absoluteExpiryHeight });
+      if (!routeCheck.ok) throw new Error(`front-ln blocked (fail closed, no LN fronted): ${routeCheck.reason}`);
       await lnrpc('sendpay', [JSON.stringify(route.route), String(s.hashH)], lspRpc, SIGNER_RPC_TIMEOUT_MS);
+      // sendpay has committed the HTLC toward the taker's hold (it now shows as pending) — the front is live.
+      // Mark it CONFIRMED before waitsendpay blocks, so the taker sees 'fronted' and may safely fund its asset.
+      markFronted();
       const w = await lnrpc('waitsendpay', [String(s.hashH)], lspRpc, CFG.mixedTimeoutMs);
       adoptP(w && (w.payment_preimage || w.preimage));
     },
@@ -1994,6 +2069,10 @@ async function prepareBridgeLegs({ match, body, job }) {
       persistJobs();
       return plan;
     }
+    // The gate sizes the taker's required front-HTLC survival from T_seq itself (requiredTakerHold, one BTC-time
+    // assumption) and demands the maker's T_btc give at least that many BTC blocks of recoup runway; a short or
+    // self-traded T_btc (or a collapsed/too-far T_seq) fails closed here. The honest fleet with a SHORT T_btc is
+    // correctly REFUSED and the wallet falls back to native — that is the fund-safe-by-construction behaviour.
     const gate = checkBridgeLocktimeOrdering({
       btcTip, btcRefundHeight: Number(sb.htlc.cltv),
       seqTip, seqRefundHeight: Number(hs.seqLocktime),
@@ -2008,10 +2087,41 @@ async function prepareBridgeLegs({ match, body, job }) {
       return plan;
     }
 
+    // W2 — HOLD-LIFE vs T_seq. The taker's BTC-LN hold must stay SETTLEABLE until strictly AFTER the maker's
+    // latest possible asset claim (T_seq wall-clock) + reorg/settle margin — else an adversarial maker WAITS
+    // for a short hold to lapse, THEN claims the taker's asset (reveals P): the taker's dead hold collects
+    // nothing while its asset is gone (full asset loss). Two guards, both fail-closed (nothing fronted yet):
+    //   FIX 2 — BOUND T_seq: refuse a maker whose T_seq is unreasonably far from the live seq tip, so the
+    //     taker's hold AND the LSP's fronted-funds lock are bounded to a sane maximum (a few hours of blocks).
+    //   Publish the required hold expiry + the front HTLC's min-final-CLTV (sized from T_seq + the live seq
+    //     tip) so the taker mints a hold that outlives T_seq and the LSP routes its front (frontLn getroute)
+    //     with an HTLC that cannot lapse before the maker's latest claim. requiredTakerHold enforces BOTH the
+    //     bound and the LN max-CLTV feasibility; either failing => fail closed here (never front).
+    const holdReq = requiredTakerHold({ seqTip, seqRefundHeight: Number(hs.seqLocktime) });
+    if (!holdReq.ok) {
+      try { session && session.close(); } catch {}
+      job._bridgeSession = null;
+      if (job.legState.btc) delete job.legState.btc.verifiedClaimLsp;
+      job.bridgeHandshake = { ok: false, error: `hold-life vs T_seq refused (nothing fronted): ${holdReq.reason}` };
+      persistJobs();
+      console.error('[bridge] hold-life vs T_seq REFUSED:', holdReq.reason);
+      return plan;
+    }
+    // EARLY handshake reject only: requiredTakerHold above already failed closed (holdReq.ok) if T_seq is
+    // out of bound or the required CLTV exceeds the LN maximum. frontMinFinalCltv is recorded for diagnostics
+    // and the taker's own hold sizing (via bridge_terms.hold_min_final_cltv), but is NO LONGER the minted
+    // value — frontLn re-derives the mint target from the LIVE tips (frontHtlcMintTarget), pinning the front
+    // HTLC's absolute expiry to T_btc - claimMargin, so no stale handshake delta can drift the minted expiry.
+    sb.frontMinFinalCltv = holdReq.minFinalCltvBlocks;
+
     job._bridgeSession = session;            // kept alive so the taker's funded asset leg can be relayed in
     job.bridge_terms = { hash_h: hs.hashHex, maker_seq_claim_pub: hs.makerSeqClaimPubHex,
       seq_locktime: hs.seqLocktime, seq_amount: hs.seqAmount, btc_amount: hs.btcAmount,
-      btc_htlc_txid: hs.btcHtlc.txid, btc_htlc_cltv: hs.btcHtlc.cltv };
+      btc_htlc_txid: hs.btcHtlc.txid, btc_htlc_cltv: hs.btcHtlc.cltv,
+      // W2 hold-life vs T_seq — the taker mints its BTC-LN hold with THIS expiry (seconds) so it stays
+      // settleable until after T_seq + margin, and hands hold_min_final_cltv to /bridge/front so the LSP's
+      // front HTLC carries enough CLTV runway. seq_tip is the live tip these were sized against.
+      seq_tip: seqTip, hold_expiry_secs: holdReq.holdExpirySecs, hold_min_final_cltv: holdReq.minFinalCltvBlocks };
     job.bridgeHandshake = { ok: true };
     persistJobs();
     console.error('[bridge] maker locked BTC HTLC to the LSP:', hs.btcHtlc.txid, 'on H', hs.hashHex);
@@ -2415,11 +2525,16 @@ const server = http.createServer(async (req, res) => {
       if (!PROV) return send(res, 501, { ok: false, error: 'per-asset node provisioning is not enabled on this LSP' });
       const body = await readBody(req);
       const nodeKey = ((body && body.node_key) || '').toLowerCase();
-      const assetId = resolveAsset(body && body.asset);
       const amount = Number(body && body.amount);
-      if (!nodeKey || !assetId || !(amount > 0)) return send(res, 400, { ok: false, error: 'body { node_key, asset, amount (asset sats), preimage? | payment_hash? } required' });
       const rec = PROV.getByKey(nodeKey);
       if (!rec || !rec.rpc) return send(res, 404, { ok: false, error: 'unknown node key (POST /node/provision first)' });
+      // The BRIDGED-SELL taker registers a HODL hold on H at its own BTC-LN node so the LSP's front (a
+      // bare-hash sendpay on H) lands HELD there — that node is a BTC node, not an asset node, so an asset
+      // id is neither present nor meaningful (the amount is BTC sats). Require an asset only for a Sequentia
+      // asset node (the sub-asset HODL buy); a BTC node holds by hash with no asset. The holdinvoice call is
+      // asset-agnostic either way (it takes only H + amount msat).
+      const assetId = (rec.chain === 'btc') ? null : resolveAsset(body && body.asset);
+      if (!nodeKey || !(amount > 0) || (rec.chain !== 'btc' && !assetId)) return send(res, 400, { ok: false, error: 'body { node_key, amount (sats), payment_hash? | preimage?, asset (Sequentia asset nodes only) } required' });
       const amtMsat = String(Math.round(amount) * 1000);           // asset sats -> asset msat
       const label = 'buy-' + crypto.randomUUID();
       const H = body && body.payment_hash ? String(body.payment_hash).toLowerCase() : null;
@@ -2429,7 +2544,13 @@ const server = http.createServer(async (req, res) => {
         if (H) {
           // HODL: register H to be HELD (holdinvoice-seq creates NO bolt11 — the maker pays the
           // hash directly via sendpay to this node id). The DEVICE holds P; settle via /node/settle.
-          inv = await lnrpc('holdinvoice', [H, amtMsat, label, 'asset buy (HODL)'], rec.rpc, SIGNER_RPC_TIMEOUT_MS);
+          // W2 HOLD-LIFE vs T_seq — the BRIDGED-SELL taker passes `expiry` (seconds) so its hold on H stays
+          // valid until strictly AFTER the maker's latest asset claim (T_seq) + margin; without a long-enough
+          // expiry the maker could wait for a short hold to lapse, then reveal P and take the asset. Absent
+          // (the sub-asset HODL buy) => the plugin default. holdinvoice: [H, amount_msat, label, desc, expiry?].
+          const holdArgs = [H, amtMsat, label, 'asset buy (HODL)'];
+          if (Number(body && body.expiry) > 0) holdArgs.push(String(Math.ceil(Number(body.expiry))));
+          inv = await lnrpc('holdinvoice', holdArgs, rec.rpc, SIGNER_RPC_TIMEOUT_MS);
           const ni = await lnrpc('getinfo', [], rec.rpc, SIGNER_RPC_TIMEOUT_MS).catch(() => ({}));
           return send(res, 200, { ok: true, bolt11: null, payment_hash: H, hodl: true, node_id: ni.id || rec.node_id || null, amount_msat: Number(amtMsat) });
         } else {
@@ -2457,8 +2578,23 @@ const server = http.createServer(async (req, res) => {
       if (!rec || !rec.rpc) return send(res, 404, { ok: false, error: 'unknown node key' });
       try {
         const l = await lnrpc('holdinvoicelookup', [H], rec.rpc, SIGNER_RPC_TIMEOUT_MS);
+        // FUND-SAFETY (bridged-sell taker) — surface the ACTUAL committed incoming-HTLC CLTV (block height) and
+        // this node's live Bitcoin tip so the taker can verify, before exposing any asset, that the front the LSP
+        // ROUTED actually stays settleable until after T_seq — never trusting the min-final-CLTV it merely
+        // REQUESTED (getroute may commit a shorter final CLTV). Best-effort: on a read hiccup we return null and
+        // the taker fails closed (refuses to fund) rather than trusting an unverifiable runway. htlc_expiry is the
+        // MIN expiry over the incoming HTLC(s) for H (the earliest-lapsing one governs settleability).
+        let htlcExpiry = null, btcTip = null;
+        try {
+          const info = await lnrpc('getinfo', [], rec.rpc, SIGNER_RPC_TIMEOUT_MS);
+          if (info && Number.isFinite(Number(info.blockheight))) btcTip = Number(info.blockheight);
+          const lh = await lnrpc('listhtlcs', [], rec.rpc, SIGNER_RPC_TIMEOUT_MS);
+          const mine = ((lh && lh.htlcs) || []).filter((x) => String(x.payment_hash || '').toLowerCase() === H
+            && x.direction === 'in' && Number.isFinite(Number(x.expiry)));
+          if (mine.length) htlcExpiry = Math.min(...mine.map((x) => Number(x.expiry)));
+        } catch { /* leave htlc_expiry/btc_tip null -> the taker fails closed */ }
         return send(res, 200, { ok: true, state: l.state,
-          held: l.state === 'accepted', settled: l.state === 'settled' });
+          held: l.state === 'accepted', settled: l.state === 'settled', htlc_expiry: htlcExpiry, btc_tip: btcTip });
       } catch (e) { return send(res, 502, { ok: false, error: `lookup: ${e.message}` }); }
     }
 
@@ -2624,16 +2760,55 @@ const server = http.createServer(async (req, res) => {
       const { _bridgeSession, ...pub } = job;   // never serialize the live WS session
       return send(res, 200, { ok: true, ...pub });
     }
-    // BRIDGE PHASE 2 (rail-crossing SELL): the taker, having learned H + the maker's asset-claim pubkey +
-    // T_seq from POST /swap's bridge_terms, funds its OWN asset HTLC self-custody (seqob-cli xfund-seq) and
-    // registers a hold on H at its OWN BTC-LN node, then hands the funded asset outpoint + the hold bolt11
-    // here. The LSP records them (so the native asset leg reads as LOCKED and the front has a target) and
-    // RELAYS the taker's asset leg to the maker over the kept-alive courier session (maker claims it,
-    // revealing P). The pure driver — already running for this job — then fronts the taker's hold (only once
-    // swapLocked) and recoups the maker's BTC HTLC with P. The LSP never holds a taker key.
+    // BRIDGE PHASE 1b — FRONT-BEFORE-FUND hold-ready. The taker, having learned H from POST /swap's
+    // bridge_terms, registers a hold on H at its OWN BTC-LN node, then calls this with its recv_node_id to
+    // signal HOLD-READY. The LSP records the node id (the front's target) so the pure driver — already
+    // running for this job — fronts the taker's hold as soon as the recoup is secured (maker BTC HTLC
+    // confirmed + amount + runway + wall-clock locktime ordering), which is STRICTLY BEFORE the taker exposes
+    // any asset. The taker then polls GET /swap/<id> for status 'fronted' and only THEN funds + relays its
+    // asset (POST /bridge/asset). This ordering is the fund-safety fix: a declined/undriven front strands
+    // nothing (the taker has funded nothing yet). Idempotent (a re-post just re-affirms the node id).
+    if (req.method === 'POST' && url.pathname === '/bridge/front') {
+      const body = await readBody(req);
+      if (!body || !body.job_id) return send(res, 400, { ok: false, error: 'need { job_id, recv_node_id }' });
+      const job = jobs.get(body.job_id);
+      if (!job) return send(res, 404, { ok: false, error: 'unknown bridge job id' });
+      if (job.rail !== 'bridged') return send(res, 400, { ok: false, error: 'not a bridged job' });
+      if (!body.recv_node_id) return send(res, 400, { ok: false, error: 'recv_node_id (the taker BTC-LN node holding the hold on H) required' });
+      // The maker handshake must have secured the recoup (BTC HTLC parse-verified locked to the LSP) before we
+      // arm the front, else there is nothing to recoup against. verifiedClaimLsp is set + the locktime gate
+      // passed only on a clean handshake; without it the driver can only stall, so refuse hold-ready plainly.
+      const sb = job.legState && job.legState.btc;
+      if (!(sb && sb.htlc && sb.verifiedClaimLsp && sb.hashH))
+        return send(res, 409, { ok: false, error: `bridge job is not past a verified maker handshake yet (status '${job.status}') — poll GET /swap/${body.job_id} for bridge_terms first, then re-post hold-ready.` });
+      // The driver must be LIVE to front (same authority the asset hand-off uses); a terminated/never-started
+      // driver will never front, so recording hold-ready would leave the taker polling forever. Fail closed.
+      if (job._driverLive !== true)
+        return send(res, 409, { ok: false, error: `bridge job driver is not live to front (status '${job.status}', driverLive=${job._driverLive === true}) — cannot arm the front. Refusing.` });
+      sb.recvNodeId = String(body.recv_node_id);   // the front's target; observe() flips recvReady:true -> the driver fronts
+      // The taker may still report the front HTLC's min-final-CLTV it wants; record the MAX for diagnostics.
+      // This NO LONGER sets the minted value: frontLn re-derives the mint target from the LIVE tips at pay time
+      // (frontHtlcMintTarget) and pins the front HTLC's absolute expiry to T_btc - claimMargin, which both covers
+      // the taker's required survival to T_seq AND stays recoupable by the LSP — the taker cannot request more
+      // than the maker's T_btc can safely cover (a larger ask that would overshoot T_btc simply fails the mint
+      // gate). The taker independently re-verifies the ACTUAL minted incoming-HTLC expiry (swap.js step-4.5).
+      if (Number(body.recv_min_final_cltv) > 0)
+        sb.frontMinFinalCltv = Math.max(Number(sb.frontMinFinalCltv) || 0, Math.ceil(Number(body.recv_min_final_cltv)));
+      persistJobs();
+      return send(res, 202, { ok: true, hold_ready: true, status: job.status,
+        note: 'hold-ready recorded; the LSP will front your BTC-LN hold on H as soon as the recoup is secured. '
+            + 'Poll GET /swap/' + body.job_id + ' until status is "fronted", then fund + relay your asset (POST /bridge/asset). Do NOT fund your asset before "fronted".' });
+    }
+    // BRIDGE PHASE 2 (rail-crossing SELL): AFTER the LSP has FRONTED (status 'fronted'), the taker funds its
+    // OWN asset HTLC self-custody (claim=maker-with-P, refund=taker-after-T_seq) and hands the funded asset
+    // outpoint here. The LSP records it (so the native asset leg reads LOCKED) and RELAYS it to the maker over
+    // the kept-alive courier session (maker claims it, revealing P; the taker then settles its already-fronted
+    // hold with P and receives BTC-LN; the LSP recoups the maker's BTC HTLC with P). The LSP never holds a
+    // taker key. FUND-SAFETY: this REJECTS the hand-off unless the front is confirmed (bridgeFrontConfirmed),
+    // so the taker never exposes its asset before it is guaranteed payment.
     if (req.method === 'POST' && url.pathname === '/bridge/asset') {
       const body = await readBody(req);
-      if (!body || !body.job_id) return send(res, 400, { ok: false, error: 'need { job_id, taker_seq_leg, recv_bolt11 }' });
+      if (!body || !body.job_id) return send(res, 400, { ok: false, error: 'need { job_id, taker_seq_leg }' });
       const job = jobs.get(body.job_id);
       if (!job) return send(res, 404, { ok: false, error: 'unknown bridge job id' });
       // W2(a): accept the asset hand-off ONLY while a bridged driver is AUTHORITATIVELY live to front it —
@@ -2647,16 +2822,22 @@ const server = http.createServer(async (req, res) => {
       // needs no second hand-off.) The predicate subsumes the session check, so both facts are surfaced.
       if (!bridgeAssetHandoffAdmissible(job))
         return send(res, 409, { ok: false, error: `bridge job is not live to accept the asset hand-off (status '${job.status}', driverLive=${job._driverLive === true}, session=${!!job._bridgeSession}) — its driver is not running to front the hold, so funding the asset now would strand it. Refusing.` });
+      // W2 — FRONT-BEFORE-FUND. REJECT the asset hand-off unless the front is CONFIRMED. This is the load-
+      // bearing reorder: the taker must not expose its asset (relaying it lets the maker claim + reveal P)
+      // until the LSP has actually paid the taker's hold on H. If the taker skipped /bridge/front, or the
+      // front has not yet committed (recoup not yet secured, e.g. the maker BTC HTLC is still 0-conf), refuse
+      // here — the taker keeps its asset (it should not have funded yet) and simply retries once 'fronted'.
+      if (!bridgeFrontConfirmed(job))
+        return send(res, 409, { ok: false, error: `the LSP has NOT fronted your BTC-LN hold yet (status '${job.status}') — do NOT fund or relay your asset before the front is confirmed. Register your hold on H, POST /bridge/front with your recv_node_id, poll GET /swap/${body.job_id} until status is "fronted", then retry. Refusing to relay (fail closed; nothing of yours is exposed).` });
       const leg = body.taker_seq_leg || {};
-      if (!leg.txid || !leg.redeem_script || !body.recv_node_id)
-        return send(res, 400, { ok: false, error: 'taker_seq_leg{txid,vout,amount,redeem_script,locktime,asset[,block_hash]} + recv_node_id (the taker BTC-LN node holding the hold on H) required' });
-      // W2(a) — RELAY-TIME LOCKTIME GATE. This is the true COMMITMENT point: relaying the taker's asset leg
-      // EXPOSES it to the maker's claim (the maker then reveals P), after which the taker can no longer refund
-      // safely. So re-run the SAME wall-clock locktime-ordering gate the front uses, against LIVE tips, BEFORE
-      // relaying — a maker whose short T_btc has DRIFTED into the danger window since handshake must be refused
-      // HERE, not only at the front (by which point the maker may already hold the asset). We run it BEFORE
-      // wiring the front target (sb.recvNodeId) or the native-lock (sa.onchain), so a refusal leaves the driver
-      // unable to front at all (frontLn fails closed without recvNodeId) — no strand, no robbery, fail closed.
+      if (!leg.txid || !leg.redeem_script)
+        return send(res, 400, { ok: false, error: 'taker_seq_leg{txid,vout,amount,redeem_script,locktime,asset[,block_hash]} required' });
+      // W2(a) — RELAY-TIME LOCKTIME GATE. This is a second COMMITMENT point: relaying the taker's asset leg
+      // EXPOSES it to the maker's claim (the maker then reveals P). The front is already secured by the front-
+      // time gate, but the BTC tip may have DRIFTED further since; re-run the SAME wall-clock locktime-ordering
+      // gate against LIVE tips BEFORE relaying — a maker whose short T_btc has drifted into the danger window
+      // must be refused HERE too, so the LSP is never left unable to recoup. A refusal does NOT strand the
+      // taker: its hold simply expires and the front returns (no-loss), and it refunds its asset at T_seq.
       {
         let btcTip = NaN, seqTip = NaN;
         const _sb = job.legState && job.legState.btc;
@@ -2667,6 +2848,8 @@ const server = http.createServer(async (req, res) => {
             btcTip = Number(bo && bo.tip); seqTip = Number(so && so.tip);
           } catch { /* a tip momentarily unreadable -> NaN -> the gate fails closed below (never relay unverified) */ }
         }
+        // RELAY-time re-check (the second commitment point, against live tips) — same one-BTC-time gate; a
+        // drifted/short T_btc that can no longer cover the taker's required front-HTLC survival is refused here too.
         const relayGate = bridgeAssetRelayLocktimeVerdict({ job, btcTip, seqTip });
         if (!relayGate.ok) {
           console.error('[bridge] /bridge/asset relay REFUSED by live-tip locktime gate:', relayGate.reason);
@@ -2675,26 +2858,18 @@ const server = http.createServer(async (req, res) => {
       }
       job.legState = job.legState || {};
       const sa = job.legState.asset = job.legState.asset || {};
-      sa.onchain = { txid: leg.txid, vout: Number(leg.vout || 0), redeem: leg.redeem_script };   // native lock the front gates on (redeem lets observe read P from the maker's claim, W2b)
-      const sb = job.legState.btc; if (sb) sb.recvNodeId = body.recv_node_id;   // the front's target (taker node holding the hold on H)
+      sa.onchain = { txid: leg.txid, vout: Number(leg.vout || 0), redeem: leg.redeem_script };   // native lock (redeem lets observe read P from the maker's claim, W2b)
+      const sb = job.legState.btc; if (sb && body.recv_node_id && !sb.recvNodeId) sb.recvNodeId = String(body.recv_node_id);   // defensive: the front's target is normally set at /bridge/front
       persistJobs();
-      // Relay the taker's asset leg -> the maker claims it (reveals P). Fire-and-forget: the maker's claim
-      // is anchor-gated (can take minutes) and the driver reads P from the front's pay result, not this.
-      // FUND-SAFETY (review Finding 3 — MEDIUM downgraded to LOW residual): this relays the asset leg BEFORE
-      // the LSP fronts the taker's hold, so in theory a maker that claims (reveals P) the instant it gets the
-      // relay PLUS a PERMANENT LSP death before the driver's next front tick could leave the taker having
-      // given its asset with no incoming LN and a void refund. Why the residual is LOW, and why we do NOT
-      // "fix" it with front-then-relay:
-      //   • The maker cannot SAFELY claim until its own anchor gate passes (VerifySeqLegSafe: the asset block
-      //     anchored at/above the maker's CONFIRMED BTC-leg height) — strictly LATER than the LSP's front
-      //     condition (maker BTC HTLC >= minRecoupConf + this asset leg locked). So an honest maker always
-      //     claims AFTER the front; the window only exists for a maker that reveals P at 0 anchor depth, which
-      //     risks a reorg clawing its own BTC back — a self-harming attack.
-      //   • resume-on-boot re-drives the front on any NON-permanent restart, so only a permanent LSP death in
-      //     the sub-window loses.
-      //   • The "proper" front-then-relay (hold the relay until the front dispatches) would REINTRODUCE the
-      //     relay-stale bug just fixed: the courier WS cannot survive idle to the front (~a BTC block). So
-      //     relaying at 0-conf immediately (xfund-seq -no-wait) is the correct trade; front-then-relay is not.
+      // Relay the taker's asset leg -> the maker claims it (reveals P). Fire-and-forget: the maker's claim is
+      // anchor-gated (can take minutes) and the driver reads P from the front's pay result / the on-chain claim.
+      // FUND-SAFETY (W2 FRONT-BEFORE-FUND): this relay — and hence the taker exposing its asset — happens ONLY
+      // AFTER the front is confirmed (the bridgeFrontConfirmed gate above). So a maker that claims the instant
+      // it gets the relay finds the taker ALREADY guaranteed payment (the LSP's hold pay on H is live); the
+      // taker settles with the revealed P and receives its BTC-LN, and the LSP recoups the maker's BTC HTLC.
+      // A PERMANENT LSP death after the relay is covered by resume-on-boot (it re-attaches the in-flight front
+      // and recoups). The old front-AFTER-relay hole — relay exposes the asset while no front is yet in flight
+      // — is closed: the relay can no longer run before the front.
       const session = job._bridgeSession; job._bridgeSession = null;   // one relay per session
       relayTakerAssetLeg({ session, takerSeqLeg: leg })
         .then((r) => { job.relay_preimage = r && r.preimageHex ? r.preimageHex : null; persistJobs(); })
@@ -2814,8 +2989,23 @@ const server = http.createServer(async (req, res) => {
       // source of truth shared with runMixed; the outer gate only adds backend readiness.
       let execName = null;
       try { execName = planExecutionName(side, settlementPlanForSide(side, payRail, recvRail)); } catch {}
-      const backendReady = (execName === 'xsubbuy' || execName === 'xsublift') ? true
-        : execName === 'xsubas' ? subasReady
+      // P3.3 — RETIRE THE CUSTODIAL SUBMARINE for any shape now covered non-custodially. xsublift (asset
+      // on-chain in, BTC-LN out) and xsubbuy (BTC-LN in, asset on-chain out) are LP-FRONTED out of the LSP's
+      // OWN funds (-ln-socket = the LSP's node; -btc-wallet/-seq-wallet = the LSP's wallets) — custodial, and
+      // a fund-safety liability. The sell shape (asset on-chain -> BTC-LN) is EXACTLY the W2 non-custodial
+      // bridge's wired shape, so route it there (bridge:true). The mirror buy (BTC-LN -> asset on-chain) has
+      // NO non-custodial route today, so gate it honestly rather than move LSP funds. Fail closed BEFORE the
+      // custodial runMixed is ever reached. (xsubas / xsubas-sell — the genuinely non-custodial sub-asset
+      // paths — are unaffected.)
+      if (execName === 'xsublift') {
+        return send(res, 422, { ok: false, finality: 'unsupported',
+          error: 'sell-asset-on-chain / receive-BTC-over-Lightning is now settled by the NON-custodial rail-crossing bridge, not the custodial submarine (which fronts the LSP\'s own funds). Retry the take with bridge:true (plus maker_btc_rail/maker_asset_rail + offer_id/maker_pubkey + taker_seq_refund_pub).' });
+      }
+      if (execName === 'xsubbuy') {
+        return send(res, 422, { ok: false, finality: 'unsupported',
+          error: 'pay-BTC-over-Lightning / receive-asset-on-chain has no non-custodial route on this LSP and the custodial submarine (which fronts the LSP\'s own funds) is retired. To buy the asset non-custodially, pay BTC ON-CHAIN and receive the asset over Lightning (the HODL buy: side:buy, hodl:true), or take a supported shape.' });
+      }
+      const backendReady = execName === 'xsubas' ? subasReady
         : execName === 'xsubas-sell' ? subasSellReady : false;
       const supported = !!execName && backendReady;
       if (!supported) {
@@ -3038,16 +3228,21 @@ server.listen(CFG.port, '127.0.0.1', () => {
   console.error(`[lsp] listening http://127.0.0.1:${CFG.port}  asset-rpc ${CFG.hostedAssetRpc}  btc-rpc ${CFG.hostedBtcRpc}  relay ${CFG.relay}`);
   // RESUME in-flight BRIDGE jobs (persist-before-broadcast + resumable). A bridged swap whose driver died
   // with the old process is recovered by re-running ONLY the pure driver against its persisted legState —
-  // NOT the maker handshake (the maker already locked its BTC HTLC; re-handshaking would lock another). We
-  // resume only jobs past the taker's /bridge/asset handoff (the maker has the asset leg + will claim it,
-  // and the front/recoup need no live courier session), so the LSP still fronts the taker + recoups after a
-  // restart instead of stranding the taker's already-committed asset. Fund-safety is unchanged: the driver
-  // obeys nextBridgeStep exactly. Best-effort + guarded; never fail the boot.
+  // NOT the maker handshake (the maker already locked its BTC HTLC; re-handshaking would lock another).
+  // W2 FRONT-BEFORE-FUND — resume any NON-TERMINAL job whose recoup is wired AND the LSP has already put
+  // value / exposure in flight: either it FRONTED (s.btc.frontHeld — the in-flight hold pay must be
+  // re-attached so the LSP learns P off the settle and recoups) or the asset was RELAYED (s.asset.onchain —
+  // the maker will claim + reveal P). Both are fund-safety-critical: without re-driving, a fronted/relayed
+  // job that died could never recoup. A job that only handshook (no front, no relay) has nothing at stake
+  // and its relay needs the now-gone courier session, so it is left to fail no-loss. (Gating on frontHeld OR
+  // sa.onchain — not merely `interrupted` — also covers a HARD kill that never marked the job 'interrupted'.)
+  // Fund-safety is unchanged: the driver obeys nextBridgeStep exactly. Best-effort + guarded; never fail boot.
   for (const [id, job] of jobs) {
     try {
-      if (job.rail !== 'bridged' || !job.interrupted) continue;
+      if (job.rail !== 'bridged') continue;
+      if (job.status === 'settled' || job.status === 'failed') continue;   // terminal — nothing to resume
       const s = job.legState || {};
-      if (!(s.btc && s.btc.htlc && s.btc.verifiedClaimLsp && s.asset && s.asset.onchain && s.btc.recvNodeId)) continue;   // only past-handoff jobs
+      if (!(s.btc && s.btc.htlc && s.btc.verifiedClaimLsp && s.btc.recvNodeId && (s.btc.frontHeld || (s.asset && s.asset.onchain)))) continue;   // fronted or relayed only
       const bt = job.bridge_terms || {};
       const rbody = { side: job.side, asset: job.asset, payRail: 'chain', recvRail: 'ln',
         maker_btc_rail: 'chain', maker_asset_rail: 'chain', taker_btc_inbound: true,

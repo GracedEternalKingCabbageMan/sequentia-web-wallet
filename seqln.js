@@ -391,8 +391,12 @@ export function seqlnChannelInbound({ node_key, asset, amount }) {
 // Register a HODL invoice by hash H on the user's OWN node (the DEVICE keeps P; the node/LSP never
 // learn it). Returns { payment_hash, bolt11:null, node_id, hodl:true } — the maker pays H BY HASH
 // to node_id (pay-by-hash, like the sell). amount in ASSET SATS.
-export function seqlnNodeInvoice({ node_key, asset, amount, payment_hash }) {
-  return lspFetch('/node/invoice', { method: 'POST', body: JSON.stringify({ node_key, asset, amount, payment_hash }) });
+// `expiry` (seconds, optional) sizes a HODL hold's validity window. The BRIDGED-SELL taker passes the
+// LSP-sized bridge_terms.hold_expiry_secs so its hold on H stays SETTLEABLE until strictly after the maker's
+// latest asset claim (T_seq) + margin — without it a short hold could lapse before the maker reveals P,
+// stranding the taker (dead hold, asset gone). Omitted for the sub-asset HODL buy (plugin default).
+export function seqlnNodeInvoice({ node_key, asset, amount, payment_hash, expiry }) {
+  return lspFetch('/node/invoice', { method: 'POST', body: JSON.stringify({ node_key, asset, amount, payment_hash, expiry }) });
 }
 // Poll the HODL invoice state on the user's node: { state, held /* maker's payment accepted+held */, settled }.
 export function seqlnInvoiceStatus({ node_key, payment_hash }) {
@@ -492,6 +496,25 @@ export function seqlnSwap({ side, asset, amount, quote_asset, payRail, recvRail,
   if (taker_btc_inbound != null) body.taker_btc_inbound = taker_btc_inbound;
   if (taker_seq_refund_pub) body.taker_seq_refund_pub = taker_seq_refund_pub;
   return lspFetch('/swap', { method: 'POST', body: JSON.stringify(body) });
+}
+
+// W2 FRONT-BEFORE-FUND — a bridged SELL (taker sells the asset, receives BTC over Lightning): AFTER the
+// /swap handshake yields H (bridge_terms), the taker registers a hold on H at its OWN BTC-LN node and hands
+// its recv_node_id here (hold-ready). The LSP fronts the hold as soon as the recoup is secured, STRICTLY
+// BEFORE the taker exposes any asset. Poll GET /swap/<id> for status 'fronted', then fund + relay the asset.
+// A declined/undriven front strands nothing — the taker has funded nothing yet.
+// recv_min_final_cltv (blocks, optional) — the min-final-CLTV the taker needs the LSP's front HTLC to carry
+// so it stays settleable until strictly after the maker's latest asset claim (T_seq). The LSP takes the MAX
+// of this and its own handshake-sized value (the taker can only ask for MORE runway, never less).
+export function seqlnBridgeFront({ job_id, recv_node_id, recv_min_final_cltv }) {
+  return lspFetch('/bridge/front', { method: 'POST', body: JSON.stringify({ job_id, recv_node_id, recv_min_final_cltv }) });
+}
+// W2 FRONT-BEFORE-FUND — hand the FUNDED asset HTLC (taker self-custody: claim=maker-with-P, refund=taker-
+// after-T_seq) to the LSP to relay to the maker. The LSP REJECTS this unless the front is already confirmed
+// (status 'fronted'), so the taker never exposes its asset before it is guaranteed payment. Call ONLY after
+// GET /swap/<id> shows status 'fronted' AND the taker's own hold on H is 'accepted'.
+export function seqlnBridgeAsset({ job_id, taker_seq_leg, recv_node_id }) {
+  return lspFetch('/bridge/asset', { method: 'POST', body: JSON.stringify({ job_id, taker_seq_leg, recv_node_id }) });
 }
 
 // The sub-asset order book for an asset: { sell_available, buy_available, sell_offers[],

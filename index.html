@@ -933,7 +933,7 @@ import { initXrswap, fetchRQuote, openReverseFromComposer, hasInFlight as hasRev
 import { initXmaker, startForwardMaker, startReverseMaker, liveMakerOffers, resumeMakerSwaps } from './xmaker.js';
 import { initSeqln, connectDevice as lnConnectDevice, disconnectDevice as lnDisconnect,
   onSeqlnStatus, seqlnState, seqlnAvailable, seqlnGetStatus, seqlnListNodes, seqlnNodeOnchain, seqlnSwap, seqlnBook, seqlnUnifiedBook, seqlnLnBook, seqlnPostOffer, lnFinalityCopy,
-  seqlnChannelInbound, seqlnNodeInvoice, seqlnInvoiceStatus, seqlnNodeSettle, seqlnNodeReceive, seqlnNodePay, seqlnJobStatus,
+  seqlnChannelInbound, seqlnNodeInvoice, seqlnInvoiceStatus, seqlnNodeSettle, seqlnNodeReceive, seqlnNodePay, seqlnJobStatus, seqlnBridgeFront, seqlnBridgeAsset,
   seqlnChannels, seqlnFunding, fundChannel, resumeFundChannel, provisionAndConnect, waitNodeReady, provisionedState,
   disconnectProvisioned, deviceTransportPubkey, registerOwnStatusKeys, closeChannelLsp } from './seqln.js';
 import { lnDeriveNode, lnDeriveAsset } from './seqln-keys.js';
@@ -1918,6 +1918,27 @@ const seqLeg = {
       return (value != null && asset) ? { value, asset } : null;   // blinded outputs lack explicit value/asset
     } catch { return null; }
   },
+  // TRUSTLESS preimage read: find the tx that SPENT our funded asset HTLC (the maker's claim) and extract
+  // the push whose sha256 equals the hashlock H. This is how the W2 bridged SELL learns P off the chain
+  // (never trusting the LSP/maker alone) so it can settle its already-fronted BTC-LN hold and receive BTC.
+  // Returns the preimage hex or null (not yet spent / not yet visible). Mirrors xrswap.readPreimageOnChain.
+  async readSpendPreimage(txid, vout, hashHex){
+    const sha256Hex = async (hex) => hexOfBytes(new Uint8Array(await crypto.subtle.digest('SHA-256', bytesOfHex(hex))));
+    try {
+      const os = await fetch(`${ESPLORA}/tx/${txid}/outspend/${vout}`).then(r=>r.ok?r.json():null);
+      if (!os || !os.spent || !os.txid) return null;
+      const stx = await fetch(`${ESPLORA}/tx/${os.txid}`).then(r=>r.ok?r.json():null);
+      if (!stx) return null;
+      const want = String(hashHex).toLowerCase();
+      for (const vin of (stx.vin || [])){
+        const pushes = [];
+        for (const tok of String(vin.scriptsig_asm || '').split(/\s+/)) if (/^[0-9a-fA-F]{2,}$/.test(tok)) pushes.push(tok.toLowerCase());
+        for (const w of (vin.witness || [])) if (/^[0-9a-fA-F]{2,}$/.test(w)) pushes.push(w.toLowerCase());
+        for (const p of pushes){ try { if (await sha256Hex(p) === want) return p; } catch {} }
+      }
+    } catch {}
+    return null;
+  },
 };
 // Broadcast a raw signed Elements tx hex on the Sequentia chain (Transaction+client,
 // falling back to a direct esplora /tx POST). Mirrors xswap.js's broadcastSeqTx.
@@ -2801,7 +2822,13 @@ function initSwapTab(){
   initSwap({
     // scriptToAddress + buildCovenantFillTx are module-level pkg exports; they ride
     // alongside the classes so the passive-CLOB covenant flow (place + FILL) can reach them.
-    wasm: { Wollet, Signer, AssetId, Address, Pset, Txid, scriptToAddress, buildCovenantFillTx },
+    // buildSeqHtlcRedeemScript + generateSwapSecret ride alongside so the W2 bridged SELL can fund its OWN
+    // asset HTLC self-custody (claim=maker-with-P, refund=taker-after-T_seq) — the same construction the
+    // cross-chain reverse path (xrswap.js/fundSeq) uses.
+    wasm: { Wollet, Signer, AssetId, Address, Pset, Txid, scriptToAddress, buildCovenantFillTx, buildSeqHtlcRedeemScript, generateSwapSecret },
+    // The SEQ-leg HTLC bridge (fund/waitConf/refundKey/refund) — the bridged SELL funds + (on a stall)
+    // refunds its asset leg through this, identical to the native cross-chain reverse flow.
+    seqLeg,
     get wollet(){ return wollet; }, get signer(){ return signer; },
     get network(){ return network; }, get client(){ return client; },
     get POLICY(){ return POLICY; }, get POLICY_HEX(){ return POLICY_HEX; },
@@ -2898,6 +2925,10 @@ function initSwapTab(){
       nodeSettle: (p) => seqlnNodeSettle(p),
       nodeReceive: (p) => seqlnNodeReceive(p),
       nodePay: (p) => seqlnNodePay(p),
+      // W2 FRONT-BEFORE-FUND bridged SELL: arm the LSP front (hold-ready) and, once fronted, hand it the
+      // funded asset leg to relay. The LSP fronts BEFORE the taker exposes any asset (see swap.js driveBridged).
+      bridgeFront: (p) => seqlnBridgeFront(p),
+      bridgeAsset: (p) => seqlnBridgeAsset(p),
       jobStatus: (pathOrId) => seqlnJobStatus(pathOrId),   // advisory async-job status (sub-asset HODL BUY)
       // The submarine (mixed) async-job status — GET /swap/<id>, the SAME endpoint as jobStatus. Wiring
       // this is what lets pollMixed advance an anchor-gated (over-0-conf) submarine past SETTLING; it was
@@ -2932,6 +2963,15 @@ function initSwapTab(){
         if (!phrase) throw new Error('Your wallet is locked; unlock it and try again.');
         return await provisionAndConnect({ chain:'seq', assetId: assetHex, label: assetMeta(assetHex).ticker, policy: lnPolicy(),
           deriveIdentity: (id) => lnDeriveAsset(phrase, id) });
+      },
+      // Bring the user's OWN hosted BTC Lightning node online (the SAME device identity Move-to-Lightning
+      // BTC uses). A bridged SELL RECEIVES BTC over Lightning, so its BTC node must be provisioned + its
+      // device signer serving before the LSP fronts the hold. Idempotent (re-attaches without re-funding).
+      connectBtcNode: async () => {
+        const phrase = (localStorage.getItem(KEY) || '').trim();
+        if (!phrase) throw new Error('Your wallet is locked; unlock it and try again.');
+        return await provisionAndConnect({ chain:'btc', label:'BTC', policy: lnPolicy(),
+          deriveIdentity: () => { const k = lnNodeIdentity(phrase, 'btc'); return { transportPrivkey: k.deviceTransportPrivkey, signingSeed: k.deviceSigningSeed }; } });
       },
       finalityCopy: () => lnFinalityCopy(),
       // Open a Lightning channel for a leg INLINE — the SAME non-custodial provision+fund flow as

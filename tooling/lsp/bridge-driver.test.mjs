@@ -4,7 +4,7 @@
 // deadlock when both legs bridge — all without a node.
 import test from 'node:test';
 import assert from 'node:assert';
-import { runBridgedLeg, runBridgedSwap, classifyLegs, describeBridge, matchFromTake, makerRailsFromOffer, takeRailsCrossed, bridgeAssetHandoffAdmissible, bridgeAssetRelayLocktimeVerdict, isPureLnTake, crossingShapeSupported, bridgedTakeSupported, describeCrossingSupport } from './bridge-driver.mjs';
+import { runBridgedLeg, runBridgedSwap, classifyLegs, describeBridge, matchFromTake, makerRailsFromOffer, takeRailsCrossed, bridgeAssetHandoffAdmissible, bridgeAssetRelayLocktimeVerdict, bridgeFrontConfirmed, isPureLnTake, crossingShapeSupported, bridgedTakeSupported, describeCrossingSupport } from './bridge-driver.mjs';
 import { planSettlement } from './settlement-router.mjs';
 
 const A = 100000;
@@ -402,22 +402,32 @@ test('W2a bridgeAssetHandoffAdmissible: needs BOTH a live driver and an open ses
 });
 
 // ---------- W2(a): bridgeAssetRelayLocktimeVerdict — the RELAY-time locktime gate for /bridge/asset ----------
-// The taker's asset leg is EXPOSED to the maker's claim the instant it is relayed, so the front's wall-clock
-// locktime ordering is re-checked HERE against LIVE tips (a maker whose short T_btc has DRIFTED into the
-// danger window since handshake is refused BEFORE the asset is exposed). Reads the two CLTV refund heights
-// from the SAME job fields the front-time gate uses. Honest terms: T_btc ~tip+100 BTC, T_seq ~tip+240 SEQ.
+// The taker's asset leg is EXPOSED to the maker's claim the instant it is relayed, so the block-based locktime
+// ordering is re-checked HERE against LIVE tips (a maker whose short T_btc has DRIFTED so it can no longer cover
+// the taker's required front-HTLC survival is refused BEFORE the asset is exposed). Reads the two CLTV refund
+// heights from the SAME job fields the front-time gate uses. Large-enough terms: T_btc ~tip+260 BTC (covers the
+// ~210-block front HTLC for a 240-block T_seq), T_seq ~tip+240 SEQ.
 const relayJob = () => ({ status: 'confirming', _driverLive: true, _bridgeSession: {},
-  legState: { btc: { htlc: { cltv: 800000 + 100 } }, asset: { seqLocktime: 44000 + 240 } } });
+  legState: { btc: { htlc: { cltv: 800000 + 260 } }, asset: { seqLocktime: 44000 + 240 } } });
 
 test('W2a bridgeAssetRelayLocktimeVerdict: a HEALTHY live tip ADMITS the relay', () => {
   const v = bridgeAssetRelayLocktimeVerdict({ job: relayJob(), btcTip: 800000, seqTip: 44000 });
   assert.equal(v.ok, true, v.reason);
 });
 
-test('W2a bridgeAssetRelayLocktimeVerdict: a DRIFTED BTC tip (T_btc now ~10 blocks out) REFUSES the relay', () => {
+test('W2a bridgeAssetRelayLocktimeVerdict: a DRIFTED BTC tip (recoup runway below the front HTLC) REFUSES the relay', () => {
   const v = bridgeAssetRelayLocktimeVerdict({ job: relayJob(), btcTip: 800090, seqTip: 44000 });
   assert.equal(v.ok, false);
-  assert.match(v.reason, /UNSAFE|refuse|short/i);
+  assert.match(v.reason, /UNSAFE|refuse|short|recoup runway/i);
+});
+
+test('W2a bridgeAssetRelayLocktimeVerdict (site 3): a maker whose T_btc CANNOT cover requiredTakerBlocks REFUSES the relay', () => {
+  // The third of the three gate sites: a short-T_btc maker (100 BTC blocks, recoupDeadline 94 < ~210) that would
+  // strand the LSP is refused at relay time too — the taker keeps its asset and refunds at T_seq (no loss).
+  const job = { legState: { btc: { htlc: { cltv: 800000 + 100 } }, asset: { seqLocktime: 44000 + 240 } } };
+  const v = bridgeAssetRelayLocktimeVerdict({ job, btcTip: 800000, seqTip: 44000 });
+  assert.equal(v.ok, false);
+  assert.ok(v.recoupDeadlineBlocks < v.requiredTakerBlocks);
 });
 
 test('W2a bridgeAssetRelayLocktimeVerdict: an unreadable tip (NaN) fails closed — never relay unverified', () => {
@@ -431,7 +441,7 @@ test('W2a bridgeAssetRelayLocktimeVerdict: a TIMESTAMP maker T_btc is refused (d
 });
 
 test('W2a bridgeAssetRelayLocktimeVerdict: reads T_seq from bridge_terms when the asset legState lacks it', () => {
-  const job = { legState: { btc: { htlc: { cltv: 800000 + 100 } }, asset: {} }, bridge_terms: { seq_locktime: 44000 + 240 } };
+  const job = { legState: { btc: { htlc: { cltv: 800000 + 260 } }, asset: {} }, bridge_terms: { seq_locktime: 44000 + 240 } };
   assert.equal(bridgeAssetRelayLocktimeVerdict({ job, btcTip: 800000, seqTip: 44000 }).ok, true);
   assert.equal(bridgeAssetRelayLocktimeVerdict({ job, btcTip: 800090, seqTip: 44000 }).ok, false);
 });
@@ -439,6 +449,79 @@ test('W2a bridgeAssetRelayLocktimeVerdict: reads T_seq from bridge_terms when th
 test('W2a bridgeAssetRelayLocktimeVerdict: a missing maker BTC HTLC cltv fails closed (NaN height)', () => {
   const v = bridgeAssetRelayLocktimeVerdict({ job: { legState: { btc: {}, asset: { seqLocktime: 44240 } } }, btcTip: 800000, seqTip: 44000 });
   assert.equal(v.ok, false);
+});
+
+// ---------- W2: FRONT-BEFORE-FUND — the driver fronts a reverse-cross receiver leg on recoup-secured +
+//            hold-ready, BEFORE the asset leg locks (swapLocked stays false the whole time). ----------
+// A reverse-cross receiver world: the maker BTC HTLC is the recoup (locked to us, confirmed, healthy locktime
+// ordering via crossLock). The whole-swap gate (swapLocked) is ALWAYS false here — the taker funds its native
+// asset leg only AFTER the front, so that leg never locks first. `recvReady` flips true when the taker posts
+// hold-ready. The front must hinge on recvReady, never on swapLocked.
+function reverseCrossWorld() {
+  const w = { tip: 800000, onchain: { funded: true, amountSat: A, cltv: 800000 + 260, lockedToLsp: true, spent: false, confs: 1 },
+    ln: { registered: true, held: false, settled: false, preimage: null }, _heldTicks: 0, recvReady: false, calls: [] };
+  return {
+    world: w, swapLocked: () => false,   // the native asset leg NEVER locks before the front (front-before-fund)
+    sleep: nap1, log: () => {},
+    observe: async () => {
+      if (w.ln.held && !w.ln.settled) { if (++w._heldTicks >= 2) { w.ln.settled = true; w.ln.preimage = 'ab'.repeat(32); } }
+      return { tip: w.tip, onchain: { ...w.onchain }, ln: { ...w.ln },
+        crossLock: { seqTip: 44000, seqRefundHeight: 44000 + 240 }, recvReady: w.recvReady };
+    },
+    frontLn: async () => { w.calls.push('frontLn'); w.ln.held = true; },
+    recoupClaim: async () => { w.calls.push('recoupClaim'); w.onchain.spent = true; },
+  };
+}
+
+test('W2 driver: fronts a reverse-cross receiver leg WITHOUT the asset leg ever locking (swapLocked false throughout)', async () => {
+  const io = reverseCrossWorld();
+  io.world.recvReady = true;   // taker already hold-ready
+  const r = await runBridgedLeg({ leg: { lnSide: 'receiver', amountSat: A }, io, driverCfg: DCFG });
+  assert.equal(r.ok, true);
+  assert.deepEqual(io.world.calls, ['frontLn', 'recoupClaim'], 'fronted + recouped though swapLocked was false the whole time');
+  assert.equal(r.fronted, true);
+});
+
+test('W2 driver: WITHHOLDS the front until the taker is hold-ready, then fronts (recvReady gates, not swapLocked)', async () => {
+  const io = reverseCrossWorld();   // recvReady:false
+  const p = runBridgedLeg({ leg: { lnSide: 'receiver', amountSat: A }, io, driverCfg: { pollMs: 1, maxTicks: 400 } });
+  await new Promise((r) => setTimeout(r, 25));
+  assert.deepEqual(io.world.calls, [], 'must not front before the taker is hold-ready (asset not yet exposed)');
+  io.world.recvReady = true;        // taker registers its hold on H + hands recv_node_id
+  const r = await p;
+  assert.equal(r.ok, true);
+  assert.deepEqual(io.world.calls, ['frontLn', 'recoupClaim'], 'fronts only once hold-ready — before the asset leg locks');
+});
+
+test('W2 driver: resume re-enters at recoup when the front already settled (P known) — never a second front', async () => {
+  // Simulate a resume AFTER the taker settled the hold (P learned pre-restart): ln.settled already true.
+  const io = reverseCrossWorld();
+  io.world.recvReady = true; io.world.ln.settled = true; io.world.ln.held = true; io.world.ln.preimage = 'ab'.repeat(32);
+  const r = await runBridgedLeg({ leg: { lnSide: 'receiver', amountSat: A }, io, driverCfg: DCFG });
+  assert.equal(r.ok, true);
+  assert.deepEqual(io.world.calls, ['recoupClaim'], 're-enters straight at the recoup — no duplicate front');
+});
+
+// ---------- W2: bridgeFrontConfirmed — /bridge/asset must REJECT the asset hand-off before the front ----------
+test('W2 bridgeFrontConfirmed: true once the BTC leg is frontHeld (the LSP has paid the taker\'s hold on H)', () => {
+  assert.equal(bridgeFrontConfirmed({ legState: { btc: { frontHeld: true } } }), true);
+});
+
+test('W2 bridgeFrontConfirmed: true once the front has settled (frontPreimage learned)', () => {
+  assert.equal(bridgeFrontConfirmed({ legState: { btc: { frontPreimage: 'ab'.repeat(32) } } }), true);
+});
+
+test('W2 bridgeFrontConfirmed: FALSE before any front — relaying the asset then would strand it (reject)', () => {
+  assert.equal(bridgeFrontConfirmed({ legState: { btc: { htlc: {}, verifiedClaimLsp: true, recvNodeId: 'n' } } }), false, 'handshook + hold-ready but NOT fronted -> refuse the relay');
+  assert.equal(bridgeFrontConfirmed({ legState: { btc: {} } }), false);
+  assert.equal(bridgeFrontConfirmed({ legState: {} }), false);
+  assert.equal(bridgeFrontConfirmed({}), false);
+  assert.equal(bridgeFrontConfirmed(null), false);
+});
+
+test('W2 bridgeFrontConfirmed: a non-hex frontPreimage is NOT treated as a confirmed front', () => {
+  assert.equal(bridgeFrontConfirmed({ legState: { btc: { frontPreimage: 'nope' } } }), false);
+  assert.equal(bridgeFrontConfirmed({ legState: { btc: { frontHeld: 'yes' } } }), false, 'only a strict true frontHeld counts');
 });
 
 // ---------- W3(c): isPureLnTake — the ln/ln dispatch branch must exempt a bridged take ----------
