@@ -165,8 +165,20 @@ function offerField(o, ...names){ for (const n of names){ if (o[n] !== undefined
 // BTC). Picks the offer paying the most BTC per asset atom; whole-HTLC (the taker
 // sells the offer's full asset amount).
 async function findReverseOffer(seqAsset, seqAtoms){
-  const book = await seqob.fetchBook(seqAsset, 'BTC');
-  const offers = (book.offers || book.Offers || []).filter(o => {
+  // Merge BOTH pair orientations, exactly like the book RENDER (xswap.js fetchXbook): the relay keys
+  // markets by EXACT base/quote order, so cross-HTLC reverse offers rest on <asset>/BTC while an SBTC
+  // silent-peg covenant (or any offer resting under the flipped orientation) advertises offer_asset=BTC
+  // and rests on BTC/<asset>. Fetching ONLY <asset>/BTC missed a pegged covenant that is the only reverse
+  // liquidity — fetchRQuote then threw, Review was disabled, and the covenant take branch in reviewCross
+  // was unreachable (the SBTC silent-peg taker loop could never complete). Dedup by maker:offer_id (a
+  // maker that seeded both orientations shows once).
+  const grab = async (base, quote) => {
+    try { const bk = await seqob.fetchBook(base, quote); return bk.offers || bk.Offers || []; }
+    catch { return []; }
+  };
+  const both = [...(await grab(seqAsset, 'BTC')), ...(await grab('BTC', seqAsset))];
+  const seen = new Set();
+  const offers = both.filter(o => {
     if (o._verified === false) return false;
     // Mirror the composer's book predicate (isReverseCrossOffer in xswap.js): a reverse offer is simply
     // one whose offer_asset is BTC (the maker gives BTC for the asset = a taker SELL). Daemon/relay-seeded
@@ -174,7 +186,10 @@ async function findReverseOffer(seqAsset, seqAtoms){
     // cross_chain.direction requirement returned null for exactly the seeded liquidity the ladder showed,
     // throwing "No one is buying this asset for BTC right now". Forward offers have want_asset==='BTC'
     // instead, so this never picks one up.
-    return offerField(o, 'offer_asset', 'offerAsset') === 'BTC';
+    if (offerField(o, 'offer_asset', 'offerAsset') !== 'BTC') return false;
+    const id = (offerField(o, 'maker_pubkey', 'makerPubkey') || '') + ':' + (offerField(o, 'offer_id', 'offerId') || '');
+    if (seen.has(id)) return false; seen.add(id);
+    return true;
   });
   if (!offers.length) return null;
   const norm = (o) => {

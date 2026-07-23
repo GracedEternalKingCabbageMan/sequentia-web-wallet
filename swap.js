@@ -1884,19 +1884,38 @@ async function requoteMixed(route, amtStr){
       $('swRoute').textContent = 'Mixed rails · buy over Lightning, pay BTC on-chain';
       setReviewEnabled(false); renderTiming(route); return;
     }
-    const assetStr = C.fmtAtoms(BigInt(offer.asset_amount), am.precision || 0);
-    const btcStr = C.fmtAtoms(BigInt(offer.btc_sats), 8);
-    // Capture what the user typed to SPEND (the BTC pay field) BEFORE we overwrite it with the offer's
-    // amounts: this rail lifts the WHOLE offer, so if the offer's BTC differs materially from the typed
-    // amount, say so (mirror the cross/pure-LN whole-offer note) instead of silently overwriting.
-    const typedBtcU = parseFloat(String($('swPayAmt').value || '').replace(/,/g, '')) || 0;
-    const offerBtcU = Number(BigInt(offer.btc_sats)) / 1e8;
+    // T8 PARTIAL FILL: this rail can take a SLICE of the resting sub-asset BUY offer, not only the whole
+    // thing. startBuy already computes a proportional slice when the user enters LESS BTC than the offer's
+    // full price (assetAtoms scaled by the BTC fraction; btcSats = the maker's ceil-proportional need),
+    // and the maker re-rests the remainder. So DON'T clobber the user's typed BTC with the whole offer's
+    // amount — that overwrote the slice and always lifted the whole offer, making the partial path
+    // unreachable. Read the SAME typed BTC reviewMixed passes to startBuy, mirror startBuy's exact BigInt
+    // slice math, and paint the proportional asset received, so the composer preview equals what executes.
+    const wholeAsset = BigInt(offer.asset_amount), wholeBtc = BigInt(offer.btc_sats);
+    const typedBtcU = fieldUnits($('swPayAmt'), 'BTC') || 0;
+    const reqBtcSats = typedBtcU > 0 ? BigInt(Math.round(typedBtcU * 1e8)) : 0n;
+    let assetAtoms = wholeAsset, btcSats = wholeBtc, sliced = false;
+    if (reqBtcSats > 0n && reqBtcSats < wholeBtc){
+      let a = (wholeAsset * reqBtcSats) / wholeBtc;   // floor slice of the entered BTC (mirror startBuy)
+      if (a < 1n) a = 1n;
+      assetAtoms = a;
+      btcSats = ceilDiv(wholeBtc * a, wholeAsset);    // = the maker's ProportionalBtc(ceil), never rejected
+      sliced = true;
+    }
+    const assetStr = C.fmtAtoms(assetAtoms, am.precision || 0);
+    const btcStr = C.fmtAtoms(btcSats, 8);
+    const wholeAssetStr = C.fmtAtoms(wholeAsset, am.precision || 0), wholeBtcStr = C.fmtAtoms(wholeBtc, 8);
+    // Paint the asset the user RECEIVES for their slice (derived field). For a SLICE, leave the pay (BTC)
+    // field exactly as the user typed it so their number routes through startBuy's partial path; only fill
+    // the pay field for the whole-offer default (nothing typed / at-or-above the offer's full price).
     setNativeField($('swRecvAmt'), assetStr);
-    setNativeField($('swPayAmt'), btcStr);
-    let mixRate = `${btcStr} BTC → ${assetStr} ${am.ticker} · best resting offer`;
-    if (typedBtcU > 0 && offerBtcU > 0 && Math.abs(offerBtcU - typedBtcU) / offerBtcU > 0.02)
-      mixRate += ` · ⚠ lifts the whole offer (${btcStr} BTC), not the ${trim(typedBtcU)} you entered`;
-    $('swRate').textContent = mixRate;
+    if (!sliced) setNativeField($('swPayAmt'), btcStr);
+    const sliceNote = sliced
+      ? `fills up to ${wholeAssetStr} ${am.ticker} (${wholeBtcStr} BTC); the maker re-rests the rest`
+      : (reqBtcSats >= wholeBtc && reqBtcSats > 0n
+        ? `capped at this offer’s ${wholeBtcStr} BTC (the most it can fill) · switch to Limit to rest a larger order`
+        : 'best resting offer');
+    $('swRate').textContent = `${btcStr} BTC → ${assetStr} ${am.ticker} · ${sliceNote}`;
     $('swRoute').textContent = 'Mixed rails · buy over Lightning, pay BTC on-chain';
     paintFee('BTC', null, 'You pay BTC on-chain; the maker pays the ' + am.ticker + ' to your device over Lightning.');
     LAST_QUOTE = { kind: 'mixed', route, seqAsset: route.seqAsset, payIsBtc: true,
@@ -2061,13 +2080,15 @@ async function requoteCross(route, amtStr){
       wholeOffer, overshoot, offerSeqAtoms: String(offerSeqAtoms), offerBtcAtoms: String(offerBtcAtoms) };
     status.textContent = '';
     paintQuoteCross();
-    // AFFORDABILITY (C4): the cross take funds the fill now AND rests the remainder, so the FULL
-    // requested pay amount is committed — gate Review on it, like the same-chain path, instead of
-    // letting the user start a swap they can't fund. For a whole-offer overshoot the real commit is the
-    // OFFER's size, which is larger than the request, so gate on THAT (else a user who can afford their
-    // typed amount but not the whole offer passes Review and fails at funding).
+    // AFFORDABILITY (C4): a MARKET cross order is IOC — it funds only the FILLABLE portion now and
+    // CANCELS (never rests) the rest, so only the fill is committed. Gate Review on the committed amount,
+    // not the full request, so a user who can afford what actually fills isn't blocked by a remainder
+    // that is never funded. For a whole-offer overshoot the real commit is the OFFER's size (larger than
+    // the request), so gate on THAT (else a user who can afford their typed amount but not the whole
+    // offer passes Review and fails at funding).
+    const fillBtcAtoms = big(rawXq.btc_amount);
     const _payAtoms = overshoot ? (route.payIsBtc ? offerBtcAtoms : offerSeqAtoms)
-                                : (route.payIsBtc ? reqBtcAtoms : reqSeqAtoms);
+                                : (route.payIsBtc ? fillBtcAtoms : fillSeq);
     const _payBal   = balAtoms(route.payIsBtc ? 'BTC' : seqAsset);
     // Paying BTC funds an on-chain HTLC whose funding tx also needs a Bitcoin miner fee on top of the
     // locked amount, so reserve a little headroom (the exact fee is computed at btcBuildTx). Without it a
@@ -2233,13 +2254,14 @@ function paintQuoteCross(){
   const seqUnits = Number(reqSeq) / Math.pow(10, sm.precision || 0);
   const btcUnits = Number(reqBtc) / 1e8;
   let line = seqUnits > 0 ? `1 ${sm.ticker} = ${trim(btcUnits / seqUnits)} BTC · cross-chain HTLC` : `cross-chain HTLC`;
-  // Market order bigger than the maker's depth: say how much fills now and how much rests — the
-  // same "fills ~X now, ~Y rests" language the same-chain route uses. No more "Capped — reduce it".
+  // Market order bigger than the maker's depth: a MARKET cross order is IOC — it fills what the book
+  // crosses now and CANCELS the rest (it never rests it; that is the Limit path). Say so honestly so the
+  // composer preview matches what reviewCross executes (spec §6: Review == execution).
   const rem = q.remainderSeqAtoms != null ? BigInt(q.remainderSeqAtoms) : 0n;
   if (rem > 0n){
     const fillU = Number(BigInt(q.fillSeqAtoms)) / Math.pow(10, sm.precision || 0);
     const restU = Number(rem) / Math.pow(10, sm.precision || 0);
-    line += ` · fills ~${trim(fillU)} ${sm.ticker} now, ~${trim(restU)} rests`;
+    line += ` · fills ~${trim(fillU)} ${sm.ticker} now, ~${trim(restU)} won’t fill (not rested)`;
   }
   // Whole-offer overshoot: the courier lifts this offer IN FULL (no partial fill on the cross rail), so
   // it takes more than the user typed. Say so plainly in the composer's info line — the same honesty the
@@ -4478,26 +4500,15 @@ async function reviewCross(q){
     $('swErr').textContent = 'You already have a cross-chain swap in progress. Finish or refund it first (open it under Active trades) before starting another.';
     return;
   }
-  // Market order bigger than the best maker's depth: fill what's available now (the HTLC wizard,
-  // below) AND rest the remainder as a limit order at the same price. Post the remainder FIRST —
-  // it's quick and non-interactive, so it rests even if the user closes the fill wizard — then open
-  // the fill. If the remainder post fails, the fill still proceeds and we say so.
+  // Market order bigger than the best maker's depth: a MARKET order on a cross/BTC pair is IOC (spec
+  // §4/§10 closed decision) — fill what the book crosses now (the HTLC wizard / covenant path below)
+  // and CANCEL the rest. A market order NEVER rests a remainder; resting is the LIMIT path (post mode →
+  // postModeCross). This mirrors the same-chain takeMarketWalk, which fills-then-cancels and says "NOT
+  // rested". Post nothing here, leave zero resting state — only tell the user what won't fill.
   const rem = q.remainderSeqAtoms != null ? BigInt(q.remainderSeqAtoms) : 0n;
   if (rem > 0n){
-    const payIsBtc = !!(q.route && q.route.payIsBtc);
-    const start = payIsBtc ? (X.makerStartReverse) : (X.makerStart);   // buy -> post a bid; sell -> post an ask
     const sm = C.assetMeta(q.seqAsset);
-    if (start){
-      try {
-        C.toast(`Filling ~${C.fmtAtoms(BigInt(q.fillSeqAtoms), sm.precision)} ${sm.ticker} now; resting ~${C.fmtAtoms(rem, sm.precision)} ${sm.ticker} as a limit order…`);
-        const recvAddr = C.wollet.address(C.addrIndex == null ? undefined : C.addrIndex).address();
-        const handle = await start({ assetHex: q.seqAsset, assetAtoms: rem, btcSats: BigInt(q.remainderBtcAtoms), expirySecs: 3600, recvAddr }, onCrossMakeState);
-        XMAKE = { handle, assetHex: q.seqAsset, assetAtoms: rem, btcSats: BigInt(q.remainderBtcAtoms), reverse: !payIsBtc, offerId: handle.offer.offer_id, state: 'resting' };
-        renderXMake();
-      } catch (e){
-        $('swErr').textContent = 'The available part will fill, but the remainder could not be rested: ' + C.prettyErr(e);
-      }
-    }
+    C.toast(`Filling ~${C.fmtAtoms(BigInt(q.fillSeqAtoms), sm.precision)} ${sm.ticker} now; the remaining ~${C.fmtAtoms(rem, sm.precision)} ${sm.ticker} can’t fill from the book and was NOT rested — a market order never rests (switch to Limit to rest an order).`);
   }
   if (q.reverse){
     // A pegged-BTC covenant bid (advertised as BTC, locking SBTC) among the reverse offers settles as
