@@ -184,6 +184,16 @@
   .swmeta{display:flex;flex-direction:column;gap:14px}
   .swmeta-row{display:flex;align-items:baseline;justify-content:space-between;gap:12px;flex-wrap:wrap}
   #swRate{color:var(--txt);font-size:13.5px}
+  /* PRICE FIELD (§6.4): a proper bordered input (it toggles editable in Limit / read-only in Market),
+     smaller than the hero amount inputs. The unit label reads like the ladder Price header (base/quote). */
+  .swprice-row{display:flex;align-items:center;gap:10px;margin:2px 0 4px;background:var(--panel2);
+               border:1px solid var(--line);border-radius:10px;padding:8px 12px}
+  .swprice-row.hide{display:none}
+  .swprice-row .swamt{font:600 20px/1.1 ui-monospace,Menlo,Consolas,monospace}
+  .swprice-unit{flex:0 0 auto;color:var(--dim);font-size:13px;white-space:nowrap;letter-spacing:.01em}
+  #swPriceAmt:disabled{color:var(--dim);opacity:.9;-webkit-text-fill-color:var(--dim)}
+  .swprice-hint{display:block;font-size:12px;color:var(--dim);margin-top:1px;min-height:0}
+  .swprice-hint:empty{display:none}
   /* two INDEPENDENT settlement rails: "Pay from ⚡/on-chain" + "Receive to ⚡/on-chain" */
   .swrails{display:grid;grid-template-columns:1fr 1fr;gap:10px}
   .swrailpick .swrail-lab{display:block;font-size:11px;color:var(--dim);text-transform:uppercase;letter-spacing:.05em;margin-bottom:5px}
@@ -596,6 +606,18 @@
                     </div>
                   </div>
                 </div>
+                <!-- PRICE FIELD (§6.4): ALWAYS present once a pair is chosen; its CONTENTS change with
+                     mode, never its presence. LIMIT -> an editable "your price" (quote per 1 base),
+                     seeded with the book's inside price; editing it derives the amount, editing an
+                     amount derives it back (like the ⇄ ref input). MARKET -> a read-only sweep
+                     estimate (VWAP) + a slippage bound. Wired + painted by paintPriceField() (swap.js). -->
+                <div class="swrow swprice-row hide" id="swPriceRow">
+                  <div class="swamt-wrap">
+                    <input id="swPriceAmt" class="swamt mono" inputmode="decimal" placeholder="0.0" aria-label="Price (quote per base)" autocomplete="off">
+                  </div>
+                  <span class="swprice-unit mono" id="swPriceUnit">&#8212;</span>
+                </div>
+                <span class="sub swprice-hint" id="swPriceHint"></span>
                 <div class="swmeta-row" id="swRateRow">
                   <span class="sub" id="swRate">Pick two assets to see a rate.</span>
                   <span class="sub" id="swRoute"></span>

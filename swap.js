@@ -195,6 +195,12 @@ const S = {
 };
 let INSTANT = {};    // ticker -> { spendable, receivable } atoms (best-effort from the LSP /status)
 let LAST_MID = null; // { price, cross, base, quote } for the current pair — feeds the pair bar + cost line
+// The last rendered book AGGREGATED into price LEVELS (best-first per side), in the SAME display frame
+// as the ladder (base/quote from pairDir). Feeds the MARKET-mode price field's sweep-estimate (VWAP) +
+// slippage bound (paintPriceField/sweepEstimate). Each level: { price (quote per base), size (base
+// units), sizeAtoms }. Set by renderBook (same-chain) + renderXBook (cross); staleness is checked by
+// comparing base/quote against the current pairDir so a mid-flip never yields a wrong-frame estimate.
+let LAST_LADDER = null;
 
 // ---- canonical price direction (C1) ----------------------------------------------------------------
 // A pair is priced ONE way — "1 base = N quote" (quote per base) — no matter which side the user is
@@ -300,6 +306,8 @@ export function initSwap(ctx){
     wireRailSeg('swRecvRailSeg', 'recv');
     // Take / Post chooser (switching to Post unlinks the two amount fields).
     wireModeSeg();
+    // The dedicated price field (§6.4): editable in Limit (drives the derived amount), read-only in Market.
+    wirePriceInput();
     // Unblinded / Blinded book toggle (switches which relay namespace we read + post to).
     wireBookSeg();
     if ($('swXBack')) $('swXBack').onclick = () => { if (X && X.hasInFlight && X.hasInFlight()) _dismissed.add('cross'); showCross(false); renderSwap(); };
@@ -332,6 +340,14 @@ function wireAmount(input, side){
       const other = side === 'pay' ? C.$('swRecvAmt') : C.$('swPayAmt');
       if (other) other._userTyped = false;
     }
+    // P2.6 price-field interplay ("respect whichever the user is actively typing"):
+    //  • TAKE: the price is a read-only sweep readout — never a user value; clear its flag so it repaints.
+    //  • LIMIT with a user-set price: this amount is the SIZE anchor -> derive the OTHER amount from the
+    //    held price (so typing a size after a price fills the total, and the price is NOT wiped).
+    //  • LIMIT with no user price: the two amounts define the price -> paintPriceField reads their ratio.
+    const _pf = C.$('swPriceAmt');
+    const priceHeld = (S.mode === 'post') && !!(_pf && _pf._userTyped);
+    if (S.mode !== 'post' && _pf) _pf._userTyped = false;
     LAST_QUOTE = null;
     setReviewEnabled(false);
     // Instant auto-fill: derive the other leg NOW from the last-known book price (no network), so it
@@ -340,7 +356,10 @@ function wireAmount(input, side){
     // the quote — this is just a snappy preview that the requote corrects if the book moved.
     if (S.mode !== 'post' && _composeBest && _composeBest.pay === S.payAsset && _composeBest.receive === S.receiveAsset && _composeBest.best){
       try { applyComposeDerivation(S.payAsset, S.receiveAsset, _composeBest.best); } catch {}
+    } else if (priceHeld){
+      try { applyPriceEdit(); } catch {}   // LIMIT: size × held price -> the other amount (price preserved)
     }
+    try { paintPriceField(); } catch {}   // snappy price readout as you type (requote repaints it too)
     clearTimeout(_quoteTimer);
     _quoteTimer = setTimeout(() => requote().catch(()=>{}), 220);
   });
@@ -398,6 +417,195 @@ function applyComposeDerivation(pay, receive, price){
     setDerived(otherEl, C.fmtAtoms(otherAtoms, meta.precision || 0));
   }
   paintRefHints();
+}
+
+// ---------------------------------------------------------------------------
+// P2.6 — the dedicated PRICE field (§6.4): an always-present control whose CONTENTS
+// change with mode (editable "your price" in Limit; a read-only sweep estimate in
+// Market), never its presence. Price is quote-per-base in the ladder's display frame
+// (pairDir), so it reads identically to the ladder Price column and a clicked level.
+// ---------------------------------------------------------------------------
+// Write `units` (NATIVE asset units, a number) into an amount field, HONORING its ⇄ ref-currency
+// display mode (native vs USD), same as applyComposeDerivation. markTyped=false marks it a derived
+// value (overwritable); true marks it the user's own input. Used when the PRICE field drives an amount.
+function writeAmountUnits(el, asset, units, markTyped){
+  if (!el) return;
+  const meta = C.assetMeta(asset);
+  const atoms = C.parseAtoms(String(trim(units)), meta.precision || 0);
+  if (el._refMode && C.refValue){
+    const rv = C.refValue(asset, atoms);
+    el.value = rv ? String(trim(rv.v)) : C.fmtAtoms(atoms, meta.precision || 0);
+  } else {
+    el.value = C.fmtAtoms(atoms, meta.precision || 0);
+  }
+  el._userTyped = !!markTyped;
+}
+// The price field's numeric value (quote per base), or 0 if empty/invalid.
+function priceFieldUnits(){
+  const el = C.$('swPriceAmt'); if (!el) return 0;
+  const v = parseFloat((el.value || '').trim());
+  return (v > 0 && isFinite(v)) ? v : 0;
+}
+// Set the price field's displayed value. userTyped=false marks it a derived readout (a later paint may
+// refresh it); true marks it the user's own limit price (paint preserves it until an amount is edited).
+function setPriceFieldValue(price, userTyped){
+  const el = C.$('swPriceAmt'); if (!el) return;
+  el.value = (price > 0 && isFinite(price)) ? String(trim(price)) : '';
+  el._userTyped = !!userTyped;
+}
+function setPriceHint(txt){ const h = C.$('swPriceHint'); if (h) h.textContent = txt || ''; }
+// Quote-per-base price implied by the two current amount fields (0 if either is unset).
+function currentAmountsPrice(){
+  const pay = S.payAsset, receive = S.receiveAsset; if (!(pay && receive)) return 0;
+  const payU = fieldUnits(C.$('swPayAmt'), pay), recvU = fieldUnits(C.$('swRecvAmt'), receive);
+  if (!(payU > 0 && recvU > 0)) return 0;
+  return ratePerPayToLine(pay, receive, recvU / payU).qpb;
+}
+// The book's inside price (the mid) in the current display frame, for the Limit placeholder / Market
+// fallback. LAST_MID.price is already quote-per-base in the rendered frame.
+function insidePrice(){ return (LAST_MID && LAST_MID.price > 0 && isFinite(LAST_MID.price)) ? LAST_MID.price : 0; }
+
+// The user edited the PRICE field (Limit only): keep the last-typed amount (S.edited) as the size anchor
+// and derive the OTHER amount = size × price. Mirrors deriveOtherField's receive-per-pay math, but the
+// price field is the driver here (so it deliberately OVERWRITES the derived side, marking it not-typed).
+function applyPriceEdit(){
+  const pay = S.payAsset, receive = S.receiveAsset; if (!(pay && receive)) return;
+  const price = priceFieldUnits(); if (!(price > 0)) return;
+  const { base } = pairDir(pay, receive);
+  const recvPerPay = (base === pay) ? price : 1 / price;   // receive-per-pay from quote-per-base
+  const anchorSide = S.edited === 'receive' ? 'receive' : 'pay';
+  const anchorEl = anchorSide === 'pay' ? C.$('swPayAmt') : C.$('swRecvAmt');
+  const otherEl  = anchorSide === 'pay' ? C.$('swRecvAmt') : C.$('swPayAmt');
+  const anchorAsset = anchorSide === 'pay' ? pay : receive;
+  const otherAsset  = anchorSide === 'pay' ? receive : pay;
+  const anchorUnits = fieldUnits(anchorEl, anchorAsset);
+  if (!(anchorUnits > 0)) return;                          // no size yet -> the price stands as the user's limit
+  const otherUnits = anchorSide === 'pay' ? anchorUnits * recvPerPay : anchorUnits / recvPerPay;
+  if (!(otherUnits > 0) || !isFinite(otherUnits)) return;
+  writeAmountUnits(otherEl, otherAsset, otherUnits, false);
+  paintRefHints();
+}
+
+// Walk the current book's aggregated LEVELS (LAST_LADDER, best-first) to estimate a MARKET sweep for the
+// order's base size: VWAP + worst level touched. null when the book/frame is stale or empty. Buying the
+// base sweeps ASKS (lowest first); selling sweeps BIDS (highest first). No size -> just the inside price.
+function sweepEstimate(){
+  const pay = S.payAsset, receive = S.receiveAsset;
+  if (!(pay && receive) || !LAST_LADDER) return null;
+  const { base } = pairDir(pay, receive);
+  if (LAST_LADDER.base !== base) return null;              // ladder rendered in a different frame -> stale
+  const buyingBase = (base === receive);                   // you RECEIVE the base => you are buying it
+  const levels = (buyingBase ? LAST_LADDER.asks : LAST_LADDER.bids) || [];
+  if (!levels.length) return null;
+  const best = levels[0].price;
+  const baseEl = (base === pay) ? C.$('swPayAmt') : C.$('swRecvAmt');
+  const wantBase = fieldUnits(baseEl, base);
+  if (!(wantBase > 0)) return { vwap: best, worst: best, best, partial: false };
+  let remaining = wantBase, totBase = 0, totQuote = 0, worst = best;
+  for (const lv of levels){
+    if (remaining <= 0) break;
+    const take = Math.min(remaining, lv.size);
+    totBase += take; totQuote += take * lv.price; worst = lv.price; remaining -= take;
+  }
+  if (!(totBase > 0)) return { vwap: best, worst: best, best, partial: false };
+  return { vwap: totQuote / totBase, worst, best, partial: remaining > totBase * 1e-9 };
+}
+// The Market-mode slippage bound line from a sweep estimate.
+function slippageHint(est){
+  if (!est || !(est.best > 0)) return '';
+  if (est.partial) return 'Market · sweeps the book; your size exceeds the resting depth (the remainder cancels).';
+  const slipPct = Math.abs(est.worst / est.best - 1) * 100;
+  if (slipPct < 0.05) return 'Market · fills at the inside price.';
+  return `Market · est. up to ${slipPct.toFixed(slipPct < 1 ? 2 : 1)}% slippage (to ${trim(est.worst)}).`;
+}
+
+// Paint the price field for the current pair + mode (§6.4). Presence is constant once a pair is chosen;
+// only the contents change. LIMIT: editable, seeded with the inside price, showing the ratio of the two
+// amounts unless the user is actively typing a price. MARKET: read-only, the effective sweep price +
+// a slippage bound. Never fights a field the user is editing (skips the active price input).
+function paintPriceField(){
+  const el = C.$('swPriceAmt'); if (!el) return;
+  const row = C.$('swPriceRow');
+  const pay = S.payAsset, receive = S.receiveAsset;
+  const show = !!(pay && receive);
+  if (row) row.classList.toggle('hide', !show);
+  if (!show){ el.value = ''; el._userTyped = false; setPriceHint(''); return; }
+  const { base, quote } = pairDir(pay, receive);
+  const bm = metaOf(base), qm = metaOf(quote);
+  const unit = C.$('swPriceUnit'); if (unit) unit.textContent = `${bm.ticker}/${qm.ticker}`;
+  if (document.activeElement === el) return;               // don't overwrite the field being typed in
+  if (S.mode === 'post'){
+    el.readOnly = false; el.disabled = false; el.removeAttribute('title');
+    const inside = insidePrice();
+    el.placeholder = inside > 0 ? String(trim(inside)) : '0.0';
+    if (!el._userTyped){                                    // amounts drive the price unless the user typed it
+      const p = currentAmountsPrice();
+      el.value = p > 0 ? String(trim(p)) : '';
+    }
+    setPriceHint('');
+  } else {
+    // MARKET: the price is not the user's to set — show the effective price of what will execute, plus a
+    // slippage bound walked from the book depth (where we have a ladder for it).
+    el.readOnly = true; el.disabled = true; el._userTyped = false;
+    el.title = 'Market orders fill at the best available price · switch to Limit to set your own.';
+    const eff = currentAmountsPrice();
+    const est = sweepEstimate();
+    const shown = eff > 0 ? eff : (est ? est.vwap : insidePrice());
+    el.value = shown > 0 ? String(trim(shown)) : '';
+    setPriceHint(est ? slippageHint(est) : (shown > 0 ? 'Market · fills at the best available price now.' : ''));
+  }
+}
+function wirePriceInput(){
+  const el = C.$('swPriceAmt'); if (!el || el._wired) return; el._wired = true;
+  el.addEventListener('input', () => {
+    if (S.mode !== 'post') return;                          // read-only in Market (guarded; also disabled)
+    el._userTyped = true;
+    applyPriceEdit();
+    LAST_QUOTE = null; setReviewEnabled(false);
+    clearTimeout(_quoteTimer);
+    _quoteTimer = setTimeout(() => requote().catch(()=>{}), 220);
+  });
+}
+
+// P2.7 — collapse per-offer ladder rows into price LEVELS: one row per distinct price with size (and
+// exact atoms) SUMMED, so a thick level of many small offers is ONE row and the N best LEVELS (not the
+// N best offers) show with cumulative depth. Rows: { price, size, sizeAtoms?, take?, mine? }. Prices are
+// keyed at 10 dp so float dust never splits a level. `take` marks the liftable (clickable) side.
+function aggregateLevels(rows){
+  const byKey = new Map();
+  for (const r of (rows || [])){
+    if (!(r.price > 0 && r.size > 0)) continue;
+    const key = r.price.toFixed(10);
+    let lv = byKey.get(key);
+    if (!lv){ lv = { price: r.price, size: 0, sizeAtoms: 0n, take: false, mine: false }; byKey.set(key, lv); }
+    lv.size += r.size;
+    if (r.sizeAtoms != null){ try { lv.sizeAtoms += BigInt(r.sizeAtoms); } catch {} }
+    if (r.take) lv.take = true;
+    if (r.mine) lv.mine = true;
+  }
+  return [...byKey.values()];
+}
+// Click a book LEVEL: seed the composer with that level's price + its aggregated size, then derive the
+// other amount. The base-side amount takes the EXACT summed atoms (no float-trim precision loss); the
+// price field takes the level price; the quote side derives from base × price. requote refines/validates.
+function seedFromLevel(price, sizeAtoms){
+  const pay = S.payAsset, receive = S.receiveAsset; if (!(pay && receive)) return;
+  const { base, quote } = pairDir(pay, receive);
+  const baseIsPay = (base === pay);
+  const baseEl  = baseIsPay ? C.$('swPayAmt') : C.$('swRecvAmt');
+  const otherEl = baseIsPay ? C.$('swRecvAmt') : C.$('swPayAmt');
+  const bm = metaOf(base);
+  S.edited = baseIsPay ? 'pay' : 'receive';
+  const atoms = (() => { try { return BigInt(sizeAtoms); } catch { return 0n; } })();
+  if (atoms > 0n){ setNativeField(baseEl, C.fmtAtoms(atoms, bm.precision || 0)); baseEl._userTyped = true; }
+  // In LIMIT the clicked price is HELD (adjusting size later keeps it); in MARKET the price field is a
+  // read-only sweep readout, so requote/paintPriceField overwrites it regardless of this flag.
+  if (price > 0) setPriceFieldValue(price, S.mode === 'post');
+  const sizeUnits = Number(atoms) / Math.pow(10, bm.precision || 0);
+  if (sizeUnits > 0 && price > 0) writeAmountUnits(otherEl, quote, sizeUnits * price, false);   // quote = base × (quote/base)
+  paintRefHints();
+  LAST_QUOTE = null; setReviewEnabled(false);
+  requote().catch(()=>{});
 }
 
 // Re-render the whole composer for the current wallet/markets/state.
@@ -775,6 +983,7 @@ function renderPairBar(){
   if (fb) fb.onclick = (e) => {
     e.stopPropagation();
     S.priceFlip = !S.priceFlip;                                  // swap the DISPLAY direction only
+    { const pe = C.$('swPriceAmt'); if (pe) { pe._userTyped = false; pe.value = ''; } }  // a held limit price is meaningless in the flipped frame -> re-placeholder from the new inside price (paintPriceField)
     renderPairBar();                                             // instant heading flip
     requote().catch(()=>{});                                     // re-render book + rate line in the new frame
     renderRecentTrades().catch(()=>{}); renderPairStats().catch(()=>{});   // keep the feed/stats in step
@@ -798,6 +1007,7 @@ function paintPanes(){
   paintRouteLine();
   updateRails();
   paintModeSeg();
+  paintPriceField();   // §6.4: keep the price field's presence in lockstep with the pair (contents refresh on requote)
   paintBookSeg();
   paintConfControl();
   paintOfflineToggle();
@@ -915,9 +1125,19 @@ function paintModeSeg(){
   const hint = C.$('swModeHint');
   if (hint){
     hint.classList.toggle('hide', !show);
-    if (show) hint.textContent = S.mode === 'post'
-      ? 'Set both amounts; their ratio is your price. Switch to Market to fill at the best price now.'
-      : 'Type an amount; the other fills at the best price. Switch to Limit to set your own.';
+    if (show){
+      if (S.mode === 'post'){
+        // P2.5: a Limit order must REST at the user's price, never silently take. Where a route can rest
+        // durably (same-chain covenant CLOB + durable cross), say so; on a rail that CANNOT rest offline
+        // (pure-LN / mixed submarine) be honest that Limit needs an on-chain leg instead of implying a rest.
+        const route = findRoute(S.payAsset, S.receiveAsset);
+        hint.textContent = postSupported(route)
+          ? 'Set your price (or an amount) — the order fills what crosses now and rests the remainder at your price. Switch to Market to fill now.'
+          : 'Limit rests at your price only on-chain (the Lightning rail can’t rest while your wallet is closed) · set both legs on-chain to rest a durable limit.';
+      } else {
+        hint.textContent = 'Type an amount; the other fills at the best price. Switch to Limit to set your own.';
+      }
+    }
   }
 }
 // Switch mode by hand. Market re-links the fields (requote re-derives the opposite at the book price);
@@ -927,6 +1147,7 @@ function setMode(m){
   S.mode = m;
   LAST_QUOTE = null; setReviewEnabled(false);
   paintModeSeg();
+  paintPriceField();   // flip the price field editable<->read-only immediately (requote repaints its value)
   requote().catch(()=>{});
 }
 
@@ -1221,6 +1442,7 @@ async function requote(){
     else                             await requoteSame(route, amtStr);
   } finally {
     try { paintCostLine(); } catch {}   // E2: the one cost line, after any rail quotes
+    try { paintPriceField(); } catch {}  // P2.6: the always-present price field, after the book + quote render
     // D5/D3: refresh the recent-trades feed + 24h stats only when the PAIR changes (not per keystroke).
     try {
       const pk = (S.payAsset && S.receiveAsset) ? (S.payAsset + '|' + S.receiveAsset) : null;
@@ -1833,6 +2055,19 @@ async function requoteMixed(route, amtStr){
   const { $ } = C;
   const am = C.assetMeta(route.seqAsset);
   $('swStatus').textContent = ''; $('swErr').textContent = '';
+  // P2.5: LIMIT on a mixed (submarine / sub-asset) rail. These settle by lifting a whole resting offer
+  // or an LSP-fronted leg — there is NO durable offline rest here — so selecting Limit must never
+  // silently market-execute at the maker's price. Render the book, then gate honestly + point at the
+  // on-chain (covenant CLOB) path, which DOES rest a durable cross limit at the user's price.
+  if (S.mode === 'post'){
+    try { await loadBtcBook(route); } catch {}
+    LAST_QUOTE = null; setReviewEnabled(false);
+    $('swRoute').textContent = 'Mixed rails · Lightning + on-chain';
+    $('swRate').textContent = `Limit orders need a rail that can rest offline · put both legs on-chain to rest a durable ${am.ticker}/BTC limit at your price (the Lightning leg can’t rest while your wallet is closed).`;
+    paintFee('BTC', null, null);
+    renderTiming(route);
+    return;
+  }
   // Defensive: the rail toggles already grey out the undeployed mixed shape (asset over LN
   // + BTC on-chain), but if state ever lands there, don't offer a doomed Review — render
   // the book, then nudge the user to a supported combo instead of hitting an HTTP 422.
@@ -2134,40 +2369,42 @@ function renderXBook(seqAsset, payIsBtc, forward, reverse, unified){
       const atoms = big(o.assetAtoms);
       const assetU = Number(atoms) / Math.pow(10, am.precision || 0);
       const btcU = Number(big(o.btcSats)) / 1e8;
-      return { price: assetU > 0 ? btcU / assetU : 0, size: assetU, assetAtoms: atoms, rail: o.rail };
+      return { price: assetU > 0 ? btcU / assetU : 0, size: assetU, sizeAtoms: atoms, rail: o.rail };
     };
     asks = (unified.asks || []).map(uRow).filter(r => r.price > 0 && r.size > 0);
     bids = (unified.bids || []).map(uRow).filter(r => r.price > 0 && r.size > 0);
     n = (unified.asks || []).length + (unified.bids || []).length;
-    const seed = (r) => () => {
-      const el = payIsBtc ? C.$('swRecvAmt') : C.$('swPayAmt');
-      // Seed the EXACT atoms at the asset's own precision (like fillFromXOffer / commit 7d85b396's
-      // MED-4 fix), not an 8dp float trim() that can lose precision or emit more decimals than the
-      // asset supports.
-      if (el){ S.edited = payIsBtc ? 'receive' : 'pay'; el.value = C.fmtAtoms(r.assetAtoms, am.precision || 0); }
-      LAST_QUOTE = null; setReviewEnabled(false); requote().catch(()=>{});
-    };
-    (payIsBtc ? asks : bids).forEach(r => r.onClick = seed(r));
   } else {
     // On-chain-only fallback (LSP unreachable). asks = forward offers (someone SELLS the asset for
     // BTC), bids = reverse offers (someone BUYS the asset with BTC). Priced BTC/asset by each offer's
     // OWN direction, not the user's side.
-    const toRow = (o, i, dirIsBtc) => {
+    const toRow = (o, dirIsBtc) => {
       const { asset, btc } = xOfferAmts(o, dirIsBtc);
       const assetU = Number(big(asset)) / Math.pow(10, am.precision || 0), btcU = Number(big(btc)) / 1e8;
-      return { price: assetU > 0 ? btcU / assetU : 0, size: assetU, _i: i };
+      return { price: assetU > 0 ? btcU / assetU : 0, size: assetU, sizeAtoms: big(asset) };
     };
-    asks = forward.map((o, i) => toRow(o, i, true)).filter(r => r.price > 0 && r.size > 0);
-    bids = reverse.map((o, i) => toRow(o, i, false)).filter(r => r.price > 0 && r.size > 0);
+    asks = forward.map((o) => toRow(o, true)).filter(r => r.price > 0 && r.size > 0);
+    bids = reverse.map((o) => toRow(o, false)).filter(r => r.price > 0 && r.size > 0);
     n = forward.length + reverse.length;
-    (payIsBtc ? asks : bids).forEach(r => r.onClick = () => fillFromXOffer(r._i));
   }
+  // The clickable side is the one takeable in the user's current direction (buy asset with BTC -> asks;
+  // sell asset for BTC -> bids). Tag it so aggregateLevels carries the flag onto the levels.
+  const takeAsk = !!payIsBtc;
+  asks.forEach(r => { r.take = takeAsk; });
+  bids.forEach(r => { r.take = !takeAsk; });
+  // P2.7: aggregate offers at the same price into ONE level per side (size + exact atoms summed), so a
+  // thick level of many small offers is ONE row and the Sum column is cumulative over LEVELS.
+  asks = aggregateLevels(asks);
+  bids = aggregateLevels(bids);
   asks.sort((a, b) => a.price - b.price);
   { let c = 0; const t = asks.reduce((s, r) => s + r.size, 0) || 1; asks.forEach(r => { c += r.size; r.cum = c; r.frac = c / t; }); }
   bids.sort((a, b) => b.price - a.price);
   { let c = 0; const t = bids.reduce((s, r) => s + r.size, 0) || 1; bids.forEach(r => { c += r.size; r.cum = c; r.frac = c / t; }); }
-  // (onClick was assigned per-branch above: seed-amount for the merged book, fillFromXOffer for the
-  // on-chain fallback. The clickable side is the one takeable in the user's current direction.)
+  // Stash the FULL aggregated levels (best-first) for the Market-mode price field's sweep estimate.
+  LAST_LADDER = { base: seqAsset, quote: 'BTC', asks: asks.slice(), bids: bids.slice() };
+  // Click-to-seed the takeable side's LEVELS: the level price + its aggregated size (exact atoms).
+  const wireX = (r) => { if (r.take) r.onClick = () => seedFromLevel(r.price, r.sizeAtoms); };
+  asks.forEach(wireX); bids.forEach(wireX);
   const bestAsk = asks.length ? Math.min(...asks.map(a => a.price)) : null;
   const bestBid = bids.length ? Math.max(...bids.map(b => b.price)) : null;
   const mid = (bestAsk != null && bestBid != null) ? (bestAsk + bestBid) / 2 : (bestAsk != null ? bestAsk : bestBid);
@@ -2181,18 +2418,6 @@ function renderXBook(seqAsset, payIsBtc, forward, reverse, unified){
     emptyMsg: 'No resting offers yet - a market maker with BTC reserves needs to post one.',
   });
   renderPairBar();
-}
-// Click a cross-book level: seed the composer with that offer's asset size + re-quote.
-function fillFromXOffer(i){
-  const o = (XBOOK.offers || [])[i]; if (!o) return;
-  const am = C.assetMeta(XBOOK.seqAsset);
-  const { asset } = xOfferAmts(o, XBOOK.payIsBtc);
-  // Clicking a book level is an EXPLICIT user amount — mark it _userTyped so the requote's
-  // derivation fills the OTHER leg and never overwrites this chosen size.
-  if (XBOOK.payIsBtc){ S.edited = 'receive'; const el = C.$('swRecvAmt'); el.value = C.fmtAtoms(asset, am.precision || 0); el._userTyped = true; const o = C.$('swPayAmt'); if (o) o._userTyped = false; }
-  else               { S.edited = 'pay';     const el = C.$('swPayAmt');  el.value = C.fmtAtoms(asset, am.precision || 0); el._userTyped = true; const o = C.$('swRecvAmt'); if (o) o._userTyped = false; }
-  LAST_QUOTE = null; setReviewEnabled(false);
-  requote().catch(()=>{});
 }
 
 // The shared ladder: asks (red, high->low) · mid · bids (green, high->low), with a
@@ -2518,6 +2743,7 @@ function openPicker(side){
     if (o && !counterpartsOf(hex).includes(o)){ if (side === 'pay') S.receiveAsset = null; else S.payAsset = null; }
     S.payRail = null; S.recvRail = null;   // rails reset to unselected for the new pair (no default; user must pick)
     S.feeAsset = null; S.feeAssetTouched = false; S.priceFlip = false;   // fee default re-follows the new pay asset; a manual pick + display flip are per-pair, not global (D2/C-11)
+    { const pe = C.$('swPriceAmt'); if (pe) { pe._userTyped = false; pe.value = ''; } }  // clear a held limit price on asset change (new frame -> re-placeholder from the new inside price)
     LAST_QUOTE = null; setReviewEnabled(false);
     paintPanes();
     requote().catch(()=>{});
@@ -4558,6 +4784,17 @@ async function requoteLn(route, amtStr){
   $('swRoute').textContent = route.payIsBtc ? `Lightning · buy with ${qtk}` : `Lightning · sell for ${qtk}`;
   $('swStatus').textContent = ''; $('swErr').textContent = '';
   renderTiming(route);
+  // P2.5: LIMIT on the Lightning rail. A pure-LN offer cannot rest durably while the maker is offline,
+  // and this wallet has no online-LN-rest path — so NEVER silently lift the whole offer at the maker's
+  // price when the user asked to REST at their own price (the old behavior: the toggle showed Limit but
+  // the quote was still a whole-offer market take). Gate honestly + point at the covenant path (an
+  // on-chain leg), which DOES rest a durable limit. Invariant: selecting Limit never market-executes.
+  if (S.mode === 'post'){
+    LAST_QUOTE = null; setReviewEnabled(false);
+    paintFee(route.quoteAsset || 'BTC', null, null);
+    $('swRate').textContent = `Limit orders can’t rest on the Lightning rail (a resting offer needs the maker online) · switch a rail to on-chain to rest a durable ${am.ticker}/${qtk} limit at your price.`;
+    return;
+  }
   // The pure-LN CLI (xpln) has NO partial fill: it lifts the best resting offer IN FULL, so the size
   // that actually executes is the OFFER'S size, not the typed amount. Price + PIN off the SAME book
   // xpln lifts from — the LSP's /lnbook, sourced from the pure-LN relay (:9965) — NOT the on-chain
@@ -4990,31 +5227,35 @@ function renderBook(pay, receive){
     const baseA  = big(offerIsBase ? (o.offer_amount || o.offerAmount) : (o.want_amount || o.wantAmount));
     const quoteA = big(offerIsBase ? (o.want_amount || o.wantAmount)  : (o.offer_amount || o.offerAmount));
     const baseU = toU(baseA, bm.precision), quoteU = toU(quoteA, qm.precision);
-    return { price: baseU > 0 ? quoteU / baseU : 0, size: baseU, isAsk: offerIsBase, take,
-             id: o.offer_id || o.offerId, maker: o.maker_pubkey || o.makerPubkey, mine: isMine(o) };
+    return { price: baseU > 0 ? quoteU / baseU : 0, size: baseU, sizeAtoms: baseA, isAsk: offerIsBase, take,
+             mine: isMine(o) };
   };
   const rows = [
     ...(BOOK.offers || []).map(o => classify(o, receive, true)),     // give receive, want pay — liftable
     ...(BOOK.otherOffers || []).map(o => classify(o, pay, false)),   // give pay, want receive — the other side
   ].filter(r => r.price > 0 && r.size > 0);
-  let asks = rows.filter(r => r.isAsk);
-  let bids = rows.filter(r => !r.isAsk);
+  // P2.7: AGGREGATE offers at the same price into ONE level per side (size summed) — two makers at the
+  // same price are one row, and the depth column (Sum) is cumulative over LEVELS, not over offers, so a
+  // thick level can't crowd out real depth. A level keeps the exact summed atoms for precise click-seed.
+  let asks = aggregateLevels(rows.filter(r => r.isAsk));
+  let bids = aggregateLevels(rows.filter(r => !r.isAsk));
   const bestAsk = asks.length ? Math.min(...asks.map(a => a.price)) : null;
   const bestBid = bids.length ? Math.max(...bids.map(b => b.price)) : null;
   const mid = (bestAsk != null && bestBid != null) ? (bestAsk + bestBid) / 2 : (bestAsk != null ? bestAsk : bestBid);
   const spread = (bestAsk != null && bestBid != null) ? (bestAsk - bestBid) : null;
-  // cumulate from the mid outward; display asks high->low, bids high->low
+  // cumulate from the mid outward over LEVELS; display asks high->low, bids high->low
   asks.sort((a, b) => a.price - b.price);
   { let c = 0; const t = asks.reduce((s, r) => s + r.size, 0) || 1; asks.forEach(r => { c += r.size; r.cum = c; r.frac = c / t; }); }
   bids.sort((a, b) => b.price - a.price);
   { let c = 0; const t = bids.reduce((s, r) => s + r.size, 0) || 1; bids.forEach(r => { c += r.size; r.cum = c; r.frac = c / t; }); }
-  // Show the 8 offers NEAREST the mid (the BEST asks + BEST bids), never the farthest: asks is sorted
-  // ascending, so slice the 8 LOWEST then reverse for the high->low display (best ask sits right above
-  // the mid); bids are already best-first (descending). Previously the ask side reversed BEFORE slicing,
-  // so it showed the 8 HIGHEST asks and hid the best ones — visibly inconsistent with the spread/mid.
+  // Stash the FULL aggregated levels (best-first) for the Market-mode price field's sweep estimate.
+  LAST_LADDER = { base, quote, asks: asks.slice(), bids: bids.slice() };
+  // Show the 8 best LEVELS NEAREST the mid per side: asks is sorted ascending, so slice the 8 LOWEST then
+  // reverse for the high->low display (best ask sits right above the mid); bids are already best-first.
   asks = asks.slice(0, 8); asks.reverse(); bids = bids.slice(0, 8);
-  // Only the liftable rows (from BOOK.offers) are clickable — seed the composer at that level's price.
-  const wire = (r) => { if (r.take) r.onClick = () => fillFromOffer(r.id, r.maker, pay, receive); };
+  // Only the liftable side's LEVELS are clickable — seed the composer with the level's price + its
+  // aggregated size (P2.7: click-to-seed preserved, now level-based).
+  const wire = (r) => { if (r.take) r.onClick = () => seedFromLevel(r.price, r.sizeAtoms); };
   asks.forEach(wire); bids.forEach(wire);
   LAST_MID = { price: mid, cross: false, base, quote, oneSided: !(bestAsk != null && bestBid != null) };
   renderLadder(host, {
@@ -5025,23 +5266,6 @@ function renderBook(pay, receive){
     emptyMsg: 'No resting offers - enter an amount and Review to start this market.',
   });
   renderPairBar();
-}
-
-// Click a book level: seed BOTH amount fields with that resting order's size + the
-// pay it wants, as the user's own limit (so placing crosses it at that price). Then
-// requote builds the place quote. Both fields are marked user-typed so the derivation
-// never overwrites them.
-function fillFromOffer(id, maker, pay, receive){
-  const o = (BOOK.offers||[]).find(x => (x.offer_id||x.offerId) === id && (x.maker_pubkey||x.makerPubkey) === maker);
-  if (!o) return;
-  const offerAmt = big(o.offer_amount||o.offerAmount);   // receive units this order gives
-  const wantAmt  = big(o.want_amount ||o.wantAmount );   // pay units it wants
-  const recvEl = C.$('swRecvAmt'), payEl = C.$('swPayAmt');
-  recvEl.value = C.fmtAtoms(offerAmt, C.assetMeta(receive).precision||0); recvEl._userTyped = true;
-  payEl.value  = C.fmtAtoms(wantAmt,  C.assetMeta(pay).precision||0);     payEl._userTyped = true;
-  S.edited = 'receive';
-  LAST_QUOTE = null; setReviewEnabled(false);
-  requote().catch(()=>{});
 }
 
 // The companion (eltr / BIP86 taproot) wollet's balance — the maker credits this
