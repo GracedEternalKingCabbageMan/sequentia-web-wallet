@@ -741,6 +741,10 @@ function startLiveData(){
   }, 15000);
 }
 
+// First-open composer default (native-BTC-at-top): open with BTC in the pay slot and
+// receive empty. One-time per page load — after the user clears/changes it we never snap
+// back. SEQ is never defaulted (no privileged coin); receive is left on "Select asset".
+let _composerDefaulted = false;
 export async function renderSwap(){
   if (!C.wollet) return;
   startLiveData();
@@ -762,6 +766,12 @@ export async function renderSwap(){
   // Validate the persisted pair (drop anything no longer tradable); we do NOT force a default pair —
   // the composer leads, and the user picks pay/receive, which brings up that pair's detail above.
   ensureDefaults();
+  if (!_composerDefaulted){
+    _composerDefaulted = true;
+    // Default PAY to native BTC (parent-chain asset, top of the dropdowns) and leave RECEIVE
+    // empty — only when nothing is already selected and BTC is startable in this book.
+    if (!S.payAsset && !S.receiveAsset && startableAssets().includes('BTC')) S.payAsset = 'BTC';
+  }
   renderFeePicker();
   paintPanes();
   renderPairBar();
