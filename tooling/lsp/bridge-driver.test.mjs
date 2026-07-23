@@ -4,7 +4,7 @@
 // deadlock when both legs bridge — all without a node.
 import test from 'node:test';
 import assert from 'node:assert';
-import { runBridgedLeg, runBridgedSwap, classifyLegs, describeBridge, matchFromTake, makerRailsFromOffer } from './bridge-driver.mjs';
+import { runBridgedLeg, runBridgedSwap, classifyLegs, describeBridge, matchFromTake, makerRailsFromOffer, takeRailsCrossed, bridgeAssetHandoffAdmissible, bridgeAssetRelayLocktimeVerdict, isPureLnTake } from './bridge-driver.mjs';
 import { planSettlement } from './settlement-router.mjs';
 
 const A = 100000;
@@ -285,6 +285,176 @@ test('runBridgedSwap: a bridged-leg fail-closed fails the whole swap', async () 
   const r = await runBridgedSwap({ match, io, driverCfg: { pollMs: 0, maxTicks: 50 } });
   assert.equal(r.ok, false);
   assert.match(r.reason, /asset:/);
+});
+
+// ---------- W2(b): maxTicks exhaustion is RESUMABLE only when nothing was fronted ----------
+test('W2b runBridgedLeg: maxTicks exhausted PRE-FRONT is resumable (interrupted:true, nothing fronted)', async () => {
+  // A receiver leg whose recoup HTLC never funds -> nextBridgeStep returns 'wait' forever -> maxTicks.
+  const io = { sleep: nap1, log: () => {},
+    observe: async () => ({ tip: 100, onchain: null, ln: { registered: true, held: false, settled: false, preimage: null } }),
+    frontLn: async () => { throw new Error('must never front'); } };
+  const r = await runBridgedLeg({ leg: { lnSide: 'receiver', amountSat: A }, io, driverCfg: { pollMs: 0, maxTicks: 5 } });
+  assert.equal(r.ok, false);
+  assert.equal(r.fronted, false);
+  assert.equal(r.interrupted, true, 'pre-front exhaustion is resumable — the job is marked interrupted, not failed');
+});
+
+test('W2b runBridgedLeg: maxTicks exhausted AFTER a front is NOT resumable (interrupted:false)', async () => {
+  // Recoup HTLC locked + confirmed, so we front; the receiver then NEVER settles -> we wait post-front.
+  let fronted = false;
+  const io = { sleep: nap1, log: () => {},
+    observe: async () => ({ tip: 100, onchain: { funded: true, amountSat: A, cltv: 200, lockedToLsp: true, confs: 6, spent: false }, ln: { registered: true, held: fronted, settled: false, preimage: null } }),
+    frontLn: async () => { fronted = true; } };
+  const r = await runBridgedLeg({ leg: { lnSide: 'receiver', amountSat: A }, io, driverCfg: { pollMs: 0, maxTicks: 5 } });
+  assert.equal(r.ok, false);
+  assert.equal(r.fronted, true);
+  assert.equal(r.interrupted, false, 'post-front exhaustion needs operator attention, never a silent resume');
+});
+
+test('W2b runBridgedSwap: a whole-swap pre-front maxTicks exhaustion surfaces interrupted:true', async () => {
+  const io = {
+    sleep: nap1, log: () => {}, legAmountSat: () => A,
+    provisionInbound: async () => {}, startNative: async () => {}, observeNativeLocked: async () => true,
+    // bridged asset leg whose recoup never funds -> waits pre-front to maxTicks; nothing fronted.
+    observe: async () => ({ tip: 100, onchain: null, ln: { registered: true, held: false, settled: false, preimage: null } }),
+    frontLn: async () => { throw new Error('must never front'); },
+  };
+  const match = { asset: 'OILX', buyer: { btcRail: 'chain', assetRail: 'ln', assetInbound: true }, seller: { assetRail: 'chain', btcRail: 'chain' } };
+  const r = await runBridgedSwap({ match, io, driverCfg: { pollMs: 0, maxTicks: 5 } });
+  assert.equal(r.ok, false);
+  assert.equal(r.interrupted, true);
+});
+
+test('W2b runBridgedSwap: a fail-closed swap is NOT marked interrupted (a real failure, not resumable)', async () => {
+  const io = {
+    sleep: nap1, log: () => {}, provisionInbound: async () => {},
+    startNative: async () => {}, observeNativeLocked: async () => true,
+    observe: async (leg) => leg.unit === 'asset'
+      ? { tip: 100, onchain: { funded: true, amountSat: A, cltv: 200, lockedToLsp: false }, ln: { registered: true, held: false, settled: false, preimage: null } }
+      : { tip: 100, onchain: null, ln: {} },
+    frontLn: async () => { throw new Error('should never front'); },
+  };
+  const match = { asset: 'OILX', buyer: { btcRail: 'chain', assetRail: 'ln', assetInbound: true }, seller: { assetRail: 'chain', btcRail: 'chain' } };
+  const r = await runBridgedSwap({ match, io, driverCfg: { pollMs: 0, maxTicks: 50 } });
+  assert.equal(r.ok, false);
+  assert.notEqual(r.interrupted, true);
+});
+
+// ---------- W3(b): takeRailsCrossed — refuse a crossed take that omitted bridge:true ----------
+test('W3b takeRailsCrossed: a genuine rail crossing is flagged (a bridge is required)', () => {
+  // SELL vs on-chain offer, taker receives BTC over LN -> BTC leg bridges (a real cross).
+  assert.equal(takeRailsCrossed({ side: 'sell', payRail: 'chain', recvRail: 'ln', makerBtcRail: 'chain', makerAssetRail: 'chain' }), true);
+});
+
+test('W3b takeRailsCrossed: a HAPPY coincidence is NOT a cross (no bridge)', () => {
+  assert.equal(takeRailsCrossed({ side: 'buy', payRail: 'chain', recvRail: 'chain', makerBtcRail: 'chain', makerAssetRail: 'chain' }), false);
+});
+
+test('W3b takeRailsCrossed: undeterminable/invalid rails -> false (caller falls through, never over-refuses)', () => {
+  assert.equal(takeRailsCrossed({ side: 'sell', payRail: 'nonsense', recvRail: 'ln', makerBtcRail: 'chain', makerAssetRail: 'chain' }), false);
+});
+
+// ---------- W2(a): AUTHORITATIVE driver-liveness gates /bridge/asset (not the lagging job.status) ----------
+// The /bridge/asset handler admits the taker's asset hand-off ONLY while a driver is live (job._driverLive,
+// set/cleared synchronously with the bridged driver) AND the courier session is open. Prove the driver sets
+// the flag while it runs and CLEARS it at exit, so the handoff predicate (bridgeAssetHandoffAdmissible)
+// refuses once the driver has stopped — even during the post-loop-await lag when status is still 'confirming'.
+test('W2a runBridgedSwap: sets _driverLive while running and CLEARS it at exit (pre-front maxTicks)', async () => {
+  const job = { _driverLive: false, _bridgeSession: {} };   // session still open (same process), no driver yet
+  let sawLiveDuringRun = false;
+  const io = {
+    sleep: nap1, log: () => {}, legAmountSat: () => A,
+    setDriverLive: (v) => { job._driverLive = !!v; },
+    provisionInbound: async () => {}, startNative: async () => {}, observeNativeLocked: async () => true,
+    observe: async () => { if (bridgeAssetHandoffAdmissible(job)) sawLiveDuringRun = true;
+      return { tip: 100, onchain: null, ln: { registered: true, held: false, settled: false, preimage: null } }; },
+    frontLn: async () => { throw new Error('must never front'); },
+  };
+  // Before any driver runs, an open session ALONE must not admit the hand-off.
+  assert.equal(bridgeAssetHandoffAdmissible(job), false, 'session-open alone (no live driver) is NOT admissible');
+  const match = { asset: 'OILX', buyer: { btcRail: 'chain', assetRail: 'ln', assetInbound: true }, seller: { assetRail: 'chain', btcRail: 'chain' } };
+  const r = await runBridgedSwap({ match, io, driverCfg: { pollMs: 0, maxTicks: 5 } });
+  assert.equal(r.ok, false);
+  assert.equal(sawLiveDuringRun, true, 'the hand-off WAS admissible while the driver ran (flag live)');
+  assert.equal(job._driverLive, false, 'driver CLEARED the liveness flag on exit');
+  assert.equal(bridgeAssetHandoffAdmissible(job), false, 'the /bridge/asset gate REFUSES after the driver stops — no strand');
+});
+
+test('W2a runBridgedSwap: clears _driverLive even when JIT fails before any leg drives', async () => {
+  const job = { _driverLive: false, _bridgeSession: {} };
+  const io = { sleep: nap1, log: () => {}, legAmountSat: () => A,
+    setDriverLive: (v) => { job._driverLive = !!v; },
+    provisionInbound: async () => { throw new Error('no LP liquidity'); },
+    observe: async () => ({ tip: 100, onchain: null, ln: {} }) };
+  const match = { asset: 'OILX', buyer: { btcRail: 'chain', assetRail: 'ln', assetInbound: false }, seller: { assetRail: 'chain', btcRail: 'chain' } };
+  const r = await runBridgedSwap({ match, io, driverCfg: DCFG });
+  assert.equal(r.ok, false);
+  assert.match(r.reason, /JIT inbound/i);
+  assert.equal(job._driverLive, false, 'liveness flag cleared on the JIT-failure early return (no leaked admit)');
+  assert.equal(bridgeAssetHandoffAdmissible(job), false);
+});
+
+test('W2a bridgeAssetHandoffAdmissible: needs BOTH a live driver and an open session', () => {
+  assert.equal(bridgeAssetHandoffAdmissible({ _driverLive: true, _bridgeSession: {} }), true);
+  assert.equal(bridgeAssetHandoffAdmissible({ _driverLive: false, _bridgeSession: {} }), false, 'no live driver -> refuse');
+  assert.equal(bridgeAssetHandoffAdmissible({ _driverLive: true, _bridgeSession: null }), false, 'session already relayed/closed -> refuse');
+  assert.equal(bridgeAssetHandoffAdmissible(null), false);
+});
+
+// ---------- W2(a): bridgeAssetRelayLocktimeVerdict — the RELAY-time locktime gate for /bridge/asset ----------
+// The taker's asset leg is EXPOSED to the maker's claim the instant it is relayed, so the front's wall-clock
+// locktime ordering is re-checked HERE against LIVE tips (a maker whose short T_btc has DRIFTED into the
+// danger window since handshake is refused BEFORE the asset is exposed). Reads the two CLTV refund heights
+// from the SAME job fields the front-time gate uses. Honest terms: T_btc ~tip+100 BTC, T_seq ~tip+240 SEQ.
+const relayJob = () => ({ status: 'confirming', _driverLive: true, _bridgeSession: {},
+  legState: { btc: { htlc: { cltv: 800000 + 100 } }, asset: { seqLocktime: 44000 + 240 } } });
+
+test('W2a bridgeAssetRelayLocktimeVerdict: a HEALTHY live tip ADMITS the relay', () => {
+  const v = bridgeAssetRelayLocktimeVerdict({ job: relayJob(), btcTip: 800000, seqTip: 44000 });
+  assert.equal(v.ok, true, v.reason);
+});
+
+test('W2a bridgeAssetRelayLocktimeVerdict: a DRIFTED BTC tip (T_btc now ~10 blocks out) REFUSES the relay', () => {
+  const v = bridgeAssetRelayLocktimeVerdict({ job: relayJob(), btcTip: 800090, seqTip: 44000 });
+  assert.equal(v.ok, false);
+  assert.match(v.reason, /UNSAFE|refuse|short/i);
+});
+
+test('W2a bridgeAssetRelayLocktimeVerdict: an unreadable tip (NaN) fails closed — never relay unverified', () => {
+  assert.equal(bridgeAssetRelayLocktimeVerdict({ job: relayJob(), btcTip: NaN, seqTip: 44000 }).ok, false);
+  assert.equal(bridgeAssetRelayLocktimeVerdict({ job: relayJob(), btcTip: 800000, seqTip: NaN }).ok, false);
+});
+
+test('W2a bridgeAssetRelayLocktimeVerdict: a TIMESTAMP maker T_btc is refused (defensive height assert)', () => {
+  const job = relayJob(); job.legState.btc.htlc.cltv = 500000000 + 800000;   // UNIX timestamp, not a height
+  assert.equal(bridgeAssetRelayLocktimeVerdict({ job, btcTip: 800000, seqTip: 44000 }).ok, false);
+});
+
+test('W2a bridgeAssetRelayLocktimeVerdict: reads T_seq from bridge_terms when the asset legState lacks it', () => {
+  const job = { legState: { btc: { htlc: { cltv: 800000 + 100 } }, asset: {} }, bridge_terms: { seq_locktime: 44000 + 240 } };
+  assert.equal(bridgeAssetRelayLocktimeVerdict({ job, btcTip: 800000, seqTip: 44000 }).ok, true);
+  assert.equal(bridgeAssetRelayLocktimeVerdict({ job, btcTip: 800090, seqTip: 44000 }).ok, false);
+});
+
+test('W2a bridgeAssetRelayLocktimeVerdict: a missing maker BTC HTLC cltv fails closed (NaN height)', () => {
+  const v = bridgeAssetRelayLocktimeVerdict({ job: { legState: { btc: {}, asset: { seqLocktime: 44240 } } }, btcTip: 800000, seqTip: 44000 });
+  assert.equal(v.ok, false);
+});
+
+// ---------- W3(c): isPureLnTake — the ln/ln dispatch branch must exempt a bridged take ----------
+test('W3c isPureLnTake: a ln/ln take with bridge:true is NOT the pure-LN route (falls through to the bridge)', () => {
+  assert.equal(isPureLnTake({ payRail: 'ln', recvRail: 'ln', bridge: true }), false);
+});
+
+test('W3c isPureLnTake: a normal ln/ln take IS the pure-LN route (unchanged runSwap dispatch)', () => {
+  assert.equal(isPureLnTake({ payRail: 'ln', recvRail: 'ln' }), true);
+  assert.equal(isPureLnTake({ payRail: 'ln', recvRail: 'ln', bridge: false }), true);
+});
+
+test('W3c isPureLnTake: a mixed or crossed take is never the pure-LN route', () => {
+  assert.equal(isPureLnTake({ payRail: 'ln', recvRail: 'chain' }), false);
+  assert.equal(isPureLnTake({ payRail: 'chain', recvRail: 'ln' }), false);
+  assert.equal(isPureLnTake({ payRail: 'chain', recvRail: 'chain', bridge: true }), false);
 });
 
 // ---- helpers ----

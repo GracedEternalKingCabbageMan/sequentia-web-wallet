@@ -64,6 +64,12 @@ export const BRIDGE_DEFAULTS = Object.freeze({
  *                                     // withholds the ONE value-front action that would let P be revealed
  *                                     // (front-ln for a receiver leg; fund-onchain for a payer leg) so a
  *                                     // partial (this leg reveals, another never locks) is impossible.
+ *   crossLock?:{ seqTip:number, seqRefundHeight:number, holdInvoiceLifeSecs?:number },
+ *                                     // reverse-cross receiver leg only: the OTHER leg's inputs for the
+ *                                     // front-time locktime-ordering re-check against the LIVE tip (W1).
+ *   preimage?:string|null,            // reverse-cross receiver leg only: P once it is PUBLIC (the maker has
+ *                                     // claimed the taker's relayed asset). Lets the front-time gate ALLOW a
+ *                                     // front that is IMMEDIATELY recoupable with the known P (W2b).
  * }} obs
  * @param {object} [cfg] overrides for BRIDGE_DEFAULTS
  * @returns {{action:'wait'|'front-ln'|'fund-onchain'|'recoup-claim'|'recoup-settle'|'refund-onchain'|'fail-closed'|'done', reason:string}}
@@ -83,6 +89,102 @@ export function nextBridgeStep(leg, obs, cfg = {}) {
   return leg.lnSide === 'receiver'
     ? stepReceiverLn(leg, obs, c)
     : stepPayerLn(leg, obs, c);
+}
+
+// ============================================================================
+// W1 — LOCKTIME-ORDERING GATE (pure).
+//
+// The receiver-leg block runway above (frontRunway/claimMargin) only compares BLOCK counts on the
+// on-chain end. It does NOT relate the BTC-HTLC refund height to the OTHER leg's refund height + the
+// taker's LN hold life. A malicious maker exploits exactly that gap: it sets a SHORT BTC-HTLC refund
+// locktime T_btc that still clears the block runway, lets the LSP front the taker's ~2h LN hold, WAITS,
+// then at T_btc REFUNDS its own BTC HTLC (reclaiming its BTC) and only AFTER that claims the taker's
+// asset HTLC with P — revealing P. The honest taker reads P, settles its LN hold (collecting the fronted
+// BTC-LN and revealing P to the LSP), but the LSP's recoup target — the maker's BTC HTLC — is already
+// refunded and gone. Full-front loss.
+//
+// This gate refuses to front unless the maker's T_btc, in WALL-CLOCK, is comfortably LATER than the last
+// moment P can be used against the LSP. Both CLTV heights are converted to wall-clock via CONSERVATIVE
+// block-time constants, chosen to err in the DANGEROUS direction: BTC assumed to refund SOONER (short
+// seconds/block => T_btc arrives earlier), SEQ assumed to let the maker claim-and-reveal LATER (long
+// seconds/block => T_seq arrives later). The rule (as specified):
+//
+//   btc_refund_wall  >=  seq_refund_wall  +  hold_invoice_remaining_life  +  margin(6 BTC blocks)
+//
+// A failure means FAIL CLOSED — front nothing. Nothing has been fronted at this point, so refusing is
+// no-loss. The honest fleet (T_btc ~tip+100 BTC blocks vs T_seq ~tip+240 SEQ blocks, ~16h vs a few h)
+// clears it with wide headroom.
+//
+// W1-UNIT — a Bitcoin/Elements nLockTime (hence a CLTV height) is a BLOCK HEIGHT only while it is
+// < 500,000,000; at or above that BIP-65 LOCKTIME_THRESHOLD it is a UNIX TIMESTAMP. This gate does
+// BLOCK-HEIGHT arithmetic (refundHeight - tip), so a TIMESTAMP CLTV is meaningless here — and a malicious
+// maker who sets a timestamp locktime would make (btcRefundHeight - btcTip) a HUGE bogus block count that
+// clears the inequality trivially = bypass. The maker's BTC CLTV is refused as a non-height at the point it
+// is parsed/verified (bridge-maker.verifyMakerBtcHtlc, which imports this constant), so the arithmetic below
+// is always valid in production; the gate ALSO asserts height-ness defensively (see checkBridgeLocktimeOrdering)
+// so it can NEVER pass on a timestamp regardless of how it is called.
+export const LOCKTIME_THRESHOLD = 500000000;
+
+export const LOCKTIME_GATE_DEFAULTS = Object.freeze({
+  // Conservative-FAST BTC (< 600s nominal): assume the maker's BTC HTLC can become refundable SOONER.
+  btcSecsPerBlock: 480,
+  // Conservative-SLOW SEQ (> ~60s nominal): assume the maker can still claim the asset (reveal P) LATER.
+  seqSecsPerBlock: 90,
+  // The taker's BTC-LN hold (~2h) — the max remaining life over which P can still be used against the LSP.
+  // At handshake time the taker has not minted the hold yet, so this is the conservative upper bound.
+  holdInvoiceLifeSecs: 2 * 3600,
+  // Safety margin, expressed in BTC blocks, converted at the conservative-fast BTC rate.
+  marginBtcBlocks: 6,
+});
+
+/**
+ * Fund-safety gate for the reverse-cross bridge (W1). Pure: converts the two CLTV heights to wall-clock
+ * with conservative constants and returns whether the maker's BTC refund is safely later than the last
+ * use of P against the LSP. Fails closed on any missing/invalid/degenerate input.
+ *
+ * @param {{
+ *   btcTip:number, btcRefundHeight:number,     // maker's BTC HTLC: current BTC tip + its CLTV refund height
+ *   seqTip:number, seqRefundHeight:number,      // taker's asset HTLC: current SEQ tip + its CLTV refund height
+ *   holdInvoiceLifeSecs?:number,                // override the default max hold life (else the default)
+ *   cfg?:object                                 // overrides for LOCKTIME_GATE_DEFAULTS
+ * }} args
+ * @returns {{ ok:boolean, reason:string, btcRefundSecs:number, seqRefundSecs:number, needSecs:number }}
+ */
+export function checkBridgeLocktimeOrdering({ btcTip, btcRefundHeight, seqTip, seqRefundHeight, holdInvoiceLifeSecs, cfg = {} } = {}) {
+  const c = { ...LOCKTIME_GATE_DEFAULTS, ...cfg };
+  const fail = (reason) => ({ ok: false, reason, btcRefundSecs: 0, seqRefundSecs: 0, needSecs: 0 });
+  for (const [k, v] of Object.entries({ btcTip, btcRefundHeight, seqTip, seqRefundHeight })) {
+    if (!Number.isFinite(v)) return fail(`locktime gate: ${k} is not a finite number — cannot bound the front, fail closed`);
+  }
+  // W1-UNIT (defensive) — a CLTV refund locktime >= LOCKTIME_THRESHOLD is a UNIX TIMESTAMP, not a block
+  // height, so the height arithmetic below would be nonsense (and a timestamp T_btc would make the "blocks
+  // to refund" a huge bogus number that trivially clears the gate). A non-height CLTV is already refused at
+  // parse/verify (bridge-maker), but assert it HERE too so the gate can never pass on a timestamp regardless
+  // of caller. Either refund locktime looking like a timestamp => fail closed. (Tips come from getblockcount
+  // and are always heights; only the two refund locktimes are counterparty-influenced, so those are asserted.)
+  for (const [k, v] of Object.entries({ btcRefundHeight, seqRefundHeight })) {
+    if (v >= LOCKTIME_THRESHOLD) return fail(`locktime gate: ${k} ${v} is a UNIX TIMESTAMP (>= ${LOCKTIME_THRESHOLD}), not a block height — height arithmetic is invalid, fail closed`);
+  }
+  const holdLife = (Number.isFinite(holdInvoiceLifeSecs) && holdInvoiceLifeSecs > 0) ? holdInvoiceLifeSecs : c.holdInvoiceLifeSecs;
+  const btcBlocksToRefund = btcRefundHeight - btcTip;
+  const seqBlocksToRefund = seqRefundHeight - seqTip;
+  // The maker's BTC HTLC is already at/after its refund height -> it can refund NOW; never front.
+  if (btcBlocksToRefund <= 0) return fail(`locktime gate: maker BTC HTLC is already refundable (T_btc ${btcRefundHeight} <= tip ${btcTip}) — refuse to front`);
+  // Conservative wall-clock: BTC SOONER (fast blocks), SEQ LATER (slow blocks). A non-positive seq gap
+  // (taker asset HTLC already refundable) contributes 0 to the "later use of P" bound but is not itself a
+  // reason to front — the btc side still has to clear the inequality.
+  const btcRefundSecs = btcBlocksToRefund * c.btcSecsPerBlock;
+  const seqRefundSecs = Math.max(0, seqBlocksToRefund) * c.seqSecsPerBlock;
+  const marginSecs = c.marginBtcBlocks * c.btcSecsPerBlock;
+  const needSecs = seqRefundSecs + holdLife + marginSecs;
+  if (btcRefundSecs < needSecs) {
+    return { ok: false, btcRefundSecs, seqRefundSecs, needSecs,
+      reason: `locktime ordering UNSAFE: BTC refund window ~${Math.round(btcRefundSecs)}s (${btcBlocksToRefund} BTC blocks) < required ~${Math.round(needSecs)}s `
+            + `(seq_refund ~${Math.round(seqRefundSecs)}s + hold ~${Math.round(holdLife)}s + margin ${marginSecs}s). `
+            + `A short T_btc lets the maker refund its BTC before the LSP can recoup with P — refuse to front (fail closed, nothing at stake)` };
+  }
+  return { ok: true, btcRefundSecs, seqRefundSecs, needSecs,
+    reason: `locktime ordering safe: BTC refund ~${Math.round(btcRefundSecs)}s is comfortably later than the last use of P against the LSP (~${Math.round(needSecs)}s)` };
 }
 
 // lnSide='receiver': LSP pays the receiver's LN, claims the payer's on-chain HTLC. The LSP's exposure is
@@ -109,6 +211,38 @@ function stepReceiverLn(leg, obs, c) {
     // This gates ONLY the front; once fronted (ln.held) confs are moot, and a settle recoups at the top.
     // Transient wait (re-observe until confirmed), NOT a fail — the recoup is otherwise secured.
     if ((oc.confs || 0) < c.minRecoupConf) return { action: 'wait', reason: `recoup HTLC has only ${oc.confs || 0} confirmation(s) (need ${c.minRecoupConf}) — wait for it to bury before fronting (an unconfirmed recoup target can be replaced out from under the front)` };
+    // W1 (FRONT-TIME) — re-run the LOCKTIME-ORDERING gate against the LIVE tip at the moment of fronting,
+    // not only at handshake. `obs.crossLock` carries the reverse-cross cross-leg inputs the handshake gate
+    // used (the taker asset-HTLC refund height T_seq + the LIVE seq tip, and optionally the real hold life);
+    // the maker BTC-HTLC refund height T_btc is oc.cltv and the LIVE btc tip is obs.tip. A maker that set
+    // T_btc to JUST clear the handshake gate can let the BTC tip DRIFT (idle, or across an LSP restart, so
+    // the resumed front re-enters here) until T_btc is inside the danger window; an un-gated front would
+    // then pay the taker's ~2h hold while the maker refunds its BTC at T_btc and reveals P too late for the
+    // LSP to recoup = full-front loss. So refuse to front once the wall-clock ordering no longer holds.
+    // Absent crossLock (payer leg, non-reverse shapes, back-compat single-leg) => skip, exactly like
+    // swapLocked===undefined. Fail closed: nothing is fronted yet, and a drifted BTC tip only worsens, so
+    // refusing is a no-loss terminal (never a spin) — the taker is protected by its own T_seq asset refund.
+    if (obs.crossLock) {
+      const g = checkBridgeLocktimeOrdering({
+        btcTip: obs.tip, btcRefundHeight: oc.cltv,
+        seqTip: obs.crossLock.seqTip, seqRefundHeight: obs.crossLock.seqRefundHeight,
+        holdInvoiceLifeSecs: obs.crossLock.holdInvoiceLifeSecs,
+      });
+      if (!g.ok) {
+        // W2(a)/W2(b) — the locktime-ordering commitment point is now /bridge/asset ADMISSION (the moment
+        // the taker's asset is EXPOSED to the maker's claim), re-checked there against live tips. So the
+        // front-time refusal must NOT strand a taker whose asset was ALREADY relayed and claimed: once P is
+        // PUBLIC (obs.preimage) and our recoup HTLC is still unspent + claimable (CLTV not reached — the
+        // frontRunway gate above already guaranteed oc.cltv - obs.tip >= frontRunway; re-assert defensively),
+        // the LSP fronts and IMMEDIATELY recoups with the known P — ZERO exposure window, so the ordering is
+        // moot and refusing would only trap the taker (its asset is gone, it cannot refund). Proceed to front.
+        // Only when P is NOT yet public does an un-recoupable-after-refund window exist -> keep fail-closed.
+        const pPublic = typeof obs.preimage === 'string' && /^[0-9a-f]{64}$/i.test(obs.preimage);
+        const recoupClaimable = !!oc && oc.spent !== true && (oc.cltv - obs.tip) > c.claimMargin;
+        if (!(pPublic && recoupClaimable))
+          return { action: 'fail-closed', reason: `front-time locktime gate REFUSED (live tip drifted since handshake): ${g.reason}` };
+      }
+    }
     // WHOLE-SWAP ATOMICITY: fronting the LN (paying the receiver's hold on H) is the action that lets
     // the receiver settle and REVEAL P. Withhold it until every OTHER leg of the swap is locked, or a
     // partial (this leg reveals + settles while another leg never locks) becomes possible. A stall here

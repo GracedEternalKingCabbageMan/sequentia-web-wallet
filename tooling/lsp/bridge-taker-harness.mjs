@@ -12,6 +12,7 @@
 
 import { execFile } from 'node:child_process';
 import { createHash } from 'node:crypto';
+import { writeFileSync } from 'node:fs';
 import { setSeqobBase, fetchBook } from '../../seqob.js';
 
 const LSP = 'http://127.0.0.1:9981';
@@ -108,6 +109,19 @@ async function main() {
     '-seq-rpc', SEQ_RPC, '-seq-wallet', TAKER_SEQ_WALLET, '-refund-priv', takerPriv, '-no-wait'], 300000);
   const fund = JSON.parse(fundOut);
   log('asset HTLC funded (self-custody, 0-conf):', fund.seq_htlc_txid, 'vout', fund.seq_htlc_vout, 'block', fund.block_hash || '(0-conf; maker polls to confirm)');
+
+  // Persist the asset-refund material (the taker's refund KEY + HTLC params) so a crash or a
+  // failed settle never strands the tSEQ. seqob-cli xrefund-seq reads this xsellState shape and
+  // reclaims the leg after T_seq. Before this, takerPriv was minted in-memory and only its pubkey
+  // logged, so a stalled run (e.g. final8) stranded its tSEQ with the refund key gone forever.
+  const recoveryFile = `/tmp/bridge-taker-recovery-${jobId.slice(0, 8)}.json`;
+  writeFileSync(recoveryFile, JSON.stringify({
+    created_at: new Date().toISOString(), asset: ASSET, seq_amount: seqAtoms,
+    seq_refund_priv_hex: takerPriv, seq_leg_txid: fund.seq_htlc_txid, seq_leg_vout: fund.seq_htlc_vout,
+    seq_leg_amount: fund.amount, seq_leg_asset: ASSET, seq_leg_script_hex: fund.redeem_script,
+    seq_locktime: terms.seq_locktime, status: 'seq_locked',
+  }, null, 2), { mode: 0o600 });
+  log(`asset-refund material persisted -> ${recoveryFile} (if this run strands, reclaim after SEQ height ${terms.seq_locktime}: seqob-cli xrefund-seq -state-file ${recoveryFile} -seq-rpc <url> -seq-wallet ${TAKER_SEQ_WALLET} -wait)`);
 
   // 5. Register a hold on H at OUR BTC-LN node (bare-hash; the seqln holdinvoice has no bolt11). The LSP
   // pays it by routing to our node id + sendpay on H; we settle it with P.

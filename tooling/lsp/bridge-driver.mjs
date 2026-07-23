@@ -21,7 +21,7 @@
 // own refund/recoup actions — never an ad-hoc spend). Because nextBridgeStep only ever fronts once the
 // recoup is secured, the driver can only ever stall into a refundable no-loss failure, never steal.
 
-import { nextBridgeStep } from './leg-bridge.mjs';
+import { nextBridgeStep, checkBridgeLocktimeOrdering } from './leg-bridge.mjs';
 import { planSettlement } from './settlement-router.mjs';
 
 export const DRIVER_DEFAULTS = Object.freeze({
@@ -102,7 +102,12 @@ export async function runBridgedLeg({ leg, io, cfg = {}, driverCfg = {} }) {
     }
     await nap(d.pollMs);
   }
-  return { ok: false, reason: 'exceeded maxTicks without terminal state — failing closed', fronted, lastAction };
+  // maxTicks exhausted. If NOTHING was fronted, no value is at stake and the leg is RESUMABLE — surface
+  // `interrupted` so the whole-swap layer marks the job 'interrupted' (re-driven by resume-on-boot) rather
+  // than 'failed' (which would strand a taker whose asset leg is already committed). A POST-front exhaustion
+  // is a genuine anomaly needing attention, so it stays a plain (non-resumable) failure with fronted:true.
+  return { ok: false, reason: 'exceeded maxTicks without terminal state — failing closed', fronted, lastAction,
+    interrupted: !fronted };
 }
 
 // Split a settlement plan's two legs into { bridged, native, jit }. Each entry carries the router leg
@@ -160,11 +165,21 @@ export async function runBridgedSwap({ match, io, cfg = {}, driverCfg = {} }) {
   const amtOf = (leg) => (io.legAmountSat ? Number(io.legAmountSat(leg)) : leg.amountSat);
   const withAmt = (leg) => ({ lnSide: leg.lnSide, amountSat: amtOf(leg), unit: leg.unit, bridge: leg.bridge, jitInbound: leg.jitInbound });
 
+  // W2(a) — AUTHORITATIVE DRIVER-LIVENESS. Mark the driver LIVE for exactly the window it can still front,
+  // and CLEAR it the instant the leg drivers stop (BELOW, before the post-loop awaits). The /bridge/asset
+  // handler gates the taker's asset hand-off on THIS flag (via bridgeAssetHandoffAdmissible) instead of the
+  // job.status, which LAGS termination by the post-loop awaits — a window in which a maxTicks-exhausted
+  // driver (no front will ever happen) still shows status 'confirming', so relaying the asset would strand
+  // it. `io.setDriverLive` is optional (bridge-driver stays node-free / job-agnostic; the live LSP io binds
+  // it to job._driverLive). clearLive is idempotent and covers every exit — early return, throw, or normal.
+  if (io.setDriverLive) io.setDriverLive(true);
+  const clearLive = () => { if (io.setDriverLive) io.setDriverLive(false); };
+
   // 0. JIT inbound FIRST (an LN receiver with no inbound cannot receive at all). Fail closed on error:
   //    nothing is locked yet, so aborting is free.
   for (const leg of jit) {
     try { await io.provisionInbound(leg); log('[bridge-swap] JIT inbound provisioned for', leg.unit); }
-    catch (e) { return { ok: false, plan, legs: [], reason: `JIT inbound for ${leg.unit} failed (fail closed, nothing locked): ${e && e.message}` }; }
+    catch (e) { clearLive(); return { ok: false, plan, legs: [], reason: `JIT inbound for ${leg.unit} failed (fail closed, nothing locked): ${e && e.message}` }; }
   }
 
   // 1. Kick off native legs on the existing path. Non-blocking: they lock, then settle once P flows.
@@ -214,7 +229,14 @@ export async function runBridgedSwap({ match, io, cfg = {}, driverCfg = {} }) {
     cfg, driverCfg,
   }).then((r) => ({ leg, r })));
 
-  const results = await Promise.all(bridgedRuns);
+  let results;
+  try {
+    results = await Promise.all(bridgedRuns);
+  } finally {
+    // The leg drivers have stopped — CLEAR driver-liveness NOW, before the post-loop awaits below, so the
+    // /bridge/asset gate refuses a hand-off the instant no driver will front it (closes the ~1.5s lag).
+    clearLive();
+  }
   coordinating = false; await refresh.catch(() => {});
   // Let native legs finish settling (they self-complete once P is public). Best-effort await.
   await Promise.allSettled(nativeRuns.map((n) => n.p));
@@ -222,9 +244,64 @@ export async function runBridgedSwap({ match, io, cfg = {}, driverCfg = {} }) {
   const failed = results.filter((x) => !x.r.ok);
   const legs = results.map((x) => ({ unit: x.leg.unit, ...x.r }));
   if (failed.length) {
-    return { ok: false, plan, legs, reason: failed.map((f) => `${f.leg.unit}: ${f.r.reason}`).join('; ') };
+    // The whole swap is INTERRUPTED (resumable) only if EVERY failed leg is a pre-front maxTicks
+    // exhaustion (nothing fronted, nothing lost). A single genuine fail-closed / post-front failure makes
+    // it a real failure that must NOT be silently resumed.
+    const interrupted = failed.every((f) => f.r.interrupted === true);
+    return { ok: false, plan, legs, interrupted,
+      reason: failed.map((f) => `${f.leg.unit}: ${f.r.reason}`).join('; ') };
   }
   return { ok: true, plan, legs };
+}
+
+// W3(b) — does a rail-blind TAKE genuinely CROSS rails (i.e. REQUIRE a bridge)? Pure; used by the LSP
+// /swap dispatch to REFUSE a crossed take that omitted bridge:true, which would otherwise misroute into
+// the CUSTODIAL submarine path and move the LSP's OWN funds on an unrelated swap while reporting success.
+// Returns false when the shape can't be determined (missing/invalid rails throw in matchFromTake) — the
+// caller then falls through to its normal, individually-guarded dispatch rather than over-refusing.
+export function takeRailsCrossed(take) {
+  try {
+    const plan = planSettlement(matchFromTake(take));
+    return !plan.happyCoincidence;
+  } catch { return false; }
+}
+
+// W2(a) — the /bridge/asset admission predicate. The taker's asset hand-off is accepted ONLY while a
+// bridged driver is authoritatively LIVE to front it (job._driverLive, set/cleared synchronously with
+// runBridgedSwap above) AND the courier session that relays the leg to the maker is still open. Gating on
+// this — NOT the lagging job.status — closes the window where a maxTicks-exhausted driver's post-loop
+// awaits still show status 'confirming' (+ a non-null session) yet no front will ever happen, so relaying
+// the asset would hand it to the maker and strand the taker. Pure; shared by the handler and its test.
+export function bridgeAssetHandoffAdmissible(job) {
+  return !!(job && job._driverLive === true && job._bridgeSession);
+}
+
+// W2(a) — the RELAY-time LOCKTIME verdict for /bridge/asset. The taker's asset leg becomes EXPOSED to the
+// maker's claim the INSTANT it is relayed (the maker can then claim it with P and reveal P; the taker can
+// no longer be protected by anything but its own T_seq asset refund). So the SAME wall-clock locktime
+// ordering the front enforces MUST also gate the relay — and against LIVE tips, because a short T_btc may
+// have DRIFTED into the danger window since the handshake gate passed. This reads the two CLTV refund
+// heights from the SAME job fields the front-time gate uses (the maker BTC HTLC's CLTV; the taker asset
+// HTLC's refund height T_seq) and defers the wall-clock decision to checkBridgeLocktimeOrdering against the
+// LIVE btc + seq tips the handler just read. A refusal => DO NOT relay (fail closed): the taker keeps its
+// asset and refunds at T_seq. Pure (the handler does the I/O of reading tips); shared with its test. An
+// unreadable tip arrives here as NaN and the gate fails closed — never relay on an unverifiable ordering.
+export function bridgeAssetRelayLocktimeVerdict({ job, btcTip, seqTip, holdInvoiceLifeSecs, cfg } = {}) {
+  const sbHtlc = (job && job.legState && job.legState.btc && job.legState.btc.htlc) || {};
+  const saState = (job && job.legState && job.legState.asset) || {};
+  const btcRefundHeight = Number(sbHtlc.cltv);
+  const seqRefundHeight = Number(saState.seqLocktime ?? (job && job.bridge_terms && job.bridge_terms.seq_locktime));
+  return checkBridgeLocktimeOrdering({ btcTip, btcRefundHeight, seqTip, seqRefundHeight, holdInvoiceLifeSecs, cfg });
+}
+
+// W3(c) — a ln/ln take is the UNCHANGED pure-LN route ONLY when it is NOT a bridged take. A genuine
+// bridged take can carry BOTH taker rails on Lightning (the resting MAKER's rails differ, so a leg still
+// crosses); it MUST fall through to the bridged driver, never be swallowed by pure-LN runSwap — which
+// would settle an UNRELATED swap over the shared node and falsely report 'settled'. Pure; shared by the
+// LSP /swap dispatch and its test so the ordering bug (ln/ln branch firing before the bridge branch, with
+// no bridge exemption) cannot silently regress.
+export function isPureLnTake({ payRail, recvRail, bridge }) {
+  return payRail === 'ln' && recvRail === 'ln' && bridge !== true;
 }
 
 // Build the per-leg io view runBridgedLeg expects from the whole-swap io, binding the swapLocked gate.

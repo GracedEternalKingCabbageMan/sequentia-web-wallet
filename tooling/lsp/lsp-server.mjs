@@ -94,7 +94,8 @@ import { makeProvisioner } from './provision.mjs';
 import { acceptUpgrade, bridgeWsToTcp } from './ws-bridge.mjs';
 import { settlementPlanForSide, planExecutionName, planSettlement } from './settlement-router.mjs';
 import { buildUnifiedBook } from './unified-book.mjs';
-import { runBridgedSwap, matchFromTake, describeBridge, classifyLegs } from './bridge-driver.mjs';
+import { runBridgedSwap, matchFromTake, describeBridge, classifyLegs, takeRailsCrossed, bridgeAssetHandoffAdmissible, bridgeAssetRelayLocktimeVerdict, isPureLnTake } from './bridge-driver.mjs';
+import { checkBridgeLocktimeOrdering } from './leg-bridge.mjs';
 import { runReverseBridgeTerms, openReverseBridgeSession, newBridgeClaimKeypair, relayTakerAssetLeg } from './bridge-maker.mjs';
 import { hashPreimageOk, subasSellStateFileForNonce, subasSellGuardVerdict, assembleSubasSellSettled } from './subas-sell-recovery.mjs';
 
@@ -1662,6 +1663,9 @@ function makeBridgeIo({ match, body, job }) {
   return {
     sleep, log: (...a) => console.error('[bridge]', ...a),
     legAmountSat: (leg) => bridgeLegAmount(body, leg),
+    // W2(a): the driver flips this synchronously at its start / stop; /bridge/asset gates the taker's asset
+    // hand-off on it (bridgeAssetHandoffAdmissible) rather than the lagging job.status.
+    setDriverLive: (v) => { job._driverLive = !!v; },
 
     // JIT inbound BEFORE any lock: an LN receiver with no inbound cannot receive. Fully wired to the
     // existing non-custodial provisionInbound (asset leg). A BTC-LN receive JIT would use the BTC
@@ -1739,7 +1743,39 @@ function makeBridgeIo({ match, body, job }) {
       } else if (s.tipRpc) {
         try { const o = await xhtlcObserve({ rpc: s.tipRpc, txid: s.tipProbeTxid || '0'.repeat(64), vout: 0 }); if (typeof o.tip === 'number') tip = o.tip; } catch {}
       }
-      return { tip, onchain, ln };
+      // W1 (front-time) — attach the cross-leg LOCKTIME inputs so nextBridgeStep re-checks the wall-clock
+      // ordering against the LIVE tip AT FRONT TIME (and on every resume tick), not only at handshake. Only
+      // the reverse-cross BTC receiver leg has a taker asset-HTLC to relate to: its refund height T_seq is
+      // on the ASSET leg state (or bridge_terms), and the maker BTC-HTLC refund height T_btc is oc.cltv on
+      // THIS leg with the live BTC tip above. Read the LIVE seq tip here so a job whose BTC tip has drifted
+      // since handshake is refused when the driver next tries to front. FAIL CLOSED: if the asset refund
+      // height or the live seq tip is unreadable, feed the gate NaN so it refuses (never front on an
+      // unverifiable ordering). Absent for every other shape -> the front path is byte-identical to before.
+      let crossLock, publicP;
+      if (leg.lnSide === 'receiver' && leg.unit === 'btc' && onchain) {
+        const sa = st('asset') || {};
+        const seqRefundHeight = Number(sa.seqLocktime ?? (job.bridge_terms && job.bridge_terms.seq_locktime));
+        let seqTip = NaN;
+        try { const so = await xhtlcObserve({ rpc: CFG.seqRpc, txid: '0'.repeat(64), vout: 0 }); seqTip = Number(so && so.tip); }
+        catch { /* seq node momentarily unreadable -> seqTip stays NaN -> the gate fails closed (no front) */ }
+        crossLock = { seqTip, seqRefundHeight };
+        // W2(b) — surface a top-level PUBLIC preimage P so the front-time locktime gate can ALLOW a front that
+        // is IMMEDIATELY recoupable (P known, recoup HTLC still unspent -> front + claim, zero exposure) rather
+        // than STRAND a taker whose asset was already relayed + claimed. P is public once the maker has claimed
+        // the taker's RELAYED asset leg; the authoritative source is that on-chain claim's witness (a
+        // non-cooperative maker may skip the courtesy XcSecretRevealed). Prefer any P already learned (the front
+        // itself, or the relay courtesy), else read the asset leg's spend. Best-effort: an unreadable P just
+        // leaves the gate's fail-closed path in force (no front) — never a false "P public".
+        const learned = (ln && ln.preimage) || (typeof job.relay_preimage === 'string' && /^[0-9a-f]{64}$/i.test(job.relay_preimage) ? job.relay_preimage : null);
+        if (learned && /^[0-9a-f]{64}$/i.test(learned)) publicP = String(learned).toLowerCase();
+        else if (sa.onchain && sa.onchain.txid) {
+          try {
+            const ao = await xhtlcObserve({ rpc: CFG.seqRpc, txid: sa.onchain.txid, vout: sa.onchain.vout || 0, hashH: s.hashH, redeem: sa.onchain.redeem });
+            if (ao && ao.preimage && /^[0-9a-f]{64}$/i.test(ao.preimage)) publicP = String(ao.preimage).toLowerCase();
+          } catch { /* asset-leg observe hiccup -> no public P this tick -> gate stays fail-closed */ }
+        }
+      }
+      return crossLock ? { tip, onchain, ln, crossLock, ...(publicP ? { preimage: publicP } : {}) } : { tip, onchain, ln };
     },
 
     // --- value-moving actions: compose the EXISTING primitives; FAIL CLOSED on missing handshake data ---
@@ -1925,6 +1961,42 @@ async function prepareBridgeLegs({ match, body, job }) {
     const sa = job.legState.asset;
     if (sa) { sa.makerSeqClaimPub = hs.makerSeqClaimPubHex; sa.seqLocktime = hs.seqLocktime; sa.seqAmount = hs.seqAmount; sa.seqAsset = resolveAsset(body.asset); }
 
+    // W1 — LOCKTIME-ORDERING GATE. Before recording the handshake OK (which lets the driver front the
+    // taker's LN hold), verify the maker's BTC-HTLC refund locktime T_btc is comfortably LATER, in
+    // WALL-CLOCK, than the last moment the shared preimage P can be used against the LSP. Otherwise a
+    // malicious maker with a SHORT T_btc that clears the pure core's naive block runway can front-bleed
+    // the LSP: front the ~2h hold, refund its BTC at T_btc, THEN reveal P by claiming the taker's asset —
+    // the LSP learns P too late and its recoup target is already gone (full-front loss). We read both tips
+    // and refuse unless btc_refund_wall >= seq_refund_wall + hold_life + margin(6 BTC blocks). ANY failure
+    // to read the tips or a failed gate => fail closed (nothing has been fronted): wipe the recoup wiring
+    // so even a stray driver tick can only stall, close the session, and record the refusal.
+    let btcTip, seqTip;
+    try {
+      const bo = await xhtlcObserve({ rpc: CFG.subasBtcRpc, wallet: CFG.subasBtcWallet, txid: sb.htlc.txid, vout: sb.htlc.vout });
+      const so = await xhtlcObserve({ rpc: CFG.seqRpc, txid: '0'.repeat(64), vout: 0 });
+      btcTip = Number(bo && bo.tip); seqTip = Number(so && so.tip);
+    } catch (e) {
+      try { session && session.close(); } catch {}
+      job._bridgeSession = null;
+      if (job.legState.btc) delete job.legState.btc.verifiedClaimLsp;
+      job.bridgeHandshake = { ok: false, error: `locktime-ordering gate could not read chain tips — fail closed (nothing fronted): ${scrubDetail(String((e && e.message) || e))}` };
+      persistJobs();
+      return plan;
+    }
+    const gate = checkBridgeLocktimeOrdering({
+      btcTip, btcRefundHeight: Number(sb.htlc.cltv),
+      seqTip, seqRefundHeight: Number(hs.seqLocktime),
+    });
+    if (!gate.ok) {
+      try { session && session.close(); } catch {}
+      job._bridgeSession = null;
+      if (job.legState.btc) delete job.legState.btc.verifiedClaimLsp;   // no recoup wiring survives a refusal
+      job.bridgeHandshake = { ok: false, error: `locktime-ordering gate refused (nothing fronted): ${gate.reason}` };
+      persistJobs();
+      console.error('[bridge] locktime-ordering gate REFUSED:', gate.reason);
+      return plan;
+    }
+
     job._bridgeSession = session;            // kept alive so the taker's funded asset leg can be relayed in
     job.bridge_terms = { hash_h: hs.hashHex, maker_seq_claim_pub: hs.makerSeqClaimPubHex,
       seq_locktime: hs.seqLocktime, seq_amount: hs.seqAmount, btc_amount: hs.btcAmount,
@@ -1963,8 +2035,11 @@ async function runBridgedSwapJob(body, job) {
   return r.ok
     ? { ok: true, settled: true, rail: 'bridged', finality: 'confirming', anchor_bound: true,
         settlement_plan: bridgeplanSummary(plan), legs: r.legs }
+    // W2(b): a pre-front maxTicks exhaustion is RESUMABLE (nothing fronted, the taker's asset leg is
+    // already committed) — surface `interrupted` so the job is marked 'interrupted' (re-driven by
+    // resume-on-boot) rather than terminal 'failed', which would strand the taker.
     : { ok: false, rail: 'bridged', error: `bridged swap did not settle: ${scrubDetail(r.reason || 'unknown')}`,
-        settlement_plan: bridgeplanSummary(plan), legs: r.legs || [] };
+        settlement_plan: bridgeplanSummary(plan), legs: r.legs || [], ...(r.interrupted ? { interrupted: true } : {}) };
 }
 
 // A compact, wire-friendly view of the plan for the wallet's honest net-terms display.
@@ -2550,13 +2625,46 @@ const server = http.createServer(async (req, res) => {
       if (!body || !body.job_id) return send(res, 400, { ok: false, error: 'need { job_id, taker_seq_leg, recv_bolt11 }' });
       const job = jobs.get(body.job_id);
       if (!job) return send(res, 404, { ok: false, error: 'unknown bridge job id' });
-      if (!job._bridgeSession) return send(res, 409, { ok: false, error: 'bridge session not open (handshake not completed / already relayed / restarted)' });
+      // W2(a): accept the asset hand-off ONLY while a bridged driver is AUTHORITATIVELY live to front it —
+      // job._driverLive (set/cleared synchronously with runBridgedSwap) AND the courier session still open.
+      // Gating on this instead of job.status closes the LAG hole: after the driver exhausts maxTicks it stops
+      // (nothing will ever front), but job.status stays 'confirming' through ~1.5s of post-loop awaits and
+      // flips terminal only in the caller .then. In that lag the OLD status check still admitted (status
+      // 'confirming' + _bridgeSession non-null), so relaying the taker's asset would hand it to the maker
+      // with no front ever = strand. _driverLive is false the instant the driver stops, so the hand-off now
+      // fails closed. (A past-handoff job re-driven by resume-on-boot has a null session -> also refused; it
+      // needs no second hand-off.) The predicate subsumes the session check, so both facts are surfaced.
+      if (!bridgeAssetHandoffAdmissible(job))
+        return send(res, 409, { ok: false, error: `bridge job is not live to accept the asset hand-off (status '${job.status}', driverLive=${job._driverLive === true}, session=${!!job._bridgeSession}) — its driver is not running to front the hold, so funding the asset now would strand it. Refusing.` });
       const leg = body.taker_seq_leg || {};
       if (!leg.txid || !leg.redeem_script || !body.recv_node_id)
         return send(res, 400, { ok: false, error: 'taker_seq_leg{txid,vout,amount,redeem_script,locktime,asset[,block_hash]} + recv_node_id (the taker BTC-LN node holding the hold on H) required' });
+      // W2(a) — RELAY-TIME LOCKTIME GATE. This is the true COMMITMENT point: relaying the taker's asset leg
+      // EXPOSES it to the maker's claim (the maker then reveals P), after which the taker can no longer refund
+      // safely. So re-run the SAME wall-clock locktime-ordering gate the front uses, against LIVE tips, BEFORE
+      // relaying — a maker whose short T_btc has DRIFTED into the danger window since handshake must be refused
+      // HERE, not only at the front (by which point the maker may already hold the asset). We run it BEFORE
+      // wiring the front target (sb.recvNodeId) or the native-lock (sa.onchain), so a refusal leaves the driver
+      // unable to front at all (frontLn fails closed without recvNodeId) — no strand, no robbery, fail closed.
+      {
+        let btcTip = NaN, seqTip = NaN;
+        const _sb = job.legState && job.legState.btc;
+        if (_sb && _sb.htlc && _sb.htlc.txid) {
+          try {
+            const bo = await xhtlcObserve({ rpc: CFG.subasBtcRpc, wallet: CFG.subasBtcWallet, txid: _sb.htlc.txid, vout: _sb.htlc.vout });
+            const so = await xhtlcObserve({ rpc: CFG.seqRpc, txid: '0'.repeat(64), vout: 0 });
+            btcTip = Number(bo && bo.tip); seqTip = Number(so && so.tip);
+          } catch { /* a tip momentarily unreadable -> NaN -> the gate fails closed below (never relay unverified) */ }
+        }
+        const relayGate = bridgeAssetRelayLocktimeVerdict({ job, btcTip, seqTip });
+        if (!relayGate.ok) {
+          console.error('[bridge] /bridge/asset relay REFUSED by live-tip locktime gate:', relayGate.reason);
+          return send(res, 422, { ok: false, error: `refusing to relay the taker asset leg: the live-tip locktime-ordering gate is unsafe (a short/drifted maker T_btc would let it refund its BTC before the LSP can recoup with P). The asset was NOT exposed — refund it at your T_seq. Detail: ${relayGate.reason}` });
+        }
+      }
       job.legState = job.legState || {};
       const sa = job.legState.asset = job.legState.asset || {};
-      sa.onchain = { txid: leg.txid, vout: Number(leg.vout || 0) };   // the native lock the front gates on
+      sa.onchain = { txid: leg.txid, vout: Number(leg.vout || 0), redeem: leg.redeem_script };   // native lock the front gates on (redeem lets observe read P from the maker's claim, W2b)
       const sb = job.legState.btc; if (sb) sb.recvNodeId = body.recv_node_id;   // the front's target (taker node holding the hold on H)
       persistJobs();
       // Relay the taker's asset leg -> the maker claims it (reveals P). Fire-and-forget: the maker's claim
@@ -2606,7 +2714,12 @@ const server = http.createServer(async (req, res) => {
         payRail = 'ln'; recvRail = 'chain';
       }
       payRail = payRail || 'ln'; recvRail = recvRail || 'ln';
-      if (payRail === 'ln' && recvRail === 'ln') {
+      // W3(c): a ln/ln take is the UNCHANGED pure-LN route ONLY when it is NOT a bridged take. This branch
+      // runs BEFORE the bridge branch below, so without the bridge:true exemption (mirror of the chain/chain
+      // branch) a genuine bridged take whose BOTH taker rails are on Lightning — legitimate when the resting
+      // MAKER's rails differ — was swallowed by pure-LN runSwap, settling an UNRELATED swap over the shared
+      // node and falsely reporting 'settled'. isPureLnTake carries that exemption so it falls through.
+      if (isPureLnTake({ payRail, recvRail, bridge: body.bridge })) {
         const r = await runSwap(body);                          // UNCHANGED pure-LN
         return send(res, r.ok ? 200 : 502, r);
       }
@@ -2650,7 +2763,9 @@ const server = http.createServer(async (req, res) => {
           ...(bnonce ? { swap_nonce: bnonce } : {}), requested_amount: body.amount ?? null, started_ms: Date.now() };
         setJob(jobId, job);   // persist BEFORE any funding (a restart sees 'interrupted', not a 404)
         const run = runBridgedSwapJob(body, job)
-          .then((r) => { setJob(jobId, { ...jobs.get(jobId), ...r, status: r.ok ? 'settled' : 'failed', done_ms: Date.now() }); if (bnonce) bridgeResult.set(bnonce, { ...r, ts: Date.now() }); return r; })
+          // W2(b): interrupted (pre-front maxTicks exhaustion) -> 'interrupted' (resumable), NOT 'failed'.
+          // Do NOT cache an interrupted result under the nonce: a retry must be able to re-drive it.
+          .then((r) => { setJob(jobId, { ...jobs.get(jobId), ...r, status: r.ok ? 'settled' : (r.interrupted ? 'interrupted' : 'failed'), done_ms: Date.now() }); if (bnonce && !r.interrupted) bridgeResult.set(bnonce, { ...r, ts: Date.now() }); return r; })
           .catch((e) => { const r = { ok: false, error: String((e && e.message) || e) }; setJob(jobId, { ...jobs.get(jobId), ...r, status: 'failed', done_ms: Date.now() }); return r; })
           .finally(() => { if (bnonce) bridgeInflight.delete(bnonce); });
         if (bnonce) bridgeInflight.set(bnonce, run);
@@ -2658,6 +2773,20 @@ const server = http.createServer(async (req, res) => {
           bridged: true, bridge_legs: job.settlement_plan.bridge_legs, jit_legs: job.settlement_plan.jit_legs,
           note: 'rail-blind bridged take: the LSP bridges the mismatched leg(s) on one shared preimage. '
               + 'Poll GET /swap/<job_id> for completion; each crossed leg is anchor-gated + refund-safe.' });
+      }
+      // W3(b) — REFUSE-CROSSED. A take that carries the maker's per-leg rails AND genuinely CROSSES rails
+      // (a bridge is required) MUST set bridge:true so it enters the non-custodial bridged driver above. If
+      // it reaches here without bridge:true, do NOT let it fall through to the CUSTODIAL submarine dispatch:
+      // with a resting submarine maker that path would execute an UNRELATED swap out of the LSP's OWN funds
+      // and report 'settled' — a false success while the client's actual bridged take never happened. Fail
+      // closed with 422. (takeRailsCrossed returns false for non-cross / undeterminable shapes, so a plain
+      // legitimate submarine — asset-LN <-> BTC-on-chain, no maker rails — is unaffected.)
+      if (body.maker_btc_rail && body.maker_asset_rail
+        && takeRailsCrossed({ side: body.side, payRail, recvRail,
+             makerBtcRail: body.maker_btc_rail, makerAssetRail: body.maker_asset_rail,
+             takerAssetInbound: !!body.taker_asset_inbound, takerBtcInbound: !!body.taker_btc_inbound })) {
+        return send(res, 422, { ok: false, finality: 'unsupported',
+          error: 'this take crosses rails (a bridge is required) but bridge:true was not set — refusing to route it through the custodial submarine path (which would move the LSP\'s own funds on an unrelated swap and misreport success). Retry the take with bridge:true.' });
       }
       // MIXED (one leg 'ln', one 'chain') -> a submarine swap. Two shapes settle:
       // asset-on-chain <-> BTC-Lightning (xsubbuy/xsublift, always), and the MIRROR
@@ -2917,7 +3046,9 @@ server.listen(CFG.port, '127.0.0.1', () => {
       job.status = 'confirming'; job.interrupted = false; job.error = null; persistJobs();
       console.error('[lsp] resuming bridged job', id, '(re-driving front+recoup on the persisted maker HTLC)');
       runBridgedSwap({ match, io, driverCfg: { pollMs: 3000, maxTicks: Math.ceil(CFG.mixedTimeoutMs / 3000) } })
-        .then((r) => { setJob(id, { ...jobs.get(id), ...(r.ok ? { ok: true, settled: true, status: 'settled' } : { ok: false, status: 'failed', error: `resumed bridged swap did not settle: ${r.reason || 'unknown'}` }), legs: r.legs, done_ms: Date.now() }); })
+        // A resumed run that again exhausts pre-front stays 'interrupted' (resumable on the next boot),
+        // not 'failed' — the taker's committed asset must never be stranded by a marking.
+        .then((r) => { setJob(id, { ...jobs.get(id), ...(r.ok ? { ok: true, settled: true, status: 'settled', interrupted: false } : (r.interrupted ? { ok: false, status: 'interrupted', interrupted: true, error: `resumed bridged swap not yet settled (pre-front): ${r.reason || 'unknown'}` } : { ok: false, status: 'failed', error: `resumed bridged swap did not settle: ${r.reason || 'unknown'}` })), legs: r.legs, done_ms: Date.now() }); })
         .catch((e) => { setJob(id, { ...jobs.get(id), ok: false, status: 'failed', error: String((e && e.message) || e), done_ms: Date.now() }); });
     } catch (e) { console.error('[lsp] bridge resume skipped for', id, e && e.message); }
   }

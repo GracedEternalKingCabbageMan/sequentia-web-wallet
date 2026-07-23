@@ -3063,6 +3063,23 @@ function isPeggedFillToRedeem(m){
   return advertisedBtc;                                          // received SBTC on a BTC-advertised market -> redeem
 }
 
+// W5 — SBTC MIS-SELL BINDING. A BTC-advertised covenant is treated as a pegged-BTC (SBTC silent-peg) bid:
+// filling it pays the taker in SBTC that the wallet then auto-redeems to real BTC. That promise is ONLY
+// sound if the covenant actually LOCKS SBTC. A malicious maker can rest a covenant that locks a WORTHLESS
+// asset while advertising the row on a BTC market; a taker who fills it pays real EURX/GOLD and receives
+// junk. So before quoting/taking such a row we REQUIRE covenant.asset_a to be exactly the given asset id.
+// Pure (no C/sbtc dependency) so it is unit-testable; the live callers pass sbtcAssetId().
+export function covenantLocksAsset(offer, expectedAssetHex){
+  const ct = (offer && (offer.covenant || offer.Covenant)) || {};
+  const locked = String(ct.asset_a || ct.assetA || '').toLowerCase();
+  const want = String(expectedAssetHex || '').toLowerCase();
+  return !!want && locked === want;                              // empty/absent expected id -> false (fail closed)
+}
+// TRUE iff a BTC-advertised covenant genuinely locks SBTC (so it is safe to fill as a pegged-BTC bid and
+// auto-redeem the received SBTC to real BTC). Returns false when SBTC is unavailable on this network — a
+// covenant can then never be mis-sold as pegged BTC.
+function peggedCovenantLocksSbtc(offer){ return covenantLocksAsset(offer, sbtcAssetId()); }
+
 // SBTC peg-OUT resume (F-FS3). pegOutReceivedSbtc broadcasts (sendSeqAsset), so a failure can leave the
 // received SBTC un-redeemed with no follow-up — the old "auto-redeem will retry" toast promised a retry
 // that did not exist. Persist the pending amount and retry it ONCE on next load, guarded by the LIVE SBTC
@@ -4301,6 +4318,13 @@ async function postPeggedBtcReview(q){
 // onCovMatched. `offer` is the resting covenant we detected in the reverse book.
 async function takePeggedCovenantReview(q, offer){
   const { $ } = C;
+  // W5 (defense-in-depth): never quote or fill a BTC-advertised covenant that does not actually LOCK
+  // SBTC — otherwise the taker pays a real asset and receives a worthless one advertised as BTC. Fail
+  // closed even if a caller reached here without the selection-point check.
+  if (!peggedCovenantLocksSbtc(offer)){
+    $('swErr').textContent = 'This BTC bid’s covenant does not lock pegged BTC (SBTC) — refusing to fill it (you could pay a real asset and receive junk).';
+    return;
+  }
   const assetHex = q.seqAsset;
   const am = C.assetMeta(assetHex);
   let assetAtoms, btcSats;
@@ -4480,7 +4504,16 @@ async function reviewCross(q){
     // a COVENANT, not an HTLC — cross it and peg out (spec §5) rather than the xrswap wizard. Detected
     // by the presence of covenant settlement terms on the best takeable reverse offer.
     const best = (XBOOK.offers || [])[0];
-    if (best && (best.covenant || best.Covenant)) return takePeggedCovenantReview(q, best);
+    if (best && (best.covenant || best.Covenant)){
+      // W5: only a covenant that genuinely LOCKS SBTC is a pegged-BTC bid we can fill safely (and
+      // auto-redeem to BTC). A BTC-advertised covenant locking any OTHER asset is a mis-sell trap — you
+      // would pay a real asset and receive junk. Refuse the row (do not quote/take it).
+      if (!peggedCovenantLocksSbtc(best)){
+        $('swErr').textContent = 'This resting BTC bid can’t be filled safely: its covenant locks an unexpected asset, not pegged BTC (SBTC). Refusing to fill it.';
+        return;
+      }
+      return takePeggedCovenantReview(q, best);
+    }
     // Reverse (sell asset for BTC): the xrswap.js wizard takes over (its own review
     // modals, leg verification, fund/claim/poll, and localStorage resume).
     if (!X.openReverseFromComposer){ $('swErr').textContent = 'Selling an asset for BTC is unavailable in this build.'; return; }
@@ -5300,5 +5333,7 @@ export const __test__ = { stripBip32, dexPost,
   acceptedFee, defaultFeeAsset,
   // Take/Post + rail-combo helpers, for headless verification of the composer's gating.
   postSupported, railSupported, applyAutoMode,
+  // W5 — the SBTC mis-sell binding: a BTC-advertised covenant is only fillable as pegged BTC if it LOCKS SBTC.
+  covenantLocksAsset,
   state: S,
 };

@@ -79,6 +79,26 @@ test('verifyMakerBtcHtlc: TRUE only when claim==LSP, H, refund, CLTV all bind', 
   assert.equal(verifyMakerBtcHtlc({ redeemScriptHex: good, hashHex: H, lspClaimPubHex: LSP.pubHex, makerRefundPubHex: MAKER_REFUND, locktime: T_BTC + 1 }).ok, false);
 });
 
+// --- W1-UNIT: the BTC-HTLC CLTV must be a BLOCK HEIGHT, never a UNIX timestamp ---
+// A Bitcoin nLockTime >= 500,000,000 (BIP-65 LOCKTIME_THRESHOLD) is a TIMESTAMP; the bridge locktime-ordering
+// gate does height arithmetic, so a timestamp CLTV would let a malicious maker bypass it. Refuse at verify.
+const LT_THRESH = 500000000;
+test('W1-UNIT verifyMakerBtcHtlc: a TIMESTAMP CLTV (>= LOCKTIME_THRESHOLD) is REFUSED — not a block height', () => {
+  const ts = buildHtlcRedeem(H, LSP.pubHex, MAKER_REFUND, LT_THRESH);
+  const v = verifyMakerBtcHtlc({ redeemScriptHex: ts, hashHex: H, lspClaimPubHex: LSP.pubHex, makerRefundPubHex: MAKER_REFUND, locktime: LT_THRESH });
+  assert.equal(v.ok, false);
+  assert.match(v.reason, /block height|TIMESTAMP/i);
+  // a height one below the threshold still binds (it is a threshold, not a blanket refusal of large CLTVs).
+  const ok = buildHtlcRedeem(H, LSP.pubHex, MAKER_REFUND, LT_THRESH - 1);
+  assert.equal(verifyMakerBtcHtlc({ redeemScriptHex: ok, hashHex: H, lspClaimPubHex: LSP.pubHex, makerRefundPubHex: MAKER_REFUND, locktime: LT_THRESH - 1 }).ok, true);
+});
+
+test('W1-UNIT runReverseBridgeTerms: FAILS CLOSED when the maker BTC HTLC CLTV is a TIMESTAMP, not a height', async () => {
+  const s = fakeSession([makerBtcLegLocked({ cltv: LT_THRESH })]);
+  await assert.rejects(() => runReverseBridgeTerms({ session: s, lspBtcClaimPubHex: LSP.pubHex, takerSeqRefundPubHex: TAKER_SEQ_REFUND,
+    expect: { btcSats: 76066, seqAtoms: 13127177428 } }), /block height|TIMESTAMP/i);
+});
+
 // --- the handshake ---
 test('runReverseBridgeTerms: sends TermsRequest w/ LSP claim + taker refund, parses BtcLegLocked', async () => {
   const s = fakeSession([makerBtcLegLocked()]);

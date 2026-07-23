@@ -35,6 +35,7 @@
 import { XcType, CourierSession, openCourierSession } from '../../xcourier.js';
 import { setSeqobBase, bytesToHex, hexToBytes } from '../../seqob.js';
 import { secp256k1 } from '../../btc.js';
+import { LOCKTIME_THRESHOLD } from './leg-bridge.mjs';
 
 export const BRIDGE_MAKER_DEFAULTS = Object.freeze({
   termsWaitMs: 120000,     // the maker mints terms + locks its BTC leg within a couple of minutes
@@ -117,6 +118,14 @@ export function parseHtlcRedeem(script) {
 export function verifyMakerBtcHtlc({ redeemScriptHex, hashHex, lspClaimPubHex, makerRefundPubHex, locktime }) {
   try {
     const p = parseHtlcRedeem(hexToBytes(redeemScriptHex));
+    // W1-UNIT — the BTC-HTLC CLTV MUST be a BLOCK HEIGHT. A Bitcoin nLockTime >= LOCKTIME_THRESHOLD
+    // (500,000,000) is a UNIX TIMESTAMP, not a height; nothing else forces the maker to pick a height, so a
+    // malicious maker could set a timestamp locktime. The bridge fund-safety gate (checkBridgeLocktimeOrdering)
+    // does HEIGHT arithmetic (T_btc - btcTip) — a timestamp there yields a huge bogus "blocks to refund" that
+    // trivially clears the gate (bypass). Refuse a non-height CLTV up front so the handshake fails closed and
+    // the height arithmetic downstream is always valid. (Also refuse a negative CScriptNum — never a height.)
+    if (!Number.isFinite(p.locktime) || p.locktime < 0 || p.locktime >= LOCKTIME_THRESHOLD)
+      return { ok: false, reason: `HTLC CLTV ${p.locktime} is not a block height (an nLockTime >= ${LOCKTIME_THRESHOLD} is a UNIX TIMESTAMP; heights are 0..${LOCKTIME_THRESHOLD - 1}) — the bridge locktime-ordering gate needs a height; refuse to front` };
     if (p.hashHex.toLowerCase() !== String(hashHex).toLowerCase())
       return { ok: false, reason: `HTLC hash ${p.hashHex} != swap H ${hashHex}` };
     if (p.claimPubHex.toLowerCase() !== String(lspClaimPubHex).toLowerCase())

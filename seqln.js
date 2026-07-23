@@ -440,7 +440,13 @@ export function closeChannelLsp({ chain = 'seq', asset, node, scid, destination,
 //     over Lightning). Anchor-gated; returns finality:'confirming' (anchor-bound).
 // Rails are only serialized when present, so the pure-LN call is byte-identical to
 // before (the LSP treats a missing rail as ln/ln).
-export function seqlnSwap({ side, asset, amount, quote_asset, payRail, recvRail, node_key, counter_node_key, btc_claim_pub, offer_id, maker_pubkey, swap_nonce, hodl, payment_hash, asset_amount, btc_htlc }) {
+export function seqlnSwap({ side, asset, amount, quote_asset, payRail, recvRail, node_key, counter_node_key, btc_claim_pub, offer_id, maker_pubkey, swap_nonce, hodl, payment_hash, asset_amount, btc_htlc,
+  // RAIL-BLIND BRIDGED TAKE (a genuine rail crossing): these fields route the take into the LSP's
+  // non-custodial bridged driver (POST /swap with bridge:true). They were previously DROPPED by this
+  // destructure, so a bridged take silently lost bridge:true + all its terms and was MISROUTED into the
+  // custodial submarine path (a false-success fund hole). Forward every one of them (W3a).
+  bridge, btc_node_key, maker_btc_rail, maker_asset_rail, btc_sats, asset_atoms,
+  taker_asset_inbound, taker_btc_inbound, taker_seq_refund_pub }) {
   const body = { side, asset, amount };
   // asset<->asset pure-LN: the counter (quote) asset id. Omitted (or 'BTC') => the classic asset<->BTC
   // pure-LN, so the pure-LN body stays byte-identical to before for every existing asset<->BTC swap.
@@ -473,6 +479,18 @@ export function seqlnSwap({ side, asset, amount, quote_asset, payRail, recvRail,
   if (payment_hash) body.payment_hash = payment_hash;
   if (asset_amount != null) body.asset_amount = asset_amount;
   if (btc_htlc) body.btc_htlc = btc_htlc;
+  // Bridged take (W3a): forward the full bridged-take contract so the LSP enters the bridged branch and
+  // binds every LSP front to the two legs' amounts. Only serialized when present, so every existing
+  // pure-LN / sub-asset body stays byte-identical (no `bridge` field -> byte-for-byte the same as before).
+  if (bridge) body.bridge = bridge;
+  if (btc_node_key) body.btc_node_key = btc_node_key;
+  if (maker_btc_rail) body.maker_btc_rail = maker_btc_rail;
+  if (maker_asset_rail) body.maker_asset_rail = maker_asset_rail;
+  if (btc_sats != null) body.btc_sats = btc_sats;
+  if (asset_atoms != null) body.asset_atoms = asset_atoms;
+  if (taker_asset_inbound != null) body.taker_asset_inbound = taker_asset_inbound;
+  if (taker_btc_inbound != null) body.taker_btc_inbound = taker_btc_inbound;
+  if (taker_seq_refund_pub) body.taker_seq_refund_pub = taker_seq_refund_pub;
   return lspFetch('/swap', { method: 'POST', body: JSON.stringify(body) });
 }
 

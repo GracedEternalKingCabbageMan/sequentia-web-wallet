@@ -128,6 +128,30 @@ assert.equal(swReq.method, 'POST'); assert.equal(swReq.path, '/swap');
 assert.deepEqual(JSON.parse(swReq.body), { side: 'buy', asset: 'GOLD', amount: 100000 });
 console.log('ok: seqlnSwap() POSTs {side,asset,amount} and parses the settle (preimage + amounts)');
 
+// W3(a): a RAIL-BLIND BRIDGED take must forward its FULL contract. These fields were previously DROPPED
+// by seqlnSwap's fixed destructure, so a bridged take lost bridge:true + all its terms and was misrouted
+// into the LSP's CUSTODIAL submarine path (a false-success fund hole). Verify every field survives.
+{
+  const before = seen.length;
+  await seqlnSwap({ side: 'sell', asset: 'GOLD', amount: 500, bridge: true,
+    payRail: 'chain', recvRail: 'ln', maker_btc_rail: 'chain', maker_asset_rail: 'chain',
+    btc_sats: 12345, asset_atoms: 500, offer_id: 'off1', maker_pubkey: 'aa'.repeat(33),
+    node_key: 'seq:GOLD', btc_node_key: 'btc:xyz', taker_asset_inbound: false, taker_btc_inbound: true,
+    taker_seq_refund_pub: 'bb'.repeat(33), swap_nonce: 'n1' });
+  const bridgeReq = seen.slice(before).find((s) => s.path === '/swap');
+  assert.ok(bridgeReq, 'bridged seqlnSwap POSTs /swap');
+  const bb = JSON.parse(bridgeReq.body);
+  for (const k of ['bridge', 'payRail', 'recvRail', 'maker_btc_rail', 'maker_asset_rail', 'btc_sats', 'asset_atoms',
+                   'offer_id', 'maker_pubkey', 'node_key', 'btc_node_key', 'taker_btc_inbound', 'taker_seq_refund_pub', 'swap_nonce']) {
+    assert.ok(k in bb, 'bridged field survives the client wrapper: ' + k);
+  }
+  assert.equal(bb.bridge, true, 'bridge:true reaches the LSP so it enters the bridged branch');
+  assert.equal(bb.btc_sats, 12345);
+  assert.equal(bb.asset_atoms, 500);
+  assert.equal(bb.taker_asset_inbound, false, 'even a false inbound flag is forwarded (not dropped)');
+  console.log('ok: seqlnSwap() forwards the FULL bridged-take contract, including bridge:true (W3a)');
+}
+
 // error propagation: a non-ok LSP body rejects with the server's error message.
 initSeqln({ lspUrl: `http://127.0.0.1:${port}/nope-prefix`, token: 'T0KEN' });
 await assert.rejects(() => seqlnGetStatus(), /nope/, 'non-ok LSP response rejects with the error');
