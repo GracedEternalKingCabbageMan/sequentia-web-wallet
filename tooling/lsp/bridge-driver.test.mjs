@@ -4,7 +4,7 @@
 // deadlock when both legs bridge — all without a node.
 import test from 'node:test';
 import assert from 'node:assert';
-import { runBridgedLeg, runBridgedSwap, classifyLegs, describeBridge, matchFromTake, makerRailsFromOffer, takeRailsCrossed, bridgeAssetHandoffAdmissible, bridgeAssetRelayLocktimeVerdict, isPureLnTake } from './bridge-driver.mjs';
+import { runBridgedLeg, runBridgedSwap, classifyLegs, describeBridge, matchFromTake, makerRailsFromOffer, takeRailsCrossed, bridgeAssetHandoffAdmissible, bridgeAssetRelayLocktimeVerdict, isPureLnTake, crossingShapeSupported, bridgedTakeSupported, describeCrossingSupport } from './bridge-driver.mjs';
 import { planSettlement } from './settlement-router.mjs';
 
 const A = 100000;
@@ -467,3 +467,72 @@ function payerLegWorld() {
     settle: () => { w.ln.settled = true; },
   };
 }
+
+// ---------- P3.2 crossing-shape capability (the wallet pre-Review check == the LSP admission) ----------
+
+test('P3.2 crossingShapeSupported: the WIRED shape (SELL asset / receive BTC over LN vs on-chain reverse maker) is supported', () => {
+  const m = matchFromTake({ asset: 'GOLD', side: 'sell', payRail: 'chain', recvRail: 'ln', makerBtcRail: 'chain', makerAssetRail: 'chain', takerBtcInbound: true });
+  const plan = planSettlement(m);
+  assert.equal(plan.btcLeg.bridge, true);
+  assert.equal(plan.btcLeg.lnSide, 'receiver');
+  assert.equal(crossingShapeSupported(plan), true);
+});
+
+test('P3.2 crossingShapeSupported: a payer-side BTC-leg bridge (BUY, pay BTC over LN) is NOT wired -> unsupported', () => {
+  const m = matchFromTake({ asset: 'GOLD', side: 'buy', payRail: 'ln', recvRail: 'chain', makerBtcRail: 'chain', makerAssetRail: 'chain' });
+  const plan = planSettlement(m);
+  assert.equal(plan.btcLeg.bridge, true);
+  assert.equal(plan.btcLeg.lnSide, 'payer');
+  assert.equal(crossingShapeSupported(plan), false);   // the io never funds a payer-side BTC HTLC for this shape
+});
+
+test('P3.2 crossingShapeSupported: an asset-leg bridge (maker sub-asset LN, taker wants asset on-chain) is NOT wired', () => {
+  const m = matchFromTake({ asset: 'GOLD', side: 'buy', payRail: 'chain', recvRail: 'chain', makerBtcRail: 'chain', makerAssetRail: 'ln' });
+  const plan = planSettlement(m);
+  assert.equal(plan.assetLeg.bridge, true);
+  assert.equal(crossingShapeSupported(plan), false);
+});
+
+test('P3.2 crossingShapeSupported: a HAPPY coincidence is never "supported" (settle natively, not via the bridge)', () => {
+  const m = matchFromTake({ asset: 'GOLD', side: 'buy', payRail: 'chain', recvRail: 'chain', makerBtcRail: 'chain', makerAssetRail: 'chain' });
+  assert.equal(planSettlement(m).happyCoincidence, true);
+  assert.equal(crossingShapeSupported(planSettlement(m)), false);
+});
+
+test('P3.2 bridgedTakeSupported: match-based wrapper agrees with crossingShapeSupported on the wired shape', () => {
+  const take = { asset: 'GOLD', side: 'sell', payRail: 'chain', recvRail: 'ln', makerBtcRail: 'chain', makerAssetRail: 'chain', takerBtcInbound: true };
+  assert.equal(bridgedTakeSupported(take), true);
+});
+
+test('P3.2 bridgedTakeSupported: undeterminable/invalid rails -> false (wallet does NOT promise a bridge, falls back)', () => {
+  assert.equal(bridgedTakeSupported({ asset: 'GOLD', side: 'sell', payRail: 'satellite', recvRail: 'ln', makerBtcRail: 'chain', makerAssetRail: 'chain' }), false);
+  assert.equal(bridgedTakeSupported({}), false);
+  assert.equal(bridgedTakeSupported(null), false);
+});
+
+test('P3.2 bridgedTakeSupported: exactly the shapes the LSP admission accepts (parity with crossingShapeSupported)', () => {
+  // Enumerate every genuine crossing vs a unified-book maker (BTC leg on-chain) and assert the match-based
+  // wallet check equals the plan-based LSP-admission check — so a Review can never promise a bridge the LSP
+  // then refuses post-confirm.
+  for (const side of ['buy', 'sell'])
+    for (const payRail of ['ln', 'chain'])
+      for (const recvRail of ['ln', 'chain'])
+        for (const makerAssetRail of ['ln', 'chain']) {
+          const take = { asset: 'GOLD', side, payRail, recvRail, makerBtcRail: 'chain', makerAssetRail,
+            takerAssetInbound: false, takerBtcInbound: false };
+          const plan = planSettlement(matchFromTake(take));
+          assert.equal(bridgedTakeSupported(take), crossingShapeSupported(plan),
+            `parity mismatch for ${side} pay=${payRail} recv=${recvRail} makerAsset=${makerAssetRail}`);
+        }
+});
+
+test('P3.2 describeCrossingSupport: publishes the wired shape + at least one supported crossing, all supported entries pass the predicate', () => {
+  const d = describeCrossingSupport();
+  assert.match(d.wired_shape, /SELL|receive|reverse/i);
+  assert.ok(Array.isArray(d.supported_crossings) && d.supported_crossings.length >= 1);
+  assert.ok(Array.isArray(d.unsupported_crossings) && d.unsupported_crossings.length >= 1);
+  for (const s of d.supported_crossings) assert.equal(s.supported, true);
+  for (const s of d.unsupported_crossings) assert.equal(s.supported, false);
+  // The one supported crossing today is SELL / recv BTC over LN (BTC-leg receiver bridge).
+  assert.ok(d.supported_crossings.every((s) => s.side === 'sell' && s.recvRail === 'ln'));
+});

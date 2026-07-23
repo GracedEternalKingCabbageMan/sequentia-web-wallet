@@ -52,7 +52,7 @@ import * as sbtc from './sbtc.js';
 // rail". ONE source of truth with the LSP + the pure driver (tooling/lsp/*).
 import { planSettlement } from './tooling/lsp/settlement-router.mjs';
 import { bestFor } from './tooling/lsp/unified-book.mjs';
-import { matchFromTake, makerRailsFromOffer, describeBridge } from './tooling/lsp/bridge-driver.mjs';
+import { matchFromTake, makerRailsFromOffer, describeBridge, bridgedTakeSupported } from './tooling/lsp/bridge-driver.mjs';
 
 let C = null;            // injected app context (see index.html initSwapTab)
 let X = null;            // the cross-chain route handle ({ openFromComposer, renderXswap, hasInFlight })
@@ -248,6 +248,13 @@ function priceLineStr(pay, receive, payU, recvU){
 // Refreshed by refreshInstant(); read synchronously by findRoute/updateRails.
 let LNSTATUS = { channels: [], funding: null };
 let LNPROV = {};     // provisionedState(): assetHexLower -> { connected, phase }
+// P3.5 — the LSP-advertised 0-conf front ceiling on the BTC leg, in SATS (the SINGLE source of truth for
+// frontCapAtoms). null until the first /status read; frontCapAtoms falls back to the box default then.
+let MAX0CONF_SATS = null;
+// P3.2 — the LSP-advertised bridge capability (which rail-crossing shapes it settles). Informational: the
+// wallet's own pre-Review check uses the SHARED pure predicate (bridgedTakeSupported), so a stale/absent
+// value never lets it promise an unsupported bridge.
+let BRIDGECAPS = null;
 let MIXED = null;    // the in-flight mixed-rail (submarine) swap (persisted; see submarine.js)
 const MIXED_KEY = 'swk.sequentia.submarine';   // localStorage key for the in-flight submarine swap
 
@@ -906,6 +913,11 @@ async function refreshInstant(){
     const st = await L.status();
     const chans = (st && (st.channels || st.channel_balances)) || [];
     LNSTATUS = { channels: chans, funding: (st && st.funding) || null, frontable: (st && st.frontable) || null };   // ground truth for rail gating (own channels + LSP-frontable inventory)
+    // P3.5/P3.2 — capture the LSP-advertised 0-conf cap (sats) + bridge capability so the composer is a
+    // single source of truth with the box config, not a hard-coded default. Absent on an older LSP -> the
+    // frontCapAtoms box default and the shared pure capability predicate still apply.
+    MAX0CONF_SATS = (st && Number.isFinite(Number(st.mixed_max_0conf_sats))) ? Number(st.mixed_max_0conf_sats) : MAX0CONF_SATS;
+    BRIDGECAPS = (st && st.bridge) || BRIDGECAPS;
     for (const c of chans){
       if (!c.node_key) continue;   // ONLY the wallet's own channels count as its Lightning balance
                                    // (never shared/demo) — consistent with the Balance tab + railAvail
@@ -2601,18 +2613,17 @@ function feeAssetSubline(hex){
 // ---------------------------------------------------------------------------
 // honest, actionable timing banner (keyed off the RECEIVE leg)
 // ---------------------------------------------------------------------------
-// The LP instant-front CAP (how much on-chain PAY the LP will front so you receive
-// on Lightning NOW). Read from window.SEQ_LSP_FRONT_CAP (BTC, e.g. 0.002); default
-// MUST track the deployed LSP's MIXED_MAX_0CONF (currently 200000 sat = 0.002 BTC) —
-// a smaller default under-advertises the instant range and needlessly warns "~1
-// confirmation" on trades the LSP would in fact front instantly. Compared against the
-// BTC leg of the trade in BTC atoms. (Ideally surfaced by the LSP /status; until then
-// this default is kept in lockstep with the box config.)
+// The LP instant-front CAP (how much on-chain PAY the LP will front so you receive on Lightning NOW), in
+// BTC atoms (= sats). SINGLE SOURCE OF TRUTH order (P3.5): an explicit operator override
+// (window.SEQ_LSP_FRONT_CAP, BTC units) wins; else the LSP /status advertises it in SATS
+// (mixed_max_0conf_sats, captured in MAX0CONF_SATS) so the composer tracks the box's real MIXED_MAX_0CONF
+// with no hard-coded drift; else the box default. Compared against the BTC leg of the trade in BTC atoms.
 function frontCapAtoms(){
   const w = (typeof window !== 'undefined') ? window : {};
   const c = w.SEQ_LSP_FRONT_CAP;
   if (c != null){ try { return C.parseAtoms(String(c), 8); } catch {} }
-  return 200000n;   // 0.002 BTC — matches the live LSP MIXED_MAX_0CONF
+  if (MAX0CONF_SATS != null && Number.isFinite(MAX0CONF_SATS) && MAX0CONF_SATS >= 0) return BigInt(Math.floor(MAX0CONF_SATS));
+  return 200000n;   // 0.002 BTC — the box default until /status is read (matches the live LSP MIXED_MAX_0CONF)
 }
 // The BTC leg amount of the current composer state, in BTC atoms (the on-chain PAY
 // exposure the CAP governs). Exactly one side of a BTC pair is BTC.
@@ -2620,6 +2631,15 @@ function btcLegAtoms(){
   const btcIsPay = (S.payAsset === 'BTC');
   const v = ((btcIsPay ? C.$('swPayAmt') : C.$('swRecvAmt')).value || '').trim();
   try { return C.parseAtoms(v, 8); } catch { return 0n; }
+}
+// The ASSET leg amount of the current composer state, in the asset's OWN atoms — the size the user
+// actually wants to trade (P3.1: size the bridged take to THIS, never the whole resting offer). On a BUY
+// (payIsBtc) the asset is the RECEIVE field; on a SELL it is the PAY field.
+function assetLegAtoms(route){
+  const assetIsPay = !route.payIsBtc;
+  const v = ((assetIsPay ? C.$('swPayAmt') : C.$('swRecvAmt')).value || '').trim();
+  const am = C.assetMeta(route.seqAsset) || {};
+  try { return C.parseAtoms(v, am.precision || 0); } catch { return 0n; }
 }
 // testnet4 on-chain payment confirmation estimate (the pay leg must confirm before an
 // over-CAP LN front settles). Overridable via window.SEQ_ONCHAIN_CONF = { n, t }.
@@ -2872,10 +2892,42 @@ function bridgedTakePlan(route){
     const offer = bestFor({ asks: book.asks || [], bids: book.bids || [] }, side);
     if (!offer || !(offer.price > 0)) return null;
     const { makerBtcRail, makerAssetRail } = makerRailsFromOffer(offer);
-    const match = matchFromTake({ asset: route.seqAsset, side, payRail: S.payRail, recvRail: S.recvRail,
-      makerBtcRail, makerAssetRail, takerAssetInbound: false, takerBtcInbound: false });   // false => the LSP JIT-provisions (always safe)
+    const take = { asset: route.seqAsset, side, payRail: S.payRail, recvRail: S.recvRail,
+      makerBtcRail, makerAssetRail, takerAssetInbound: false, takerBtcInbound: false };   // false => the LSP JIT-provisions (always safe)
+    const match = matchFromTake(take);
     const plan = planSettlement(match);
-    return { side, offer, match, plan, describe: describeBridge(match), bridged: !plan.happyCoincidence, makerBtcRail, makerAssetRail };
+    const crosses = !plan.happyCoincidence;
+    // P3.2 — CAPABILITY PRE-CHECK. A crossing that the LSP's bridge does NOT settle (any shape but the ONE
+    // wired: taker-sells-asset / receives-BTC-over-LN vs an on-chain reverse maker) must NOT be promised as
+    // a bridge in Review — the SHARED pure predicate (identical to the LSP's /swap admission) decides, so
+    // there is never a Review that fails post-confirm. Unsupported -> bridged:false, so onReview FALLS BACK
+    // to the native/on-chain path at the same price (never a dead-end promise).
+    const supported = crosses && bridgedTakeSupported(take);
+    // P3.1 — SIZE THE TAKE to the USER's composer amount, never the whole resting offer (spec §2.4: asking
+    // to sell 10 must not sign you up for 43). Partial-fill the offer when it allows it and the slice clears
+    // its min_fill; otherwise flag an overshoot so Review warns and Place is blocked (fail closed, never a
+    // silent whole-offer overshoot). The LSP + maker re-verify every amount and fail closed on any mismatch.
+    const offerAtoms = BigInt(offer.assetAtoms || 0), offerBtc = BigInt(offer.btcSats || 0);
+    const want = assetLegAtoms(route);
+    let takeAtoms = offerAtoms, takeBtc = offerBtc, partial = false, overshoot = false;
+    if (want > 0n && offerAtoms > 0n && want < offerAtoms){
+      const raw = offer.raw || {};
+      const allowPartial = raw.allow_partial === true || raw.allowPartial === true;
+      const minFill = BigInt(raw.min_fill || raw.minFill || 0);
+      if (allowPartial && want >= (minFill > 0n ? minFill : 1n)){
+        takeAtoms = want;
+        // FLOOR the BTC the taker EXPECTS for the slice — never demand MORE than the proportional amount the
+        // maker will pay (the reverse-FLOOR rule the maker's proportional terms use, P2.3). The bind is only
+        // a floor; the LSP verifies the maker pays AT LEAST this and fails closed otherwise.
+        takeBtc = (want * offerBtc) / offerAtoms;
+        partial = true;
+      } else {
+        overshoot = true;   // this offer can't be sliced to the requested size -> refuse to overshoot
+      }
+    }
+    return { side, offer, match, plan, describe: describeBridge(match), bridged: crosses && supported,
+      crosses, supported, makerBtcRail, makerAssetRail,
+      takeAtoms, takeBtc, want, partial, overshoot };
   } catch { return null; }
 }
 
@@ -2883,20 +2935,40 @@ async function reviewBridged(route, bp){
   const { $ } = C;
   if (!L || !L.swap){ $('swErr').textContent = 'The bridged (rail-crossing) route needs the Lightning service, which is unavailable in this build.'; return; }
   if (hasBridgeInFlight()){ $('swErr').textContent = 'You already have a bridged swap in progress · finish it first (Active trades) before starting another.'; return; }
-  const am = C.assetMeta(route.seqAsset);
+  const am = C.assetMeta(route.seqAsset) || {};
+  const aprec = am.precision || 0, tk = am.ticker || 'asset';
   const d = bp.describe;
-  const legName = (u) => u === 'btc' ? 'Bitcoin' : am.ticker;
+  const legName = (u) => u === 'btc' ? 'Bitcoin' : tk;
   const bridgedUnits = d.bridgeLegs.map((l) => legName(l.unit)).join(' + ');
   const jitNote = d.jitLegs.length ? ` A Lightning channel is opened for you to receive ${d.jitLegs.map(legName).join(' + ')} (near-instant).` : '';
+  // P3.1 — FORMATTED units, never raw atoms/sats, and the SIZED take (bp.takeAtoms/takeBtc), never the
+  // whole resting offer. A partial fill of a larger offer is stated so the Review == what executes (§6).
+  const takeAssetStr = C.fmtAtoms(BigInt(bp.takeAtoms || 0), aprec) + ' ' + tk;
+  const takeBtcStr = C.fmtAtoms(BigInt(bp.takeBtc || 0), 8) + ' BTC';
+  const offerAssetStr = C.fmtAtoms(BigInt(bp.offer.assetAtoms || 0), aprec) + ' ' + tk;
+  const pricing = bp.side === 'buy'
+    ? `Pay ${takeBtcStr}, receive ${takeAssetStr}.`
+    : `Sell ${takeAssetStr}, receive ${takeBtcStr}.`;
+  const partialNote = bp.partial ? ` Partial fill of a larger resting offer (${offerAssetStr}).` : '';
   const kv = [
     ['Route', `Rail-blind bridged swap · the service bridges the ${bridgedUnits} leg${d.bridgeLegs.length > 1 ? 's' : ''} between Lightning and on-chain, on ONE shared secret (both legs settle together or not at all).`],
-    ['Direction', bp.side === 'buy' ? `Buy ${am.ticker} with Bitcoin` : `Sell ${am.ticker} for Bitcoin`],
-    ['Pricing', `Best resting offer across rails · you take ${bp.offer.btcSats} sats for ${bp.offer.assetAtoms} ${am.ticker} atoms.${jitNote}`],
+    ['Direction', bp.side === 'buy' ? `Buy ${tk} with Bitcoin` : `Sell ${tk} for Bitcoin`],
+    ['You trade', `${pricing}${partialNote}${jitNote}`],
     ['Bridge', `The service is a counterparty ONLY on the crossed leg${d.bridgeLegs.length > 1 ? 's' : ''}; a coincident leg settles directly. It secures its recoup BEFORE it fronts, so a stall can only refund with no loss.`],
     ['Finality', 'Anchored to Bitcoin (reverts only if Bitcoin reverts), so not the instant finality of a pure-Lightning swap.'],
     ['If it stalls', 'Nothing is lost · each leg refunds after its own timeout; the service never fronts value without its recoup already secured.'],
   ];
-  const { m: modal, ok } = C.modalRows({ title: 'Review bridged swap', kv });
+  // §2.4 overshoot guard: the best offer can't be sliced to the requested size, so taking it would sign the
+  // user up for the WHOLE offer. Warn and BLOCK Place (fail closed) rather than silently overshoot.
+  if (bp.overshoot){
+    kv.splice(3, 0, ['⚠ Size mismatch', `You asked to ${bp.side === 'buy' ? 'buy' : 'sell'} ${C.fmtAtoms(BigInt(bp.want || 0), aprec)} ${tk}, but the best resting offer (${offerAssetStr}) can't be partially filled. Taking it would trade the whole offer — cancelled. Enter a size that matches an offer, or place a limit order.`]);
+  }
+  const { m: modal, ok, st } = C.modalRows({ title: 'Review bridged swap', kv });
+  if (bp.overshoot){
+    ok.disabled = true; ok.textContent = 'Size does not match an offer';
+    if (st) st.textContent = 'Adjust the amount to a size a resting offer can fill.';
+    return;
+  }
   ok.onclick = async () => { modal.remove(); resetComposer(); await startBridged(route, bp); };
 }
 
@@ -2908,9 +2980,11 @@ async function startBridged(route, bp){
   try {
     const asset = route.seqAsset;
     const swap_nonce = newSwapNonce();
+    // P3.1 — persist the SIZED take (bp.takeAtoms/takeBtc), never the whole offer, so the /swap body,
+    // the maker handshake bind, and any resume all use the user's requested size (§2.4).
     BRIDGE = { state: 'starting', swap_nonce, asset, side: bp.side, payRail: S.payRail, recvRail: S.recvRail,
       maker_btc_rail: bp.makerBtcRail, maker_asset_rail: bp.makerAssetRail,
-      btc_sats: bp.offer.btcSats, asset_atoms: bp.offer.assetAtoms,
+      btc_sats: String(bp.takeBtc), asset_atoms: String(bp.takeAtoms), partial: !!bp.partial,
       offer_id: bp.offer.id || null, maker_pubkey: bp.offer.maker || null, started_ms: Date.now() };
     saveBridge();
     // Taker node keys for the LN legs / JIT (device-cosigned; the LSP never holds the keys).

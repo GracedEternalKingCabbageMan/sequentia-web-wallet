@@ -266,6 +266,52 @@ export function takeRailsCrossed(take) {
   } catch { return false; }
 }
 
+// P3.2 — CROSSING-SHAPE CAPABILITY. A crossing may be REQUIRED (takeRailsCrossed/plan.bridged) yet not be
+// one the LSP's live bridge io actually SETTLES. Today EXACTLY ONE shape is wired end to end: the BTC leg
+// is BRIDGED with the LSP on the LN-receiver side (the taker SELLS the asset and RECEIVES BTC over
+// Lightning) while the asset leg settles NATIVELY (direct taker<->maker). This is the SINGLE source of
+// truth for "is this crossing settleable" — the LSP's prepareBridgeLegs admission (`canBridge`) and the
+// wallet's PRE-REVIEW check both call it, so a Review can never promise a bridge the LSP refuses
+// post-confirm. Pure. `plan` is a planSettlement result.
+export function crossingShapeSupported(plan) {
+  if (!plan || plan.happyCoincidence) return false;   // not a crossing -> settle natively, not via the bridge
+  const btc = plan.btcLeg, asset = plan.assetLeg;
+  return !!(btc && btc.bridge && btc.lnSide === 'receiver' && (!asset || !asset.bridge));
+}
+
+// P3.2 — the wallet's pre-Review verdict for a rail-blind TAKE: does this crossing settle on the LSP's
+// bridge? Match-based wrapper over crossingShapeSupported so the wallet composer can FALL BACK to the
+// native/on-chain path (same price) instead of promising a bridge that fails post-confirm. Fails safe:
+// an undeterminable shape (bad rails throw in matchFromTake) returns false -> the wallet does not promise
+// a bridge. Never throws.
+export function bridgedTakeSupported(take) {
+  try { return crossingShapeSupported(planSettlement(matchFromTake(take))); }
+  catch { return false; }
+}
+
+// P3.2 — the LSP capability descriptor published on /status, so any client (Ambra, future wallets) can
+// read what crossing shapes the bridge settles WITHOUT re-deriving the wired-shape predicate. Enumerated
+// over the four taker rail combinations against a unified-book maker (BTC leg on-chain; asset leg follows
+// the offer rail), tagging each genuine crossing supported/unsupported via the ONE predicate above. Pure.
+export function describeCrossingSupport() {
+  const shapes = [];
+  for (const side of ['buy', 'sell'])
+    for (const payRail of ['ln', 'chain'])
+      for (const recvRail of ['ln', 'chain'])
+        for (const makerAssetRail of ['ln', 'chain']) {
+          let plan;
+          try { plan = planSettlement(matchFromTake({ asset: 'x', side, payRail, recvRail, makerBtcRail: 'chain', makerAssetRail })); }
+          catch { continue; }
+          if (plan.happyCoincidence) continue;   // only genuine crossings appear
+          shapes.push({ side, payRail, recvRail, makerAssetRail, supported: crossingShapeSupported(plan) });
+        }
+  return {
+    wired_shape: 'taker SELLS the asset and RECEIVES BTC over Lightning, against an on-chain reverse maker (BTC leg bridged LN-receiver, asset leg native)',
+    supported_crossings: shapes.filter((s) => s.supported),
+    unsupported_crossings: shapes.filter((s) => !s.supported),
+  };
+}
+
 // W2(a) — the /bridge/asset admission predicate. The taker's asset hand-off is accepted ONLY while a
 // bridged driver is authoritatively LIVE to front it (job._driverLive, set/cleared synchronously with
 // runBridgedSwap above) AND the courier session that relays the leg to the maker is still open. Gating on

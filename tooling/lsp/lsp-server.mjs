@@ -94,7 +94,7 @@ import { makeProvisioner } from './provision.mjs';
 import { acceptUpgrade, bridgeWsToTcp } from './ws-bridge.mjs';
 import { settlementPlanForSide, planExecutionName, planSettlement } from './settlement-router.mjs';
 import { buildUnifiedBook } from './unified-book.mjs';
-import { runBridgedSwap, matchFromTake, describeBridge, classifyLegs, takeRailsCrossed, bridgeAssetHandoffAdmissible, bridgeAssetRelayLocktimeVerdict, isPureLnTake } from './bridge-driver.mjs';
+import { runBridgedSwap, matchFromTake, describeBridge, classifyLegs, takeRailsCrossed, bridgeAssetHandoffAdmissible, bridgeAssetRelayLocktimeVerdict, isPureLnTake, crossingShapeSupported, describeCrossingSupport } from './bridge-driver.mjs';
 import { checkBridgeLocktimeOrdering } from './leg-bridge.mjs';
 import { runReverseBridgeTerms, openReverseBridgeSession, newBridgeClaimKeypair, relayTakerAssetLeg } from './bridge-maker.mjs';
 import { hashPreimageOk, subasSellStateFileForNonce, subasSellGuardVerdict, assembleSubasSellSettled } from './subas-sell-recovery.mjs';
@@ -575,6 +575,16 @@ async function status(deviceKeys = []) {
       assets: fundableAssets(),
       provisioning: !!PROV,
     },
+    // P3.5 — the 0-conf LP-fronting ceiling on the BTC leg, in SATS, as the SINGLE SOURCE OF TRUTH the
+    // wallet reads (frontCapAtoms) instead of hard-coding a default that can drift from the box config.
+    // The BTC leg's atoms ARE sats (BTC has 8 decimals), so CFG.mixedMax0conf — the deployed MIXED_MAX_0CONF
+    // — is already the sats ceiling. 0 means "no 0-conf fronting configured" (every mixed trade waits for a
+    // confirmation), which the wallet surfaces honestly.
+    mixed_max_0conf_sats: CFG.mixedMax0conf || 0,
+    // P3.2 — which rail-crossing shapes the LSP's bridge actually SETTLES, so a client checks BEFORE it
+    // promises a bridge in Review (never a promise-then-fail post-confirm). Derived from the same pure
+    // predicate the /swap admission uses (bridge-driver.crossingShapeSupported).
+    bridge: describeCrossingSupport(),
   };
 }
 
@@ -1914,9 +1924,10 @@ async function prepareBridgeLegs({ match, body, job }) {
   // (taker sells the asset, receives BTC over LN), against a reverse maker. Everything else stays unwired
   // (fail closed). Never throws out of the job: a failure records job.bridgeHandshake.error and leaves the
   // maker side unset, so the driver fails closed rather than the job crashing.
-  const btcLeg = plan.btcLeg;
-  const canBridge = btcLeg && btcLeg.bridge && btcLeg.lnSide === 'receiver'
-    && (!plan.assetLeg || !plan.assetLeg.bridge);   // asset leg must be native (direct taker<->maker)
+  // ONE source of truth with the wallet's pre-Review capability check (bridge-driver.crossingShapeSupported):
+  // the wired shape is BTC-leg bridged / lnSide 'receiver' (taker sells asset, receives BTC over LN) with a
+  // native asset leg. If the wallet ever promised a bridge for another shape, this refuses it identically.
+  const canBridge = crossingShapeSupported(plan);
   if (!canBridge) {
     job.bridgeHandshake = { ok: false, error: 'this crossing shape is not wired (only taker-sells-asset / receives-BTC-over-LN vs a reverse maker is)' };
     return plan;
