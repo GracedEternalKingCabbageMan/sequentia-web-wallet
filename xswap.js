@@ -1463,9 +1463,14 @@ function renderStepper(){
   // the Active-trades card as a record, not just live status. logTrade dedups by id, so re-renders of
   // the terminal view log exactly once.
   if (isForwardComplete() && C.logTrade){
+    // Enriched receipt (P5.1): cross-chain BUY — BTC paid, asset claimed. base = asset, quote = BTC.
+    const xbSeqU = (() => { try { return Number(big(SWAP.seq_amount || 0)) / Math.pow(10, sm.precision || 0); } catch { return null; } })();
+    const xbBtcU = (() => { try { return Number(big(SWAP.btc_amount || 0)) / 1e8; } catch { return null; } })();
     C.logTrade({ id: 'xbuy:' + (SWAP.offer_id || SWAP.session_id || SWAP.seq_claim_txid || ''),
       title: 'Bought ' + C.fmtAtoms(SWAP.seq_amount || 0, sm.precision) + ' ' + sm.ticker + ' with BTC (cross-chain)',
-      status: 'complete', txid: SWAP.seq_claim_txid || null });
+      status: 'complete', txid: SWAP.seq_claim_txid || null, rail: 'cross',
+      pair: (sm.ticker || 'asset') + '/BTC', side: 'buy', size: xbSeqU, sizeTicker: sm.ticker || null,
+      price: (xbBtcU != null && xbSeqU > 0) ? xbBtcU / xbSeqU : null });
   }
 
   // Header card: market + overall badge + amounts + the secret/timeouts.

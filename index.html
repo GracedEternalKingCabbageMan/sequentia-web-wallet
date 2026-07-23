@@ -78,6 +78,20 @@
   .bal-total-amt{font:600 26px ui-monospace,monospace;margin-top:2px}
   .bal-total-note{font-size:12px;color:var(--dim);margin-top:2px}
   .ref-unpriced{outline:1px solid var(--amber2)}
+  .rate-stale{font-size:11px;color:var(--amber2);border:1px solid #5a4412;background:#241c0a;border-radius:999px;padding:1px 8px;cursor:help}
+  .bal-total-note.stale{color:var(--amber2)}
+  .hist-buy{color:var(--green)} .hist-sell{color:var(--amber2)}
+  .swmarkets{border:1px solid var(--line);border-radius:12px;margin-bottom:14px;overflow:hidden}
+  .swmk-head{display:flex;align-items:center;gap:8px;padding:10px 12px;border-bottom:1px solid var(--line)}
+  .swmk-scroll{max-height:340px;overflow-y:auto}
+  .swmk-tbl{width:100%;border-collapse:collapse;font-size:12.5px}
+  .swmk-tbl th{position:sticky;top:0;background:var(--bg);text-align:right;font-weight:600;color:var(--dim);padding:7px 12px;border-bottom:1px solid var(--line);font-size:11px}
+  .swmk-tbl th:first-child{text-align:left}
+  .swmk-tbl td{padding:8px 12px;border-top:1px solid var(--line);text-align:right;white-space:nowrap}
+  .swmk-tbl td:first-child{text-align:left;font-weight:600}
+  .swmk-row{cursor:pointer} .swmk-row:hover{background:rgba(255,183,51,0.06)}
+  .swmk-row.nodepth{opacity:0.55} .swmk-dot{display:inline-block;width:7px;height:7px;border-radius:50%;margin-right:6px;vertical-align:middle}
+  .swmk-dot.on{background:var(--green)} .swmk-dot.off{background:var(--line)}
   .asset-row{display:flex;align-items:baseline;gap:10px;padding:10px 0;border-top:1px solid var(--line)}
   .asset-row:first-child{border-top:none}
   .tk{font-weight:700} .aid{font:12px ui-monospace,monospace;color:var(--dim);word-break:break-all}
@@ -396,6 +410,9 @@
 
     <!-- wallet-wide reference-currency picker: every tab/amount field reflects this -->
     <div class="sub" id="refBar" style="display:flex;align-items:center;justify-content:flex-end;gap:8px;margin:8px 2px 14px">
+      <!-- P5.4b staleness badge: shown when the /prices feed is down/old so no reference-currency
+           value (headline total, "≈" hints, the ⇄ converter) is ever presented as a fresh rate. -->
+      <span id="rateStaleBadge" class="rate-stale hide" title="">rates may be stale</span>
       <span>Show values in</span>
       <select id="refCcySel" style="width:auto"></select>
     </div>
@@ -524,7 +541,13 @@
             <button type="button" data-book="confidential">Blinded book</button>
           </div>
           <span class="sub" id="swBookNote"></span>
+          <!-- P5.2 markets overview: browse tradeable pairs with liquidity signals, then click one to
+               load it into the composer — so a user finds pairs WITH depth instead of a blind guess. -->
+          <button type="button" class="ghost" id="swMarketsBtn" style="margin-left:auto">Browse markets</button>
         </div>
+
+        <!-- P5.2 markets overview panel (hidden until "Browse markets"); rendered by renderMarketsOverview. -->
+        <div class="swmarkets hide" id="swMarketsView"></div>
 
         <!-- (the per-asset balance cards used to live here; their info now lives inside the
              asset dropdown's "Your assets" group, so the Swap view stays uncluttered.) -->
@@ -1301,18 +1324,42 @@ function applyFee(b, feeHex){
 // base/USD price); value = amount * price[asset] / price[reference]. Display only.
 let PRICES = (()=>{ try{ return JSON.parse(localStorage.getItem('swk.pricesCache')||'{}'); }catch{ return {}; } })();   // TICKER -> base (USD) price; restored from cache for instant reference values
 let REF = (typeof localStorage!=='undefined' && localStorage.getItem('seqRefCcy')) || 'USD';
+// P5.4b — the ms timestamp of the LAST SUCCESSFUL /prices fetch, persisted alongside the cache so a
+// reload knows the TRUE age of the cached rates (a page load doesn't reset the clock — a value cached
+// yesterday is honestly a day old). null => never fetched this install (cache is of unknown age → stale).
+let _pricesTs = (()=>{ try{ const t=Number(localStorage.getItem('swk.pricesTs')); return t>0?t:null; }catch{ return null; } })();
+const PRICES_STALE_MS = 10*60*1000;   // rates older than 10 min are flagged (feed publishes far more often)
+// True when a reference-currency conversion would be built on a rate we can't vouch is fresh: we DO have
+// prices to show, but the last good fetch is unknown or older than the threshold. When we have NO prices
+// at all there is nothing to mislabel (values already read "unavailable"), so that isn't "stale".
+function pricesStale(){ return Object.keys(PRICES).length>0 && (_pricesTs==null || (Date.now()-_pricesTs) > PRICES_STALE_MS); }
+function _ageStr(ms){ const s=Math.floor(ms/1000); return s<90?s+'s':s<5400?Math.round(s/60)+' min':Math.round(s/3600)+' h'; }
+// The staleness badge in the ref bar: honest about WHY a conversion may be off (feed down/old), governing
+// every reference value at once (headline total, "≈" hints, the ⇄ converter) rather than badging each.
+function updateRateStaleBadge(){
+  const b=$('rateStaleBadge'); if(!b) return;
+  const stale=pricesStale();
+  b.classList.toggle('hide', !stale);
+  b.title = stale ? (_pricesTs==null ? 'Price feed not reached this session; shown values use cached rates of unknown age.'
+                                     : 'Price feed last updated '+_ageStr(Date.now()-_pricesTs)+' ago; values may be off until it refreshes.') : '';
+}
 async function loadPrices(){
   try{
     const d = await fetch('/prices', {cache:'no-store'}).then(r=>r.json());
     const m = {};
     for(const [t,v] of Object.entries(d)){ const p=(v&&typeof v==='object')?v.price:v; if(p>0) m[t.toUpperCase()]=p; }
-    if(Object.keys(m).length){ PRICES = m; try{ localStorage.setItem('swk.pricesCache', JSON.stringify(m)); }catch{} }   // keep last-good; cache for instant reference values next load
+    if(Object.keys(m).length){ PRICES = m; _pricesTs = Date.now(); try{ localStorage.setItem('swk.pricesCache', JSON.stringify(m)); localStorage.setItem('swk.pricesTs', String(_pricesTs)); }catch{} }   // keep last-good; cache value + timestamp for honest staleness next load
     try{ initRefSelector(); }catch{}
     try{ if(typeof renderBalance==='function') renderBalance(); }catch{}
     try{ refreshAllRefHints(); }catch{}
-  }catch(e){ console.warn('[prices] fetch failed:', e?.message??e); }
+  }catch(e){ console.warn('[prices] fetch failed:', e?.message??e); }   // keep last-good rates on a transient failure; the badge flags their age
+  try{ updateRateStaleBadge(); }catch{}
 }
 loadPrices();
+// Re-evaluate staleness on a steady tick so the badge APPEARS as cached rates age out even with no other
+// activity (and a periodic re-fetch keeps the feed fresh). Cheap: a HEAD-less GET only every few minutes.
+setInterval(()=>{ loadPrices(); }, 4*60*1000);
+setInterval(()=>{ try{ updateRateStaleBadge(); }catch{} }, 30*1000);
 // Market-feed ticker for an asset (BTC parent-chain -> BTC price; tSEQ -> SEQ).
 function priceTicker(hex){ if(hex==='BTC') return 'BTC'; if(hex===POLICY_HEX) return 'SEQ'; return assetMeta(hex).ticker; }
 // USD price for a ticker, tolerating BTC feed-key drift so Bitcoin is always valued whichever
@@ -1352,6 +1399,7 @@ function initRefSelector(){
   const unpriced = refUnpriced();
   sel.title = unpriced ? (REF+' has no live price right now; values are shown in USD') : '';
   sel.classList.toggle('ref-unpriced', unpriced);
+  try{ updateRateStaleBadge(); }catch{}   // P5.4b — keep the staleness badge in sync with the ref bar
 }
 // --- live "≈ <ref>" hints under any asset-amount <input>, wallet-wide ---
 // attachRefHint(input, assetFn) drops a muted line under `input` that re-values the
@@ -3157,7 +3205,10 @@ function renderBalance(){
     card.appendChild(el('div','bal-total-amt', anyPriced ? fmtRef(total, totalRef||REF) : 'unavailable'));
     if(anyPriced && !allPriced) card.appendChild(el('div','bal-total-note','priced assets only'));
     else if(refUnpriced()) card.appendChild(el('div','bal-total-note', REF+' has no live price; shown in USD'));
+    // P5.4b — never present a stale-rate total as fresh: flag it honestly right under the headline.
+    if(anyPriced && pricesStale()){ const n=el('div','bal-total-note stale', 'rates may be stale · '+(_pricesTs==null?'feed not reached':'updated '+_ageStr(Date.now()-_pricesTs)+' ago')); card.appendChild(n); }
   }
+  try{ updateRateStaleBadge(); }catch{}
 
   // BTC (parent chain) leads only because it is the other chain, not a privileged unit.
   rowFull({ ticker:'BTC', refKey:'BTC', precision:8, onchainAtoms:btcBal, kind:'BTC',

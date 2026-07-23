@@ -138,6 +138,16 @@ const CFG = {
   // it (or when the amount is unknown) /swap returns a pollable 'confirming' job so the
   // browser never hangs through the multi-block anchor gate. 0 = always anchor-gated.
   mixedMax0conf: Number(process.env.MIXED_MAX_0CONF || 0),
+  // --- Shared terminal constants (P5.4a): the ONE source of truth for values the wallet
+  // otherwise hard-codes as its own literals (market-order slippage bound, covenant partial-fill
+  // min-lot floor, on-chain dust). Advertised in /status.constants so the composer's slippage /
+  // instant-range copy tracks THIS box instead of drifting from a wallet-side constant. The wallet
+  // falls back to matching defaults when /status is unreachable, so an old LSP never breaks it.
+  // NOTE min_lot_bps is DISPLAY-ONLY on the wallet: the covenant leaf bakes its min-lot at placement
+  // and re-derives it at fill, so the settlement divisor is consensus-frozen and never tracks this.
+  marketSlip: Number(process.env.MARKET_SLIP || 0.15),          // market-order walk stops this far below best
+  minLotBps: Number(process.env.MIN_LOT_BPS || 10),            // covenant partial-fill floor, basis points (~0.1%)
+  dustSats: Number(process.env.DUST_SATS || 546),             // on-chain dust floor (sats)
   // --- Sub-asset rail: the MIRROR submarine (asset over Lightning + BTC ON-CHAIN HTLC). ---
   // A buy where the taker pays BTC on-chain and receives the asset over Lightning
   // (seqob-cli xsubas). It needs a bitcoind (funds + refunds the BTC HTLC), an asset LN
@@ -581,6 +591,16 @@ async function status(deviceKeys = []) {
     // — is already the sats ceiling. 0 means "no 0-conf fronting configured" (every mixed trade waits for a
     // confirmation), which the wallet surfaces honestly.
     mixed_max_0conf_sats: CFG.mixedMax0conf || 0,
+    // P5.4a — the shared terminal constants block: the SINGLE source of truth the wallet reads into its
+    // config so the market-slippage bound, the covenant min-lot copy, the front cap, and the dust floor
+    // are one number, not independent literals that silently drift between the box and the composer.
+    // front_cap_sats mirrors mixed_max_0conf_sats (same value, grouped here for discoverability).
+    constants: {
+      market_slip: CFG.marketSlip,
+      min_lot_bps: CFG.minLotBps,
+      front_cap_sats: CFG.mixedMax0conf || 0,
+      dust_sats: CFG.dustSats,
+    },
     // P3.2 — which rail-crossing shapes the LSP's bridge actually SETTLES, so a client checks BEFORE it
     // promises a bridge in Review (never a promise-then-fail post-confirm). Derived from the same pure
     // predicate the /swap admission uses (bridge-driver.crossingShapeSupported).

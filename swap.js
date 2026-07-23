@@ -73,19 +73,103 @@ const _ordStatus = {};
 // stepper; the "Active trades" card (renderInFlightCard) reopens any of them. Session-only: a reload
 // clears it, so an in-flight trade force-shows again on load (fund-safety: never silently lost).
 const _dismissed = new Set();
-// A small persistent log of COMPLETED trades (submarine/sell/cross), so the orders card is a
-// history too, not just live status. Capped; deduped by a per-trade id so a terminal view that
-// re-renders logs once. Summaries only (no keys/secrets) — safe to persist.
-const HIST_KEY = 'swk.dex.history';
-function loadHist(){ try { return JSON.parse(localStorage.getItem(HIST_KEY) || '[]') || []; } catch { return []; } }
+// A persistent log of the user's OWN completed trades (P5.1): every settle path the wallet drives
+// records one durable receipt so the terminal has a real trade HISTORY, not just live status. Kept
+// PER-WALLET (histKey) so one browser holding several wallets never blends their fills, deduped by a
+// per-trade id, capped at a long tail, and exportable (CSV/JSON). Summaries + the user's own
+// txids/preimage only (no signing keys) — safe to persist locally and hand back to the user.
+const HIST_KEY = 'swk.dex.history';   // legacy/global key; folded into the active wallet's key on first read
+const HIST_CAP = 400;                 // durable tail (the old 15-row cap lost history); the view slices for display
+// A stable per-wallet suffix from the wallet descriptor (FNV-1a -> 8 hex). Falls back to the maker id,
+// then 'default', when no wallet/context is wired yet — so a call before openWallet never throws.
+function walletTag(){
+  let src = null;
+  try { src = (C && C.wollet && C.wollet.descriptor) ? C.wollet.descriptor().toString() : null; } catch {}
+  if (!src){ try { src = makerPubHex(); } catch {} }
+  if (!src) return 'default';
+  let h = 0x811c9dc5 >>> 0;
+  for (let i = 0; i < src.length; i++){ h ^= src.charCodeAt(i); h = Math.imul(h, 0x01000193) >>> 0; }
+  return h.toString(16).padStart(8, '0');
+}
+function histKey(){ return HIST_KEY + '.' + walletTag(); }
+function loadHist(){
+  try {
+    const k = histKey();
+    let raw = localStorage.getItem(k);
+    // One-time migration: fold the pre-P5.1 global history into the first wallet that loads (guarded so
+    // it never duplicates across wallets), so upgrading a live wallet doesn't drop its recent trades.
+    if (raw == null && !localStorage.getItem('swk.dex.history.migrated')){
+      const legacy = localStorage.getItem(HIST_KEY);
+      if (legacy != null) localStorage.setItem(k, legacy);
+      try { localStorage.setItem('swk.dex.history.migrated', '1'); } catch {}
+      raw = legacy;
+    }
+    return JSON.parse(raw || '[]') || [];
+  } catch { return []; }
+}
+function saveHist(h){ try { localStorage.setItem(histKey(), JSON.stringify(h.slice(0, HIST_CAP))); } catch {} }
+// Derive the pair label, side (buy/sell of the pair's base), price (quote per base) and base size for a
+// receipt from the trade's pay/receive assets + atom amounts. Pure/display; used to enrich logTrade.
+function tradeMeta(pay, receive, payAtoms, recvAtoms){
+  try {
+    if (!pay || !receive) return {};
+    const { base, quote } = canonicalPair(pay, receive);
+    const bm = metaOf(base), qm = metaOf(quote);
+    const baseIsReceive = (base === receive);
+    const baseAtoms  = big(baseIsReceive ? recvAtoms : payAtoms);
+    const quoteAtoms = big(baseIsReceive ? payAtoms  : recvAtoms);
+    const baseU  = Number(baseAtoms)  / Math.pow(10, bm.precision || 0);
+    const quoteU = Number(quoteAtoms) / Math.pow(10, qm.precision || 0);
+    return { pair: bm.ticker + '/' + qm.ticker, side: baseIsReceive ? 'buy' : 'sell',
+             price: baseU > 0 ? quoteU / baseU : null, size: baseU || null, sizeTicker: bm.ticker };
+  } catch { return {}; }
+}
 export function logTrade(e){
   if (!e || !e.id) return;
   try {
     const h = loadHist();
     if (h.some(x => x.id === e.id)) return;   // once per trade
-    h.unshift({ id: e.id, title: e.title || '', status: e.status || '', txid: e.txid || null, at: Date.now() });
-    localStorage.setItem(HIST_KEY, JSON.stringify(h.slice(0, 15)));
+    const at = e.at || Date.now();
+    h.unshift({
+      id: e.id, title: e.title || '', status: e.status || '',
+      txid: e.txid || (Array.isArray(e.txids) && e.txids[0]) || null, at, ts: e.ts || at,
+      // Enriched, durable receipt fields (all optional; a path that can't supply one leaves it blank —
+      // honest, not fabricated). pair/side/price/size/fee/rail feed the "Your trades" view + the export.
+      pair: e.pair || null, side: e.side || null,
+      price: (e.price != null && isFinite(e.price)) ? e.price : null,
+      size: (e.size != null) ? e.size : null, sizeTicker: e.sizeTicker || null,
+      fee: (e.fee != null) ? e.fee : null, feeTicker: e.feeTicker || null,
+      rail: e.rail || null, preimage: e.preimage || null,
+      txids: Array.isArray(e.txids) ? e.txids.filter(Boolean).slice(0, 12) : (e.txid ? [e.txid] : []),
+    });
+    saveHist(h);
+    try { renderInFlightCard(); } catch {}   // surface the new receipt in the trades view immediately
   } catch {}
+}
+// P5.1 — export the user's durable trade history as CSV or JSON (a file they keep). Reads the SAME
+// per-wallet records the view renders; purely local (no network), only the user's own txids/preimage.
+function exportTrades(fmt){
+  const h = loadHist();
+  if (!h.length){ try { C.toast && C.toast('No trades to export yet.'); } catch {} return; }
+  const iso = (ms) => { try { return new Date(ms).toISOString(); } catch { return ''; } };
+  let blob, name;
+  if (fmt === 'json'){
+    blob = new Blob([JSON.stringify(h, null, 2)], { type: 'application/json' });
+    name = 'sequentia-trades.json';
+  } else {
+    const cols = ['time', 'pair', 'side', 'price', 'size', 'size_asset', 'fee', 'fee_asset', 'rail', 'status', 'txids', 'preimage'];
+    const cell = (v) => { const s = (v == null ? '' : String(v)); return /[",\n]/.test(s) ? '"' + s.replace(/"/g, '""') + '"' : s; };
+    const lines = [cols.join(',')];
+    for (const e of h) lines.push([iso(e.ts || e.at), e.pair, e.side, e.price, e.size, e.sizeTicker, e.fee, e.feeTicker, e.rail, e.status, (e.txids || []).join(' '), e.preimage].map(cell).join(','));
+    blob = new Blob([lines.join('\n')], { type: 'text/csv' });
+    name = 'sequentia-trades.csv';
+  }
+  try {
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a'); a.href = url; a.download = name;
+    document.body.appendChild(a); a.click(); a.remove();
+    setTimeout(() => { try { URL.revokeObjectURL(url); } catch {} }, 4000);
+  } catch (err){ try { C.toast && C.toast('Export failed: ' + (err && err.message || err)); } catch {} }
 }
 // Same-chain DEX swaps receive TRANSPARENTLY by default (principle #6: transparent-by-default);
 // the user can OPT IN to a confidential (blinded) receive. Persisted wallet-wide.
@@ -255,6 +339,27 @@ let MAX0CONF_SATS = null;
 // wallet's own pre-Review check uses the SHARED pure predicate (bridgedTakeSupported), so a stale/absent
 // value never lets it promise an unsupported bridge.
 let BRIDGECAPS = null;
+// P5.4a — shared terminal constants: ONE source of truth so the market-slippage bound, the covenant
+// min-lot copy, the front cap, and the dust floor track the backend instead of being independent
+// literals here. Seeded with the historical defaults so nothing breaks before the first /status read
+// (or if /status is unreachable / an older LSP omits the block); refreshInstant() overlays whatever the
+// LSP advertises in st.constants. marketSlip feeds BOTH the walk floor and the displayed slippage bound
+// (they can't disagree); frontCapSats mirrors mixed_max_0conf_sats. minLotBps is DISPLAY-ONLY — the
+// covenant leaf bakes its min-lot at placement + re-derives it at fill, so covenantMinLot() stays a
+// consensus-frozen constant and MUST NOT read this mutable value (a drift would strand a resting order).
+const CONFIG = { marketSlip: 0.15, minLotBps: 10, frontCapSats: null, dustSats: 546 };
+// Overlay the LSP /status `constants` block onto CONFIG, validating each field so a garbage/absent value
+// leaves the safe default in place. Called from refreshInstant with the parsed /status.
+function applyStatusConstants(st){
+  const c = st && st.constants;
+  if (!c || typeof c !== 'object') return;
+  const num = (v) => (Number.isFinite(Number(v)) ? Number(v) : null);
+  const ms = num(c.market_slip);   if (ms != null && ms > 0 && ms < 1) CONFIG.marketSlip = ms;
+  const mb = num(c.min_lot_bps);   if (mb != null && mb >= 0) CONFIG.minLotBps = mb;
+  const ds = num(c.dust_sats);     if (ds != null && ds >= 0) CONFIG.dustSats = ds;
+  const fc = num(c.front_cap_sats);
+  if (fc != null && fc >= 0){ CONFIG.frontCapSats = fc; if (MAX0CONF_SATS == null) MAX0CONF_SATS = fc; }
+}
 let MIXED = null;    // the in-flight mixed-rail (submarine) swap (persisted; see submarine.js)
 const MIXED_KEY = 'swk.sequentia.submarine';   // localStorage key for the in-flight submarine swap
 
@@ -317,6 +422,8 @@ export function initSwap(ctx){
     wirePriceInput();
     // Unblinded / Blinded book toggle (switches which relay namespace we read + post to).
     wireBookSeg();
+    // P5.2 — markets overview (pair discovery) toggle.
+    if ($('swMarketsBtn')) $('swMarketsBtn').onclick = toggleMarketsView;
     if ($('swXBack')) $('swXBack').onclick = () => { if (X && X.hasInFlight && X.hasInFlight()) _dismissed.add('cross'); showCross(false); renderSwap(); };
     if ($('swRBack')) $('swRBack').onclick = () => { if (X && X.hasReverseInFlight && X.hasReverseInFlight()) _dismissed.add('reverse'); showReverse(false); renderSwap(); };
     // Live re-quote as the user types. The edited side is the "fixed" leg; the
@@ -741,6 +848,158 @@ function startableAssets(){
   return [...byKey.values()];
 }
 
+// ---------------------------------------------------------------------------
+// P5.2 — markets overview (pair discovery)
+// ---------------------------------------------------------------------------
+// A browsable list of every tradeable pair with liquidity signals (last price, 24h change, spread,
+// depth) sourced from the SAME relay endpoints the pair stats already use (/candles, /orderbook), so a
+// user finds pairs WITH resting depth instead of picking a possibly-empty one. Clicking a row loads the
+// pair into the composer. Read-only: it never funds, quotes, or touches the settlement path.
+let _marketsOpen = false, _mkReq = 0;
+function overviewPairs(){
+  const out = [], seen = new Set();
+  const add = (a, b) => {
+    if (!a || !b || a === b) return;
+    const { base, quote } = canonicalPair(a, b);
+    const k = base + '|' + quote; if (seen.has(k)) return; seen.add(k);
+    out.push({ base, quote });
+  };
+  for (const m of MARKETS) add(m.market.base_asset, m.market.quote_asset);
+  for (const xm of XMARKETS) add('BTC', xm.seq_asset);
+  return out;
+}
+// Bounded-concurrency pool so the overview loads ~N pairs without firing every relay request at once.
+async function _pool(items, n, fn){
+  const q = items.slice(), workers = [];
+  for (let i = 0; i < Math.min(n, q.length); i++) workers.push((async () => { while (q.length){ const it = q.shift(); try { await fn(it); } catch {} } })());
+  await Promise.all(workers);
+}
+// Best bid/ask, spread, mid, offer count + base-side depth for a pair, from BOTH book orientations. Each
+// offer self-describes its offer/want asset, so we classify ask (gives base) vs bid (gives quote) directly.
+async function bookSignals(base, quote){
+  const [b1, b2] = await Promise.all([
+    seqob.fetchBook(base, quote).catch(() => ({ offers: [] })),
+    seqob.fetchBook(quote, base).catch(() => ({ offers: [] })),
+  ]);
+  const bm = metaOf(base), qm = metaOf(quote);
+  const toU = (a, p) => Number(big(a)) / Math.pow(10, p || 0);
+  const now = Math.floor(Date.now() / 1000);
+  const seen = new Set(); let bestAsk = null, bestBid = null, count = 0, baseDepth = 0;
+  for (const o of [...(b1.offers || []), ...(b2.offers || [])]){
+    if (o._verified === false) continue;                                        // untrusted relay row
+    const exp = Number(o.expires_at_unix || o.expiresAtUnix || 0); if (exp && exp <= now) continue;
+    const id = (o.maker_pubkey || o.makerPubkey) + ':' + (o.offer_id || o.offerId); if (seen.has(id)) continue; seen.add(id);
+    const oa = o.offer_asset || o.offerAsset, wa = o.want_asset || o.wantAsset;
+    let baseA, quoteA, isAsk;
+    if (oa === base && wa === quote){ baseA = big(o.offer_amount || o.offerAmount); quoteA = big(o.want_amount || o.wantAmount); isAsk = true; }
+    else if (oa === quote && wa === base){ baseA = big(o.want_amount || o.wantAmount); quoteA = big(o.offer_amount || o.offerAmount); isAsk = false; }
+    else continue;
+    const baseU = toU(baseA, bm.precision), quoteU = toU(quoteA, qm.precision);
+    if (!(baseU > 0 && quoteU > 0)) continue;
+    const price = quoteU / baseU; count++; baseDepth += baseU;
+    if (isAsk){ if (bestAsk == null || price < bestAsk) bestAsk = price; }
+    else { if (bestBid == null || price > bestBid) bestBid = price; }
+  }
+  const spread = (bestAsk != null && bestBid != null) ? (bestAsk - bestBid) : null;
+  const mid = (bestAsk != null && bestBid != null) ? (bestAsk + bestBid) / 2 : (bestAsk != null ? bestAsk : bestBid);
+  return { count, baseDepth, bestAsk, bestBid, spread, mid };
+}
+// 24h last / change% / volume for a pair, from /candles — the SAME one-canonical-direction handling as
+// renderPairStats (query the pair's direction, else the inverse and invert each candle).
+async function candleSignals(base, quote){
+  const fetchDir = async (b, q) => {
+    try {
+      const r = await fetch(seqob.seqobBase() + '/v1/market/' + encodeURIComponent(b) + '/' + encodeURIComponent(q) + '/candles?interval=3600&limit=48', { cache: 'no-store' });
+      if (!r.ok) return []; const j = await r.json(); return Array.isArray(j.candles) ? j.candles : [];
+    } catch { return []; }
+  };
+  let inv = false, candles = await fetchDir(base, quote);
+  if (!candles.length){ const alt = await fetchDir(quote, base); if (alt.length){ candles = alt; inv = true; } }
+  if (!candles.length) return null;
+  const ivn = (x) => { const n = Number(x); return n > 0 ? 1 / n : 0; };
+  const cN = candles.map(c => inv ? { t: c.t, o: ivn(c.o), c: ivn(c.c), v: c.v } : { t: c.t, o: Number(c.o), c: Number(c.c), v: c.v });
+  const cutoff = Math.floor(Date.now() / 1000) - 86400;
+  const win = cN.filter(c => (c.t || 0) >= cutoff), use = win.length ? win : cN.slice(-1);
+  let vol = 0n; for (const c of use) vol += big(String(c.v || 0));
+  const first = use[0], last = use[use.length - 1];
+  const changePct = (first && first.o > 0) ? ((last.c - first.o) / first.o * 100) : null;
+  return { last: last.c, changePct, vol };
+}
+function _mkRowId(p){ return 'mk_' + (p.base + '_' + p.quote).replace(/[^a-zA-Z0-9]/g, ''); }
+function patchMarketRow(id, p, bk, cd){
+  const tr = document.getElementById(id); if (!tr) return;
+  const bm = metaOf(p.base), qm = metaOf(p.quote);
+  const last = (cd && cd.last != null && isFinite(cd.last)) ? cd.last : (bk && bk.mid != null ? bk.mid : null);
+  const chg = (cd && cd.changePct != null && isFinite(cd.changePct)) ? cd.changePct : null;
+  const hasDepth = !!(bk && bk.count > 0);
+  const dot = tr.querySelector('.swmk-dot'); if (dot) dot.className = 'swmk-dot ' + (hasDepth ? 'on' : 'off');
+  tr.classList.toggle('nodepth', !hasDepth);
+  const setCell = (cls, html) => { const c = tr.querySelector(cls); if (c) c.innerHTML = html; };
+  setCell('.mk-last', last != null ? `<span class="mono">${esc(fmtPrice(last))}</span> <span class="sub">${esc(qm.ticker)}</span>` : '<span class="sub">-</span>');
+  setCell('.mk-chg', chg != null ? `<b style="color:${chg >= 0 ? '#3ddc84' : 'var(--amber2)'}">${(chg >= 0 ? '+' : '') + chg.toFixed(2)}%</b>` : '<span class="sub">-</span>');
+  setCell('.mk-spread', (bk && bk.spread != null && bk.mid > 0) ? `<span class="sub">${(bk.spread / bk.mid * 100).toFixed(2)}%</span>` : '<span class="sub">-</span>');
+  setCell('.mk-depth', hasDepth ? `<span class="mono">${esc(trim(bk.baseDepth))}</span> <span class="sub">${esc(bm.ticker)}</span>` : '<span class="sub">no resting depth</span>');
+  tr._depth = hasDepth ? 1 : 0; tr._vol = (cd && cd.vol != null) ? Number(cd.vol) : 0;
+}
+function reorderMarketRows(host){
+  const tbody = host.querySelector('tbody'); if (!tbody) return;
+  const rows = [...tbody.querySelectorAll('tr')];
+  rows.sort((a, b) => (b._depth || 0) - (a._depth || 0) || (b._vol || 0) - (a._vol || 0));   // pairs WITH depth first, then by 24h volume
+  for (const r of rows) tbody.appendChild(r);
+}
+function wireMarketsView(host){
+  host.querySelectorAll('.swmk-close').forEach(b => b.onclick = () => hideMarketsView());
+  host.querySelectorAll('.swmk-row').forEach(tr => tr.onclick = () => onSelectMarket(tr.dataset.base, tr.dataset.quote));
+}
+// Load the clicked pair into the composer: pay the QUOTE, receive the BASE ("buy the base"); the user can
+// flip in the composer. Falls back to the other orientation if that one isn't startable in this book.
+function onSelectMarket(base, quote){
+  const startable = startableAssets();
+  let pay = quote, receive = base;
+  if (!(startable.includes(pay) && startable.includes(receive)) && startable.includes(base) && startable.includes(quote)){ pay = base; receive = quote; }
+  selectPairInComposer(pay, receive);
+}
+function selectPairInComposer(pay, receive){
+  S.payAsset = pay; S.receiveAsset = receive;
+  S.payRail = null; S.recvRail = null;                     // no default rail for the new pair (user must pick)
+  S.feeAsset = null; S.feeAssetTouched = false; S.priceFlip = false;
+  { const pe = C.$('swPriceAmt'); if (pe){ pe._userTyped = false; pe.value = ''; } }
+  resetComposer();                                         // clear both amount fields for the new pair
+  hideMarketsView();
+  paintPanes();
+  requote().catch(() => {});
+}
+function hideMarketsView(){ _marketsOpen = false; const v = C.$('swMarketsView'); if (v) v.classList.add('hide'); const b = C.$('swMarketsBtn'); if (b) b.textContent = 'Browse markets'; }
+function toggleMarketsView(){ _marketsOpen ? hideMarketsView() : showMarketsView(); }
+function showMarketsView(){ _marketsOpen = true; const b = C.$('swMarketsBtn'); if (b) b.textContent = 'Hide markets'; renderMarketsOverview().catch(() => {}); }
+async function renderMarketsOverview(){
+  const host = C.$('swMarketsView'); if (!host) return;
+  host.classList.remove('hide');
+  if (!MARKETS.length && !XMARKETS.length){ try { await loadMarkets(); } catch {} }
+  const pairs = overviewPairs();
+  const req = ++_mkReq;
+  const head = `<div class="swmk-head"><span class="lbl">Markets</span>`
+    + `<span class="sub">${pairs.length} pair${pairs.length === 1 ? '' : 's'} · click one to load it into the composer</span>`
+    + `<button type="button" class="ghost swmk-close" style="margin-left:auto">Close</button></div>`;
+  if (!pairs.length){ host.innerHTML = head + '<div style="padding:12px"><span class="sub">No markets are listed right now.</span></div>'; wireMarketsView(host); return; }
+  const skeleton = pairs.map(p => {
+    const bm = metaOf(p.base), qm = metaOf(p.quote);
+    return `<tr class="swmk-row" id="${_mkRowId(p)}" data-base="${esc(p.base)}" data-quote="${esc(p.quote)}">`
+      + `<td><span class="swmk-dot off"></span>${esc(bm.ticker)}/${esc(qm.ticker)}</td>`
+      + `<td class="mk-last sub">…</td><td class="mk-chg sub">…</td><td class="mk-spread sub">…</td><td class="mk-depth sub">…</td></tr>`;
+  }).join('');
+  host.innerHTML = head + `<div class="swmk-scroll"><table class="swmk-tbl">`
+    + `<thead><tr><th>Pair</th><th>Last</th><th>24h</th><th>Spread</th><th>Depth</th></tr></thead>`
+    + `<tbody>${skeleton}</tbody></table></div>`;
+  wireMarketsView(host);
+  await _pool(pairs, 4, async (p) => {
+    const [bk, cd] = await Promise.all([bookSignals(p.base, p.quote).catch(() => null), candleSignals(p.base, p.quote).catch(() => null)]);
+    if (req !== _mkReq) return;                             // superseded by a newer open/refresh
+    patchMarketRow(_mkRowId(p), p, bk, cd);
+  });
+  if (req === _mkReq) reorderMarketRows(host);
+}
+
 // Assets that have a market with `other` (the already-chosen side). If `other` is
 // null, every tradable asset is a candidate. This is how the pickers only offer a
 // counter-asset that actually trades against the chosen one.
@@ -918,6 +1177,7 @@ async function refreshInstant(){
     // frontCapAtoms box default and the shared pure capability predicate still apply.
     MAX0CONF_SATS = (st && Number.isFinite(Number(st.mixed_max_0conf_sats))) ? Number(st.mixed_max_0conf_sats) : MAX0CONF_SATS;
     BRIDGECAPS = (st && st.bridge) || BRIDGECAPS;
+    applyStatusConstants(st);   // P5.4a — overlay shared constants (market_slip/min_lot_bps/front_cap/dust)
     for (const c of chans){
       if (!c.node_key) continue;   // ONLY the wallet's own channels count as its Lightning balance
                                    // (never shared/demo) — consistent with the Balance tab + railAvail
@@ -3368,6 +3628,10 @@ async function resolveVout(txid, spkHex){
 // smallest remainder that may re-rest (planFill rejects a fill leaving a smaller remainder as
 // dust-griefing). ~0.1% of the order (min 1 atom) — fine-grained enough that a market order fills
 // almost all of the available book, coarse enough that no dust remainder is ever left.
+// FUND-SAFETY: this divisor is CONSENSUS-FROZEN and must NOT read CONFIG.minLotBps. The value is baked
+// into the covenant's fill leaf (→ merkle root → tweaked key) at placement and re-derived here at fill;
+// the resting record does not store it. If it tracked a mutable /status value, a min-lot change between
+// place and fill would compute a different leaf and strand the order. CONFIG.minLotBps is display-only.
 function covenantMinLot(sellAtoms){ const s = BigInt(sellAtoms); const f = s / 1000n; return f > 0n ? f : 1n; }
 
 async function placeCovenant(pay, receive, payAtoms, recvAtoms, onStatus, opts){
@@ -3679,6 +3943,11 @@ function covFeeAtoms(feeAsset){
     return ceilDiv(nativeFeeSats * BigInt(C.EXCHANGE_RATE_SCALE), rate);
   } catch { return 1000n; }
 }
+// The same-chain covenant fee in the fee asset's HUMAN units (for a trade-history receipt). Best-effort.
+function covFeeUnits(feeAsset){
+  try { return Number(covFeeAtoms(feeAsset)) / Math.pow(10, C.assetMeta(feeAsset).precision || 0); }
+  catch { return null; }
+}
 
 // Reconstruct the exact covenant Order a local PLACED record placed, so its
 // scriptPubKey / taptree re-derive byte-identically for the REFUND reclaim. Throws
@@ -3840,8 +4109,9 @@ async function scripthashOf(spkHex){
 // executableQuote maps our remaining PAY budget onto each offer's own orientation +
 // rounding, so amounts are exact and a single fill never over-takes the offer. The
 // unfilled budget simply does not fill — a market order leaves NOTHING resting.
-// Slippage is bounded: stop walking once an ask is worse than MARKET_SLIP below best.
-const MARKET_SLIP = 0.15;   // walk down to 15% below top-of-book, then stop (partial fill, never rest)
+// Slippage is bounded: stop walking once an ask is worse than the market-slip below best. The bound
+// lives in CONFIG.marketSlip (P5.4a — one source of truth, /status-overridable, default 0.15) so the
+// walk floor here and the slippage line the composer shows (slippageHint) can never disagree.
 async function takeMarketWalk(pay, receive, payAtoms, recvAtoms, onStatus){
   payAtoms = BigInt(payAtoms);
   // Re-fetch BOTH orientations so we cross the CURRENT resting offers, not a stale compose snapshot.
@@ -3854,7 +4124,7 @@ async function takeMarketWalk(pay, receive, payAtoms, recvAtoms, onStatus){
     .filter((o) => String(o.maker_pubkey || o.makerPubkey || '').toLowerCase() !== mine);   // never self-fill
   if (!asks.length) throw new Error('No resting orders are on the book to fill right now. Switch to Limit to rest an order.');
   const bestPrice = Number(big(asks[0].offer_amount || asks[0].offerAmount || 0)) / Number(big(asks[0].want_amount || asks[0].wantAmount || 1));
-  const floor = bestPrice * (1 - MARKET_SLIP);   // receive-per-pay we refuse to go below
+  const floor = bestPrice * (1 - CONFIG.marketSlip);   // receive-per-pay we refuse to go below
   let paidPay = 0n, gotRecv = 0n; const txids = []; const seen = new Set(); let idx = 0, lastErr = null;
   for (const o of asks){
     if (paidPay >= payAtoms) break;
@@ -3920,8 +4190,13 @@ async function takeCovenantWalkReview(q){
       const res = await takeMarketWalk(pay, receive, payAtoms, recvAtoms,
         (msg) => { st.innerHTML = '<span class="spin"></span>' + esc(msg); });
       modal.remove();
-      for (const txid of res.txids)
-        logTrade({ id: 'covfill:' + txid, title: 'Swapped ' + pm.ticker + ' for ' + rm.ticker, status: 'settled', txid });
+      // ONE receipt for the whole market order (the actual paid/received totals across every level it
+      // swept), keyed by the first fill txid, carrying all fill txids — a per-txid row would repeat the
+      // full size N times and mislead the export. Enriched with the pair/side/price/size (P5.1).
+      logTrade({ id: 'covfill:' + (res.txids[0] || Date.now()), title: 'Swapped ' + pm.ticker + ' for ' + rm.ticker,
+        status: 'settled', txid: res.txids[0] || null, txids: res.txids, rail: 'chain',
+        fee: covFeeUnits(feeAsset), feeTicker: C.assetMeta(feeAsset).ticker,
+        ...tradeMeta(pay, receive, res.paidPay, res.gotRecv) });
       const gotStr = C.fmtAtoms(res.gotRecv, rm.precision);
       if (res.full)
         C.toast(`Market order filled · received ${gotStr} ${rm.ticker}.`,
@@ -4255,7 +4530,14 @@ async function claimSell(){
     preimage: SELL.preimage, txid: H.txid, vout: H.vout, amount: H.amount });
   const claimTxid = await C.btcLeg.claim({ txid: H.txid, vout: H.vout, amount: H.amount, redeem_script: H.redeem_script, preimage: SELL.preimage });
   SELL.state = 'done'; SELL.claim_txid = (claimTxid && claimTxid.toString) ? claimTxid.toString() : String(claimTxid); saveSell();
-  logTrade({ id: 'sell:' + (SELL.hash_h || SELL.claim_txid || ''), title: 'Sold ' + SELL.ticker + ' for BTC', status: 'BTC claimed', txid: SELL.claim_txid });
+  // Enriched receipt (P5.1): sub-asset SELL = asset paid over LN, BTC claimed on-chain. base = the asset,
+  // quote = BTC; size = asset units sold, price = BTC received per asset unit.
+  const sellBtcU = (() => { try { return Number(big(H.amount || 0)) / 1e8; } catch { return null; } })();
+  logTrade({ id: 'sell:' + (SELL.hash_h || SELL.claim_txid || ''), title: 'Sold ' + SELL.ticker + ' for BTC',
+    status: 'BTC claimed', txid: SELL.claim_txid, rail: 'sub-asset', preimage: SELL.preimage || null,
+    pair: (SELL.ticker || 'asset') + '/BTC', side: 'sell', sizeTicker: SELL.ticker || null,
+    size: (SELL.amount != null ? Number(SELL.amount) : null),
+    price: (sellBtcU != null && Number(SELL.amount) > 0) ? sellBtcU / Number(SELL.amount) : null });
 }
 // On wallet load: if a sell paid the asset but its BTC claim never confirmed, re-attempt the
 // claim (the preimage + HTLC terms are persisted). This is the fund-recovery path.
@@ -4497,7 +4779,14 @@ async function driveBuy(say){
       say('Payment received · releasing your ' + BUY.ticker + ' and revealing the preimage…');
       await L.nodeSettle({ node_key, payment_hash: H, preimage: BUY.preimage });   // 5. device-settle
       BUY.state = 'settled'; saveBuy();
-      logTrade({ id: 'buy:' + H, title: 'Bought ' + BUY.ticker + ' with BTC', status: 'asset received' });
+      // Enriched receipt (P5.1): sub-asset BUY = BTC paid on-chain, asset received over LN. base = asset,
+      // quote = BTC; size = asset units bought, price = BTC paid per asset unit (best-effort from the HTLC).
+      const buyAssetU = (() => { try { return Number(big(BUY.asset_amount || 0)) / Math.pow(10, (metaOf(BUY.asset) || {}).precision || 0); } catch { return null; } })();
+      const buyBtcU = (() => { try { return Number(big((BUY.btc_htlc && (BUY.btc_htlc.amount || BUY.btc_htlc.btc_sats)) || 0)) / 1e8; } catch { return null; } })();
+      logTrade({ id: 'buy:' + H, title: 'Bought ' + BUY.ticker + ' with BTC', status: 'asset received',
+        rail: 'sub-asset', preimage: BUY.preimage || null, pair: (BUY.ticker || 'asset') + '/BTC', side: 'buy',
+        size: buyAssetU, sizeTicker: BUY.ticker || null,
+        price: (buyBtcU != null && buyAssetU > 0) ? buyBtcU / buyAssetU : null });
       // 6. best-effort: confirm the maker claimed the BTC (job settled). Non-fatal.
       if (L.jobStatus && (BUY.poll || BUY.job_id)){ try { const j = await L.jobStatus(BUY.poll || ('/swap/' + BUY.job_id)); if (j && j.status) { BUY.detail = j.status; saveBuy(); } } catch {} }
       return;
@@ -4631,7 +4920,11 @@ function renderMixedSwap(){
   const tip = mixedTip();
   const refundable = sub.isRefundable(MIXED, tip);
   if (terminal) logTrade({ id: 'mx:' + (MIXED.id || MIXED.ts || (MIXED.htlc && MIXED.htlc.refund_locktime) || ''),
-    title: (MIXED.side === 'buy' ? 'Bought ' : 'Sold ') + metaOf(MIXED.asset).ticker + ' · submarine', status: MIXED.state });
+    title: (MIXED.side === 'buy' ? 'Bought ' : 'Sold ') + metaOf(MIXED.asset).ticker + ' · submarine', status: MIXED.state,
+    rail: 'submarine', pair: metaOf(MIXED.asset).ticker + '/BTC', side: MIXED.side === 'buy' ? 'buy' : 'sell',
+    preimage: (MIXED.state === sub.ST.SETTLED ? (MIXED.preimage || null) : null),
+    size: (MIXED.amount != null ? Number(MIXED.amount) / Math.pow(10, metaOf(MIXED.asset).precision || 0) : null),
+    sizeTicker: metaOf(MIXED.asset).ticker });
   const phase = {
     [sub.ST.SETTLING]:  'Settling · the on-chain HTLC leg is burying under Bitcoin (anchor-gated).',
     [sub.ST.REFUNDING]: 'Refunding the on-chain HTLC leg…',
@@ -4929,8 +5222,17 @@ function renderXMake(){
   };
   const label = phases[XMAKE.state] || XMAKE.state;
   const done = XMAKE.state === 'settled' || XMAKE.state === 'refunded';
-  if (done) logTrade({ id: 'xm:' + (XMAKE.offerId || ''),
-    title: (XMAKE.reverse ? 'Sold ' : 'Bought ') + (C.assetMeta(XMAKE.assetHex).ticker || 'asset') + ' · cross-chain', status: XMAKE.state });
+  if (done){
+    // Enriched receipt (P5.1): resting cross order settled/refunded. base = asset, quote = BTC. reverse
+    // = the wallet BOUGHT the asset for BTC (a bid); else it SOLD the asset. price only on a real settle.
+    const xmAssetU = (() => { try { return Number(big(XMAKE.assetAtoms || 0)) / Math.pow(10, am.precision || 0); } catch { return null; } })();
+    const xmBtcU = (() => { try { return Number(big(XMAKE.btcSats || 0)) / 1e8; } catch { return null; } })();
+    logTrade({ id: 'xm:' + (XMAKE.offerId || ''),
+      title: (XMAKE.reverse ? 'Sold ' : 'Bought ') + (C.assetMeta(XMAKE.assetHex).ticker || 'asset') + ' · cross-chain', status: XMAKE.state,
+      rail: 'cross', pair: (am.ticker || 'asset') + '/BTC', side: XMAKE.reverse ? 'buy' : 'sell',
+      size: xmAssetU, sizeTicker: am.ticker || null,
+      price: (XMAKE.state === 'settled' && xmBtcU != null && xmAssetU > 0) ? xmBtcU / xmAssetU : null });
+  }
   const headline = XMAKE.reverse
     ? `Your resting cross bid · buy ${esc(C.fmtAtoms(XMAKE.assetAtoms, am.precision))} ${esc(am.ticker)} for ${esc(C.fmtAtoms(XMAKE.btcSats,8))} BTC`
     : `Your resting cross offer · sell ${esc(C.fmtAtoms(XMAKE.assetAtoms, am.precision))} ${esc(am.ticker)} for ${esc(C.fmtAtoms(XMAKE.btcSats,8))} BTC`;
@@ -5000,7 +5302,10 @@ async function reviewSame(q){
       // status — same-chain taker lifts were the one completed flow that never logged one (W6).
       logTrade({ id: 'lift:' + txid,
         title: 'Swapped ' + C.assetMeta(q.assetP).ticker + ' for ' + C.assetMeta(q.assetR).ticker,
-        status: 'settled', txid });
+        status: 'settled', txid, rail: 'chain',
+        fee: (q.feeAmount != null ? Number(big(q.feeAmount)) / Math.pow(10, C.assetMeta(q.feeAsset).precision || 0) : null),
+        feeTicker: q.feeAsset ? C.assetMeta(q.feeAsset).ticker : null,
+        ...tradeMeta(q.assetP, q.assetR, q.amountP, q.amountR) });
       C.toast('Swap settled (anchor-bound; reverts only if Bitcoin reverts):', {href:'/explorer/tx/'+txid, label:String(txid).slice(0,18)+'…'});
       resetComposer();
       await C.sync();
@@ -5252,9 +5557,16 @@ async function reviewLn(q){
       modal.remove();
       // Receipt into the persistent history (W6); no on-chain txid on this rail, so key by the
       // payment hash. Drop the raw preimage from the toast — it is protocol jargon, not user info (C-7).
+      // Enriched receipt (P5.1): no on-chain txid on this rail, so the payment hash is the id + we keep
+      // the preimage the user's own settlement revealed (their proof of the swap). base = the asset leg,
+      // quote = BTC (or the counter asset); price = quote per base from the settled leg amounts.
+      const lnBaseU  = Number(big(r.base_amount || 0))  / Math.pow(10, aprec || 0);
+      const lnQuoteU = Number(big(r.quote_amount || 0)) / Math.pow(10, qprec || 0);
       logTrade({ id: 'ln:' + (r.hash_h || r.preimage || Date.now()),
         title: (r.direction === 'sold' ? 'Sold ' + bm.ticker + ' for ' + qtkR : 'Bought ' + bm.ticker + ' with ' + qtkR) + ' over Lightning',
-        status: 'settled' });
+        status: 'settled', rail: 'ln', preimage: r.preimage || null,
+        pair: bm.ticker + '/' + qtkR, side: (r.direction === 'sold') ? 'sell' : 'buy',
+        price: lnBaseU > 0 ? lnQuoteU / lnBaseU : null, size: lnBaseU || null, sizeTicker: bm.ticker });
       C.toast(`Lightning swap settled and final: received ${got}.`);
       resetComposer();
       await C.sync();
@@ -5589,11 +5901,103 @@ function creditsHtml(){
   return `<div class="swbook"><div class="swbook-head"><span class="lbl">Order credits received</span>
       <span class="sub">paid into a payout only this wallet controls</span></div>${rows}</div>`;
 }
+// ---------------------------------------------------------------------------
+// P5.3 — needs-action notifications
+// ---------------------------------------------------------------------------
+// Surface the states a user MUST act on — a refund window opening, a fill while the tab is elsewhere, a
+// resting order nearing expiry — with an in-app toast AND (when the tab is hidden + permission granted) a
+// browser Notification, so a needs-action state is never left silently. Read-only signalling: no funds move.
+let _notifyAsked = false;
+function ensureNotifyPermission(){
+  try {
+    if (typeof Notification === 'undefined' || _notifyAsked) return;
+    _notifyAsked = true;
+    if (Notification.permission === 'default') { const p = Notification.requestPermission(); if (p && p.catch) p.catch(() => {}); }
+  } catch {}
+}
+// Toast, plus a browser Notification when the tab is HIDDEN and permission is granted (a foreground toast
+// suffices when the tab is visible). `link` matches C.toast's {href,label} shape.
+function notify(text, link, opts){
+  try { C.toast && C.toast(text, link); } catch {}
+  try {
+    if (typeof document !== 'undefined' && document.hidden && typeof Notification !== 'undefined' && Notification.permission === 'granted'){
+      const n = new Notification('Sequentia', { body: text, tag: (opts && opts.tag) || undefined });
+      n.onclick = () => { try { window.focus(); } catch {} try { n.close(); } catch {} };
+    }
+  } catch {}
+}
+// One notification per distinct needs-action TRANSITION (keyed) so a state that stays actionable across
+// re-renders nags exactly once (persisted so a reload doesn't re-nag the same still-open window).
+let _needActed = null;
+function _loadNeedActed(){ if (_needActed) return _needActed; try { _needActed = new Set(JSON.parse(localStorage.getItem('swk.dex.needacted.v1') || '[]')); } catch { _needActed = new Set(); } return _needActed; }
+function _notifiedOnce(key, text, link, opts){ const s = _loadNeedActed(); if (s.has(key)) return false; s.add(key); try { localStorage.setItem('swk.dex.needacted.v1', JSON.stringify([...s].slice(-200))); } catch {} notify(text, link, opts); return true; }
+// (a) Refund/reclaim windows that have OPENED on an in-flight swap the wallet drives — nag once. A stalled
+// submarine / sub-asset swap whose timeout passed needs the user to reclaim; both have clean predicates.
+function checkRefundWindows(){
+  ensureNotifyPermission();
+  try {
+    if (MIXED && !sub.isTerminal(MIXED) && sub.isRefundable(MIXED, mixedTip())){
+      const am = metaOf(MIXED.asset);
+      _notifiedOnce('refund:mx:' + (MIXED.id || MIXED.ts || (MIXED.htlc && MIXED.htlc.refund_locktime) || ''),
+        `A ${am.ticker} submarine swap stalled · its on-chain refund is now available. Open Active trades to reclaim.`, undefined, { tag: 'refund-mx' });
+    }
+  } catch {}
+  try {
+    if (SELL && (SELL.state === 'failed' || SELL.error) && SELL.btc_htlc){
+      _notifiedOnce('refund:sell:' + (SELL.hash_h || SELL.claim_txid || ''),
+        `A sell of ${SELL.ticker || 'an asset'} for BTC needs your attention · reclaim it under Active trades.`, undefined, { tag: 'refund-sell' });
+    }
+  } catch {}
+}
+// (c) A resting relay order nearing its bounded TTL — warn once + surface a Re-post action (see
+// renderMyOrders). Keyed by offer id + the exact expiry so each TTL window nags exactly once.
+const RESTING_EXPIRY_WARN_S = 300;   // 5 min before the relay evicts
+function checkRestingExpiry(orders){
+  ensureNotifyPermission();
+  const now = Math.floor(Date.now() / 1000);
+  for (const o of (orders || [])){
+    const exp = Number(o.expires_at_unix || o.expiresAtUnix || 0);
+    if (!exp) continue;
+    const left = exp - now;
+    if (left > 0 && left <= RESTING_EXPIRY_WARN_S){
+      const give = C.assetMeta(o.offer_asset || o.offerAsset), want = C.assetMeta(o.want_asset || o.wantAsset);
+      _notifiedOnce('expiry:' + (o.offer_id || o.offerId || '') + ':' + exp,
+        `A resting order (give ${give.ticker} · want ${want.ticker}) expires in ~${Math.max(1, Math.round(left / 60))} min. Re-post it to keep it live.`, undefined, { tag: 'expiry' });
+    }
+  }
+}
+// True when a relay order is within the warn window (drives the row badge + Re-post button).
+function isNearExpiry(o){ const exp = Number(o.expires_at_unix || o.expiresAtUnix || 0); if (!exp) return false; const left = exp - Math.floor(Date.now() / 1000); return left > 0 && left <= RESTING_EXPIRY_WARN_S; }
+// Re-post an already-funded covenant order to the relay to refresh its TTL. NO funds move: it re-derives
+// the SAME covenant offer (guarded to match the funded spk) and re-sends it, exactly like placeCovenant's
+// post step. Refuses if the re-derivation doesn't reproduce the funded output (never posts a mismatch).
+async function repostCovenantOrder(rec){
+  if (!rec || rec.covTxid == null) throw new Error('this order is not funded on-chain');
+  const payout = makerPayout(C.signer, C.network, rec.makerIndex);
+  const { rateNum, rateDen } = computeRate(BigInt(rec.sellAtoms), BigInt(rec.recvAtoms));
+  const minLot = covenantMinLot(BigInt(rec.sellAtoms));
+  const plan = planPlaceOrder({
+    assetA: rec.pay, assetB: rec.receive, sellAtoms: BigInt(rec.sellAtoms),
+    rateNum, rateDen, minLot, expiryLocktime: Number(rec.expiry),
+    makerProg: payout.program, makerX: payout.internalKey,
+  });
+  if (rec.spkHex && plan.spkHex !== rec.spkHex) throw new Error('re-derived covenant does not match the funded order');
+  const covenant = buildCovenantTerms(plan.order, rec.covTxid, rec.covVout, plan.tap);
+  const offer = buildCovenantOffer({
+    assetA: rec.pay, assetB: rec.receive, sellAtoms: BigInt(rec.sellAtoms), recvAtoms: BigInt(rec.recvAtoms),
+    covenant, makerPubkey: makerPubHex(), recvAddress: payout.address, offerId: rec.offerId,
+    allowPartial: true, minLot, advertiseOfferAssetAs: rec.pegged ? rec.advertiseAs : undefined,
+  });
+  await seqob.postCovenantOffer(offer, makerPriv());
+  rec.posted = true; savePlaced();
+  ensureCovenantRelay();
+}
 // E3: notify when a RESTING order fills — including one that filled while the wallet was CLOSED.
 // The maker-credit balance is the fill signal (a covenant fill pays a payout only this wallet
 // controls). Persist the last-seen balance across sessions; any per-asset INCREASE is a fill, so
-// toast the delta. The very first observation just baselines (no toast). Cheap + idempotent, so it's
+// notify the delta. The very first observation just baselines (no toast). Cheap + idempotent, so it's
 // safe to call on every renderMyOrders (live fills via onCovOrderStatus, and on reopen via resume).
+// P5.3: routed through notify() so a fill while the tab is ELSEWHERE also raises a browser Notification.
 let _seenCredits = undefined;
 function notifyNewCredits(){
   let bal; try { bal = covenantCreditBalance(); } catch { return; }
@@ -5604,18 +6008,41 @@ function notifyNewCredits(){
     const now = big(cur[h]), was = big(_seenCredits[h] || '0');
     if (now > was){
       const m = C.assetMeta(h);
-      try { C.toast && C.toast(`Your resting order filled · received ${C.fmtAtoms(now - was, m.precision)} ${m.ticker}.`); } catch {}
+      try { notify(`Your resting order filled · received ${C.fmtAtoms(now - was, m.precision)} ${m.ticker}.`, undefined, { tag: 'fill' }); } catch {}
     }
   }
   _seenCredits = cur; try { localStorage.setItem('swk.seenCredits.v1', JSON.stringify(cur)); } catch {}
 }
 
+// P5.1 — "Your trades" history view. Collapsed to the latest few; expandable to the full durable log.
+let _histExpanded = false;
+const _RAIL_LABEL = { chain: 'on-chain', ln: 'Lightning', cross: 'cross-chain', submarine: 'submarine', 'sub-asset': 'sub-asset', bridged: 'bridged' };
+// One history row: the structured pair/side/price/size line when the receipt carries it, else the
+// legacy title. Escapes every field (receipts hold user/relay strings). No secrets beyond the user's own.
+function fmtHistRow(e){
+  const when = e.at ? new Date(e.at).toLocaleString(undefined, { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' }) : '';
+  let main;
+  if (e.pair){
+    const side = e.side ? `<b class="${e.side === 'buy' ? 'hist-buy' : 'hist-sell'}">${esc(e.side.toUpperCase())}</b> ` : '';
+    const px = (e.price != null && isFinite(e.price)) ? ` @ ${esc(trim(e.price))}` : '';
+    const sz = (e.size != null) ? ` · ${esc(trim(Number(e.size)))}${e.sizeTicker ? ' ' + esc(e.sizeTicker) : ''}` : '';
+    const rail = e.rail ? ` · ${esc(_RAIL_LABEL[e.rail] || e.rail)}` : '';
+    main = `${side}${esc(e.pair)}${px}${sz}${rail} · ${esc(e.status || '')}`;
+  } else {
+    main = `${esc(e.title || '')} · ${esc(e.status || '')}`;
+  }
+  const ref = e.txid ? `<span class="sub mono" title="${esc(String(e.txid))}">${esc(String(e.txid).slice(0, 12))}…</span>`
+    : (e.preimage ? `<span class="sub" title="preimage ${esc(String(e.preimage))}">Lightning</span>` : '');
+  return `<div class="swbook-row myorder"><span class="mono">${main}</span>`
+    + `<span class="sub" style="min-width:90px;text-align:right">${esc(when)}</span>${ref}</div>`;
+}
 // The unified "Active trades" card: every in-flight swap (submarine, sub-asset sell, cross-chain),
 // so a DISMISSED one is never lost — each row reopens its process view (clearing the dismiss). A
 // trade that may need an on-chain action (refundable / claiming) is flagged so leaving it is a
 // deliberate, informed choice. Rendered in the composer (above your resting orders).
 function renderInFlightCard(){
   const host = C.$('swInFlight'); if (!host) return;
+  try { checkRefundWindows(); } catch {}   // P5.3 — nag once when a refund/reclaim window opens
   const rows = [];
   if (hasMixedInFlight()){
     const am = metaOf(MIXED.asset);
@@ -5667,14 +6094,25 @@ function renderInFlightCard(){
       + `</div>`;
   }
   if (hist.length){
+    const shown = _histExpanded ? hist : hist.slice(0, 6);
+    const more = hist.length - shown.length;
     html += `<div class="swbook"><div class="swbook-head">
-        <span class="lbl">Your recent trades</span><span class="sub">last ${hist.length}</span></div>`
-      + hist.slice(0, 6).map(e => `<div class="swbook-row myorder">
-          <span class="mono">${esc(e.title)} · ${esc(e.status)}</span>
-          ${e.txid ? `<span class="sub mono">${esc(String(e.txid).slice(0, 12))}…</span>` : ''}</div>`).join('')
+        <span class="lbl">Your trades</span>
+        <span class="sub" style="display:flex;gap:8px;align-items:center;margin-left:auto">
+          <span>${hist.length} trade${hist.length === 1 ? '' : 's'}</span>
+          <button type="button" class="ghost swexport" data-fmt="csv" title="Download your trade history as CSV">Export CSV</button>
+          <button type="button" class="ghost swexport" data-fmt="json" title="Download your trade history as JSON">JSON</button>
+        </span></div>`
+      + shown.map(fmtHistRow).join('')
+      + (more > 0 ? `<div class="swbook-row"><button type="button" class="ghost swhistmore" style="width:100%">Show ${more} more</button></div>`
+                  : (_histExpanded && hist.length > 6 ? `<div class="swbook-row"><button type="button" class="ghost swhistless" style="width:100%">Show fewer</button></div>` : ''))
       + `</div>`;
   }
   host.innerHTML = html;
+  // P5.1 — export + expand controls for the trade history.
+  host.querySelectorAll('.swexport').forEach(b => b.onclick = () => exportTrades(b.dataset.fmt));
+  host.querySelectorAll('.swhistmore').forEach(b => b.onclick = () => { _histExpanded = true; renderInFlightCard(); });
+  host.querySelectorAll('.swhistless').forEach(b => b.onclick = () => { _histExpanded = false; renderInFlightCard(); });
   // Clear a terminally-failed sub-asset sell: its BTC HTLC is already resolved on-chain, so removing
   // the record loses no funds and unblocks the sell rail. Retry re-drives resumeSell for a transient one.
   host.querySelectorAll('.swclearsell').forEach(b => b.onclick = () => {
@@ -5708,6 +6146,7 @@ async function renderMyOrders(){
   // "~N% filled" if the relay ever re-uses an offer_id.
   const relayIds = new Set(orders.map(o => o.offer_id || o.offerId));
   { for (const k of Object.keys(_ordStatus)) if (!relayIds.has(k)) delete _ordStatus[k]; }
+  try { checkRestingExpiry(orders); } catch {}   // P5.3 — nag once when a resting order nears its TTL
   // LOCAL reclaim rows: covenant orders THIS wallet funded on-chain that the relay no longer
   // lists (its offer TTL is far shorter than the ~24h on-chain lock) but whose locked asset is
   // still reclaimable via the CLTV refund. Without these the reclaim UI vanished with the relay
@@ -5733,12 +6172,29 @@ async function renderMyOrders(){
       const pct = Number((base - stat.active) * 100n / base);
       fillHint = pct >= 100 ? ' · <span style="color:#3ddc84">filled</span>' : ` · <span style="color:#3ddc84">~${pct}% filled</span>`;
     }
-    return `<div class="swbook-row myorder">
-      <span class="mono">give ${esc(C.fmtAtoms(big(o.offer_amount||o.offerAmount), give.precision))} ${esc(give.ticker)} · want ${esc(C.fmtAtoms(big(o.want_amount||o.wantAmount), want.precision))} ${esc(want.ticker)}${isCov ? ' · resting on-chain' : ''}${fillHint}</span>
-      <button type="button" class="ghost swcancel" data-id="${esc(id)}">Cancel</button></div>`;
+    // P5.3 — a resting order within its TTL warn window: flag it + offer a Re-post (refresh the relay
+    // listing) for a covenant order this wallet funded (repost re-sends the SAME signed offer, no funds move).
+    const near = isNearExpiry(o);
+    const hasRec = PLACED.some(r => r.offerId === id && r.covTxid != null);
+    const expBadge = near ? ' · <b class="actneed">expiring soon</b>' : '';
+    const repostBtn = (near && hasRec) ? `<button type="button" class="ghost swrepost" data-id="${esc(id)}">Re-post</button>` : '';
+    return `<div class="swbook-row myorder${near ? ' needsact' : ''}">
+      <span class="mono">give ${esc(C.fmtAtoms(big(o.offer_amount||o.offerAmount), give.precision))} ${esc(give.ticker)} · want ${esc(C.fmtAtoms(big(o.want_amount||o.wantAmount), want.precision))} ${esc(want.ticker)}${isCov ? ' · resting on-chain' : ''}${fillHint}${expBadge}</span>
+      <span>${repostBtn}<button type="button" class="ghost swcancel" data-id="${esc(id)}">Cancel</button></span></div>`;
   }).join('');
   host.innerHTML = credits + `<div class="swbook"><div class="swbook-head"><span class="lbl">Your resting orders</span>
       <span class="sub">funded on-chain · fill whenever matched, even offline</span></div>${rows}${localRows}</div>`;
+  // P5.3 — Re-post a near-expiry covenant order to refresh its relay TTL (no funds move; re-sends the offer).
+  host.querySelectorAll('.swrepost').forEach(b => b.onclick = async () => {
+    b.disabled = true; const label = b.textContent; b.textContent = 'Re-posting…';
+    const rec = PLACED.find(r => r.offerId === b.dataset.id && r.covTxid != null);
+    try {
+      if (!rec) throw new Error('no funded record for this order');
+      await repostCovenantOrder(rec);
+      try { C.toast && C.toast('Order re-posted · its listing is live again.'); } catch {}
+      try { renderMyOrders(); } catch {}
+    } catch (e){ b.disabled = false; b.textContent = label; try { C.toast && C.toast('Re-post failed: ' + C.prettyErr(e)); } catch {} }
+  });
   host.querySelectorAll('.swcancel').forEach(b => b.onclick = async () => {
     b.disabled = true; b.textContent = 'Cancelling…';
     const id = b.dataset.id;
