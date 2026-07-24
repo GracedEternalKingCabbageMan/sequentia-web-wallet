@@ -1,5 +1,5 @@
 // Tests for the settlement router. Run: node settlement-router.test.mjs
-import { planSettlement, planLeg, settlementPlanForSide, planExecutionName } from './settlement-router.mjs';
+import { planSettlement, planLeg, settlementPlanForSide, planExecutionName, chooseSettlementPath } from './settlement-router.mjs';
 
 let passed = 0, failed = 0;
 function eq(actual, expected, msg) {
@@ -92,6 +92,51 @@ eq(execFor('sell', 'ln',    'chain'), 'xsubas-sell', 'sell pay-asset-LN recv-BTC
 // the mixed dispatch correctly has no binary for them.
 ok(execFor('buy', 'ln', 'ln') === null, 'ln/ln is not a mixed binary (pure-LN path)');
 ok(execFor('buy', 'chain', 'chain') === null, 'chain/chain is not a mixed binary (cross-book path)');
+
+// --- chooseSettlementPath: P2P-first, LSP-fallback, both directions ---
+// A happy coincidence settles natively (LSP not in the value path), regardless of caps.
+eq(chooseSettlementPath({ asset:'GOLD',
+    buyer:  { btcRail:'ln', assetRail:'chain' },
+    seller: { assetRail:'chain', btcRail:'ln', btcInbound:true } },
+   { btc_ln:true, interactive:true }),
+   { path:'native', ln_direction:null, lnSide:null },
+   'chooseSettlementPath: mirror shape (no cross) -> native');
+
+// BUY, taker pays BTC over LN, maker on-chain: BTC leg crosses (payer). An interactive maker that accepts
+// BTC-LN -> P2P reverse submarine (ln_direction 1); an on-chain-only maker -> LSP payer bridge.
+const buyMatch = { asset:'GOLD',
+  buyer:  { btcRail:'ln', assetRail:'chain' },
+  seller: { assetRail:'chain', btcRail:'chain' } };
+eq(chooseSettlementPath(buyMatch, { caps: { btc_ln:true, interactive:true } }),
+   { path:'p2p-submarine', ln_direction:1, lnSide:'payer' },
+   'buy cross + interactive btc_ln maker -> P2P reverse submarine (ln_direction 1)');
+eq(chooseSettlementPath(buyMatch, { caps: { btc_ln:false, interactive:false } }),
+   { path:'lsp-bridge', ln_direction:null, lnSide:'payer' },
+   'buy cross + on-chain-only maker -> LSP payer bridge');
+eq(chooseSettlementPath(buyMatch, {}),
+   { path:'lsp-bridge', ln_direction:null, lnSide:'payer' },
+   'buy cross + no caps -> LSP payer bridge (fallback)');
+
+// SELL, taker receives BTC over LN, maker on-chain: BTC leg crosses (receiver). Interactive -> normal
+// submarine (ln_direction 0); on-chain-only -> LSP receiver bridge.
+const sellMatch = { asset:'GOLD',
+  seller: { assetRail:'chain', btcRail:'ln' },
+  buyer:  { btcRail:'chain', assetRail:'chain' } };
+eq(chooseSettlementPath(sellMatch, { btc_ln:true, interactive:true }),
+   { path:'p2p-submarine', ln_direction:0, lnSide:'receiver' },
+   'sell cross + interactive btc_ln maker -> P2P normal submarine (ln_direction 0)');
+eq(chooseSettlementPath(sellMatch, { btc_ln:true, interactive:false }),
+   { path:'lsp-bridge', ln_direction:null, lnSide:'receiver' },
+   'sell cross + non-interactive (passive covenant) -> LSP receiver bridge');
+eq(chooseSettlementPath(sellMatch, { btc_ln:false, interactive:true }),
+   { path:'lsp-bridge', ln_direction:null, lnSide:'receiver' },
+   'sell cross + interactive but NOT btc_ln -> LSP receiver bridge (maker cannot accept BTC-LN)');
+
+// An asset-leg-only crossing (JIT asset-LN receive) -> LSP bridge on the asset leg (no P2P submarine here).
+const assetCross = chooseSettlementPath({ asset:'OILX',
+  buyer:  { btcRail:'chain', assetRail:'ln', assetInbound:false },
+  seller: { assetRail:'chain', btcRail:'chain' } }, { btc_ln:true, interactive:true });
+ok(assetCross.path === 'lsp-bridge' && assetCross.lnSide === 'receiver', 'asset-leg-only cross -> LSP bridge, asset-leg receiver');
 
 // --- validation ---
 throws(() => planSettlement({}), 'missing buyer/seller throws');

@@ -94,9 +94,9 @@ import { makeProvisioner } from './provision.mjs';
 import { acceptUpgrade, bridgeWsToTcp } from './ws-bridge.mjs';
 import { settlementPlanForSide, planExecutionName, planSettlement } from './settlement-router.mjs';
 import { buildUnifiedBook } from './unified-book.mjs';
-import { runBridgedSwap, matchFromTake, describeBridge, classifyLegs, takeRailsCrossed, bridgeAssetHandoffAdmissible, bridgeAssetRelayLocktimeVerdict, bridgeFrontConfirmed, isPureLnTake, crossingShapeSupported, describeCrossingSupport } from './bridge-driver.mjs';
-import { checkBridgeLocktimeOrdering, requiredTakerHold, frontHtlcMintTarget, verifyFrontRouteExpiry } from './leg-bridge.mjs';
-import { runReverseBridgeTerms, openReverseBridgeSession, newBridgeClaimKeypair, relayTakerAssetLeg } from './bridge-maker.mjs';
+import { runBridgedSwap, matchFromTake, describeBridge, classifyLegs, takeRailsCrossed, bridgeAssetHandoffAdmissible, bridgeAssetRelayLocktimeVerdict, bridgeFrontConfirmed, isPureLnTake, crossingShapeSupported, describeCrossingSupport, fundedBtcSatsForResume } from './bridge-driver.mjs';
+import { checkBridgeLocktimeOrdering, requiredTakerHold, frontHtlcMintTarget, verifyFrontRouteExpiry, checkPayerFundGate, runPayerFundOnce, runPayerRefundOnce, runPayerRefundBumpOnce, sizeRefundFee } from './leg-bridge.mjs';
+import { runReverseBridgeTerms, openReverseBridgeSession, newBridgeClaimKeypair, relayTakerAssetLeg, runForwardBridgeTerms, sendForwardBtcLegFunded, openForwardBridgeSession, checkMakerAssetLegObserved, buildHtlcRedeem } from './bridge-maker.mjs';
 import { hashPreimageOk, subasSellStateFileForNonce, subasSellGuardVerdict, assembleSubasSellSettled } from './subas-sell-recovery.mjs';
 
 function reqEnv(name) {
@@ -161,6 +161,17 @@ const CFG = {
   // making the LSP's net (paid LN, recouped on-chain) unambiguous. Falls back to subasBtcWallet if unset.
   bridgeRecoupWallet: process.env.BRIDGE_RECOUP_WALLET || '',
   subasBtcChain: process.env.SUBAS_BTC_CHAIN || 'testnet4',
+  // --- payer-bridge REFUND FEE ADEQUACY (Fix 2) ---
+  // The LSP's T_btc refund of its own funded BTC HTLC must confirm INSIDE the taker hold's remaining life
+  // (holdBuffer blocks). A flat fee stalls under congestion, the hold fails back to the taker, and a maker
+  // claim then takes the LSP's BTC HTLC (full front loss). So the fee is sized from estimatesmartfee and the
+  // refund is RBF-bumped while it sits 0-conf. Tunables:
+  refundFeeVsize: Number(process.env.REFUND_FEE_VSIZE || 250),        // estimated refund-tx vsize (1-in 1-out P2SH HTLC refund; conservative over-estimate)
+  refundFeeTargetBlocks: Number(process.env.REFUND_FEE_TARGET_BLOCKS || 3), // estimatesmartfee conf-target: confirm WELL inside the hold (holdBuffer blocks), not at its edge
+  refundFeeFloorSats: Number(process.env.REFUND_FEE_FLOOR || 600),    // never below this (min-relay + a margin)
+  refundFeeCeilSats: Number(process.env.REFUND_FEE_CEIL || 50000),    // never above this (and always below the HTLC value less dust)
+  refundFeeFallbackSatPerVb: Number(process.env.REFUND_FEE_FALLBACK_SATVB || 20), // when estimatesmartfee has no data (fresh testnet), assume this sat/vB
+  refundBumpFactor: Number(process.env.REFUND_BUMP_FACTOR || 1.5),    // each RBF bump raises the fee by at least this factor (guarantees the min-increment)
   subasAssetLn: process.env.SUBAS_ASSET_LN || process.env.HOSTED_ASSET_RPC || hostedRpcFallback,
   subasMinBtcConf: Number(process.env.SUBAS_MIN_BTC_CONF || 0), // 0 = LP fronts the reorg risk (instant)
   // Sub-asset INBOUND provisioning (JIT / pay-to-open). For a PER-USER receive the
@@ -459,6 +470,53 @@ const STATUS_RPC_TIMEOUT_MS = 5000;
 // heavier than a plain read. Same rationale as STATUS_RPC_TIMEOUT_MS: lnrpc defaults timeoutMs=0 (no
 // timeout), so an offline signer or a wedged node would hang the request handler forever otherwise.
 const SIGNER_RPC_TIMEOUT_MS = 20000;
+// Bound the FORWARD (payer bridge) maker's XcSeqLegLocked reply after the LSP funds + sends XcBtcLegFunded.
+// A live maker locks the asset within seconds; cap the per-fund wait so a slow/absent maker cannot block the
+// driver tick for the full bolt-default (15m). On timeout fundOnchain throws -> the leg stalls no-loss (our
+// BTC HTLC refunds at T_btc; the taker's hold expires) rather than hanging.
+const FORWARD_RELAY_RECV_MS = Number(process.env.LSP_FORWARD_RELAY_RECV_MS) || 120000;
+// Hole 6 — SELF-TRADE / EXPOSURE CAP for the PAYER bridge (the only shape where the LSP fronts real BTC
+// on-chain for a counterparty). A self-trading attacker taking repeatedly against its OWN resting offer could
+// otherwise pin the LSP's on-chain liquidity + fees at will. These bound (a) live jobs per offer, (b) live jobs
+// total, and (c) total concurrent fronted-BTC exposure — a service-side rate/exposure limit, NOT a trade fee.
+const PAYER_BRIDGE_LIMITS = Object.freeze({
+  maxConcurrentPerOffer: Number(process.env.LSP_PAYER_MAX_PER_OFFER) || 2,
+  maxConcurrentTotal:    Number(process.env.LSP_PAYER_MAX_CONCURRENT) || 20,
+  maxExposureSatTotal:   Number(process.env.LSP_PAYER_MAX_EXPOSURE_SAT) || 50_000_000,   // 0.5 BTC of concurrent fronted BTC across all live payer legs
+});
+// The live (non-terminal) payer-bridge jobs = jobs where the LSP has, or is about to have, real BTC exposure.
+function livePayerBridgeJobs() {
+  const live = [];
+  for (const [, j] of jobs) {
+    if (!j || j.rail !== 'bridged') continue;
+    if (j.status === 'settled' || j.status === 'failed') continue;   // terminal -> exposure resolved
+    const sb = j.legState && j.legState.btc;
+    const bl = j.settlement_plan && j.settlement_plan.btc_leg;   // { rail, bridge, lnSide, jitInbound }
+    // legState.btc.lnSide is set once prepareBridgeLegs runs; settlement_plan.btc_leg carries it from the
+    // instant the job is created (a concurrent burst still counts a just-created payer job before its handshake).
+    const isPayer = (sb && sb.lnSide === 'payer') || (bl && bl.bridge && bl.lnSide === 'payer');
+    if (isPayer) live.push(j);
+  }
+  return live;
+}
+function payerBridgeExposureSat(j) {
+  return Number((j.legState && j.legState.btc && j.legState.btc.amountSat) || j.requested_btc_sats || 0) || 0;
+}
+// Admission verdict for a NEW payer-direction bridged take. Pure over the live job set + the requested bound.
+function payerBridgeAdmission({ offerId, btcSats } = {}) {
+  const live = livePayerBridgeJobs();
+  if (live.length >= PAYER_BRIDGE_LIMITS.maxConcurrentTotal)
+    return { ok: false, reason: `${live.length} concurrent payer-bridge job(s) already live (cap ${PAYER_BRIDGE_LIMITS.maxConcurrentTotal}) — the LSP bounds its concurrent on-chain exposure; retry once some settle` };
+  const exposure = live.reduce((a, j) => a + payerBridgeExposureSat(j), 0);
+  if (exposure + Number(btcSats || 0) > PAYER_BRIDGE_LIMITS.maxExposureSatTotal)
+    return { ok: false, reason: `${exposure} + ${Number(btcSats || 0)} sat would exceed the ${PAYER_BRIDGE_LIMITS.maxExposureSatTotal}-sat concurrent fronted-BTC cap — retry once some payer-bridge jobs settle` };
+  if (offerId) {
+    const perOffer = live.filter((j) => j.offer_id === offerId).length;
+    if (perOffer >= PAYER_BRIDGE_LIMITS.maxConcurrentPerOffer)
+      return { ok: false, reason: `${perOffer} live payer-bridge job(s) already fronting against offer ${offerId} (per-offer cap ${PAYER_BRIDGE_LIMITS.maxConcurrentPerOffer}) — a self-trading counterparty cannot lock LSP liquidity at will; retry later` };
+  }
+  return { ok: true, reason: 'within the payer-bridge rate + exposure caps' };
+}
 // Redact secrets/internal paths from CLI output before returning it to a client: SEQ_RPC is a
 // http://user:pass@host:port URL and seqob-cli/lightning-cli errors can echo it (or internal
 // --rpc-file=/root/... paths). Keep the last 6 non-empty lines but strip credentials + fs paths.
@@ -1662,6 +1720,39 @@ function xhtlcObserve({ rpc, wallet, txid, vout, hashH, redeem }) {
   });
 }
 
+// execFile seqob-cli xsubas-htlc-spend-status and parse its JSON. READ-ONLY: never moves value. This is the
+// AUTHORITATIVE chain-truth oracle for the payer leg-bridge's recoup/refund decision — it REPLACES the racy
+// persisted s.refunded intent flag with the on-chain fate of the LSP's OWN funded BTC HTLC. It returns the
+// normalized classification the pure driver (stepPayerLn) keys on:
+//   { status:'unspent'|'spent_claim'|'spent_refund'|'uncertain', preimage? }
+// The seqdex CLI FAILS CLOSED on an unresolvable read (exits NON-ZERO), so an exec error REJECTS here; callers
+// treat a rejection as 'uncertain' (fail closed) — observe surfaces spendStatus:'uncertain' (=> stepPayerLn
+// waits, neither recoup nor refund), and runPayerRefundOnce lets the throw propagate (no broadcast on
+// uncertainty). H is read from the redeem script by the CLI (HashFromHTLCRedeemScript), so no -hash is passed.
+function xhtlcSpendStatus({ rpc, wallet, chain, txid, vout, redeem }) {
+  return new Promise((resolve, reject) => {
+    if (!rpc || !txid || !redeem) return reject(new Error('xsubas-htlc-spend-status needs btc-rpc + txid + redeem-script'));
+    const args = ['xsubas-htlc-spend-status', '-btc-rpc', rpc, '-txid', String(txid), '-vout', String(vout ?? 0),
+      '-redeem-script', String(redeem), '-btc-chain', String(chain || CFG.subasBtcChain)];
+    if (wallet) args.push('-btc-wallet', String(wallet));
+    execFile(CFG.seqobCli, args, { timeout: STATUS_RPC_TIMEOUT_MS + 8000, maxBuffer: 4 << 20 }, (err, stdout) => {
+      if (err) return reject(new Error(`xsubas-htlc-spend-status: ${scrubDetail(err.message)}`));   // fail closed -> caller treats as uncertain
+      let o; try { o = JSON.parse(stdout); } catch { return reject(new Error('xsubas-htlc-spend-status: bad JSON')); }
+      // Normalize the seqdex label (UNSPENT|SPENT_VIA_CLAIM|SPENT_VIA_REFUND) to the driver's chain-fact token.
+      const map = { UNSPENT: 'unspent', SPENT_VIA_CLAIM: 'spent_claim', SPENT_VIA_REFUND: 'spent_refund' };
+      const status = map[String(o && o.status)] || 'uncertain';
+      const preimage = (o && o.preimage && /^[0-9a-f]{64}$/i.test(o.preimage)) ? String(o.preimage).toLowerCase() : null;
+      // BURIAL DEPTH of the spender (0 when unspent / mempool / uncertain, or the spender's confirmation count
+      // when spent). stepPayerLn keys the reorg-aware "a refund is terminal only once BURIED" decision on this:
+      // a shallow (0-conf) refund can be replaced by a conflicting maker claim, so the hold stays alive until it
+      // buries. Fail-safe to 0 on an absent/non-finite/negative field (SHALLOW => keep watching, never release).
+      const rawConfs = Number(o && o.spender_confirmations);
+      const spendConfs = (Number.isFinite(rawConfs) && rawConfs > 0) ? rawConfs : 0;
+      resolve({ status, preimage, spendConfs, raw: o });
+    });
+  });
+}
+
 // Build the planSettlement match from a bridged-take body (ONE source of truth with the wallet:
 // bridge-driver.matchFromTake). Throws on a malformed body so the dispatch fails closed.
 function buildBridgeMatchFromBody(body) {
@@ -1739,7 +1830,7 @@ function makeBridgeIo({ match, body, job }) {
     observe: async (leg) => {
       const s = st(leg.unit) || {};
       let ln = { registered: false, held: false, settled: false, preimage: null, expiryBlocks: s.lnExpiryBlocks };
-      let recvReady;
+      let recvReady, crossFund = false, relayPending = false;
       if (leg.lnSide === 'receiver') {
         // RECEIVER leg: the LSP PAYS the taker's hold on H out of its OWN node. The LN state is that
         // outgoing pay, captured by frontLn (a successful pay to a hold invoice returns P once the taker
@@ -1751,12 +1842,35 @@ function makeBridgeIo({ match, body, job }) {
         // Until then recvReady:false withholds the front in nextBridgeStep (no-loss; nothing paid into a
         // void hold). frontLn itself also fails closed without recvNodeId — this just avoids the spin.
         recvReady = !!s.recvNodeId;
-      } else if (s.lnRpc && s.hashH) {
-        // PAYER leg: the LSP HOLDS the taker's incoming LN on H at its own node -> holdinvoicelookup.
+      } else if (leg.lnSide === 'payer' && s.hashH) {
+        // PAYER leg (buy-btcln-assetchain): the LSP ISSUED a BTC-LN hold on the taker's H at its OWN node
+        // (POST /bridge/hold) and the taker PAID it, so it lands HELD at the LSP node — NOT the taker's. Point
+        // s.lnRpc at the LSP's own node so holdinvoicelookup (and the whole-swap lock oracle) read the ACTUAL
+        // held state. Also surface the hold's remaining life in BTC blocks (from the ACTUAL committed incoming
+        // HTLC via listhtlcs) as ln.expiryBlocks, so stepPayerLn's holdBuffer check has a real bound.
+        // B — FUND-BEFORE-LOCK: this is the taker-holds-P payer bridge, so mark the leg crossFund so
+        // nextBridgeStep funds the maker BTC HTLC the instant the hold is HELD (the asset leg locks only AFTER
+        // that fund + the XcBtcLegFunded relay) rather than deadlocking on the swapLocked whole-swap gate.
+        crossFund = true;
+        // B — RESUMABLE RELAY: the BTC HTLC is FUNDED (s.htlc) but the maker's asset-leg lock/relay is not yet
+        // complete (!s.forwardRelayDone). Surface relayPending so nextBridgeStep re-drives the (idempotent)
+        // fund-onchain action to complete the relay, instead of 'wait'-ing forever after a one-shot maker-reply
+        // timeout / an LSP restart — a funded payer leg must never be stranded.
+        relayPending = !!(s.htlc && !s.forwardRelayDone);
+        s.lnRpc = lspRpc;
         try {
-          const l = await lnrpc('holdinvoicelookup', [s.hashH], s.lnRpc, SIGNER_RPC_TIMEOUT_MS);
+          const l = await lnrpc('holdinvoicelookup', [s.hashH], lspRpc, SIGNER_RPC_TIMEOUT_MS);
+          let expiryBlocks = s.lnExpiryBlocks;
+          try {
+            const gi = await lnrpc('getinfo', [], lspRpc, SIGNER_RPC_TIMEOUT_MS);
+            const lh = await lnrpc('listhtlcs', [], lspRpc, SIGNER_RPC_TIMEOUT_MS);
+            const mine = ((lh && lh.htlcs) || []).filter((x) => String(x.payment_hash || '').toLowerCase() === String(s.hashH).toLowerCase()
+              && x.direction === 'in' && Number.isFinite(Number(x.expiry)));
+            if (mine.length && Number.isFinite(Number(gi && gi.blockheight)))
+              expiryBlocks = Math.min(...mine.map((x) => Number(x.expiry))) - Number(gi.blockheight);
+          } catch { /* leave expiryBlocks as the recorded default (Infinity if unset) -> holdBuffer skipped, checkPayerFundGate is authoritative */ }
           ln = { registered: !!l.state, held: l.state === 'accepted', settled: l.state === 'settled',
-            preimage: (l.payment_preimage || l.preimage || null), expiryBlocks: s.lnExpiryBlocks };
+            preimage: (l.payment_preimage || l.preimage || null), expiryBlocks };
         } catch { /* node momentarily unreadable -> treat as not-yet; the driver just re-observes */ }
       }
       let tip = s.tip || 0, onchain = null;
@@ -1778,6 +1892,36 @@ function makeBridgeIo({ match, body, job }) {
         } catch { /* observe hiccup -> re-observe next tick */ }
       } else if (s.tipRpc) {
         try { const o = await xhtlcObserve({ rpc: s.tipRpc, txid: s.tipProbeTxid || '0'.repeat(64), vout: 0 }); if (typeof o.tip === 'number') tip = o.tip; } catch {}
+      }
+      // CHAIN-TRUTH SPEND CLASSIFICATION (payer leg): fetch the AUTHORITATIVE on-chain fate of the LSP's OWN
+      // funded BTC HTLC via the seqdex classifier and surface it as obs.onchain.spendStatus. stepPayerLn keys
+      // the recoup-vs-refund-vs-release decision ENTIRELY on this chain fact — NEVER on the racy persisted
+      // s.refunded intent. A 'spent_claim' ALSO yields P (the maker's claim witness) — merge it as a P source.
+      // Any classifier failure (exec non-zero on an UNCERTAIN fate, or an unreadable node) => 'uncertain', so
+      // stepPayerLn fails closed (neither recoup nor refund until the read is definitive). Read against the
+      // LSP's OWN BTC node/wallet — the same node it funds + refunds the HTLC on (CFG.subasBtc*).
+      if (leg.lnSide === 'payer' && onchain && s.htlc && s.htlc.txid) {
+        try {
+          const ss = await xhtlcSpendStatus({ rpc: CFG.subasBtcRpc, wallet: CFG.subasBtcWallet, chain: CFG.subasBtcChain, txid: s.htlc.txid, vout: s.htlc.vout, redeem: s.htlc.script });
+          onchain.spendStatus = ss.status;   // 'unspent'|'spent_claim'|'spent_refund'|'uncertain'
+          onchain.spendConfs = ss.spendConfs; // spender BURIAL DEPTH — makes the REFUND-terminal decision reorg-aware (a shallow refund is NOT terminal; a conflicting claim can still swap in)
+          if (ss.preimage && !ln.preimage) ln.preimage = ss.preimage;   // spent_claim reveals P (the maker's claim witness)
+        } catch { onchain.spendStatus = 'uncertain'; onchain.spendConfs = 0; }   // fail closed: unreadable classifier => neither recoup nor release (confs immaterial when uncertain)
+      }
+      // B — PAYER-bridge PRIMARY P source. The TAKER claims the maker's asset HTLC (locked to the taker on H)
+      // with P, revealing it on Sequentia — normally BEFORE the maker claims our BTC HTLC. Read that claim's
+      // witness so the driver can recoup-settle the held LN as soon as P is public, not only off the maker's
+      // BTC-HTLC spend (the backstop above). The maker's asset leg is recorded on the ASSET leg state
+      // (sa.onchain) by fundOnchain after the XcBtcLegFunded relay. Best-effort: an unreadable claim just
+      // leaves the backstop in force. Only for a crossFund payer leg with no P yet learned.
+      if (crossFund && !ln.preimage) {
+        const saP = st('asset') || {};
+        if (saP.onchain && saP.onchain.txid) {
+          try {
+            const ao = await xhtlcObserve({ rpc: CFG.seqRpc, txid: saP.onchain.txid, vout: saP.onchain.vout || 0, hashH: s.hashH, redeem: saP.onchain.redeem });
+            if (ao && ao.preimage && /^[0-9a-f]{64}$/i.test(ao.preimage)) ln.preimage = String(ao.preimage).toLowerCase();
+          } catch { /* asset-leg observe hiccup -> rely on the BTC HTLC spend backstop this tick */ }
+        }
       }
       // W1 (front-time) — attach the cross-leg LOCKTIME inputs so nextBridgeStep re-checks the wall-clock
       // ordering against the LIVE tip AT FRONT TIME (and on every resume tick), not only at handshake. Only
@@ -1820,6 +1964,14 @@ function makeBridgeIo({ match, body, job }) {
         if (publicP && job.public_preimage !== publicP) { job.public_preimage = publicP; persistJobs(); }
       }
       const base = (recvReady !== undefined) ? { tip, onchain, ln, recvReady } : { tip, onchain, ln };
+      if (crossFund) base.crossFund = true;   // B: fund-before-lock — nextBridgeStep funds once the hold is HELD, skipping the swapLocked deadlock
+      if (relayPending) base.relayPending = true;   // B: fund-before-lock — re-drive the idempotent relay until the maker's asset leg is locked + relayed (resumable)
+      // C — persisted on-chain FACT for the payer leg's transient-outage / reorg-eviction guard, so a momentary
+      // null on-chain read (bitcoind hiccup) or a reorg-evicted funding over a KNOWN-funded HTLC WAITS instead of
+      // fail-closing / re-funding. (The terminal-after-refund + no-double-dip decision is NO LONGER driven by a
+      // surfaced s.refunded intent — it is derived from obs.onchain.spendStatus, chain truth. s.refunded survives
+      // on the leg state purely as runPayerRefundOnce's broadcast-dedup hint and is intentionally NOT surfaced.)
+      if (s.htlc && s.htlc.txid) base.onchainKnownFunded = true;   // this leg's BTC HTLC is funded per persisted state
       return crossLock ? { ...base, crossLock, ...(publicP ? { preimage: publicP } : {}) } : base;
     },
 
@@ -1911,16 +2063,158 @@ function makeBridgeIo({ match, body, job }) {
       const w = await lnrpc('waitsendpay', [String(s.hashH)], lspRpc, CFG.mixedTimeoutMs);
       adoptP(w && (w.payment_preimage || w.preimage));
     },
-    // payer leg: fund the receiver's on-chain HTLC (claim=receiver w/ P, refund=LSP). Reuses the audited
-    // xsubas-fund-btc primitive; records the funded HTLC + the LSP refund key in legState.
+    // payer leg (PAYER BRIDGE, fund-before-lock): (1) fund the maker's on-chain BTC HTLC (claim=maker w/ P,
+    // refund=LSP), then (2) DRIVE the FORWARD maker — send XcBtcLegFunded, receive+VERIFY its XcSeqLegLocked
+    // asset leg (claim=the REAL taker on H) and record it so the taker self-claims. Both halves are idempotent
+    // (fund once on s.htlc; relay once on s.forwardRelayDone), so a re-entry never double-funds or double-relays.
+    // Every half FAILS CLOSED on the safe side: a failed gate/relay leaves nothing exposed (our BTC refunds at
+    // T_btc; the taker's hold expires — double no-loss). Reuses the audited xsubas-fund-btc + bridge-maker.
     fundOnchain: async (leg) => {
       const s = st(leg.unit);
       if (!s || !s.receiverClaimPub || !s.hashH || !(s.amountSat > 0) || !s.cltv) throw new Error('fund-onchain blocked: receiver claim pub / H / amount / cltv not established — fail closed (nothing funded)');
-      const funded = await fundBridgeHtlcBtc({ claimPub: s.receiverClaimPub, hashH: s.hashH, amountSat: s.amountSat, cltv: s.cltv });
-      s.htlc = { txid: funded.btc_htlc_txid, vout: funded.btc_htlc_vout, amount: funded.btc_htlc_amount,
-        script: funded.btc_htlc_script, cltv: funded.btc_locktime, lockedTo: 'receiver' };
-      s.lspRefundPriv = funded.btc_refund_priv;   // LSP-held; bounds our recoup to exactly this HTLC
-      persistJobs();
+      job.legState = job.legState || {};
+      const sa = job.legState.asset = job.legState.asset || {};   // the REAL persisted asset leg (observe reads sa.onchain for P)
+      // (1) FUND (idempotent) — skip if we already funded the BTC HTLC for this leg. The fund-once sequencing —
+      // (i) NEVER broadcast on a locate uncertainty, (ii) ADOPT-BEFORE-GATE, (iii) PERSIST-INTENT-BEFORE-BROADCAST
+      // + DEFINITIVE scan-before-broadcast — lives in the PURE runPayerFundOnce orchestrator (leg-bridge.mjs) so
+      // the fund-safety discipline is exhaustively unit-tested without a node. All the I/O is injected below as
+      // thin closures; the dry-locate REJECTS on ANY uncertainty (the seqdex `-locate-only` CLI exits non-zero
+      // when a wallet-aware lookup fails), so an unreadable read can never reach the gate or cause a
+      // (double-)broadcast — it throws out of here and the driver re-drives next tick.
+      if (!s.htlc) {
+        // DEFINITIVE wallet-aware dry-locate for our deterministic P2SH (broadcast nothing). Reads s.lspRefundPub
+        // fresh each call — set by persistIntent on the first-fund path, already durable on a re-entry.
+        const dryLocate = () => fundBridgeHtlcBtc({ claimPub: s.receiverClaimPub, hashH: s.hashH,
+          amountSat: s.amountSat, cltv: s.cltv, refundPub: s.lspRefundPub, locateOnly: true });
+        const { funded } = await runPayerFundOnce({
+          // A persisted intent (refund key + intended redeemScript, written by persistIntent BEFORE any broadcast)
+          // means a broadcast to the deterministic P2SH MAY already be on-chain -> locate + adopt BEFORE the gate.
+          hasIntent: !!(s.intendedRedeem && s.lspRefundPub),
+          dryLocate,
+          runGate: async () => {
+            // B — PAYER FUND-TIME GATE (only reached when the leg is DEFINITIVELY not funded; it ASSUMES
+            // not-yet-funded). VERIFY-NOT-TRUST from the LSP's OWN node's ACTUAL committed incoming HTLCs
+            // (listhtlcs): (B0) the SUMMED held amount on H covers the ordered BTC price, (B1) T_btc's wall-clock
+            // is strictly later than T_seq's + a maker-claim runway, (B2) the committed incoming-hold CLTV covers
+            // T_seq, (B3) T_btc matures inside the hold's life. The taker's BTC is merely HELD, so a refusal is
+            // no-loss. Any unreadable value arrives at the gate as NaN and it fails closed (throws).
+            const tSeqForGate = Number(sa.seqLocktime ?? (job.bridge_terms && job.bridge_terms.seq_locktime));
+            let gateBtcTip = NaN, incomingHtlcExpiry = NaN, gateSeqTip = NaN, heldSat = NaN;
+            try {
+              const gi = await lnrpc('getinfo', [], lspRpc, SIGNER_RPC_TIMEOUT_MS);
+              gateBtcTip = Number(gi && gi.blockheight);
+              const lh = await lnrpc('listhtlcs', [], lspRpc, SIGNER_RPC_TIMEOUT_MS);
+              const mine = ((lh && lh.htlcs) || []).filter((x) => String(x.payment_hash || '').toLowerCase() === String(s.hashH).toLowerCase()
+                && x.direction === 'in' && Number.isFinite(Number(x.expiry)));
+              if (mine.length) {
+                incomingHtlcExpiry = Math.min(...mine.map((x) => Number(x.expiry)));   // the earliest-lapsing incoming HTLC governs settleability
+                // B0 — SUM the taker's incoming HTLCs on H. holdinvoice marks HELD on the FIRST HTLC regardless of
+                // amount, so a 1-sat pay would else trip funding; require the full ordered price to be held. CLN's
+                // amount lives on amount_msat (msat, number or "..msat" string) or msatoshi -> convert to sats.
+                heldSat = mine.reduce((acc, x) => acc + Math.floor(Number(String(x.amount_msat ?? x.msatoshi ?? 0).toString().replace(/msat$/i, '')) / 1000), 0);
+              }
+            } catch { /* unreadable -> NaN -> gate fails closed below */ }
+            try { const so = await xhtlcObserve({ rpc: CFG.seqRpc, txid: '0'.repeat(64), vout: 0 }); gateSeqTip = Number(so && so.tip); } catch { /* unreadable -> NaN -> gate fails closed */ }
+            const fundGate = checkPayerFundGate({ btcTip: gateBtcTip, incomingHtlcExpiry, btcRefundHeight: Number(s.cltv),
+              seqTip: gateSeqTip, seqRefundHeight: tSeqForGate, heldAmountSat: heldSat, orderedAmountSat: Number(s.amountSat) });
+            if (!fundGate.ok) throw new Error(`fund-onchain blocked (fail closed, nothing funded): ${fundGate.reason}`);
+          },
+          persistIntent: async () => {
+            // B — REFUND KEY PERSIST-BEFORE-BROADCAST (fund-loss). Mint the LSP's OWN refund keypair LSP-side and
+            // PERSIST it + the intended Design-A redeemScript BEFORE the irreversible funding broadcast. A crash/
+            // restart between the broadcast and the post-broadcast persist can then NEVER lose the refund key (the
+            // funded BTC would else be unspendable forever — only this key reclaims the refund branch) — AND the
+            // persisted intent arms adopt-before-gate on the next re-entry. Idempotent across a re-drive (reuse the
+            // persisted key so re-funding stays the SAME deterministic HTLC). Only the PUBKEY crosses the process
+            // boundary (-refund-pub), so xsubas-fund-btc builds the HTLC with OUR key and never mints/returns one.
+            if (!s.lspRefundPriv || !s.lspRefundPub) {
+              const rk = newBridgeClaimKeypair();
+              s.lspRefundPriv = rk.privHex;   // LSP-held; bounds our recoup/refund to exactly this HTLC
+              s.lspRefundPub = rk.pubHex;     // the refund pubkey the forward BtcLegFunded relays as taker_btc_refund_pub
+            }
+            s.intendedRedeem = buildHtlcRedeem({ hashHex: s.hashH, claimPubHex: s.receiverClaimPub,
+              refundPubHex: s.lspRefundPub, locktime: Number(s.cltv) });
+            persistJobs();   // <-- key + intended script durable BEFORE any broadcast (and arms adopt-before-gate on re-entry)
+          },
+          // The irreversible funding broadcast. runPayerFundOnce calls this AT MOST ONCE, and only after a
+          // DEFINITIVE scan-before-broadcast certified funded:false — never on an uncertain read.
+          broadcast: () => fundBridgeHtlcBtc({ claimPub: s.receiverClaimPub, hashH: s.hashH,
+            amountSat: s.amountSat, cltv: s.cltv, refundPub: s.lspRefundPub }),
+        });
+        // VERIFY-NOT-TRUST: the funded (or adopted) HTLC must be EXACTLY the redeemScript we intended (our refund
+        // key on H at T_btc). A mismatch => fail closed (never record an HTLC we cannot refund with s.lspRefundPriv).
+        if (String(funded.btc_htlc_script || '').toLowerCase() !== String(s.intendedRedeem).toLowerCase())
+          throw new Error('fund-onchain blocked (fail closed): funded HTLC script does not match the intended redeemScript (our refund key on H at T_btc) — refuse to record an un-refundable HTLC');
+        s.htlc = { txid: funded.btc_htlc_txid, vout: funded.btc_htlc_vout, amount: funded.btc_htlc_amount,
+          script: funded.btc_htlc_script, cltv: funded.btc_locktime, lockedTo: 'receiver' };
+        persistJobs();
+      }
+      // (2) RELAY (idempotent, RESUMABLE) — DRIVE the FORWARD maker so it locks the asset TO THE TAKER on H, then
+      // VERIFY that asset leg ON-CHAIN before handing it to the taker. Split into (2a) receive+persist the maker's
+      // SeqLegLocked ONCE and (2b) on-chain value-verify + hand-off, so a re-drive (a one-shot maker-reply timeout,
+      // or an LSP restart) NEVER re-sends XcBtcLegFunded and waits for a second SeqLegLocked that never comes — it
+      // resumes at whichever half is unfinished. Every failure FAILS CLOSED on the safe side: nothing is exposed
+      // to the taker, our BTC refunds at T_btc, the taker's hold expires — double no-loss.
+      if (!s.forwardRelayDone) {
+        // (2a) Receive the maker's XcSeqLegLocked exactly once (marker: sa.makerSeqLeg persisted). sendForward
+        // BtcLegFunded PARSE-verifies claim==the real taker on H + refund==maker + CLTV==T_seq (verifyMakerAssetLeg)
+        // before returning. PERSIST the outpoint the INSTANT it is received+parsed, BEFORE the on-chain observe in
+        // (2b), so an LSP crash during that observe never loses the PRIMARY on-Sequentia P source (observe reads P
+        // from sa.onchain). Idempotent across a re-drive: if we already have the leg, skip straight to (2b).
+        if (!sa.makerSeqLeg) {
+          let session = job._bridgeSession;
+          if (!session) {
+            // RESUMABLE RELAY: the forward session is transient (dropped on a restart, or after a prior one-shot
+            // reply timeout). Reconnect it from the PERSISTED offer so the relay is resumable across restarts —
+            // the BTC is already funded (s.htlc), so we MUST drive the lock/relay or refund at T_btc. If we cannot
+            // reconnect (no persisted offer), fail closed: our BTC refunds at T_btc (double no-loss). (A maker
+            // without resume support simply never replies -> the per-attempt recv times out -> re-drive -> refund.)
+            if (!job.offer_id || !job.maker_pubkey) throw new Error('fund-onchain relay blocked: no forward maker session and no persisted offer to reconnect — cannot deliver XcBtcLegFunded (our BTC refunds at T_btc; double no-loss). fail closed');
+            session = await openForwardBridgeSession({ offer: { offer_id: job.offer_id, maker_pubkey: job.maker_pubkey },
+              relayBase: CFG.crossRelay, takeAtoms: BigInt(Number(sa.seqAmount ?? (job.bridge_terms && job.bridge_terms.seq_amount) ?? 0)) });
+            job._bridgeSession = session;
+          }
+          const takerSeqClaimPub = sa.takerSeqClaimPub || (job.bridge_terms && job.bridge_terms.taker_seq_claim_pub);
+          const makerSeqRefundPub = sa.makerSeqRefundPub || (job.bridge_terms && job.bridge_terms.maker_seq_refund_pub);
+          const seqLocktime = Number(sa.seqLocktime ?? (job.bridge_terms && job.bridge_terms.seq_locktime));
+          const takeSeqAtoms = Number(sa.seqAmount ?? (job.bridge_terms && job.bridge_terms.seq_amount) ?? 0);
+          const relay = await sendForwardBtcLegFunded({
+            session, hashHex: s.hashH, takerSeqClaimPubHex: takerSeqClaimPub, lspBtcRefundPubHex: s.lspRefundPub,
+            btcLeg: { txid: s.htlc.txid, vout: s.htlc.vout, amount: s.htlc.amount, redeem_script: s.htlc.script },
+            takeSeqAtoms, makerSeqRefundPubHex: makerSeqRefundPub, seqLocktime,
+            cfg: { secretWaitMs: FORWARD_RELAY_RECV_MS },
+          });
+          const ml = relay.makerSeqLeg;
+          // PERSIST the outpoint BEFORE the on-chain verify (crash-safety for the P source). NOT yet handed to
+          // the taker (job.maker_seq_leg + forwardRelayDone are set only after (2b) passes).
+          sa.onchain = { txid: ml.txid, vout: ml.vout, redeem: ml.redeem_script };
+          sa.makerSeqLeg = ml;
+          persistJobs();
+        }
+        // (2b) ON-CHAIN VALUE VERIFY (mirror observeNativeLocked) then HAND OFF to the taker. Parse-verify (2a)
+        // proved what the maker CLAIMS; this proves the maker actually FUNDED the asset leg, for the AGREED asset
+        // + at least the AGREED atoms, bound to the SAME redeemScript — BEFORE the taker is told to claim it.
+        // Retryable: a not-yet-funded outpoint (the maker broadcast lag) throws and is re-driven via relayPending,
+        // WITHOUT re-sending XcBtcLegFunded. A genuine mismatch also throws (fail closed) -> our BTC refunds at
+        // T_btc, the taker is never handed a bogus/underfunded/wrong-asset leg.
+        const ml = sa.makerSeqLeg;
+        let observed = null;
+        try { observed = await xhtlcObserve({ rpc: CFG.seqRpc, txid: ml.txid, vout: ml.vout, hashH: s.hashH, redeem: ml.redeem_script }); }
+        catch (e) { throw new Error(`fund-onchain relay blocked (maker asset-leg observe failed — re-drive): ${scrubDetail(String((e && e.message) || e))}`); }
+        const expectAtoms = Number(sa.seqAmount ?? (job.bridge_terms && job.bridge_terms.seq_amount) ?? 0);
+        const assetV = checkMakerAssetLegObserved({ observed, expectAssetId: sa.seqAsset, expectAtoms });
+        if (!assetV.ok) throw new Error(`fund-onchain relay blocked (fail closed, NOT handed to the taker): ${assetV.reason}`);
+        // Verified on-chain: hand the leg to the taker (job.maker_seq_leg, via GET /swap/<id>: the outpoint +
+        // redeem it re-verifies sha256(P)==H + claim==its own key, then claims self-custody with P) and mark the
+        // relay DONE. sa.onchain already lets observe read P from the taker's claim (the PRIMARY P source).
+        s.forwardRelayDone = true;
+        job.maker_seq_leg = ml;
+        if (job.bridge_terms) job.bridge_terms.maker_seq_leg = ml;
+        persistJobs();
+        // The forward session's work is done (asset locked, verified, relayed). Free it; observe reads P on-chain now.
+        try { const sess = job._bridgeSession; if (sess) sess.close(); } catch {}
+        job._bridgeSession = null;
+      }
     },
     // receiver leg: claim the payer's on-chain HTLC (locked to the LSP) with the revealed P. Reuses
     // xsubas-claim-btc; the LSP's claim key is bounded to exactly what it fronted.
@@ -1939,10 +2233,58 @@ function makeBridgeIo({ match, body, job }) {
     },
     // payer leg: no claim by the on-chain CLTV -> refund the LSP-funded HTLC (the payer's LN hold returns
     // to them on its own). Reuses the xsubas BTC refund path.
-    refundOnchain: async (leg) => {
+    refundOnchain: async (leg, step, obs) => {
       const s = st(leg.unit);
       if (!s || !s.htlc || !s.lspRefundPriv) throw new Error('refund-onchain blocked: HTLC/refund-key missing — fail closed');
-      await refundBridgeHtlcBtc({ htlc: s.htlc, refundPriv: s.lspRefundPriv });
+      // Fix 2 — REFUND FEE ADEQUACY: size the refund fee from estimatesmartfee (targeting confirmation within the
+      // hold's remaining life, holdBuffer blocks) with a floor/ceiling, so the refund confirms INSIDE the hold —
+      // a flat fee can stall 0-conf past the hold and let a maker claim take our BTC HTLC (full front loss). The
+      // fee is recorded (s.refundFee) so refundBump can RBF-escalate from it; s.lastBumpTip anchors the per-block
+      // throttle. Fee sizing is best-effort (estimatesmartfee falls back to a sane sat/vB on a data-less chain).
+      const tip = Number(obs && obs.tip) || 0;
+      const estSatPerVb = await estimateBtcFeeSatPerVb(CFG.refundFeeTargetBlocks);
+      const feeSats = sizeRefundFee({ estSatPerVb, vsize: CFG.refundFeeVsize, amountSat: Number(s.htlc.amount),
+        floorSats: CFG.refundFeeFloorSats, ceilSats: CFG.refundFeeCeilSats, dustSats: CFG.dustSats });
+      // CHAIN-TRUTH idempotency (round-7 structural fix): runPayerRefundOnce consults the seqdex classifier
+      // (xsubas-htlc-spend-status) IMMEDIATELY before broadcasting and NEVER broadcasts unless the BTC HTLC is
+      // DEFINITIVELY unspent. A 'spent_claim' (the maker already claimed) => skip the refund (the next observe
+      // drives a recoup-settle); a 'spent_refund' (already reclaimed) => done (idempotent); an uncertain /
+      // unreadable classifier => THROW (fail closed, re-drive) — never a refund on an unresolved chain read.
+      // s.refunded is still persisted before the broadcast, but ONLY as a dedup hint; it no longer gates recoup
+      // (the on-chain 'spent_refund' fact does), so the round-6 persist/broadcast race can no longer lose funds.
+      await runPayerRefundOnce({
+        classifySpend: () => xhtlcSpendStatus({ rpc: CFG.subasBtcRpc, wallet: CFG.subasBtcWallet, chain: CFG.subasBtcChain, txid: s.htlc.txid, vout: s.htlc.vout, redeem: s.htlc.script }),
+        persistRefundIntent: async () => { s.refunded = true; s.refundFee = feeSats; s.lastBumpTip = tip; persistJobs(); },
+        broadcastRefund: () => refundBridgeHtlcBtc({ htlc: s.htlc, refundPriv: s.lspRefundPriv, feeSats }),
+        clearRefundIntent: async () => { s.refunded = false; persistJobs(); },
+      });
+    },
+    // payer leg: the refund is broadcast but sits 0-conf and the hold is approaching expiry -> RBF fee-BUMP it so
+    // it confirms INSIDE the hold (Fix 2). runPayerRefundBumpOnce re-classifies (only bumps a STILL-0-conf
+    // spent_refund), throttles to one bump per new BTC block (s.lastBumpTip), and only re-broadcasts a
+    // strictly-higher fee (escalated from s.refundFee by refundBumpFactor, re-clamped to a fresh estimate + the
+    // floor/ceiling). A flip to spent_claim / a buried refund makes the next observe drive recoup/done instead.
+    refundBump: async (leg, step, obs) => {
+      const s = st(leg.unit);
+      if (!s || !s.htlc || !s.lspRefundPriv) throw new Error('refund-bump blocked: HTLC/refund-key missing — fail closed');
+      const tip = Number(obs && obs.tip) || 0;
+      await runPayerRefundBumpOnce({
+        classifySpend: () => xhtlcSpendStatus({ rpc: CFG.subasBtcRpc, wallet: CFG.subasBtcWallet, chain: CFG.subasBtcChain, txid: s.htlc.txid, vout: s.htlc.vout, redeem: s.htlc.script }),
+        tipAdvanced: () => tip > (Number(s.lastBumpTip) || 0),
+        computeFee: async () => {
+          const estSatPerVb = await estimateBtcFeeSatPerVb(CFG.refundFeeTargetBlocks);
+          const lastFee = Number(s.refundFee) || CFG.refundFeeFloorSats;
+          const fee = sizeRefundFee({ estSatPerVb, vsize: CFG.refundFeeVsize, amountSat: Number(s.htlc.amount),
+            floorSats: CFG.refundFeeFloorSats, ceilSats: CFG.refundFeeCeilSats, dustSats: CFG.dustSats,
+            lastFee, bumpFactor: CFG.refundBumpFactor });
+          return { fee, bump: fee > lastFee };
+        },
+        rebroadcast: async (fee) => {
+          const r = await refundBridgeHtlcBtc({ htlc: s.htlc, refundPriv: s.lspRefundPriv, feeSats: fee });
+          s.refundFee = fee; s.lastBumpTip = tip; persistJobs();
+          return r;
+        },
+      });
     },
   };
 }
@@ -1950,16 +2292,24 @@ function makeBridgeIo({ match, body, job }) {
 // fund/claim/refund helpers that shell out to the EXISTING audited BTC HTLC primitives. The SEQ-asset
 // on-chain leg (asset<->asset bridging) reuses the SAME xchain code via a mirror CLI; wiring it is the
 // remaining mechanical step (see report). These are the ONLY value-moving shells the bridge io calls.
-function fundBridgeHtlcBtc({ claimPub, hashH, amountSat, cltv, refundPriv }) {
+function fundBridgeHtlcBtc({ claimPub, hashH, amountSat, cltv, refundPriv, refundPub, locateOnly }) {
   return new Promise((resolve, reject) => {
     if (!CFG.subasBtcRpc || !CFG.subasBtcWallet) return reject(new Error('BTC HTLC fund not configured (SUBAS_BTC_RPC + SUBAS_BTC_WALLET)'));
     const args = ['xsubas-fund-btc', '-maker-claim-pub', String(claimPub), '-hash', String(hashH),
       '-btc-amount', String(amountSat), '-btc-locktime', String(cltv),
       '-btc-rpc', CFG.subasBtcRpc, '-btc-wallet', CFG.subasBtcWallet, '-btc-chain', CFG.subasBtcChain];
-    if (refundPriv) args.push('-refund-priv', String(refundPriv));
+    // Prefer -refund-pub (payer bridge): the LSP minted + persisted its refund keypair BEFORE this broadcast, so
+    // the CLI builds the HTLC with OUR pubkey and neither mints nor returns an ephemeral key (the priv never
+    // crosses the process boundary). -refund-priv stays supported for callers that hand a full key.
+    if (refundPub) args.push('-refund-pub', String(refundPub));
+    else if (refundPriv) args.push('-refund-priv', String(refundPriv));
+    // DRY-LOCATE (broadcast NOTHING): scan the chain + wallet for an output already paying the deterministic
+    // P2SH and return {funded,...}. Used for scan-before-broadcast crash-idempotent funding. Requires
+    // -refund-pub/-refund-priv (present above) so the scanned P2SH matches what a real fund would produce.
+    if (locateOnly) args.push('-locate-only');
     execFile(CFG.seqobCli, args, { timeout: CFG.mixedTimeoutMs, maxBuffer: 4 << 20 }, (err, stdout) => {
-      if (err) return reject(new Error(`fund BTC HTLC: ${scrubDetail(err.message)}`));
-      try { resolve(JSON.parse(stdout)); } catch { reject(new Error('fund BTC HTLC: bad JSON')); }
+      if (err) return reject(new Error(`${locateOnly ? 'locate' : 'fund'} BTC HTLC: ${scrubDetail(err.message)}`));
+      try { resolve(JSON.parse(stdout)); } catch { reject(new Error(`${locateOnly ? 'locate' : 'fund'} BTC HTLC: bad JSON`)); }
     });
   });
 }
@@ -1978,12 +2328,28 @@ function claimBridgeHtlcBtc({ htlc, preimage, claimPriv, refundPub }) {
     });
   });
 }
-function refundBridgeHtlcBtc({ htlc, refundPriv }) {
+function refundBridgeHtlcBtc({ htlc, refundPriv, feeSats }) {
   return new Promise((resolve, reject) => {
     if (!CFG.subasBtcRpc) return reject(new Error('BTC HTLC refund not configured (SUBAS_BTC_RPC)'));
-    // xsubas-refund recovers by state-file; a param-based refund reuses the same xchain RefundBTCLeg.
-    // Left to the E2E wiring (needs the funded-HTLC state file the fund step persists on the box).
-    return reject(new Error('on-chain refund via state-file left to E2E wiring (no-loss: the CLTV refund path exists in xsubas-refund)'));
+    if (!htlc || !htlc.txid || !htlc.script || !htlc.cltv || !(Number(htlc.amount) > 0) || !refundPriv)
+      return reject(new Error('refund BTC HTLC: missing htlc{txid,vout,amount,script,cltv} or refundPriv — fail closed'));
+    // PAYER leg: no claim by the maker before T_btc -> reclaim the LSP-funded BTC HTLC on its refund branch,
+    // back to the LSP wallet, with the LSP's refund priv. Param-based (from legState.btc.htlc + lspRefundPriv):
+    // the MIRROR of claimBridgeHtlcBtc (which spends the claim branch via xsubas-claim-btc) — both compose the
+    // SAME xchain HTLC spend (Refund/ClaimBTCLeg), so this refund spends the refund branch symmetrically.
+    const args = ['xsubas-refund-btc', '-btc-rpc', CFG.subasBtcRpc, '-btc-chain', CFG.subasBtcChain,
+      '-txid', String(htlc.txid), '-vout', String(htlc.vout || 0), '-amount', String(htlc.amount),
+      '-redeem-script', String(htlc.script), '-t-btc', String(htlc.cltv), '-refund-priv', String(refundPriv)];
+    // Fix 2 — REFUND FEE ADEQUACY: pass the estimatesmartfee-sized (and, on an RBF bump, escalated) absolute fee
+    // so the refund confirms INSIDE the hold's remaining life. The CLI's refund tx is RBF-signalling, so a later
+    // higher -spend-fee cleanly REPLACES this one. Omitted => the CLI's conservative default (back-compat).
+    if (Number.isFinite(Number(feeSats)) && Number(feeSats) > 0) args.push('-spend-fee', String(Math.floor(Number(feeSats))));
+    const refundWallet = CFG.bridgeRecoupWallet || CFG.subasBtcWallet;   // the LSP's own wallet receives the reclaimed BTC
+    if (refundWallet) args.push('-btc-wallet', refundWallet);
+    execFile(CFG.seqobCli, args, { timeout: CFG.mixedTimeoutMs, maxBuffer: 4 << 20 }, (err, stdout) => {
+      if (err) return reject(new Error(`refund BTC HTLC: ${scrubDetail(err.message)}`));
+      resolve(String(stdout || '').trim());
+    });
   });
 }
 
@@ -1992,6 +2358,39 @@ function refundBridgeHtlcBtc({ htlc, refundPriv }) {
 // over Lightning, against a REVERSE (buy) cross maker whose BTC leg is on-chain) — the MAKER SIDE via the
 // real courier handshake (bridge-maker.runReverseBridgeTerms). That handshake hands the maker the LSP's
 // OWN btc-claim pubkey, so the maker locks a real on-chain BTC HTLC paying the LSP on the maker's H; we
+// ============================================================================
+// PAYER-BRIDGE NODE-CAPABILITY GATE (Fix 3). A payer bridge's fund-safety DEPENDS on the LSP's BTC node being
+// able to read a confirmed NON-wallet maker CLAIM (the sole on-chain source of P when the maker wins the T_btc
+// race) — which REQUIRES an UNPRUNED node with a SYNCED txindex. On a pruned / non-txindex node the HTLC-spend
+// classifier fails CLOSED (UNCERTAIN) forever, so the LSP can never recoup a maker-claim front. Rather than only
+// WARN per-classifier-call, REFUSE to originate a payer bridge (prepareBridgeLegs) — and log loudly at bring-up
+// — when the node is not capable. Shells to seqob-cli xsubas-node-caps (which runs the SAME
+// xchain.CheckClassifierNodeCapabilities the classifier relies on); a non-zero exit (not capable / unreachable /
+// old binary lacking the subcommand) => fail closed (refuse). Result cached with a short TTL.
+function checkPayerBridgeNodeCaps() {
+  return new Promise((resolve) => {
+    if (!CFG.subasBtcRpc) return resolve({ ok: false, reason: 'SUBAS_BTC_RPC not configured — no BTC node to gate' });
+    const args = ['xsubas-node-caps', '-btc-rpc', CFG.subasBtcRpc, '-btc-chain', CFG.subasBtcChain];
+    if (CFG.subasBtcWallet) args.push('-btc-wallet', CFG.subasBtcWallet);
+    execFile(CFG.seqobCli, args, { timeout: 20000, maxBuffer: 1 << 20 }, (err, stdout, stderr) => {
+      if (!err) return resolve({ ok: true, reason: 'BTC node capable (unpruned + synced txindex)' });
+      // Non-zero exit (1 = not capable; 2 = usage/node unreachable) OR ENOENT (an older seqob-cli without the
+      // subcommand) — fail closed: refuse payer bridges. Surface the CLI's stderr reason for the operator.
+      const reason = scrubDetail(String((stderr && String(stderr).trim()) || (err && err.message) || 'node-caps check failed'));
+      resolve({ ok: false, reason });
+    });
+  });
+}
+let _payerBridgeCaps = null;   // { ok, reason, at } — cached node-caps verdict
+const PAYER_CAPS_TTL_MS = 5 * 60 * 1000;
+async function payerBridgeNodeCapsOk({ force = false } = {}) {
+  const now = Date.now();
+  if (!force && _payerBridgeCaps && (now - _payerBridgeCaps.at) < PAYER_CAPS_TTL_MS) return _payerBridgeCaps;
+  const res = await checkPayerBridgeNodeCaps();
+  _payerBridgeCaps = { ...res, at: now };
+  return _payerBridgeCaps;
+}
+
 // parse+verify that HTLC (claim==LSP, H, refund, CLTV) BEFORE recording it, so leg-bridge only ever fronts
 // once the recoup is provably locked to the LSP. Any other crossing shape (or a missing taker key) leaves
 // the maker side UNSET, so every value move fails closed (stall, never mis-front). Async (opens a relay
@@ -2024,9 +2423,118 @@ async function prepareBridgeLegs({ match, body, job }) {
   // native asset leg. If the wallet ever promised a bridge for another shape, this refuses it identically.
   const canBridge = crossingShapeSupported(plan);
   if (!canBridge) {
-    job.bridgeHandshake = { ok: false, error: 'this crossing shape is not wired (only taker-sells-asset / receives-BTC-over-LN vs a reverse maker is)' };
+    job.bridgeHandshake = { ok: false, error: 'this crossing shape is not wired (only a BTC-leg crossing with a native asset leg, either direction: taker-sells-asset/receives-BTC-over-LN vs a reverse maker, or taker-buys-asset/pays-BTC-over-LN vs a forward maker)' };
     return plan;
   }
+
+  // PAYER bridge (buy: the taker pays BTC over LN, receives the asset on-chain). The TAKER mints H + holds P
+  // and hands H + its OWN asset-claim key. The LSP runs the FORWARD maker handshake TERMS round (no funding
+  // here) and records the recoup wiring: it will FUND an on-chain BTC HTLC paying the maker (receiverClaimPub)
+  // on H, refundable to the LSP at T_btc — but only LATER (fundOnchain), after the taker's BTC-LN hold is HELD
+  // (stepPayerLn). Sizes the hold from T_seq (requiredTakerHold). The post-fund BtcLegFunded send + the maker's
+  // SeqLegLocked verify+relay (sendForwardBtcLegFunded) is the E2E-completion boundary (a LIVE forward maker,
+  // which this environment does not run); the kept-alive session carries it.
+  if (plan.btcLeg && plan.btcLeg.bridge && plan.btcLeg.lnSide === 'payer') {
+    const takerHash = String(body.hash_h || body.payment_hash || '').toLowerCase();
+    const takerSeqClaimPub = body.taker_seq_claim_pub || body.takerSeqClaimPub || '';
+    if (!/^[0-9a-f]{64}$/.test(takerHash)) {
+      job.bridgeHandshake = { ok: false, error: 'payer bridge needs hash_h (H = SHA256(P); the TAKER mints P) — fail closed' };
+      return plan;
+    }
+    if (!/^[0-9a-fA-F]{66}$/.test(takerSeqClaimPub)) {
+      job.bridgeHandshake = { ok: false, error: 'payer bridge needs taker_seq_claim_pub (the taker\'s OWN asset-claim key on H; the LSP never holds a taker key) — fail closed' };
+      return plan;
+    }
+    if (!body.offer_id || !body.maker_pubkey) {
+      job.bridgeHandshake = { ok: false, error: 'payer bridge needs offer_id + maker_pubkey to lift the forward maker' };
+      return plan;
+    }
+    // OVERPAY GUARD. The LSP FUNDS the BTC leg for the taker; runForwardBridgeTerms binds the maker's demanded
+    // BTC to expect.btcSats ONLY when it is > 0 (a 0/absent bound SKIPS the upper-bound check, so the maker
+    // could demand ANY amount and the LSP would fund it). Require a real positive btc_sats BEFORE the terms
+    // round so the price upper-bound always binds. Fail closed (nothing funded); the dispatch also 422s this
+    // up front.
+    if (!(Number(body.btc_sats) > 0)) {
+      job.bridgeHandshake = { ok: false, error: 'payer bridge needs btc_sats > 0 to bound the price the LSP funds (else the maker could demand any BTC amount — overpay) — fail closed' };
+      return plan;
+    }
+    if (!CFG.subasBtcRpc || !CFG.subasBtcWallet) {
+      job.bridgeHandshake = { ok: false, error: 'BTC on-chain backend (SUBAS_BTC_RPC + SUBAS_BTC_WALLET) not configured — cannot fund the bridged BTC leg' };
+      return plan;
+    }
+    // Fix 3 — NODE-CAPS GATE: a payer bridge's recoup reads a confirmed NON-wallet maker claim off-chain to learn
+    // P, which needs an UNPRUNED node with a SYNCED txindex. Refuse to ORIGINATE the bridge (no handshake, no
+    // funding) on an incapable node — else the front is stranded (the classifier fails closed forever). Fail
+    // closed on an unreadable/incapable node (payer-bridge fund-safety depends on this classifier).
+    const caps = await payerBridgeNodeCapsOk();
+    if (!caps.ok) {
+      job.bridgeHandshake = { ok: false, error: `payer bridge REFUSED — the LSP's BTC node cannot read a non-wallet maker claim (needs txindex + unpruned): ${caps.reason}. Payer-bridge recoup depends on it; fail closed (nothing funded).` };
+      console.error('[bridge] payer bridge REFUSED (node caps):', caps.reason);
+      return plan;
+    }
+    let session = null;
+    try {
+      session = await openForwardBridgeSession({
+        offer: { offer_id: body.offer_id, maker_pubkey: body.maker_pubkey },
+        relayBase: CFG.crossRelay,
+        takeAtoms: BigInt(Number(body.asset_atoms) || 0),
+      });
+      const terms = await runForwardBridgeTerms({ session,
+        expect: { btcSats: Number(body.btc_sats) || 0, seqAtoms: Number(body.asset_atoms) || 0 } });
+
+      // Read the live seq tip to size + bound the taker's hold from T_seq. Unreadable => fail closed.
+      let seqTip;
+      try { const so = await xhtlcObserve({ rpc: CFG.seqRpc, txid: '0'.repeat(64), vout: 0 }); seqTip = Number(so && so.tip); }
+      catch (e) {
+        try { session.close(); } catch {}
+        job._bridgeSession = null;
+        job.bridgeHandshake = { ok: false, error: `payer bridge could not read the seq tip — fail closed (nothing funded): ${scrubDetail(String((e && e.message) || e))}` };
+        persistJobs();
+        return plan;
+      }
+      const holdReq = requiredTakerHold({ seqTip, seqRefundHeight: Number(terms.seqLocktime) });
+      if (!holdReq.ok) {
+        try { session.close(); } catch {}
+        job._bridgeSession = null;
+        job.bridgeHandshake = { ok: false, error: `payer bridge hold-life vs T_seq refused (nothing funded): ${holdReq.reason}` };
+        persistJobs();
+        console.error('[bridge] payer hold-life vs T_seq REFUSED:', holdReq.reason);
+        return plan;
+      }
+
+      // BRIDGED BTC leg (payer): record the recoup wiring the fund action + the driver need.
+      const sb = job.legState.btc;
+      sb.hashH = takerHash;
+      sb.receiverClaimPub = terms.makerBtcClaimPubHex;   // the on-chain HTLC's claim branch pays the maker with P
+      sb.cltv = Number(terms.btcLocktime);               // T_btc — the LSP-refund height on the HTLC we fund
+      sb.amountSat = Number(terms.btcAmount) || Number(body.btc_sats) || sb.amountSat;
+      sb.lnSide = 'payer';
+      sb.lnRpc = CFG.mixedBtcRpc || sb.lnRpc;             // the hold lives at the LSP's OWN node (also set in observe)
+      sb.lnExpiryBlocks = holdReq.minFinalCltvBlocks;
+
+      // NATIVE asset leg: the maker locks the asset TO THE TAKER on H (verified + relayed after funding).
+      const sa = job.legState.asset;
+      if (sa) {
+        sa.makerSeqRefundPub = terms.makerSeqRefundPubHex; sa.seqLocktime = terms.seqLocktime;
+        sa.seqAmount = terms.seqAmount; sa.seqAsset = resolveAsset(body.asset); sa.takerSeqClaimPub = takerSeqClaimPub;
+      }
+
+      job._bridgeSession = session;   // kept alive for the forward BtcLegFunded send + SeqLegLocked verify+relay (E2E boundary: a live maker)
+      job.bridge_terms = { hash_h: takerHash, maker_btc_claim_pub: terms.makerBtcClaimPubHex,
+        maker_seq_refund_pub: terms.makerSeqRefundPubHex, taker_seq_claim_pub: takerSeqClaimPub,
+        btc_locktime: terms.btcLocktime, seq_locktime: terms.seqLocktime, seq_amount: terms.seqAmount, btc_amount: terms.btcAmount,
+        seq_tip: seqTip, hold_expiry_secs: holdReq.holdExpirySecs, hold_min_final_cltv: holdReq.minFinalCltvBlocks };
+      job.bridgeHandshake = { ok: true, direction: 'payer' };
+      persistJobs();
+      console.error('[bridge] forward maker terms: T_btc', terms.btcLocktime, 'T_seq', terms.seqLocktime, 'on taker H', takerHash);
+    } catch (e) {
+      try { session && session.close(); } catch {}
+      job._bridgeSession = null;
+      job.bridgeHandshake = { ok: false, error: `forward maker handshake failed (nothing funded): ${scrubDetail(String((e && e.message) || e))}` };
+    }
+    return plan;
+  }
+
   const takerSeqRefundPub = body.taker_seq_refund_pub || body.takerSeqRefundPub || '';
   if (!/^[0-9a-fA-F]{66}$/.test(takerSeqRefundPub)) {
     job.bridgeHandshake = { ok: false, error: 'bridged sell needs taker_seq_refund_pub (the taker\'s OWN asset-refund key; the LSP never holds a taker key) — fail closed' };
@@ -2224,6 +2732,37 @@ async function seqRpcCall(method, params = []) {
   const j = await r.json();
   if (j.error) throw new Error((j.error && j.error.message) || `seq rpc ${method} error`);
   return j.result;
+}
+
+// Read-only JSON-RPC to the LSP's OWN bitcoind (CFG.subasBtcRpc) — the node that funds + refunds the payer
+// bridge's BTC HTLC. Used only for fee estimation (estimatesmartfee) when sizing/bumping a refund (Fix 2).
+async function btcRpcCall(method, params = []) {
+  if (!CFG.subasBtcRpc) throw new Error('SUBAS_BTC_RPC not configured');
+  const u = new URL(CFG.subasBtcRpc);
+  const auth = 'Basic ' + Buffer.from(`${decodeURIComponent(u.username)}:${decodeURIComponent(u.password)}`).toString('base64');
+  const endpoint = `${u.protocol}//${u.host}${u.pathname === '/' ? '' : u.pathname}`;
+  const r = await fetch(endpoint, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', authorization: auth },
+    body: JSON.stringify({ jsonrpc: '1.0', id: 'lsp-fee', method, params }),
+    signal: AbortSignal.timeout(8000),
+  });
+  const j = await r.json();
+  if (j.error) throw new Error((j.error && j.error.message) || `btc rpc ${method} error`);
+  return j.result;
+}
+
+// Fee estimate (sat/vB) for a BTC tx that must confirm within `targetBlocks`, via estimatesmartfee. bitcoind
+// returns feerate in BTC/kvB; convert to sat/vB. On a fresh chain (no fee data) estimatesmartfee returns no
+// feerate (or an `errors` array) -> fall back to CFG.refundFeeFallbackSatPerVb so a refund is NEVER un-sized
+// (an un-sized refund is exactly the Fix-2 fund-loss: it stalls 0-conf past the hold and a maker claim wins).
+async function estimateBtcFeeSatPerVb(targetBlocks) {
+  try {
+    const r = await btcRpcCall('estimatesmartfee', [Math.max(1, Math.floor(Number(targetBlocks) || 1))]);
+    const btcPerKvb = r && Number(r.feerate);
+    if (Number.isFinite(btcPerKvb) && btcPerKvb > 0) return (btcPerKvb * 1e8) / 1000;
+  } catch { /* node unreachable / no fee data -> fall back below */ }
+  return CFG.refundFeeFallbackSatPerVb;
 }
 
 // Short-TTL cache for the no-param /anchor tip. That path is unauthenticated (the wallet needs it
@@ -2819,6 +3358,64 @@ const server = http.createServer(async (req, res) => {
         note: 'hold-ready recorded; the LSP will front your BTC-LN hold on H as soon as the recoup is secured. '
             + 'Poll GET /swap/' + body.job_id + ' until status is "fronted", then fund + relay your asset (POST /bridge/asset). Do NOT fund your asset before "fronted".' });
     }
+    // BRIDGE PHASE 1b (PAYER, buy-btcln-assetchain): the INVERSE of /bridge/front. The taker BUYS the asset
+    // and PAYS BTC over Lightning; it minted H and holds P. Having learned the sizing from POST /swap's
+    // bridge_terms, it calls this and the LSP ISSUES a BTC-LN HOLD invoice on H at its OWN node. The taker
+    // pays it -> the payment lands HELD at the LSP (NOT captured). Only after that does the driver fund the
+    // on-chain BTC HTLC to the maker (stepPayerLn, gated by checkPayerFundGate). Returns the node id + H +
+    // amount (and a bolt11 if the node mints one) + the required hold expiry so the taker's hold stays
+    // settleable until after T_seq. Idempotent (a re-post just re-affirms the hold on H).
+    if (req.method === 'POST' && url.pathname === '/bridge/hold') {
+      const body = await readBody(req);
+      if (!body || !body.job_id) return send(res, 400, { ok: false, error: 'need { job_id }' });
+      const job = jobs.get(body.job_id);
+      if (!job) return send(res, 404, { ok: false, error: 'unknown bridge job id' });
+      if (job.rail !== 'bridged') return send(res, 400, { ok: false, error: 'not a bridged job' });
+      // The forward-maker terms must have secured the recoup wiring (receiverClaimPub = the maker's BTC claim
+      // + T_btc) before we issue a hold, else there is nothing the eventual fund pays. verifiedClaimLsp is a
+      // receiver-leg concept; the payer leg is armed once receiverClaimPub + cltv + hashH are recorded.
+      const sb = job.legState && job.legState.btc;
+      if (!(sb && sb.lnSide === 'payer' && sb.hashH && sb.receiverClaimPub && sb.cltv))
+        return send(res, 409, { ok: false, error: `this bridge job is not a payer-side BTC-LN buy past its forward-maker terms (status '${job.status}') — poll GET /swap/${body.job_id} for bridge_terms first, then re-post.` });
+      const lspRpc = CFG.mixedBtcRpc || (targetFor('btc', null, null).rpc);
+      if (!lspRpc) return send(res, 503, { ok: false, error: 'no LSP BTC-LN node configured (MIXED_BTC_RPC) to issue the hold' });
+      const amtSats = Number(sb.amountSat || 0);
+      if (!(amtSats > 0)) return send(res, 409, { ok: false, error: 'the BTC leg amount is not established yet' });
+      const amtMsat = String(Math.round(amtSats) * 1000);
+      const H = String(sb.hashH).toLowerCase();
+      const label = 'bridge-hold-' + body.job_id;
+      try {
+        // seqln holdinvoice signature: holdinvoice(payment_hash, amount_msat, label, description, cltv). The
+        // 5th positional param is `cltv` = the required MIN-FINAL-CLTV in BLOCKS covering T_seq (sized from
+        // T_seq via requiredTakerHold), NOT an expiry-in-seconds. Pass it so the hold's incoming HTLC is bound
+        // to enough CLTV to stay settleable until strictly after the maker's latest asset claim (T_seq).
+        //
+        // ⚠ SEQLN-FORK CHANGE NEEDED for invoice-side enforcement: the M0 holdinvoice plugin ACCEPTS `cltv`
+        // but currently IGNORES it — it mints NO bolt11 (external-hash invoice signing is unimplemented), so it
+        // cannot stamp min_final_cltv_expiry on an invoice, and the taker pays by bare-hash sendpay choosing its
+        // own final-hop CLTV. So passing cltv here is forward-compatible (a fork that HONORS it will enforce it)
+        // but does NOT itself force the taker's HTLC today. The ENFORCED backstop is checkPayerFundGate in
+        // fundOnchain: it reads the taker's ACTUAL committed incoming-HTLC CLTV (listhtlcs) and REFUSES to fund
+        // the maker BTC leg unless it covers T_seq — so a too-short hold stalls no-loss (nothing funded). We
+        // also return hold_min_final_cltv below so the taker sizes its payment's final-hop CLTV up front.
+        const minFinalCltv = Number(job.bridge_terms && job.bridge_terms.hold_min_final_cltv);
+        const holdArgs = [H, amtMsat, label, 'rail-crossing buy (LSP payer bridge)', minFinalCltv > 0 ? String(Math.ceil(minFinalCltv)) : '0'];
+        const inv = await lnrpc('holdinvoice', holdArgs, lspRpc, SIGNER_RPC_TIMEOUT_MS);
+        const ni = await lnrpc('getinfo', [], lspRpc, SIGNER_RPC_TIMEOUT_MS).catch(() => ({}));
+        sb.holdIssued = true; sb.lnRpc = lspRpc; persistJobs();
+        const expirySecs = Number(job.bridge_terms && job.bridge_terms.hold_expiry_secs);
+        return send(res, 200, { ok: true, payment_hash: H, node_id: ni.id || null, bolt11: inv.bolt11 || null,
+          amount_msat: Number(amtMsat),
+          hold_min_final_cltv: minFinalCltv > 0 ? Math.ceil(minFinalCltv) : null,
+          hold_expiry_secs: expirySecs > 0 ? Math.ceil(expirySecs) : null,
+          note: 'Pay this hold on H at the returned node_id (bare-hash sendpay). Size your payment\'s final-hop '
+              + 'CLTV to at least hold_min_final_cltv blocks so your incoming HTLC stays settleable until after '
+              + 'T_seq — the LSP verifies the ACTUAL committed CLTV (listhtlcs) and funds the maker BTC leg only '
+              + 'once your hold is HELD with enough CLTV. Poll GET /swap/' + body.job_id + ' for settlement.' });
+      } catch (e) {
+        return send(res, 502, { ok: false, error: `bridge hold: ${scrubDetail(String((e && e.message) || e))}` });
+      }
+    }
     // BRIDGE PHASE 2 (rail-crossing SELL): AFTER the LSP has FRONTED (status 'fronted'), the taker funds its
     // OWN asset HTLC self-custody (claim=maker-with-P, refund=taker-after-T_seq) and hands the funded asset
     // outpoint here. The LSP records it (so the native asset leg reads LOCKED) and RELAYS it to the maker over
@@ -2963,9 +3560,28 @@ const server = http.createServer(async (req, res) => {
           return send(res, 422, { ok: false, handled_by: 'native',
             error: 'this match is a happy coincidence (rails coincide) — settle it natively, not via the bridge' });
         }
+        // OVERPAY GUARD (payer-direction buy): the LSP FUNDS the BTC leg, so a real positive btc_sats bound is
+        // required — runForwardBridgeTerms only binds the maker's demanded BTC when expect.btcSats > 0. Refuse
+        // up front (422) rather than spawn a job whose handshake would fail closed anyway.
+        if (planPreview.btcLeg && planPreview.btcLeg.bridge && planPreview.btcLeg.lnSide === 'payer' && !(Number(body.btc_sats) > 0)) {
+          return send(res, 422, { ok: false, error: 'payer-direction bridged buy needs btc_sats > 0 to bound the price the LSP funds (else the maker could demand any BTC amount — overpay) — refusing' });
+        }
+        // Hole 6 — SELF-TRADE / EXPOSURE CAP (payer direction only: the LSP FRONTS real BTC on-chain). A
+        // self-trading counterparty (taking repeatedly against its own resting offer) could otherwise lock the
+        // LSP's liquidity + fees at will. Rate-limit payer-bridge jobs per offer and cap the concurrent on-chain
+        // exposure (total fronted sats + job count). No protocol fee — a service-side rate/exposure limit. The
+        // same-nonce idempotent replay above already returned, so this only bounds genuinely NEW jobs.
+        if (planPreview.btcLeg && planPreview.btcLeg.bridge && planPreview.btcLeg.lnSide === 'payer') {
+          const adm = payerBridgeAdmission({ offerId: body.offer_id || null, btcSats: Number(body.btc_sats) || 0 });
+          if (!adm.ok) return send(res, 429, { ok: false, error: `payer-bridge admission refused (self-trade / exposure cap): ${adm.reason}` });
+        }
         const jobId = crypto.randomUUID();
         const job = { job_id: jobId, status: 'confirming', side: body.side, asset: body.asset,
           rail: 'bridged', finality: 'confirming', settlement_plan: bridgeplanSummary(planPreview),
+          // Persist the maker offer identity so a funded-but-unrelayed PAYER leg can RECONNECT its forward session
+          // on resume (hole 5), and record the fronted-BTC bound so the exposure cap can sum live jobs (hole 6).
+          ...(body.offer_id ? { offer_id: body.offer_id } : {}), ...(body.maker_pubkey ? { maker_pubkey: body.maker_pubkey } : {}),
+          requested_btc_sats: Number(body.btc_sats) || null,
           ...(bnonce ? { swap_nonce: bnonce } : {}), requested_amount: body.amount ?? null, started_ms: Date.now() };
         setJob(jobId, job);   // persist BEFORE any funding (a restart sees 'interrupted', not a 404)
         const run = runBridgedSwapJob(body, job)
@@ -3022,8 +3638,12 @@ const server = http.createServer(async (req, res) => {
           error: 'sell-asset-on-chain / receive-BTC-over-Lightning is now settled by the NON-custodial rail-crossing bridge, not the custodial submarine (which fronts the LSP\'s own funds). Retry the take with bridge:true (plus maker_btc_rail/maker_asset_rail + offer_id/maker_pubkey + taker_seq_refund_pub).' });
       }
       if (execName === 'xsubbuy') {
+        // NARROWED to non-bridge legacy: a bridge:true buy already routed into the non-custodial bridged
+        // driver above (and returned). Only a LEGACY non-bridge buy reaches here — its custodial submarine
+        // (which fronts the LSP's own funds) is retired. Point it at the non-custodial route: the P2P reverse
+        // submarine (an interactive maker) or the LSP payer leg-bridge, both driven with bridge:true.
         return send(res, 422, { ok: false, finality: 'unsupported',
-          error: 'pay-BTC-over-Lightning / receive-asset-on-chain has no non-custodial route on this LSP and the custodial submarine (which fronts the LSP\'s own funds) is retired. To buy the asset non-custodially, pay BTC ON-CHAIN and receive the asset over Lightning (the HODL buy: side:buy, hodl:true), or take a supported shape.' });
+          error: 'pay-BTC-over-Lightning / receive-asset-on-chain is now settled by the NON-custodial rail-crossing bridge (a P2P reverse-submarine maker, else the LSP payer leg-bridge), not the custodial submarine (which fronts the LSP\'s own funds). Retry the take with bridge:true (plus maker_btc_rail/maker_asset_rail + offer_id/maker_pubkey + hash_h/taker_seq_claim_pub; the taker mints H and holds P). Or pay BTC ON-CHAIN and receive the asset over Lightning (the HODL buy: side:buy, hodl:true).' });
       }
       const backendReady = execName === 'xsubas' ? subasReady
         : execName === 'xsubas-sell' ? subasSellReady : false;
@@ -3246,37 +3866,110 @@ server.on('upgrade', (req, socket) => {
 
 server.listen(CFG.port, '127.0.0.1', () => {
   console.error(`[lsp] listening http://127.0.0.1:${CFG.port}  asset-rpc ${CFG.hostedAssetRpc}  btc-rpc ${CFG.hostedBtcRpc}  relay ${CFG.relay}`);
+  // Fix 3 — BRING-UP NODE-CAPS CHECK: warm the payer-bridge capability verdict once and log it loudly. A payer
+  // bridge's recoup reads a confirmed NON-wallet maker claim to learn P (needs txindex + unpruned); an incapable
+  // node cannot recoup a maker-claim front, so prepareBridgeLegs REFUSES payer bridges until the node is fixed.
+  // Best-effort (never blocks/fails boot): if SUBAS_BTC_RPC is unset the LSP serves no payer bridges anyway.
+  if (CFG.subasBtcRpc) {
+    payerBridgeNodeCapsOk({ force: true })
+      .then((caps) => {
+        if (caps.ok) console.error('[lsp] payer-bridge node caps OK —', caps.reason);
+        else console.error('[lsp] WARNING: payer-bridge node caps NOT OK — payer bridges will be REFUSED until fixed (txindex=1, prune=0):', caps.reason);
+      })
+      .catch((e) => console.error('[lsp] payer-bridge node-caps check errored (payer bridges refused until it passes):', (e && e.message) || e));
+  }
   // RESUME in-flight BRIDGE jobs (persist-before-broadcast + resumable). A bridged swap whose driver died
   // with the old process is recovered by re-running ONLY the pure driver against its persisted legState —
   // NOT the maker handshake (the maker already locked its BTC HTLC; re-handshaking would lock another).
-  // W2 FRONT-BEFORE-FUND — resume any NON-TERMINAL job whose recoup is wired AND the LSP has already put
-  // value / exposure in flight: either it FRONTED (s.btc.frontHeld — the in-flight hold pay must be
-  // re-attached so the LSP learns P off the settle and recoups) or the asset was RELAYED (s.asset.onchain —
-  // the maker will claim + reveal P). Both are fund-safety-critical: without re-driving, a fronted/relayed
-  // job that died could never recoup. A job that only handshook (no front, no relay) has nothing at stake
-  // and its relay needs the now-gone courier session, so it is left to fail no-loss. (Gating on frontHeld OR
-  // sa.onchain — not merely `interrupted` — also covers a HARD kill that never marked the job 'interrupted'.)
-  // Fund-safety is unchanged: the driver obeys nextBridgeStep exactly. Best-effort + guarded; never fail boot.
+  // Resume any NON-TERMINAL bridged job in which the LSP has real (or crash-strandable) exposure on its BTC
+  // HTLC, in EITHER direction:
+  //   • RECEIVER (sell): it FRONTED (s.btc.frontHeld — re-attach the in-flight hold pay so the LSP learns P
+  //     off the settle and recoups the maker's BTC HTLC) or the asset was RELAYED (s.asset.onchain — the maker
+  //     will claim + reveal P). A mere-handshake job (no front, no relay) has nothing at stake and its relay
+  //     needs the now-gone session, so it is left no-loss.
+  //   • PAYER (buy): it FUNDED the on-chain BTC HTLC (s.btc.htlc) — re-drive to settle the held LN when P is
+  //     public or refund at T_btc. Fund-safety-critical: without it, a crash after the maker claims our BTC
+  //     would never settle the held LN = LSP loss. No maker session needed (P is read on-chain).
+  //   • PAYER crash-mid-broadcast (s.btc.intendedRedeem but NO s.btc.htlc): fundOnchain persists the LSP refund
+  //     key + the intended redeemScript BEFORE the irreversible funding broadcast, and s.htlc only AFTER it. A
+  //     crash/error/reorg in that window leaves the BTC funded on-chain (movable only by our persisted key)
+  //     while the state shows no htlc. Gating solely on s.btc.htlc would STRAND it — so such a payer leg is
+  //     ALSO resumed and its funded output RE-DERIVED from the chain (the authoritative source) before driving.
+  // All re-run ONLY the pure driver against the persisted legState — NOT the maker handshake (re-handshaking
+  // would lock another HTLC). Gating on s.btc.htlc/intendedRedeem (not merely `interrupted`) also covers a HARD
+  // kill that never marked the job 'interrupted'. Fund-safety is unchanged: the driver obeys nextBridgeStep
+  // exactly. Each job resumes in its OWN guarded async IIFE (the payer chain-recover awaits a dry-locate), so
+  // one job's recover/drive never blocks or fails another, and never fails boot.
   for (const [id, job] of jobs) {
+    (async () => {
     try {
-      if (job.rail !== 'bridged') continue;
-      if (job.status === 'settled' || job.status === 'failed') continue;   // terminal — nothing to resume
+      if (job.rail !== 'bridged') return;
+      if (job.status === 'settled' || job.status === 'failed') return;   // terminal — nothing to resume
       const s = job.legState || {};
-      if (!(s.btc && s.btc.htlc && s.btc.verifiedClaimLsp && s.btc.recvNodeId && (s.btc.frontHeld || (s.asset && s.asset.onchain)))) continue;   // fronted or relayed only
+      // Resume on a funded/observed HTLC (either direction) OR a payer leg with a persisted intended
+      // redeemScript but no htlc yet (crash-mid-broadcast — recovered from chain below). Nothing else is at
+      // stake (a mere-handshake receiver relay needs the now-gone session), so it is left no-loss.
+      if (!(s.btc && (s.btc.htlc || (s.btc.lnSide === 'payer' && s.btc.intendedRedeem)))) return;
       const bt = job.bridge_terms || {};
-      const rbody = { side: job.side, asset: job.asset, payRail: 'chain', recvRail: 'ln',
-        maker_btc_rail: 'chain', maker_asset_rail: 'chain', taker_btc_inbound: true,
-        btc_sats: bt.btc_amount, asset_atoms: bt.seq_amount };
+      let rbody;
+      if (s.btc.lnSide === 'payer') {
+        // CRASH-MID-BROADCAST RECOVERY (re-derive from the authoritative source = the chain). The intended
+        // redeemScript is persisted but s.htlc is not, so a crash struck in the broadcast->persist window.
+        // DRY-LOCATE (broadcast nothing) the output already paying our deterministic P2SH and ADOPT it into
+        // s.htlc BEFORE driving — so observe() reads the real HTLC (its funded amount, and onchainKnownFunded,
+        // which arms the transient/reorg guard) and the driver recoups/refunds it, even if the taker's hold is
+        // momentarily unreadable. VERIFY-NOT-TRUST that the located script equals the intended one (never adopt
+        // an HTLC our persisted key cannot refund). If nothing is located (the crash was BEFORE any broadcast
+        // landed, or bitcoind is unreadable), leave s.htlc unset — the driver's own fundOnchain re-locates/
+        // re-funds idempotently (scan-before-broadcast), so recovery is never lost either way. Best-effort.
+        if (!s.btc.htlc && s.btc.intendedRedeem) {
+          try {
+            const located = await fundBridgeHtlcBtc({ claimPub: s.btc.receiverClaimPub, hashH: s.btc.hashH,
+              amountSat: s.btc.amountSat, cltv: s.btc.cltv, refundPub: s.btc.lspRefundPub, locateOnly: true });
+            if (located && located.funded && located.btc_htlc_txid
+                && String(located.btc_htlc_script || '').toLowerCase() === String(s.btc.intendedRedeem).toLowerCase()) {
+              s.btc.htlc = { txid: located.btc_htlc_txid, vout: located.btc_htlc_vout, amount: located.btc_htlc_amount,
+                script: located.btc_htlc_script, cltv: located.btc_locktime, lockedTo: 'receiver' };
+              persistJobs();
+              console.error('[lsp] bridge resume RECOVERED a crash-stranded funded BTC HTLC from chain for', id, located.btc_htlc_txid);
+            } else {
+              console.error('[lsp] bridge resume: no funded BTC HTLC on chain yet for', id, '(intendedRedeem persisted, pre-broadcast crash) — driver fundOnchain will re-locate/re-fund idempotently');
+            }
+          } catch (e) { console.error('[lsp] bridge resume chain-recover skipped for', id, e && e.message); }
+        }
+        // PAYER bridge (BUY): the LSP FUNDED the on-chain BTC HTLC (real exposure), so it MUST re-drive to
+        // recoup — settle the held LN the instant P is public (the taker's asset claim, primary; or the maker's
+        // BTC-HTLC spend, backstop) or REFUND at T_btc. Fund-safety-critical: without re-driving, a crash after
+        // the maker claims our BTC HTLC would leave the held LN unsettled = LSP loss. No maker session is needed
+        // (observe reads P on-chain; the fund is already done). A job that funded but never relayed (no
+        // s.asset.onchain, session gone) can only refund at T_btc — still no-loss. The payer take shape is
+        // payRail 'ln' / recvRail 'chain' (mirror of the receiver's chain/ln).
+        // D — RESUME FROM PERSISTED ON-CHAIN FACTS. Drive btc_sats off the ACTUAL funded amount
+        // (legState.btc.amountSat, with an HTLC-output fallback) — NEVER bridge_terms.btc_amount, which a
+        // 0-price maker could have set to 0 while the LSP still funded the real price (a resume off that would
+        // drive a 0-sat / unbounded leg). fundedBtcSatsForResume encodes exactly that precedence.
+        rbody = { side: job.side || 'buy', asset: job.asset, payRail: 'ln', recvRail: 'chain',
+          maker_btc_rail: 'chain', maker_asset_rail: 'chain', taker_asset_inbound: true,
+          btc_sats: fundedBtcSatsForResume(s.btc), asset_atoms: bt.seq_amount };
+      } else {
+        // RECEIVER bridge (SELL): fronted or relayed only — a mere-handshake job (no recvNodeId/front/relay)
+        // has nothing at stake and its relay needs the gone session, so leave it no-loss.
+        if (!(s.btc.verifiedClaimLsp && s.btc.recvNodeId && (s.btc.frontHeld || (s.asset && s.asset.onchain)))) return;
+        rbody = { side: job.side, asset: job.asset, payRail: 'chain', recvRail: 'ln',
+          maker_btc_rail: 'chain', maker_asset_rail: 'chain', taker_btc_inbound: true,
+          btc_sats: bt.btc_amount, asset_atoms: bt.seq_amount };
+      }
       const match = buildBridgeMatchFromBody(rbody);
       const io = makeBridgeIo({ match, body: rbody, job });
       job.status = 'confirming'; job.interrupted = false; job.error = null; persistJobs();
-      console.error('[lsp] resuming bridged job', id, '(re-driving front+recoup on the persisted maker HTLC)');
+      console.error('[lsp] resuming bridged job', id, `(${s.btc.lnSide || 'receiver'}-side re-drive recoup on the ${s.btc.htlc ? 'persisted' : 'to-be-relocated'} BTC HTLC)`);
       runBridgedSwap({ match, io, driverCfg: { pollMs: 3000, maxTicks: Math.ceil(CFG.mixedTimeoutMs / 3000) } })
         // A resumed run that again exhausts pre-front stays 'interrupted' (resumable on the next boot),
         // not 'failed' — the taker's committed asset must never be stranded by a marking.
         .then((r) => { setJob(id, { ...jobs.get(id), ...(r.ok ? { ok: true, settled: true, status: 'settled', interrupted: false } : (r.interrupted ? { ok: false, status: 'interrupted', interrupted: true, error: `resumed bridged swap not yet settled (pre-front): ${r.reason || 'unknown'}` } : { ok: false, status: 'failed', error: `resumed bridged swap did not settle: ${r.reason || 'unknown'}` })), legs: r.legs, done_ms: Date.now() }); })
         .catch((e) => { setJob(id, { ...jobs.get(id), ok: false, status: 'failed', error: String((e && e.message) || e), done_ms: Date.now() }); });
     } catch (e) { console.error('[lsp] bridge resume skipped for', id, e && e.message); }
+    })();
   }
   // T10 restart-invisibility: the per-user lightningd nodes are spawned DETACHED, so they SURVIVE an
   // LSP restart — only our in-process view of them is lost. Proactively re-attach on boot (getinfo is a

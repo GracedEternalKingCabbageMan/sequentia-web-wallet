@@ -35,6 +35,58 @@
 
 /** @typedef {'receiver'|'payer'} LnSide */
 
+// ============================================================================
+// PAYER-BRIDGE REFUND/HOLD WINDOW SIZING — the two named constants that COMPOSE the hold buffer, kept
+// module-local so `holdBuffer` is DERIVED from them and the invariant
+//
+//     holdBuffer === refundFinalityConfs + refundConfirmBudget
+//
+// can never silently drift into a too-tight window. The window is the SLACK the incoming taker hold keeps
+// ABOVE T_btc (B3: T_btc <= holdCLTV - holdBuffer). If no P surfaces by T_btc the LSP refunds its own BTC HTLC
+// on-chain, then KEEPS the taker hold ALIVE (stepPayerLn (5)) until that refund BURIES — because a conflicting
+// maker CLAIM can still swap in over a shallow refund (RBF/reorg) and the LSP recoups it by settling the
+// STILL-LIVE hold with the revealed P. So the hold must OUTLIVE the ENTIRE refund lifecycle: broadcast at
+// T_btc -> CONFIRM (refundConfirmBudget blocks) -> BURY refundFinalityConfs deep. The slack that spans both
+// IS holdBuffer.
+// ----------------------------------------------------------------------------
+// refundFinalityConfs — the BTC FINALITY DEPTH (confirmations) that makes the LSP's OWN refund of its funded
+// BTC HTLC a TERMINAL fate. A CLAIM reveals P immutably and is safe to act on at ANY depth, but a REFUND is only
+// terminal once BURIED to a CONVENTIONAL Bitcoin finality: while the LSP's refund spend is shallower than this, a
+// conflicting maker CLAIM can still swap in over it (RBF a 0-conf refund; a reorg < this depth re-mines the claim
+// instead), which would take the LSP's BTC HTLC with no recoup if the hold had already been released. So a
+// shallow refund is NON-terminal (stepPayerLn (5) keeps the taker hold ALIVE and watches); only
+// spendConfs >= refundFinalityConfs releases it. 6 — a conventional BTC finality (the prior 2 was too shallow: a
+// 2-deep refund can still be reorged out in favour of a maker claim). Conservatively > minRecoupConf. (Amount-
+// scaling to a DEEPER finality for large-value legs is deliberately DEFERRED: it would need a proportionally
+// larger holdBuffer AND a larger taker-minted hold, which the current handshake does not size from the BTC-leg
+// amount — so a flat, conventional 6 is what is safe with the present hold sizing; revisit alongside a hold-
+// sizing change.)
+const REFUND_FINALITY_CONFS = 6;
+// refundConfirmBudget — a GENEROUS confirmation budget (BTC blocks) for the LSP's T_btc refund to get MINED under
+// RBF, BEFORE the refundFinalityConfs-deep burial-wait begins. Round-10's RBF bumping (sizeRefundFee sized off
+// estimatesmartfee, then 'refund-bump' escalation, targeting ~3 blocks) makes an honestly-fee'd refund confirm
+// fast, so 12 is a comfortable ~4x congestion cushion over that target — NOT a tight fit. Sizing it EXPLICITLY (vs
+// the old "+ a few blocks of latency" hand-wave that left holdBuffer at 8 == refundFinalityConfs+2, no real
+// confirm room) is the whole point of this round: an adversarial maker pins T_btc to exactly holdCLTV - holdBuffer
+// (B3's ceiling), so holdBuffer IS the worst-case wall-clock window a stuck-then-buried refund gets. 12 blocks of
+// confirm room + 6 of burial = a real, reasoned margin, not a coincidental one.
+const REFUND_CONFIRM_BUDGET = 12;
+
+// RESIDUAL RISK (known, mitigated — NOT a logic bug). A FIXED hold window (holdBuffer blocks) versus real
+// on-chain finality carries an IRREDUCIBLE residual: under SUSTAINED, multi-hour congestion where even a
+// top-of-mempool, RBF-bumped refund cannot CONFIRM + BURY inside the window, the LSP's refund stalls past the
+// taker hold, the hold fails back to the taker, and a maker claim can then take the LSP's BTC HTLC (a front
+// loss BORNE BY THE LSP — never by the taker, whose BTC was only ever HELD, and never by the maker). We MITIGATE
+// it, we do not eliminate it: (a) a GENEROUS, reasoned window — refundConfirmBudget=12 is ~4x the ~3-block RBF
+// target, so only congestion that starves a top-fee tx for 12+ blocks even bites; (b) RBF escalation from the
+// first post-refund tick (refundBumpWithin, sizeRefundFee, the 'refund-bump' action); (c) the LSP's concurrent-
+// exposure caps bound the worst case. This is the SAME known limitation every HTLC / Lightning system lives with
+// (a fixed CLTV delta vs. on-chain confirmation latency — an LN forwarding node can likewise lose an HTLC if it
+// cannot confirm a timeout-claim before the incoming CLTV under sustained congestion). Chasing it to ZERO would
+// need an UNBOUNDED window, which is itself a liveness / capital-lock failure. So: size it generously (done here),
+// document it (here + doc/sequentia/rail-crossing-p2p-lsp-design.md), and STOP — do not treat the residual as a
+// bug to be closed.
+
 // Default block margins (caller may override per chain/leg). Deliberately conservative.
 export const BRIDGE_DEFAULTS = Object.freeze({
   // Min CLTV runway (blocks) the on-chain HTLC must have BEYOND the current tip before the LSP fronts,
@@ -42,22 +94,85 @@ export const BRIDGE_DEFAULTS = Object.freeze({
   frontRunway: 6,
   // The LSP must recoup (claim/refund) at least this many blocks BEFORE the on-chain CLTV, never racing it.
   claimMargin: 2,
-  // lnSide='payer': the on-chain HTLC CLTV must be at least this many blocks INSIDE the LN hold's
-  // remaining lifetime, so an unclaimed on-chain HTLC refunds to the LSP before the LN hold is at risk.
-  holdBuffer: 6,
+  // lnSide='payer': the on-chain HTLC CLTV (T_btc) must be at least this many blocks INSIDE the LN hold's
+  // remaining lifetime (B3: T_btc <= holdCLTV - holdBuffer). It bounds the SLACK the incoming hold keeps ABOVE
+  // T_btc — an adversarial maker can push T_btc as high as holdCLTV - holdBuffer, so holdBuffer IS the worst-case
+  // window a no-reveal refund gets to confirm THEN bury before the hold is at risk. DERIVED, NOT hand-set:
+  //   holdBuffer = refundFinalityConfs (6) + refundConfirmBudget (12) = 18
+  // — 12 BTC blocks for the refund to CONFIRM under RBF + 6 to BURY to finality. The derivation (see the two
+  // module consts above) makes the coupling structural: the confirm budget and the finality depth can never drift
+  // out of the window, because holdBuffer is literally their sum (asserted below). The honest fleet rests T_btc
+  // well BELOW this ceiling (seqdex BtcLocktimeDelta 180 vs a ~210-block hold => ~30 blocks below, clearing B3
+  // with headroom; see checkPayerFundGate + the seqdex maker's BtcLocktimeDelta comment).
+  holdBuffer: REFUND_FINALITY_CONFS + REFUND_CONFIRM_BUDGET,
+  // lnSide='payer' FORWARD bridge (B1 — checkPayerFundGate): the maker-claim runway. T_btc must be at least
+  // this many BTC blocks BEYOND the BTC-height that covers T_seq's wall-clock, so the maker still has room to
+  // claim the LSP's BTC HTLC with P AFTER the taker reveals P at ~T_seq — i.e. T_btc's wall-clock is strictly
+  // later than T_seq's. Without it a wall-clock inversion (T_btc <= T_seq) lets the LSP refund its BTC before
+  // the taker reveals P; this margin forbids that. Conservatively >= claimMargin.
+  makerClaimRunwayBlocks: 6,
   // lnSide='receiver': the COUNTERPARTY's on-chain HTLC (the LSP's recoup target) must have at least this
   // many confirmations before the LSP fronts irreversible LN against it. A 0-conf recoup target can be
   // RBF'd / double-spent out from under the front by a malicious counterparty (who mints P), letting them
   // take the fronted LN AND reclaim their on-chain funds. 1 confirmation removes the fee-bump/RBF path.
   minRecoupConf: 1,
+  // lnSide='payer' FORWARD bridge: the BTC finality depth that makes the LSP's OWN refund TERMINAL. Sized +
+  // documented at REFUND_FINALITY_CONFS above; holdBuffer is DERIVED as this + refundConfirmBudget.
+  refundFinalityConfs: REFUND_FINALITY_CONFS,
+  // lnSide='payer' FORWARD bridge: the confirm budget (BTC blocks) for the refund to get MINED under RBF before
+  // the burial-wait. Sized + documented at REFUND_CONFIRM_BUDGET above; holdBuffer is DERIVED as refundFinality-
+  // Confs + this. Surfaced on the object so a caller can override the pair together (the invariant is asserted).
+  refundConfirmBudget: REFUND_CONFIRM_BUDGET,
+  // lnSide='payer' FORWARD bridge (Fix 2 — REFUND FEE ADEQUACY / RBF re-bump): once the LSP has broadcast its own
+  // refund at T_btc it must CONFIRM + BURY inside the taker hold's remaining life, so an UNDER-fee'd refund that
+  // sits 0-conf must be FEE-BUMPED (RBF) until it confirms — else the refund stalls past the hold, the hold fails
+  // back to the taker, and a maker claim then takes the LSP's BTC HTLC (full front loss). stepPayerLn emits
+  // 'refund-bump' while the refund is 0-conf (spendConfs === 0, still mempool-replaceable), no P is public (a
+  // public P means the maker is entitled — let its claim win, never race it), and the hold's remaining life is
+  // within this many BTC blocks (the danger window). MUST stay >= holdBuffer (asserted below) so the TIGHTEST
+  // possible gap — an adversarial maker resting T_btc at the B3 ceiling, gap == holdBuffer — still gets the FULL
+  // confirm+bury budget of bumping from the first post-refund tick. Set to 48 so it ALSO comfortably covers the
+  // honest fleet's whole T_btc-below-hold gap range (from the B3 ceiling ~holdBuffer up to the reorg+settle margin
+  // in BTC blocks, ~60 at the B1 floor; the deployed maker's ~30) — bumping proactively for any honest resting.
+  // Harmless if larger: the io re-broadcasts at most once per new BTC block (persisted lastBumpTip) and is a no-op
+  // when the current fee already suffices; a mined-but-shallow refund (spendConfs >= 1) is NOT bumpable (RBF
+  // cannot replace a confirmed tx) so it falls through to 'wait' (watch for burial / a conflicting claim).
+  refundBumpWithin: 48,
 });
+
+// INVARIANTS (belt-and-suspenders; holdBuffer is already DERIVED above, but a future edit that hard-codes it — or
+// a caller override that violates the coupling — would silently re-open the too-tight window this round closes):
+//   (1) holdBuffer === refundFinalityConfs + refundConfirmBudget — the slack spans CONFIRM then BURY, exactly.
+//   (2) refundBumpWithin >= holdBuffer — the tightest gap (an adversarial T_btc at the B3 ceiling) still gets the
+//       full confirm+bury budget of RBF bumping; if it were smaller a stuck refund at that gap would go un-bumped.
+if (BRIDGE_DEFAULTS.holdBuffer !== BRIDGE_DEFAULTS.refundFinalityConfs + BRIDGE_DEFAULTS.refundConfirmBudget)
+  throw new Error(`BRIDGE_DEFAULTS invariant: holdBuffer (${BRIDGE_DEFAULTS.holdBuffer}) must equal refundFinalityConfs (${BRIDGE_DEFAULTS.refundFinalityConfs}) + refundConfirmBudget (${BRIDGE_DEFAULTS.refundConfirmBudget}) — the refund/hold window must span CONFIRM then BURY`);
+if (BRIDGE_DEFAULTS.refundBumpWithin < BRIDGE_DEFAULTS.holdBuffer)
+  throw new Error(`BRIDGE_DEFAULTS invariant: refundBumpWithin (${BRIDGE_DEFAULTS.refundBumpWithin}) must be >= holdBuffer (${BRIDGE_DEFAULTS.holdBuffer}) — the tightest gap must still get the full confirm+bury budget of RBF bumping`);
 
 /**
  * Decide the next safe action for ONE bridged leg.
  * @param {{lnSide:LnSide, amountSat:number, lspClaimPub?:string, receiverClaimPub?:string}} leg
  * @param {{
  *   tip:number,                       // current block height of the ON-CHAIN end's chain
- *   onchain:null|{ funded:boolean, amountSat:number, cltv:number, lockedToLsp?:boolean, lockedToReceiver?:boolean, spent?:boolean, refundable?:boolean },
+ *   onchain:null|{ funded:boolean, amountSat:number, cltv:number, lockedToLsp?:boolean, lockedToReceiver?:boolean, spent?:boolean, refundable?:boolean,
+ *                  spendStatus?:'unspent'|'spent_claim'|'spent_refund'|'uncertain', spendConfs?:number },
+ *                                     // FORWARD-cross PAYER leg only (CHAIN-TRUTH recoup/refund oracle): the
+ *                                     // AUTHORITATIVE on-chain spend classification of the LSP's OWN funded BTC
+ *                                     // HTLC, from the seqdex `xsubas-htlc-spend-status` classifier (surfaced by
+ *                                     // observe). stepPayerLn keys the recoup-vs-refund decision ENTIRELY on this
+ *                                     // fact — NEVER on the racy persisted s.refunded intent flag. 'spent_claim'
+ *                                     // (the maker got paid, P revealed) drives recoup-settle at ANY depth (a claim
+ *                                     // is immutable once revealed). 'spent_refund' (the LSP reclaimed its BTC =>
+ *                                     // the maker is unpaid) RELEASES the taker hold and forbids a recoup double-dip
+ *                                     // — but ONLY once it is BURIED (spendConfs >= refundFinalityConfs). 'unspent' defers to
+ *                                     // the P-public / T_btc decision; 'uncertain' (or absent over a funded leg)
+ *                                     // FAILS CLOSED to 'wait' (neither recoup nor release until the read is
+ *                                     // definitive). spendConfs = the spender's confirmation DEPTH (0 when
+ *                                     // unspent/mempool/uncertain); it makes the REFUND-terminal decision
+ *                                     // reorg-aware: a shallow refund is NON-terminal (a conflicting claim can still
+ *                                     // swap in — RBF/reorg), so the hold stays alive until it buries. A crash at
+ *                                     // any point recovers because the decision re-derives from the chain each tick.
  *   ln:{ registered:boolean, held:boolean, settled:boolean, preimage:string|null, expiryBlocks?:number },
  *   swapLocked?:boolean,              // WHOLE-SWAP atomicity: are ALL OTHER legs of this swap locked?
  *                                     // Undefined => true (single-leg / back-compat). When false, the LSP
@@ -77,9 +192,44 @@ export const BRIDGE_DEFAULTS = Object.freeze({
  *                                     // is withheld until this is true (===false withholds; undefined/true =>
  *                                     // ready, back-compat) — it REPLACES swapLocked for a crossLock leg, so
  *                                     // the LSP fronts BEFORE the taker exposes its asset (see stepReceiverLn).
+ *   crossFund?:boolean,               // FORWARD-cross PAYER leg only (B — FUND-BEFORE-LOCK): this is the
+ *                                     // taker-holds-P payer bridge where the maker's asset leg locks ONLY
+ *                                     // AFTER the LSP funds its BTC HTLC + relays XcBtcLegFunded. It is the
+ *                                     // MIRROR of the receiver leg's crossLock/recvReady: it REPLACES the
+ *                                     // swapLocked gate for the FUND (gating on swapLocked would deadlock —
+ *                                     // the asset never locks until after the fund) since funding reveals
+ *                                     // nothing (P is the taker's, exposed only when it claims the asset).
+ *                                     // The fund-time CLTV ordering is enforced by checkPayerFundGate in the
+ *                                     // io before funding. Absent => the generic swapLocked gate applies.
+ *   relayPending?:boolean,            // FORWARD-cross PAYER leg only (B — RESUMABLE RELAY): the BTC HTLC is
+ *                                     // FUNDED but the maker's asset-leg lock/relay (XcBtcLegFunded ->
+ *                                     // XcSeqLegLocked -> on-chain verify -> hand-off to the taker) is NOT yet
+ *                                     // complete (io: crossFund && s.htlc && !s.forwardRelayDone). The
+ *                                     // fund-onchain io action ALSO drives that (idempotent) relay, so while it
+ *                                     // is pending nextBridgeStep RE-RETURNS fund-onchain — the driver re-drives
+ *                                     // it every tick until it completes (a one-shot maker-reply timeout, or an
+ *                                     // LSP restart, must not strand a funded leg). It only fires when no P is
+ *                                     // public, the HTLC is unspent, and T_btc is not yet reached (those take
+ *                                     // priority: recoup-settle / refund-onchain). Absent => no relay to resume.
+ *   onchainKnownFunded?:boolean,      // FORWARD-cross PAYER leg only (transient-outage / reorg-eviction guard):
+ *                                     // the driver's PERSISTED state records this leg's BTC HTLC as funded
+ *                                     // (s.htlc.txid), so a tick whose on-chain read reports NOT-funded — a
+ *                                     // null/unreadable read (momentary bitcoind outage) OR onchain.funded===false
+ *                                     // (a reorg that evicted the funding tx) — is KNOWN to be transient over an
+ *                                     // already-funded leg: stepPayerLn WAITS instead of treating it as "not
+ *                                     // funded" (no fail-close / no re-fund; a re-fund would double-broadcast).
+ *                                     // A funded payer leg is never dropped on a transient read or a reorg.
+ *   refunded?:boolean,                // FORWARD-cross PAYER leg only — DEMOTED to a BROADCAST-DEDUP HINT ONLY.
+ *                                     // stepPayerLn NO LONGER reads this flag: the recoup/refund/terminal decision
+ *                                     // keys ENTIRELY on obs.onchain.spendStatus (chain truth). It is racy across
+ *                                     // the persist/broadcast window (crash-before-broadcast => stale true;
+ *                                     // RPC-error-after-broadcast => stale false), which is exactly the round-6 hole
+ *                                     // this rewrite closes. It survives on the leg state only so runPayerRefundOnce
+ *                                     // can dedup a re-broadcast; the authoritative no-double-dip guard is the
+ *                                     // on-chain 'spent_refund' classification, not this intent.
  * }} obs
  * @param {object} [cfg] overrides for BRIDGE_DEFAULTS
- * @returns {{action:'wait'|'front-ln'|'fund-onchain'|'recoup-claim'|'recoup-settle'|'refund-onchain'|'fail-closed'|'done', reason:string}}
+ * @returns {{action:'wait'|'front-ln'|'fund-onchain'|'recoup-claim'|'recoup-settle'|'refund-onchain'|'refund-bump'|'fail-closed'|'done', reason:string}}
  */
 export function nextBridgeStep(leg, obs, cfg = {}) {
   if (!leg || (leg.lnSide !== 'receiver' && leg.lnSide !== 'payer'))
@@ -510,6 +660,109 @@ export function takerHoldSettleableToTseq({ seqTip, seqRefundHeight, holdExpiryS
     reason: `hold (expiry ${Math.round(holdExpirySecs)}s${minFinalCltvBlocks !== undefined ? `, min-final-CLTV ${minFinalCltvBlocks} blocks` : ''}) stays settleable until after T_seq — safe` };
 }
 
+// ============================================================================
+// B — PAYER-SIDE FUND-TIME GATE (the LSP payer leg-bridge, buy: taker pays BTC over LN, receives the asset
+// on-chain). The MIRROR of checkBridgeLocktimeOrdering/verifyFrontRouteExpiry, for the direction where the
+// LSP RECEIVES the taker's BTC-LN (a HELD hold on the taker's H, at the LSP's own node) and FUNDS an on-chain
+// BTC HTLC to the maker. Both HTLCs live on Bitcoin (the incoming hold's HTLC and the LSP's on-chain HTLC),
+// so this is pure BTC-block arithmetic — no second chain, no divisor drift.
+//
+// The taker mints H + holds P and claims the maker's asset leg with P (revealing it); the maker reads P and
+// claims the LSP's BTC HTLC; the LSP reads P (from the asset claim, primary; its BTC HTLC spend, backstop)
+// and SETTLES the held hold to recoup exactly its fund. So BEFORE the LSP funds on-chain it must verify, from
+// the ACTUAL committed incoming-HTLC CLTV (holdinvoicelookup/listhtlcs — never a merely-requested value):
+//   (B0) HELD AMOUNT covers the ordered price: the SUM of the taker's incoming 'in' HTLCs on H (from
+//        listhtlcs, summed by the io) is at least the ordered BTC price (orderedAmountSat). The holdinvoice
+//        plugin marks a hold HELD on the FIRST incoming HTLC regardless of amount, so a 1-sat pay would else
+//        trip funding — the LSP would front the full BTC price for a token payment. Mirror stepReceiverLn's
+//        oc.amountSat < leg.amountSat fail-close: fund ONLY once the FULL price is held. (Only enforced when
+//        the caller supplies the amounts; fundOnchain always does. The pure CLTV-only tests omit them.)
+//   (B1) T_btc's WALL-CLOCK is strictly LATER than T_seq's + a maker-claim runway: convert the T_seq window to
+//        BTC blocks with the SAME conservative slow-SEQ/fast-BTC divisors requiredTakerHold uses, and require
+//        T_btc >= that BTC-height + makerClaimRunwayBlocks. Otherwise a wall-clock inversion (a maker/self-trader
+//        sets T_btc <= T_seq in wall-clock) lets the LSP's BTC HTLC hit its refund height BEFORE the taker
+//        reveals P at ~T_seq — the LSP could refund its BTC, and a late P then double-recoups (or strands the
+//        maker) — an inversion B2/B3 alone do NOT forbid (they only bound T_btc from ABOVE, via the hold). This
+//        is the payer analog of checkBridgeLocktimeOrdering, enforced by the LSP (verify-not-trust the maker).
+//   (B2) the incoming hold covers T_seq: its committed CLTV is at least requiredTakerHold(T_seq) blocks above
+//        the tip, so the hold stays settleable until strictly after the maker's latest asset claim + margin —
+//        else the maker (or a self-trader) waits the hold out, THEN reveals P, and the LSP's dead hold recoups
+//        nothing while its on-chain BTC HTLC is claimed. (requiredTakerHold sizes hold_expiry AND this CLTV.)
+//   (B3) T_btc matures INSIDE the hold's remaining life (holdBuffer): the LSP's on-chain HTLC (CLTV = T_btc)
+//        refunds to the LSP strictly before the incoming hold is at risk, so a NO-reveal ends double-no-loss
+//        (BTC refunds to the LSP; the hold expires to the taker) — the LSP is never forced to settle a hold
+//        with a P it does not have.
+// B1 + B3 together COUPLE T_btc into a non-empty window ABOVE the T_seq-cover height (maker runway) and BELOW
+// the hold's refund-safe ceiling — the coupled-locktime relation T_seq < T_btc < hold, verified by the LSP.
+// FAIL CLOSED on any missing/invalid/timestamp/degenerate input (never fund on an unverifiable ordering). In
+// the payer flow the taker's BTC is merely HELD (nothing captured), so a fund-time refusal is no-loss.
+/**
+ * @param {{
+ *   btcTip:number, incomingHtlcExpiry:number,   // the LSP node's live BTC tip + the ACTUAL committed CLTV of the taker's incoming hold HTLC on H
+ *   btcRefundHeight:number,                       // T_btc — the CLTV the LSP will set on the on-chain BTC HTLC it funds (its refund height)
+ *   seqTip:number, seqRefundHeight:number,        // the maker's asset HTLC: live SEQ tip + its refund height T_seq (sizes requiredTakerHold)
+ *   heldAmountSat?:number, orderedAmountSat?:number,  // (B0) SUM of the taker's incoming HTLCs on H (io-summed) vs the ordered BTC price; enforced only when supplied
+ *   cfg?:object                                   // overrides for BRIDGE_DEFAULTS.holdBuffer/makerClaimRunwayBlocks + HOLD_LIFE_DEFAULTS (threaded to requiredTakerHold)
+ * }} args
+ * @returns {{ ok:boolean, reason:string, requiredTakerBlocks:number, incomingHoldBlocks:number, tBtcInsideHold:boolean, tSeqCoverHeight:number }}
+ */
+export function checkPayerFundGate({ btcTip, incomingHtlcExpiry, btcRefundHeight, seqTip, seqRefundHeight, heldAmountSat, orderedAmountSat, cfg = {} } = {}) {
+  const c = { ...BRIDGE_DEFAULTS, ...cfg };          // holdBuffer + makerClaimRunwayBlocks live here
+  const hlc = { ...HOLD_LIFE_DEFAULTS, ...cfg };      // the slow-SEQ / fast-BTC divisors (shared with requiredTakerHold)
+  const fail = (reason) => ({ ok: false, reason, requiredTakerBlocks: NaN, incomingHoldBlocks: NaN, tBtcInsideHold: false, tSeqCoverHeight: NaN });
+  for (const [k, v] of Object.entries({ btcTip, incomingHtlcExpiry, btcRefundHeight, seqTip, seqRefundHeight })) {
+    if (!Number.isFinite(v)) return fail(`payer fund gate: ${k} is not a finite number — cannot verify the hold covers T_seq/T_btc, fail closed (nothing funded)`);
+  }
+  // A CLTV height >= LOCKTIME_THRESHOLD is a UNIX TIMESTAMP, not a block height; the arithmetic below would be
+  // nonsense (and a timestamp would make "blocks" a huge bogus number). Assert height-ness on every counterparty
+  // -influenced height (the incoming hold's CLTV, T_btc, T_seq). Tips come from getinfo/getblockcount (heights).
+  for (const [k, v] of Object.entries({ incomingHtlcExpiry, btcRefundHeight, seqRefundHeight })) {
+    if (v >= LOCKTIME_THRESHOLD) return fail(`payer fund gate: ${k} ${v} is a UNIX TIMESTAMP (>= ${LOCKTIME_THRESHOLD}), not a block height — fail closed`);
+  }
+  // (B0) HELD-AMOUNT gate — enforced only when the caller supplies the amounts (fundOnchain always does; the
+  // pure CLTV-only tests omit them). holdinvoice marks HELD on the first incoming HTLC regardless of amount, so
+  // a 1-sat pay must NOT trip funding: require the SUMMED incoming HTLCs on H to cover the ordered BTC price.
+  if (orderedAmountSat !== undefined || heldAmountSat !== undefined) {
+    if (!Number.isFinite(orderedAmountSat) || orderedAmountSat <= 0)
+      return fail(`payer fund gate (B0): the ordered BTC price is not a positive number (got ${JSON.stringify(orderedAmountSat)}) — cannot bound the held-amount check, fail closed (nothing funded)`);
+    if (!Number.isFinite(heldAmountSat) || heldAmountSat < orderedAmountSat)
+      return { ok: false, requiredTakerBlocks: NaN, incomingHoldBlocks: NaN, tBtcInsideHold: false, tSeqCoverHeight: NaN,
+        reason: `payer fund gate (B0): the taker's HELD BTC-LN totals ${Number.isFinite(heldAmountSat) ? heldAmountSat : JSON.stringify(heldAmountSat)} sat across its incoming HTLCs on H, below the ordered ${orderedAmountSat} sat — holdinvoice marks HELD on the first HTLC regardless of amount, so fund the maker's BTC leg ONLY once the FULL price is held. Fail closed (stay unfunded).` };
+  }
+  // The on-chain BTC HTLC we will fund must not be refundable the instant it is funded.
+  if (btcRefundHeight <= btcTip) return fail(`payer fund gate: T_btc ${btcRefundHeight} <= tip ${btcTip} — the BTC HTLC would be refundable immediately, refuse to fund`);
+  // requiredTakerHold enforces the T_seq min/max bound + LN max-CLTV feasibility, so a collapsed/too-far/
+  // infeasible T_seq fails closed right here (before B1/B2/B3). It also yields the T_seq -> BTC-block conversion.
+  const req = requiredTakerHold({ seqTip, seqRefundHeight, cfg });
+  if (!req.ok) return fail(`payer fund gate: ${req.reason}`);
+  const requiredTakerBlocks = req.minFinalCltvBlocks;
+  const incomingHoldBlocks = incomingHtlcExpiry - btcTip;
+  // (B1) T_btc WALL-CLOCK ORDERING (the payer analog of checkBridgeLocktimeOrdering). Convert the T_seq window
+  // to BTC blocks with the SAME slow-SEQ / fast-BTC divisors requiredTakerHold uses — the earliest BTC-block
+  // count by which T_seq's wall-clock can arrive — and require T_btc to sit at least makerClaimRunwayBlocks
+  // beyond it. This is a RAW conversion (no reorg/settle margins, so it stays below requiredTakerBlocks and
+  // leaves a non-empty window with B3), giving the maker room to claim the LSP's BTC with P AFTER the taker
+  // reveals P at ~T_seq. A T_btc below this (a wall-clock inversion) is refused BEFORE anything is funded.
+  const tSeqBtcBlocks = Math.ceil(Math.max(0, seqRefundHeight - seqTip) * hlc.seqSecsPerBlock / hlc.fastBtcSecsPerBlock);
+  const tSeqCoverHeight = btcTip + tSeqBtcBlocks;
+  const tBtcOrderingFloor = tSeqCoverHeight + c.makerClaimRunwayBlocks;
+  if (btcRefundHeight < tBtcOrderingFloor)
+    return { ok: false, requiredTakerBlocks, incomingHoldBlocks, tBtcInsideHold: false, tSeqCoverHeight,
+      reason: `payer fund gate (B1): T_btc ${btcRefundHeight} is below the wall-clock ordering floor ${tBtcOrderingFloor} `
+            + `(T_seq ${seqRefundHeight} covers ~${tSeqBtcBlocks} BTC blocks from tip ${btcTip} under slow-SEQ/fast-BTC, + maker-claim runway ${c.makerClaimRunwayBlocks}) — a T_btc this small is a wall-clock inversion (T_btc <= T_seq) that lets the LSP refund its BTC before the taker reveals P at ~T_seq. Refuse to fund (fail closed, nothing at stake).` };
+  // (B2) the incoming hold must cover T_seq.
+  if (incomingHoldBlocks < requiredTakerBlocks)
+    return { ok: false, requiredTakerBlocks, incomingHoldBlocks, tBtcInsideHold: false, tSeqCoverHeight,
+      reason: `payer fund gate (B2): the taker's incoming BTC-LN hold gives only ${incomingHoldBlocks} BTC blocks (committed CLTV ${incomingHtlcExpiry} - tip ${btcTip}), below the ${requiredTakerBlocks} needed to stay settleable until after T_seq (${seqRefundHeight}) under conservative-fast BTC — the maker could reveal P after the hold dies. Fail closed (nothing funded).` };
+  // (B3) T_btc must mature inside the hold's remaining life (holdBuffer blocks of margin).
+  const tBtcInsideHold = btcRefundHeight <= incomingHtlcExpiry - c.holdBuffer;
+  if (!tBtcInsideHold)
+    return { ok: false, requiredTakerBlocks, incomingHoldBlocks, tBtcInsideHold: false, tSeqCoverHeight,
+      reason: `payer fund gate (B3): T_btc ${btcRefundHeight} is NOT inside the incoming hold's life (needs <= hold CLTV ${incomingHtlcExpiry} - holdBuffer ${c.holdBuffer} = ${incomingHtlcExpiry - c.holdBuffer}) — a no-reveal could leave the LSP unable to refund on-chain before the hold is at risk. Fail closed (nothing funded).` };
+  return { ok: true, requiredTakerBlocks, incomingHoldBlocks, tBtcInsideHold: true, tSeqCoverHeight,
+    reason: `payer fund gate: held amount covers the price, T_seq < T_btc < hold — incoming hold covers T_seq (${incomingHoldBlocks} >= ${requiredTakerBlocks} BTC blocks), T_btc ${btcRefundHeight} is beyond the T_seq wall-clock floor ${tBtcOrderingFloor} (maker runway) AND matures inside the hold (<= ${incomingHtlcExpiry - c.holdBuffer}) — safe to fund the on-chain BTC HTLC` };
+}
+
 // lnSide='receiver': LSP pays the receiver's LN, claims the payer's on-chain HTLC. The LSP's exposure is
 // the LN it fronts; its recoup is the on-chain claim. Order everything so the recoup is secured first.
 function stepReceiverLn(leg, obs, c) {
@@ -596,25 +849,307 @@ function stepPayerLn(leg, obs, c) {
   const oc = obs.onchain;
   // Terminal: LN settled (recouped) — nothing more to do here.
   if (obs.ln.settled) return { action: 'done', reason: 'LN hold settled with P — our on-chain fund recouped' };
-  // The receiver claimed the on-chain HTLC (revealed P) -> settle the held LN NOW to recoup.
-  if (oc && oc.spent && obs.ln.preimage) return { action: 'recoup-settle', reason: 'receiver claimed on-chain (P revealed) — settle the held LN to recoup' };
-  if (oc && oc.spent && !obs.ln.preimage) return { action: 'wait', reason: 'on-chain HTLC spent but P not yet read — read the claim tx witness for P, then settle the LN' };
-  // The receiver never claimed and the on-chain CLTV matured -> refund our on-chain HTLC; the LN hold
-  // returns to the payer on its own. Both no-loss.
-  if (oc && oc.funded && !oc.spent && obs.tip >= oc.cltv) return { action: 'refund-onchain', reason: 'on-chain HTLC CLTV reached with no claim — refund it (LN hold returns to the payer, no loss)' };
-  // Not yet funded on-chain: gate hard on the payer's LN being HELD (our recoup) first.
+
+  // ============================================================================
+  // CHAIN-TRUTH recoup/refund decision (STRUCTURAL FIX, round 7). Once OUR BTC HTLC is FUNDED, the
+  // recoup-vs-refund-vs-release choice keys ENTIRELY on the AUTHORITATIVE on-chain spend classification
+  // (obs.onchain.spendStatus, from the seqdex xsubas-htlc-spend-status classifier) — NEVER on the racy
+  // persisted s.refunded intent flag (whose stale-true after a crash-before-broadcast, or stale-false
+  // after an RPC-error-after-broadcast, was the round-6 fund-loss hole).
+  //
+  // INVARIANT: the LSP's BTC HTLC has EXACTLY ONE spend.
+  //   - REFUND/CLTV branch (the LSP reclaimed its BTC => the maker is UNPAID) => RELEASE the taker hold
+  //     (let it expire / cancel), NEVER recoup-settle. This is the authoritative no-double-dip guard.
+  //   - CLAIM branch, spender reveals P (the maker got PAID) => recoup-settle the taker hold with P.
+  //   - Before any spend confirms: P public (the taker claimed the maker asset leg) => recoup + never
+  //     refund; T_btc passed with no P => refund. Uncertain => fail closed (wait, re-observe).
+  // A crash at ANY point recovers because this re-derives from the chain each tick.
+  //
+  // ORDERING (round-10 Fix 1 — RECOUP NEVER AFTER REFUND): the spend-status classification is decided
+  // STRICTLY before any P-public inference. Once the classifier reports EITHER refund fate — BURIED (1) or
+  // SHALLOW (4) — the LSP has already reclaimed (or is reclaiming) its BTC on the refund branch, so it must
+  // NEVER also recoup-settle the hold, EVEN IF P later goes public. The prior ordering ran the pPublic recoup
+  // branch AHEAD of the shallow-refund branch, so a shallow-but-CONFIRMED refund (spendConfs 1..finality-1)
+  // plus a late public P double-dipped: it kept the (near-certain-to-bury) refund AND settled the hold, robbing
+  // the maker. Now pPublic only drives a recoup on a DEFINITIVELY-UNSPENT HTLC (5); any spent_refund waits for
+  // chain truth (burial => done, or a conflicting spent_claim swapping in => recoup at (2)).
+  // ============================================================================
+  if (oc && oc.funded) {
+    const spend = oc.spendStatus;      // 'unspent'|'spent_claim'|'spent_refund'|'uncertain'|undefined
+    // BURIAL DEPTH of the LSP's OWN refund spend (from the classifier). A CLAIM reveals P immutably and is
+    // safe to act on at ANY depth; a REFUND is a TERMINAL fate ONLY once BURIED to a conventional BTC finality
+    // (a 0-conf/shallow refund can be replaced by a conflicting maker CLAIM — RBF the unconfirmed refund, or a
+    // reorg < this depth re-mines the claim). Absent/non-finite => 0 (SHALLOW): the fail-safe direction (keep
+    // watching, never prematurely release).
+    const spendConfs = Number.isFinite(oc.spendConfs) ? oc.spendConfs : 0;
+    const buriedRefund = spend === 'spent_refund' && spendConfs >= c.refundFinalityConfs;
+    const pPublic = !!obs.ln.preimage; // P public via the maker asset-leg claim (sa.onchain, primary) or a BTC claim witness (backstop)
+    // Remaining life (BTC blocks) of the taker's held incoming HTLC — the deadline the refund must confirm
+    // inside (Fix 2). Infinity when unknown (holdinvoicelookup/listhtlcs was momentarily unreadable) => the
+    // fee-bump danger-window gate below fails SAFE to 'wait' (never bump on an unknown deadline).
+    const holdLife = typeof obs.ln.expiryBlocks === 'number' ? obs.ln.expiryBlocks : Infinity;
+
+    // (1) SPENT_VIA_REFUND and BURIED (spendConfs >= refundFinalityConfs) — chain truth: the LSP reclaimed its
+    // BTC on the REFUND/CLTV branch AND the refund is now beyond a conventional BTC finality, so no conflicting
+    // claim can swap in. RELEASE the taker hold (let it expire / cancel); NEVER recoup-settle — even if P later
+    // leaks (the maker's own T_seq negligence). AUTHORITATIVE no-double-dip guard; does NOT consult s.refunded.
+    // Terminal (double no-loss: BTC reclaimed to the LSP, the hold expires to the taker).
+    if (buriedRefund)
+      return { action: 'done', reason: `BTC HTLC spent on the REFUND/CLTV branch and BURIED (${spendConfs} >= finality depth ${c.refundFinalityConfs} confs; on-chain truth: the LSP reclaimed its BTC, the maker is UNPAID) — RELEASE the taker hold, NEVER recoup-settle; double no-loss. A P that leaks after a buried refund is NOT ours to capture.` };
+
+    // (2) SPENT_VIA_CLAIM(P) at ANY depth (incl 0-conf) — chain truth: the maker spent the CLAIM/IF branch
+    // REVEALING P, so the maker got PAID. A claim is immutable once revealed (P is public), so it is safe to
+    // recoup immediately at any depth. Recoup the held LN with P (idempotent). NOT gated by s.refunded — (1)
+    // already excludes a BURIED refund, so no stale flag can block this recoup (the round-6 stale-true hole).
+    // This is ALSO the "watch for a conflicting claim" resolution of a prior shallow refund: if the maker's
+    // claim swaps in over our unconfirmed refund (spend flips spent_refund -> spent_claim), we recoup HERE.
+    if (spend === 'spent_claim')
+      return { action: 'recoup-settle', reason: 'BTC HTLC spent on the CLAIM branch (on-chain truth: the maker got paid, P revealed in the spend witness) — settle the held LN with P to recoup exactly our fund (a claim reveals P immutably, safe to act at ANY depth, incl 0-conf)' };
+
+    // (3) UNCERTAIN (or an absent spendStatus over a funded leg — the classifier was momentarily unreadable):
+    // we CANNOT tell CLAIM from REFUND => FAIL CLOSED. Never recoup (might already be a buried refund =>
+    // double-dip) and never release (might already be a claim => rob the maker). WAIT and re-observe; the
+    // classifier is definitive on the next clean read. A stall is no-loss. This holds EVEN when P is public —
+    // an uncertain spend could be an already-buried refund, so a public P alone must not force a recoup here.
+    if (spend === 'uncertain' || spend === undefined)
+      return { action: 'wait', reason: `BTC HTLC spend status is ${spend === undefined ? 'UNAVAILABLE (classifier not yet read)' : 'UNCERTAIN'} — fail closed: neither recoup (a maybe-refund would double-dip) nor release (a maybe-claim would rob the maker) until the chain read is definitive (re-observe)` };
+
+    // (4) SPENT_VIA_REFUND but SHALLOW (spendConfs < refundFinalityConfs) — NOT terminal, and (Fix 1) NEVER a
+    // recoup: the LSP already reclaimed (or is reclaiming) its BTC on the refund branch, so settling the hold
+    // too would be a double-dip. A public P does NOT change that here — it is decided AFTER the refund fate, so
+    // a shallow-but-confirmed refund + a late P can never double-dip (the old ordering's fund-loss hole). Two
+    // sub-cases:
+    //   (4a) FEE-BUMP (Fix 2): the refund is still 0-conf (spendConfs === 0 => mempool, RBF-replaceable), no P
+    //        is public (a public P means the maker is entitled to the BTC — let its claim win, never race it),
+    //        and the taker hold's remaining life is inside the danger window (holdLife <= refundBumpWithin). The
+    //        refund MUST confirm before the hold expires, so fee-bump it (RBF). The io re-broadcasts at most once
+    //        per new BTC block, escalating toward a ceiling, and is a no-op when the current fee already suffices.
+    //   (4b) WAIT: a mined-but-shallow refund (spendConfs >= 1) cannot be RBF'd, or a public P (let the maker's
+    //        claim win), or an unknown hold deadline — keep the taker hold ALIVE and re-observe. The next tick
+    //        recoups if a claim swaps in (2), or goes terminal 'done' once the refund BURIES (1).
+    if (spend === 'spent_refund') {
+      if (spendConfs === 0 && !pPublic && Number.isFinite(holdLife) && holdLife <= c.refundBumpWithin)
+        return { action: 'refund-bump', reason: `BTC HTLC refund is 0-conf (mempool, RBF-replaceable), no P public, and the taker hold has only ${holdLife} BTC block(s) of life left (<= danger window ${c.refundBumpWithin}) — FEE-BUMP the refund (RBF) so it confirms INSIDE the hold; a stalled refund past the hold would fail the hold back to the taker and let a maker claim take our BTC HTLC (full front loss). Never recoup-settle a spent_refund HTLC (no double-dip).` };
+      return { action: 'wait', reason: `BTC HTLC spent on the REFUND branch but SHALLOW (${spendConfs} < finality depth ${c.refundFinalityConfs} confs)${pPublic ? ' (P is public — let the maker\'s claim win over our unconfirmed refund, never race it)' : ''} — NOT terminal and NEVER a recoup (we already reclaimed our BTC on the refund branch; settling the hold too would double-dip). A conflicting maker CLAIM can still swap in (RBF/reorg) => recoup at (2); release only once the refund BURIES (1). Keep the taker hold ALIVE and re-observe.` };
+    }
+
+    // (5) DEFINITIVELY UNSPENT + P PUBLIC (the taker claimed the maker asset leg — sa.onchain, primary) at ANY
+    // depth — the maker is entitled to (and will) claim our still-OPEN BTC HTLC with the now-public P, so recoup
+    // NOW (settle the held LN). Gated on spend === 'unspent': a spent_refund was already handled at (4) and NEVER
+    // recoups (Fix 1), so pPublic can only force a recoup while the HTLC is genuinely unspent — never over an
+    // existing refund spend. Fund-safe: we NEVER refund/release a P-public unspent HTLC.
+    if (spend === 'unspent' && pPublic)
+      return { action: 'recoup-settle', reason: 'BTC HTLC DEFINITIVELY unspent and P is PUBLIC (the taker claimed the maker asset leg — sa.onchain) — the maker will claim our open HTLC with it, so recoup the held LN now (never refund a P-public unspent HTLC)' };
+
+    // (6) DEFINITIVELY UNSPENT, P NOT public, T_btc reached — refund our BTC HTLC (the taker hold returns on its
+    // own; double no-loss). Idempotent: runPayerRefundOnce re-checks DEFINITIVELY-unspent via the classifier
+    // before broadcasting, and skips to recoup/done if a claim/refund landed in the interim.
+    if (spend === 'unspent' && obs.tip >= oc.cltv)
+      return { action: 'refund-onchain', reason: 'BTC HTLC DEFINITIVELY unspent, no P public, tip>=T_btc — refund it (the taker hold returns on its own, double no-loss); idempotent — the io re-verifies unspent via the classifier before any broadcast' };
+
+    // (7) DEFINITIVELY UNSPENT, P NOT public, T_btc NOT reached — RESUMABLE RELAY (crossFund) then WAIT. The
+    // fund-onchain io action drives BOTH the fund AND the (idempotent) maker asset-leg relay, so while the relay
+    // is pending RE-RETURN fund-onchain to re-drive it (resumable across a one-shot maker-reply timeout / an LSP
+    // restart) — never strand a funded leg. Otherwise wait for the taker's asset claim (reveals P) or T_btc.
+    if (spend === 'unspent' && obs.crossFund && obs.relayPending)
+      return { action: 'fund-onchain', reason: 'BTC HTLC funded (unspent) but the maker asset-leg lock/relay (XcBtcLegFunded -> XcSeqLegLocked -> on-chain verify -> hand-off) is not complete — re-drive the idempotent relay (resumable across a one-shot maker-reply timeout / an LSP restart) so the funded leg is never stranded' };
+    if (spend === 'unspent')
+      return { action: 'wait', reason: 'BTC HTLC funded and DEFINITIVELY unspent, no P yet, tip<T_btc — awaiting the taker\'s asset claim (reveals P) or T_btc. No claim unwinds no-loss.' };
+
+    // (defensive) any other spendStatus value -> fail closed (wait, re-observe).
+    return { action: 'wait', reason: `BTC HTLC spend status ${JSON.stringify(spend)} unrecognized — fail closed (wait, re-observe)` };
+  }
+
+  // ---- not yet funded on-chain (oc null or oc.funded false): gate hard on the payer's LN being HELD first ----
   if (!obs.ln.held) return { action: 'wait', reason: 'awaiting the payer\'s LN payment to arrive HELD (our recoup) before we fund the on-chain HTLC' };
   const holdLife = typeof obs.ln.expiryBlocks === 'number' ? obs.ln.expiryBlocks : Infinity;
-  if (!oc || !oc.funded) {
-    // The on-chain HTLC CLTV we will set must mature INSIDE the LN hold's remaining life (holdBuffer).
-    if (holdLife !== Infinity && holdLife <= c.holdBuffer) return { action: 'fail-closed', reason: 'LN hold too close to expiry to safely fund an on-chain HTLC inside it — fail closed (LN hold returns to the payer)' };
-    // WHOLE-SWAP ATOMICITY: funding the receiver's on-chain HTLC is the action that lets them claim and
-    // REVEAL P. Withhold it until every OTHER leg is locked, or a partial becomes possible. Safe to
-    // stall: the payer's LN is merely HELD and returns to them untouched. Default (undefined) => locked.
-    if (obs.swapLocked === false) return { action: 'wait', reason: 'payer LN held, but WITHHOLDING the on-chain fund until every other leg locks (whole-swap atomicity on the shared H)' };
-    return { action: 'fund-onchain', reason: 'payer\'s LN is held — fund the receiver\'s on-chain HTLC (CLTV set inside the hold\'s life, locked to the receiver, refundable to us)' };
+  // TRANSIENT-OUTAGE / REORG-EVICTION GUARD (funded payer leg). If the driver's persisted state KNOWS this leg's
+  // BTC HTLC is already funded (obs.onchainKnownFunded — s.htlc.txid recorded) but THIS tick's on-chain read
+  // reports it as NOT funded — a null/unreadable read (a momentary bitcoind outage) OR onchain.funded===false (a
+  // reorg that evicted the funding tx) — do NOT fall into the not-funded branch: its fail-close (hold-near-expiry)
+  // or RE-FUND path would be wrong for a leg we already funded (a re-fund would double-broadcast; a fail-close
+  // would strand it). Treat both as transient and WAIT (re-observe): a hiccup clears next tick, and a reorg
+  // re-mines the same funding tx (its txid is unchanged). A funded payer leg is never dropped to terminal 'failed'.
+  if ((!oc || oc.funded === false) && obs.onchainKnownFunded === true)
+    return { action: 'wait', reason: `BTC HTLC reports ${!oc ? 'unreadable (transient bitcoind outage)' : 'funded:false (reorg evicted the funding tx)'} this tick but it is KNOWN funded (persisted s.htlc) — wait and re-observe rather than fail-close or re-fund; a funded payer leg is never dropped on a momentary outage or a reorg near expiry` };
+  // The on-chain HTLC CLTV we will set must mature INSIDE the LN hold's remaining life (holdBuffer).
+  if (holdLife !== Infinity && holdLife <= c.holdBuffer) return { action: 'fail-closed', reason: 'LN hold too close to expiry to safely fund an on-chain HTLC inside it — fail closed (LN hold returns to the payer)' };
+  // B — FUND-BEFORE-LOCK (the payer BRIDGE, taker holds P). The MIRROR of the receiver leg's crossLock/recvReady
+  // FRONT-BEFORE-FUND. Here the maker's asset leg locks ONLY AFTER this fund (the LSP sends XcBtcLegFunded, then
+  // the maker locks the asset TO THE TAKER), so gating on swapLocked ("every OTHER leg locked") would DEADLOCK —
+  // the asset never locks until after the fund. Funding the BTC HTLC reveals NOTHING (P is the taker's secret,
+  // exposed only when the taker claims the asset), so a no-reveal ends double-no-loss. The fund-time CLTV ordering
+  // is enforced by checkPayerFundGate in the io BEFORE it funds. Fund the instant the hold is HELD, ignoring swapLocked.
+  if (obs.crossFund) return { action: 'fund-onchain', reason: 'payer\'s LN is HELD (FUND-BEFORE-LOCK: the maker\'s asset leg locks only AFTER this fund + our XcBtcLegFunded relay) — fund the maker\'s on-chain BTC HTLC (checkPayerFundGate enforced in the io; a no-reveal is double-no-loss)' };
+  // NON-cross-fund (generic single-leg / back-compat, receiver holds P): funding the receiver's on-chain HTLC is
+  // the action that lets THEM claim + REVEAL P, so withhold it until every OTHER leg is locked. Safe to stall: the
+  // payer's LN is merely HELD and returns untouched. Default (undefined) => locked.
+  if (obs.swapLocked === false) return { action: 'wait', reason: 'payer LN held, but WITHHOLDING the on-chain fund until every other leg locks (whole-swap atomicity on the shared H)' };
+  return { action: 'fund-onchain', reason: 'payer\'s LN is held — fund the receiver\'s on-chain HTLC (CLTV set inside the hold\'s life, locked to the receiver, refundable to us)' };
+}
+
+// ============================================================================
+// PAYER-BRIDGE FUND-ONCE ORCHESTRATOR (pure control-flow; ALL I/O injected). The `fund-onchain` io action funds
+// the maker's on-chain BTC HTLC exactly once and must NEVER double-fund the deterministic P2SH (a second output
+// strands the first, un-refunded = fund-loss). This orchestrator encodes the three UNIFORM disciplines so they
+// are exhaustively unit-tested WITHOUT a node (this module's whole philosophy) instead of buried in the server:
+//
+//   (i)  NEVER BROADCAST ON UNCERTAINTY. Every dry-locate is DEFINITIVE-or-throw: the seqdex `-locate-only` CLI
+//        exits non-zero (=> the injected `dryLocate` REJECTS) whenever ANY wallet-aware chain lookup fails, so
+//        "I couldn't tell" can never masquerade as funded:false. An uncertain read propagates as a throw and NO
+//        broadcast happens — the caller re-drives on the next tick. There is deliberately no catch-and-broadcast.
+//   (ii) ADOPT-BEFORE-GATE. When a prior attempt already persisted the funding INTENT (`hasIntent` — the refund
+//        key + intended redeemScript are durable, and they are persisted BELOW strictly BEFORE any broadcast), a
+//        broadcast to the deterministic P2SH MAY already be on-chain (a crash between broadcast and the s.htlc
+//        persist, or a momentarily-unreadable resume locate). So DRY-LOCATE FIRST and ADOPT an already-funded
+//        leg, BEFORE runGate() can run. runGate() (checkPayerFundGate) assumes the leg is NOT-yet-funded — it
+//        reads the taker's still-live incoming hold + the T_seq/T_btc ordering, which by re-entry may have moved
+//        (the hold lapsed, T_seq passed) — so running it against an already-funded leg would THROW and abandon a
+//        leg whose BTC is committed (grief->fund; the BTC strands un-refunded). Adoption skips the gate entirely.
+//   (iii) PERSIST-INTENT-BEFORE-BROADCAST. On the first-fund path the leg is DEFINITIVELY not funded (adopt-locate
+//        certified funded:false, or there was no prior intent so nothing was ever broadcast). Only then run the
+//        gate; then persistIntent() (mint+persist the refund key + intended redeemScript) BEFORE any broadcast;
+//        then a DEFINITIVE scan-before-broadcast — broadcast ONLY on funded:false, never on a throw.
+//
+// @param {{
+//   hasIntent:boolean,          // a prior attempt persisted the funding intent (refund key + intended script durable)?
+//   dryLocate:()=>Promise<{funded?:boolean, btc_htlc_txid?:string}>,  // DEFINITIVE wallet-aware locate; REJECTS on uncertainty
+//   runGate:()=>Promise<void>,  // checkPayerFundGate wrapper; REJECTS (throws) on a fail-closed gate (assumes not-yet-funded)
+//   persistIntent:()=>Promise<void>,  // mint (idempotent) + persist refund key + intended redeemScript, durable BEFORE broadcast
+//   broadcast:()=>Promise<{funded facts}>,  // the irreversible funding broadcast (called at most ONCE, only on a definitive funded:false)
+// }} io
+// @returns {Promise<{funded:object, broadcasted:boolean, adopted:'pre-gate'|'pre-broadcast'|null}>}
+export async function runPayerFundOnce({ hasIntent, dryLocate, runGate, persistIntent, broadcast } = {}) {
+  if (typeof dryLocate !== 'function' || typeof runGate !== 'function'
+    || typeof persistIntent !== 'function' || typeof broadcast !== 'function')
+    throw new Error('runPayerFundOnce: dryLocate/runGate/persistIntent/broadcast must all be functions — fail closed');
+  // (1a) ADOPT-BEFORE-GATE — only when a prior intent could have produced a broadcast. DEFINITIVE locate first;
+  // a REJECT (uncertain) propagates and nothing is funded (re-drive). A definitive funded:true adopts, skipping
+  // the gate; a definitive funded:false falls through to first-fund.
+  if (hasIntent) {
+    const located = await dryLocate();   // throws on uncertainty -> caller re-drives; NEVER a guess
+    if (located && located.funded && located.btc_htlc_txid) return { funded: located, broadcasted: false, adopted: 'pre-gate' };
   }
-  // Funded, awaiting the receiver's on-chain claim. Safe to wait: no claim ends in on-chain refund + LN
-  // hold return (handled above).
-  return { action: 'wait', reason: 'on-chain HTLC funded and locked to the receiver — awaiting their claim (reveals P). No claim unwinds no-loss.' };
+  // (1b) FIRST-FUND — DEFINITIVELY not funded. The gate (assumes not-yet-funded) is now correct to run.
+  await runGate();                       // throws on a fail-closed gate -> nothing funded
+  await persistIntent();                 // refund key + intended script durable BEFORE any broadcast
+  // DEFINITIVE scan-before-broadcast: broadcast ONLY on funded:false; a REJECT (uncertain) propagates (re-drive),
+  // so a transient read over an already-funded leg can never trigger a SECOND broadcast.
+  const located = await dryLocate();     // throws on uncertainty
+  if (located && located.funded && located.btc_htlc_txid) return { funded: located, broadcasted: false, adopted: 'pre-broadcast' };
+  const funded = await broadcast();      // definitively not funded -> broadcast exactly once
+  return { funded, broadcasted: true, adopted: null };
+}
+
+// ============================================================================
+// PAYER-BRIDGE REFUND-ONCE ORCHESTRATOR (pure control-flow; I/O injected). The `refund-onchain` io action
+// reclaims the LSP's own funded BTC HTLC at T_btc. Its IDEMPOTENCY + no-double-dip is now enforced by
+// CHAIN TRUTH, not by the racy persisted s.refunded intent flag:
+//
+//   classifySpend() (the seqdex xsubas-htlc-spend-status classifier, DEFINITIVE-or-throw) is consulted FIRST,
+//   IMMEDIATELY before broadcasting:
+//     - 'spent_claim'  => the maker already claimed our BTC HTLC (revealing P). DO NOT refund — return without
+//        broadcasting; the next observe drives a recoup-settle. (A refund broadcast now would fail anyway — the
+//        output is spent — but skipping it avoids a wasted/again-racy broadcast and is the correct decision.)
+//     - 'spent_refund' => our refund already landed. DONE (idempotent) — return without broadcasting.
+//     - 'unspent'      => DEFINITIVELY not yet spent + the driver already gated tip>=T_btc: broadcast the refund
+//        exactly once. s.refunded is still persisted FIRST, but purely as a broadcast-DEDUP HINT (it no longer
+//        gates recoup — the 'spent_refund' chain fact does).
+//     - anything else (uncertain) => THROW: fail closed, do not broadcast on an unresolved chain read; re-drive.
+//   classifySpend() also THROWS on an unreadable classifier (exec error), which propagates — never a guess.
+//
+// On a broadcast FAILURE the refund tx did NOT land (xsubas-refund-btc leaves the HTLC untouched on any error,
+// retryable), so clearRefundIntent() clears the dedup hint and the error re-throws so the driver re-drives.
+//
+// @param {{ classifySpend:()=>Promise<{status:string}>, persistRefundIntent:()=>Promise<void>,
+//           broadcastRefund:()=>Promise<any>, clearRefundIntent:()=>Promise<void> }} io
+// @returns {Promise<{broadcasted:boolean, status:string, result?:any}>}
+export async function runPayerRefundOnce({ classifySpend, persistRefundIntent, broadcastRefund, clearRefundIntent } = {}) {
+  if (typeof classifySpend !== 'function' || typeof persistRefundIntent !== 'function'
+    || typeof broadcastRefund !== 'function' || typeof clearRefundIntent !== 'function')
+    throw new Error('runPayerRefundOnce: classifySpend/persistRefundIntent/broadcastRefund/clearRefundIntent must all be functions — fail closed');
+  // CHAIN-TRUTH idempotency: never broadcast a refund unless the BTC HTLC is DEFINITIVELY unspent.
+  const cls = await classifySpend();   // DEFINITIVE-or-throw (an uncertain/unreadable classifier propagates)
+  const status = cls && cls.status;
+  if (status === 'spent_claim')
+    return { broadcasted: false, status };   // the maker claimed -> recoup instead (next observe drives recoup-settle); NEVER refund
+  if (status === 'spent_refund')
+    return { broadcasted: false, status };   // our refund already landed -> done (idempotent)
+  if (status !== 'unspent')
+    throw new Error(`runPayerRefundOnce: spend status ${JSON.stringify(status)} is not DEFINITIVELY unspent — fail closed (do not broadcast a refund on an unresolved chain read)`);
+  // DEFINITIVELY unspent -> persist the dedup hint (NOT a recoup gate), then broadcast exactly once.
+  await persistRefundIntent();   // s.refunded = true — broadcast-dedup hint only
+  try {
+    return { broadcasted: true, status, result: await broadcastRefund() };
+  } catch (e) {
+    await clearRefundIntent();    // tx did NOT land -> clear the dedup hint; re-drive
+    throw e;
+  }
+}
+
+// ============================================================================
+// PAYER-BRIDGE REFUND FEE SIZING (Fix 2 — REFUND FEE ADEQUACY). PURE. Given a fresh sat/vB estimate (from
+// estimatesmartfee, targeting confirmation inside the hold's remaining life) and the refund tx vsize, return
+// the ABSOLUTE fee (sats) to target — clamped to [floor, min(ceil, amountSat - dust)]. Used for BOTH the
+// INITIAL refund broadcast (lastFee 0, bumpFactor 1) and each RBF bump (lastFee = the prior fee, bumpFactor
+// > 1 so the replacement clears the min-increment even if the estimate itself has not risen). Fee value is
+// PRESERVED across the HTLC by never letting the fee eat past (amount - dust): a refund must still pay out.
+//
+// @param {{ estSatPerVb:number, vsize:number, amountSat:number, floorSats:number, ceilSats:number,
+//           dustSats?:number, lastFee?:number, bumpFactor?:number }} a
+// @returns {number} the absolute fee in sats to set (>= 0)
+export function sizeRefundFee({ estSatPerVb, vsize, amountSat, floorSats, ceilSats, dustSats = 546, lastFee = 0, bumpFactor = 1 } = {}) {
+  const vb = Number(vsize) > 0 ? Number(vsize) : 250;
+  const estFee = (Number.isFinite(estSatPerVb) && estSatPerVb > 0) ? Math.ceil(estSatPerVb * vb) : 0;
+  const factor = Number(bumpFactor) > 1 ? Number(bumpFactor) : 1;
+  const bumpFloor = Math.ceil((Number(lastFee) || 0) * factor);
+  let fee = Math.max(estFee, bumpFloor, Number(floorSats) || 0);
+  // Never fee more than the HTLC value can spare (the refund output must still be >= dust). This ceiling
+  // dominates the configured ceil for a small HTLC — a fee that would strand the output is refused implicitly.
+  const spendCap = Math.max(0, (Number(amountSat) || 0) - (Number(dustSats) || 0));
+  const ceil = Math.min(Number.isFinite(Number(ceilSats)) ? Number(ceilSats) : Infinity, spendCap > 0 ? spendCap : Infinity);
+  if (Number.isFinite(ceil)) fee = Math.min(fee, ceil);
+  return Math.max(0, Math.floor(fee));
+}
+
+// ============================================================================
+// PAYER-BRIDGE REFUND FEE-BUMP ORCHESTRATOR (Fix 2, pure control-flow; I/O injected). While the LSP's own
+// T_btc refund sits 0-conf it must be RBF-BUMPED until it confirms inside the taker hold's life — else a
+// stalled refund past the hold fails the hold back to the taker and a maker claim then takes the LSP's BTC
+// HTLC (full front loss). Disciplines (mirror of runPayerRefundOnce's chain-truth gating):
+//   (i)   RE-CLASSIFY FIRST (chain truth): only bump an HTLC the classifier STILL reads as spent_refund AND
+//         still 0-conf (spendConfs === 0 => mempool, RBF-replaceable). A flip to spent_claim / a BURIED
+//         refund / an unspent read => do NOT bump (the driver's recoup / done / refund path takes over).
+//         classifySpend() is DEFINITIVE-or-throw; an uncertain/unreadable classifier propagates => no bump.
+//   (ii)  THROTTLE to at most one bump per new BTC block (tipAdvanced) so a ~3s driver tick cannot spam
+//         replacements (each replacement pays the min-relay increment; unthrottled it would burn to the ceiling
+//         in seconds). tipAdvanced() is true only when the BTC tip rose since the last bump.
+//   (iii) STRICTLY-HIGHER fee only: computeFee() returns { fee, bump } — bump is false when the current fee
+//         already suffices or the ceiling is hit, so the replacement is a no-op rather than an equal-fee churn.
+// A failed rebroadcast (RBF rejected / node hiccup) leaves the prior refund untouched (retryable) and the
+// error propagates so the driver re-observes — never a double no-op.
+//
+// @param {{ classifySpend:()=>Promise<{status:string, spendConfs?:number}>,
+//           tipAdvanced:()=>Promise<boolean>|boolean,
+//           computeFee:()=>Promise<{fee:number, bump:boolean}>,
+//           rebroadcast:(fee:number)=>Promise<any> }} io
+// @returns {Promise<{bumped:boolean, status?:string, fee?:number, reason?:string, result?:any}>}
+export async function runPayerRefundBumpOnce({ classifySpend, tipAdvanced, computeFee, rebroadcast } = {}) {
+  if (typeof classifySpend !== 'function' || typeof tipAdvanced !== 'function'
+    || typeof computeFee !== 'function' || typeof rebroadcast !== 'function')
+    throw new Error('runPayerRefundBumpOnce: classifySpend/tipAdvanced/computeFee/rebroadcast must all be functions — fail closed');
+  const cls = await classifySpend();     // DEFINITIVE-or-throw (an uncertain/unreadable classifier propagates)
+  const status = cls && cls.status;
+  const confs = Number.isFinite(cls && cls.spendConfs) ? cls.spendConfs : 0;
+  // Only a STILL-0-conf spent_refund is RBF-bumpable. Anything else — a mined refund (can't RBF a confirmed
+  // tx), a claim that swapped in, a buried refund, or an unspent read — is the main driver path's business.
+  if (status !== 'spent_refund' || confs !== 0)
+    return { bumped: false, status, reason: `not a 0-conf refund (status=${status}, confs=${confs}) — no bump` };
+  if (!(await tipAdvanced()))
+    return { bumped: false, status, reason: 'no new BTC block since the last bump — throttled' };
+  const { fee, bump } = await computeFee();   // fresh estimate vs the last fee -> a strictly-higher target, or bump:false
+  if (!bump)
+    return { bumped: false, status, fee, reason: 'current refund fee already sufficient / ceiling reached — no bump' };
+  const result = await rebroadcast(fee);      // RBF-replace the refund with the higher fee (throws => retry next tick)
+  return { bumped: true, status, fee, result };
 }

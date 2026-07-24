@@ -5,7 +5,8 @@ import test from 'node:test';
 import assert from 'node:assert';
 import { nextBridgeStep, BRIDGE_DEFAULTS, checkBridgeLocktimeOrdering, LOCKTIME_GATE_DEFAULTS, LOCKTIME_THRESHOLD,
   HOLD_LIFE_DEFAULTS, checkTseqWithinBound, requiredTakerHold, takerHoldSettleableToTseq, frontHtlcMintTarget,
-  verifyFrontRouteExpiry } from './leg-bridge.mjs';
+  verifyFrontRouteExpiry, checkPayerFundGate, runPayerFundOnce, runPayerRefundOnce,
+  runPayerRefundBumpOnce, sizeRefundFee } from './leg-bridge.mjs';
 
 const R = BRIDGE_DEFAULTS.frontRunway;   // 6
 const M = BRIDGE_DEFAULTS.claimMargin;   // 2
@@ -86,23 +87,25 @@ test('payer-LN: REFUSES to fund on-chain if the LN hold is too close to expiry',
   assert.equal(s.action, 'fail-closed');
 });
 
-test('payer-LN: after funding, waits for the receiver to claim', () => {
-  const s = nextBridgeStep({ lnSide: 'payer', amountSat: A }, { tip: 110, onchain: { funded: true, amountSat: A, cltv: 130, lockedToReceiver: true, spent: false }, ln: { registered: true, held: true, settled: false, preimage: null } });
+test('payer-LN: after funding, waits for the receiver to claim (spendStatus unspent, tip<T_btc)', () => {
+  const s = nextBridgeStep({ lnSide: 'payer', amountSat: A }, { tip: 110, onchain: { funded: true, amountSat: A, cltv: 130, lockedToReceiver: true, spent: false, spendStatus: 'unspent' }, ln: { registered: true, held: true, settled: false, preimage: null } });
   assert.equal(s.action, 'wait');
 });
 
-test('payer-LN: on the receiver claim (P read), settles the held LN to recoup', () => {
-  const s = nextBridgeStep({ lnSide: 'payer', amountSat: A }, { tip: 120, onchain: { funded: true, amountSat: A, cltv: 130, lockedToReceiver: true, spent: true }, ln: { registered: true, held: true, settled: false, preimage: 'cd'.repeat(32) } });
+test('payer-LN: on the receiver claim (spendStatus spent_claim), settles the held LN to recoup', () => {
+  const s = nextBridgeStep({ lnSide: 'payer', amountSat: A }, { tip: 120, onchain: { funded: true, amountSat: A, cltv: 130, lockedToReceiver: true, spent: true, spendStatus: 'spent_claim' }, ln: { registered: true, held: true, settled: false, preimage: 'cd'.repeat(32) } });
   assert.equal(s.action, 'recoup-settle');
+  assert.match(s.reason, /CLAIM branch/);
 });
 
-test('payer-LN: on-chain spent but P not yet read -> wait (read the witness), never settle blind', () => {
-  const s = nextBridgeStep({ lnSide: 'payer', amountSat: A }, { tip: 120, onchain: { funded: true, amountSat: A, cltv: 130, lockedToReceiver: true, spent: true }, ln: { registered: true, held: true, settled: false, preimage: null } });
+test('payer-LN: on-chain spent but classification UNCERTAIN -> wait (never settle/refund blind)', () => {
+  const s = nextBridgeStep({ lnSide: 'payer', amountSat: A }, { tip: 120, onchain: { funded: true, amountSat: A, cltv: 130, lockedToReceiver: true, spent: true, spendStatus: 'uncertain' }, ln: { registered: true, held: true, settled: false, preimage: null } });
   assert.equal(s.action, 'wait');
+  assert.match(s.reason, /UNCERTAIN|fail closed/i);
 });
 
-test('payer-LN: no claim by the on-chain CLTV -> refund on-chain (LN hold returns to the payer)', () => {
-  const s = nextBridgeStep({ lnSide: 'payer', amountSat: A }, { tip: 130, onchain: { funded: true, amountSat: A, cltv: 130, lockedToReceiver: true, spent: false }, ln: { registered: true, held: true, settled: false, preimage: null } });
+test('payer-LN: no claim by the on-chain CLTV (spendStatus unspent) -> refund on-chain', () => {
+  const s = nextBridgeStep({ lnSide: 'payer', amountSat: A }, { tip: 130, onchain: { funded: true, amountSat: A, cltv: 130, lockedToReceiver: true, spent: false, spendStatus: 'unspent' }, ln: { registered: true, held: true, settled: false, preimage: null } });
   assert.equal(s.action, 'refund-onchain');
 });
 
@@ -143,7 +146,7 @@ test('payer-LN: WITHHOLDS the on-chain fund while the other leg is not yet locke
 });
 
 test('payer-LN: the gate only guards the FUND — an already-funded leg proceeds while unlocked', () => {
-  const s = nextBridgeStep({ lnSide: 'payer', amountSat: A }, { tip: 110, onchain: { funded: true, amountSat: A, cltv: 130, lockedToReceiver: true, spent: false }, ln: { registered: true, held: true, settled: false, preimage: null }, swapLocked: false });
+  const s = nextBridgeStep({ lnSide: 'payer', amountSat: A }, { tip: 110, onchain: { funded: true, amountSat: A, cltv: 130, lockedToReceiver: true, spent: false, spendStatus: 'unspent' }, ln: { registered: true, held: true, settled: false, preimage: null }, swapLocked: false });
   assert.equal(s.action, 'wait');   // awaiting the receiver's claim — not the atomicity withhold
   assert.doesNotMatch(s.reason, /atomicity/i);
 });
@@ -151,6 +154,459 @@ test('payer-LN: the gate only guards the FUND — an already-funded leg proceeds
 test('payer-LN: the gate NEVER overrides fail-closed — hold too close to expiry fails closed while unlocked', () => {
   const s = nextBridgeStep({ lnSide: 'payer', amountSat: A }, { tip: 100, onchain: null, ln: { registered: true, held: true, settled: false, preimage: null, expiryBlocks: BRIDGE_DEFAULTS.holdBuffer }, swapLocked: false });
   assert.equal(s.action, 'fail-closed');
+});
+
+// ---- B — FUND-BEFORE-LOCK (crossFund): the payer BRIDGE where the taker holds P and the maker's asset leg
+//      locks ONLY AFTER the LSP funds its BTC HTLC. swapLocked would DEADLOCK (the asset never locks until
+//      after the fund), so crossFund REPLACES it — the mirror of the receiver leg's crossLock/recvReady. ----
+test('crossFund payer: FUNDS the instant the hold is HELD even though swapLocked:false (no deadlock)', () => {
+  // This is the load-bearing case: the native asset leg has NOT locked (it can't — the maker locks it only
+  // AFTER this fund), so swapLocked is false; a generic payer leg would WAIT forever. crossFund funds anyway.
+  const s = nextBridgeStep({ lnSide: 'payer', amountSat: A },
+    { tip: 100, onchain: null, ln: { registered: true, held: true, settled: false, preimage: null, expiryBlocks: 40 }, swapLocked: false, crossFund: true });
+  assert.equal(s.action, 'fund-onchain');
+  assert.match(s.reason, /FUND-BEFORE-LOCK/);
+});
+
+test('crossFund payer: swapLocked is IGNORED — both states fund once the hold is HELD', () => {
+  const mk = (swapLocked) => nextBridgeStep({ lnSide: 'payer', amountSat: A },
+    { tip: 100, onchain: null, ln: { registered: true, held: true, settled: false, preimage: null, expiryBlocks: 40 }, swapLocked, crossFund: true });
+  assert.equal(mk(false).action, 'fund-onchain');
+  assert.equal(mk(true).action, 'fund-onchain');
+});
+
+test('crossFund payer: still WAITS until the hold is HELD (never fund before the recoup is held)', () => {
+  const s = nextBridgeStep({ lnSide: 'payer', amountSat: A },
+    { tip: 100, onchain: null, ln: { registered: true, held: false, settled: false, preimage: null, expiryBlocks: 40 }, crossFund: true });
+  assert.equal(s.action, 'wait');
+});
+
+test('crossFund payer: still FAILS CLOSED when the hold is too close to expiry (fund-before-lock never overrides)', () => {
+  const s = nextBridgeStep({ lnSide: 'payer', amountSat: A },
+    { tip: 100, onchain: null, ln: { registered: true, held: true, settled: false, preimage: null, expiryBlocks: BRIDGE_DEFAULTS.holdBuffer }, crossFund: true });
+  assert.equal(s.action, 'fail-closed');
+});
+
+test('crossFund payer: recoups on P PUBLIC (taker asset claim) while our BTC HTLC is DEFINITIVELY unspent', () => {
+  // The PRIMARY P source: the taker claimed the maker asset leg, so P is public while our BTC HTLC is still
+  // DEFINITIVELY unspent (spendStatus:'unspent') by the maker. We settle immediately (recoup), never waiting for
+  // the maker's BTC claim — and we never refund a P-public HTLC (the maker claims it with the now-public P).
+  const s = nextBridgeStep({ lnSide: 'payer', amountSat: A },
+    { tip: 120, onchain: { funded: true, amountSat: A, cltv: 200, lockedToReceiver: true, spent: false, spendStatus: 'unspent' }, ln: { registered: true, held: true, settled: false, preimage: 'cd'.repeat(32) }, crossFund: true });
+  assert.equal(s.action, 'recoup-settle');
+  assert.match(s.reason, /P is public/i);
+});
+
+test('crossFund payer: does NOT settle on a public P for a leg we never funded (oc.funded guard)', () => {
+  // Defence: a public P must not let us capture the taker's held BTC unless we actually funded the maker HTLC.
+  const s = nextBridgeStep({ lnSide: 'payer', amountSat: A },
+    { tip: 120, onchain: null, ln: { registered: true, held: true, settled: false, preimage: 'cd'.repeat(32) }, crossFund: true });
+  assert.notEqual(s.action, 'recoup-settle');
+});
+
+test('crossFund payer: past T_btc with NO reveal (spendStatus unspent) still refunds our BTC HTLC (double no-loss)', () => {
+  const s = nextBridgeStep({ lnSide: 'payer', amountSat: A },
+    { tip: 200, onchain: { funded: true, amountSat: A, cltv: 200, lockedToReceiver: true, spent: false, spendStatus: 'unspent' }, ln: { registered: true, held: true, settled: false, preimage: null }, crossFund: true });
+  assert.equal(s.action, 'refund-onchain');
+});
+
+// ---- C — ALWAYS-RESUMABLE-WHILE-FUNDED: a transient on-chain read must not fail-close / re-fund a FUNDED leg.
+test('payer transient outage: onchain null over a KNOWN-funded HTLC WAITS — never fail-closes / re-funds', () => {
+  // A momentary bitcoind outage returns onchain:null. onchainKnownFunded (s.htlc.txid persisted) says the leg
+  // is already funded, so even a near-expiry hold must NOT fall into the not-funded fail-close branch — WAIT.
+  const s = nextBridgeStep({ lnSide: 'payer', amountSat: A },
+    { tip: 100, onchain: null, ln: { registered: true, held: true, settled: false, preimage: null, expiryBlocks: BRIDGE_DEFAULTS.holdBuffer }, crossFund: true, onchainKnownFunded: true });
+  assert.equal(s.action, 'wait');
+  assert.match(s.reason, /transient|KNOWN funded|re-observe/i);
+});
+test('payer transient outage: WITHOUT onchainKnownFunded a null-onchain near-expiry hold STILL fails closed (unchanged)', () => {
+  // The guard is scoped to KNOWN-funded legs: a genuinely-unfunded near-expiry hold keeps the old fail-close.
+  const s = nextBridgeStep({ lnSide: 'payer', amountSat: A },
+    { tip: 100, onchain: null, ln: { registered: true, held: true, settled: false, preimage: null, expiryBlocks: BRIDGE_DEFAULTS.holdBuffer }, crossFund: true });
+  assert.equal(s.action, 'fail-closed');
+});
+
+// ---- E — TERMINAL DONE / RELEASE AFTER OUR OWN REFUND, keyed ENTIRELY on chain truth (spendStatus:'spent_refund')
+// AND its BURIAL DEPTH (spendConfs >= refundFinalityConfs). The recoup-vs-release decision NO LONGER reads a
+// P-less-at-T_btc heuristic or the persisted s.refunded intent — only the on-chain classification + confirmations.
+// A refund is a TERMINAL fate (release the taker hold, NEVER recoup) ONLY once it is BURIED to a conventional BTC
+// finality (>= refundFinalityConfs, now 6); a shallow (0-conf) refund is NOT terminal (a conflicting maker claim
+// can still swap in) — see the SHALLOW-refund tests below.
+test('payer refund landed + BURIED: spendStatus spent_refund (confs>=refundFinalityConfs) -> TERMINAL done / RELEASE the hold', () => {
+  const s = nextBridgeStep({ lnSide: 'payer', amountSat: A },
+    { tip: 130, onchain: { funded: true, amountSat: A, cltv: 130, lockedToReceiver: true, spent: true, spendStatus: 'spent_refund', spendConfs: BRIDGE_DEFAULTS.refundFinalityConfs }, ln: { registered: true, held: true, settled: false, preimage: null }, crossFund: true });
+  assert.equal(s.action, 'done');
+  assert.match(s.reason, /REFUND\/CLTV branch|reclaimed|RELEASE the taker hold|BURIED/i);
+});
+test('payer refund landed + BURIED: spent_refund is TERMINAL even BEFORE tip>=T_btc (chain truth, not tip/intent)', () => {
+  // A BURIED refund on chain is authoritative regardless of the observed tip vs T_btc — no reliance on a
+  // persisted s.refunded flag (a stale refunded:true is present here and MUST be irrelevant).
+  const s = nextBridgeStep({ lnSide: 'payer', amountSat: A },
+    { tip: 120, onchain: { funded: true, amountSat: A, cltv: 130, lockedToReceiver: true, spent: true, spendStatus: 'spent_refund', spendConfs: BRIDGE_DEFAULTS.refundFinalityConfs + 3 }, ln: { registered: true, held: true, settled: false, preimage: null }, refunded: false, crossFund: true });
+  assert.equal(s.action, 'done');
+});
+test('payer refund vs maker claim: spendStatus spent_claim at/after T_btc RECOUP-SETTLES (chain says the maker claimed)', () => {
+  // Even at/after T_btc, a CLAIM spend (spendStatus:'spent_claim') is the maker's claim -> recoup, never done.
+  const s = nextBridgeStep({ lnSide: 'payer', amountSat: A },
+    { tip: 130, onchain: { funded: true, amountSat: A, cltv: 130, lockedToReceiver: true, spent: true, spendStatus: 'spent_claim' }, ln: { registered: true, held: true, settled: false, preimage: 'cd'.repeat(32) }, crossFund: true });
+  assert.equal(s.action, 'recoup-settle');
+});
+test('payer spend before T_btc, classification UNCERTAIN: STILL waits (never guesses claim vs refund)', () => {
+  const s = nextBridgeStep({ lnSide: 'payer', amountSat: A },
+    { tip: 129, onchain: { funded: true, amountSat: A, cltv: 130, lockedToReceiver: true, spent: true, spendStatus: 'uncertain' }, ln: { registered: true, held: true, settled: false, preimage: null }, crossFund: true });
+  assert.equal(s.action, 'wait');
+});
+
+// ---- C(reorg) — REORG-EVICTION RESUMABILITY: a KNOWN-funded leg whose on-chain read reports funded:false
+// (a reorg evicted the funding tx) must WAIT/re-observe, NOT re-fund or fail-close — the reorg re-mines the
+// same funding txid, so a re-fund would double-broadcast and a fail-close would strand the fund.
+test('payer reorg: onchain funded:false over a KNOWN-funded HTLC WAITS — never fail-closes / re-funds', () => {
+  const s = nextBridgeStep({ lnSide: 'payer', amountSat: A },
+    { tip: 100, onchain: { funded: false, amountSat: 0, cltv: 130, spent: false }, ln: { registered: true, held: true, settled: false, preimage: null, expiryBlocks: BRIDGE_DEFAULTS.holdBuffer }, crossFund: true, onchainKnownFunded: true });
+  assert.equal(s.action, 'wait');
+  assert.match(s.reason, /reorg|KNOWN funded|re-observe/i);
+});
+test('payer reorg: funded:false WITHOUT onchainKnownFunded is a genuinely-unfunded leg (funds when the hold has runway)', () => {
+  // Not a reorg of a known-funded leg — just a not-yet-funded on-chain read. With hold runway + crossFund it funds.
+  const s = nextBridgeStep({ lnSide: 'payer', amountSat: A },
+    { tip: 100, onchain: { funded: false, amountSat: 0, cltv: 130, spent: false }, ln: { registered: true, held: true, settled: false, preimage: null, expiryBlocks: 40 }, crossFund: true });
+  assert.equal(s.action, 'fund-onchain');
+});
+
+// ---- E(no-double-dip) — RELEASE-ON-BURIED-REFUND, keyed on CHAIN TRUTH (spendStatus:'spent_refund') + BURIAL
+// DEPTH, NOT the racy s.refunded intent. Once the BTC HTLC is spent on the REFUND branch AND that refund is BURIED
+// (the LSP definitively reclaimed its BTC, no conflicting claim can swap in), a P that LEAKS afterwards (the maker's
+// own T_seq negligence) must NEVER also settle the taker's hold — the held LN belongs to the taker. A BURIED
+// 'spent_refund' beats a public P. (A SHALLOW refund + public P is the OPPOSITE — the claim wins; see below.)
+test('payer NO-DOUBLE-DIP: BURIED spent_refund + P leaks -> TERMINAL done/RELEASE, NEVER recoup-settle (buried refund beats public P)', () => {
+  const s = nextBridgeStep({ lnSide: 'payer', amountSat: A },
+    { tip: 135, onchain: { funded: true, amountSat: A, cltv: 130, lockedToReceiver: true, spent: true, spendStatus: 'spent_refund', spendConfs: BRIDGE_DEFAULTS.refundFinalityConfs }, ln: { registered: true, held: true, settled: false, preimage: 'cd'.repeat(32) }, crossFund: true });
+  assert.equal(s.action, 'done');
+  assert.notEqual(s.action, 'recoup-settle');
+  assert.match(s.reason, /REFUND\/CLTV branch|RELEASE|not ours to capture|BURIED/i);
+});
+// INVARIANT ("before any spend confirms: P public => recoup + do not refund"): a DEFINITIVELY-unspent BTC HTLC
+// with P public means the taker HAS its asset and the maker will claim our still-open HTLC — so we RECOUP now and
+// never refund. (Round-6 keyed this on s.refunded and could WRONGLY refund a P-public HTLC; chain truth corrects it.)
+test('payer INVARIANT: UNSPENT + P public -> RECOUP-SETTLE (never refund a P-public HTLC), even with a stale refunded flag', () => {
+  const s = nextBridgeStep({ lnSide: 'payer', amountSat: A },
+    { tip: 131, onchain: { funded: true, amountSat: A, cltv: 130, lockedToReceiver: true, spent: false, spendStatus: 'unspent' }, ln: { registered: true, held: true, settled: false, preimage: 'cd'.repeat(32) }, refunded: true, crossFund: true });
+  assert.equal(s.action, 'recoup-settle');
+});
+test('payer control: NOT refunded + P public + spendStatus unspent still RECOUP-SETTLES', () => {
+  const s = nextBridgeStep({ lnSide: 'payer', amountSat: A },
+    { tip: 120, onchain: { funded: true, amountSat: A, cltv: 130, lockedToReceiver: true, spent: false, spendStatus: 'unspent' }, ln: { registered: true, held: true, settled: false, preimage: 'cd'.repeat(32) }, crossFund: true });
+  assert.equal(s.action, 'recoup-settle');
+});
+
+// ---- CHAIN-TRUTH IGNORES THE RACY s.refunded INTENT (round-6 crash scenarios now resolve on chain fate) ----
+// crash-BEFORE-broadcast: s.refunded persisted true, but the refund NEVER broadcast, so the BTC HTLC is really
+// claimed by the maker (spent_claim). The stale-true flag must NOT block the recoup (round-6 would have stalled).
+test('round-6 crash-before-broadcast: stale refunded:true is IGNORED — spent_claim still RECOUP-SETTLES', () => {
+  const s = nextBridgeStep({ lnSide: 'payer', amountSat: A },
+    { tip: 132, onchain: { funded: true, amountSat: A, cltv: 130, lockedToReceiver: true, spent: true, spendStatus: 'spent_claim' }, ln: { registered: true, held: true, settled: false, preimage: 'cd'.repeat(32) }, refunded: true, crossFund: true });
+  assert.equal(s.action, 'recoup-settle');
+});
+// RPC-error-AFTER-broadcast: the refund DID broadcast + confirm + BURY (spent_refund, confs>=refundFinalityConfs) but the
+// RPC errored so s.refunded was cleared to false. The stale-false flag must NOT force a recoup double-dip — chain
+// truth (a buried refund) releases the hold.
+test('round-6 RPC-error-after-broadcast: stale refunded:false is IGNORED — BURIED spent_refund RELEASES (no double-dip)', () => {
+  const s = nextBridgeStep({ lnSide: 'payer', amountSat: A },
+    { tip: 140, onchain: { funded: true, amountSat: A, cltv: 130, lockedToReceiver: true, spent: true, spendStatus: 'spent_refund', spendConfs: BRIDGE_DEFAULTS.refundFinalityConfs + 5 }, ln: { registered: true, held: true, settled: false, preimage: 'cd'.repeat(32) }, refunded: false, crossFund: true });
+  assert.equal(s.action, 'done');
+  assert.notEqual(s.action, 'recoup-settle');
+});
+
+// ---- E(reorg-aware) — SHALLOW REFUND IS NOT TERMINAL until a conventional BTC finality. A refund is a terminal
+// fate ONLY once BURIED (spendConfs >= refundFinalityConfs, now 6). Below the finality depth a conflicting maker
+// CLAIM can still swap in (RBF the unconfirmed refund / a reorg < that depth re-mines the claim), so the LSP must
+// KEEP the taker hold ALIVE and watch — releasing it on a shallow refund is the fund-loss this closes (the maker's
+// claim swaps in, takes our BTC HTLC, no recoup). The prior 2-conf margin was too shallow to be a true finality. ----
+test('payer 0-conf-refund NOT terminal: SHALLOW spent_refund (no confs) + no P -> WAIT, never done (keep watching)', () => {
+  const s = nextBridgeStep({ lnSide: 'payer', amountSat: A },
+    { tip: 135, onchain: { funded: true, amountSat: A, cltv: 130, lockedToReceiver: true, spent: true, spendStatus: 'spent_refund' }, ln: { registered: true, held: true, settled: false, preimage: null }, crossFund: true });
+  assert.equal(s.action, 'wait');
+  assert.notEqual(s.action, 'done');
+  assert.match(s.reason, /SHALLOW|NOT terminal|swap in|keep|re-observe/i);
+});
+test('payer 0-conf-refund NOT terminal: refund at refundFinalityConfs-1 is still SHALLOW -> WAIT (burial boundary)', () => {
+  const s = nextBridgeStep({ lnSide: 'payer', amountSat: A },
+    { tip: 135, onchain: { funded: true, amountSat: A, cltv: 130, lockedToReceiver: true, spent: true, spendStatus: 'spent_refund', spendConfs: BRIDGE_DEFAULTS.refundFinalityConfs - 1 }, ln: { registered: true, held: true, settled: false, preimage: null }, crossFund: true });
+  assert.equal(s.action, 'wait');
+});
+test('payer 0-conf-refund BURIES at exactly refundFinalityConfs -> DONE (burial boundary, inclusive)', () => {
+  const s = nextBridgeStep({ lnSide: 'payer', amountSat: A },
+    { tip: 135, onchain: { funded: true, amountSat: A, cltv: 130, lockedToReceiver: true, spent: true, spendStatus: 'spent_refund', spendConfs: BRIDGE_DEFAULTS.refundFinalityConfs }, ln: { registered: true, held: true, settled: false, preimage: null }, crossFund: true });
+  assert.equal(s.action, 'done');
+});
+test('payer 0-conf-refund THEN a conflicting CLAIM swaps in (spendStatus flips to spent_claim) -> RECOUP (claim wins)', () => {
+  // Tick 1: a shallow refund with no P -> the LSP waits (hold kept alive).
+  const shallow = nextBridgeStep({ lnSide: 'payer', amountSat: A },
+    { tip: 135, onchain: { funded: true, amountSat: A, cltv: 130, lockedToReceiver: true, spent: true, spendStatus: 'spent_refund', spendConfs: 0 }, ln: { registered: true, held: true, settled: false, preimage: null }, crossFund: true });
+  assert.equal(shallow.action, 'wait');
+  // Tick 2: the maker's claim replaces the unconfirmed refund (RBF/reorg) — the classifier now reads spent_claim,
+  // revealing P. The LSP RECOUPS (settles the hold with P) — a claim wins over an unconfirmed refund.
+  const swappedIn = nextBridgeStep({ lnSide: 'payer', amountSat: A },
+    { tip: 136, onchain: { funded: true, amountSat: A, cltv: 130, lockedToReceiver: true, spent: true, spendStatus: 'spent_claim', spendConfs: 0 }, ln: { registered: true, held: true, settled: false, preimage: 'cd'.repeat(32) }, crossFund: true });
+  assert.equal(swappedIn.action, 'recoup-settle');
+});
+
+// ---- CHANGE (round 9): FINALITY is a CONVENTIONAL BTC depth, and a CONFIRMED maker CLAIM beats a conflicted
+// (shallow) refund. The classifier's improved output (spendStatus + spendConfs) drives: a spent_claim that
+// SUPERSEDES a prior 0-conf refund => RECOUP (not release), and a refund is terminal ONLY at a conventional
+// finality (>= 6 confs) — never at the old shallow 2 (a 2-deep refund can still be reorged out for a claim). ----
+test('refundFinalityConfs is a CONVENTIONAL BTC finality (>= 6) — a 2-deep refund is no longer terminal', () => {
+  assert.ok(BRIDGE_DEFAULTS.refundFinalityConfs >= 6,
+    `refundFinalityConfs must be a conventional BTC finality depth (>= 6), got ${BRIDGE_DEFAULTS.refundFinalityConfs}`);
+  // Explicit at the OLD threshold: a refund only 2 deep is now SHALLOW -> WAIT (keep the hold alive), never done.
+  const twoDeep = nextBridgeStep({ lnSide: 'payer', amountSat: A },
+    { tip: 135, onchain: { funded: true, amountSat: A, cltv: 130, lockedToReceiver: true, spent: true, spendStatus: 'spent_refund', spendConfs: 2 }, ln: { registered: true, held: true, settled: false, preimage: null }, crossFund: true });
+  assert.equal(twoDeep.action, 'wait');
+  assert.notEqual(twoDeep.action, 'done');
+  // ...and only at the full conventional finality (6) does the refund become terminal / release the hold.
+  const buried = nextBridgeStep({ lnSide: 'payer', amountSat: A },
+    { tip: 135, onchain: { funded: true, amountSat: A, cltv: 130, lockedToReceiver: true, spent: true, spendStatus: 'spent_refund', spendConfs: 6 }, ln: { registered: true, held: true, settled: false, preimage: null }, crossFund: true });
+  assert.equal(buried.action, 'done');
+});
+
+// ---- WINDOW SIZING COUPLING: holdBuffer is DERIVED so the refund/hold window ALWAYS spans CONFIRM then BURY.
+// The B3 slack (T_btc <= holdCLTV - holdBuffer) is the worst-case wall-clock window a no-reveal refund gets: an
+// adversarial maker pins T_btc to exactly that ceiling. holdBuffer must therefore be refundConfirmBudget (mine
+// under RBF) + refundFinalityConfs (bury) so a stuck-then-buried refund fits — and the two must never silently
+// drift out of the window (the whole point of this round). ----
+test('window sizing: holdBuffer === refundFinalityConfs + refundConfirmBudget (DERIVED, never drifts)', () => {
+  assert.equal(BRIDGE_DEFAULTS.holdBuffer, BRIDGE_DEFAULTS.refundFinalityConfs + BRIDGE_DEFAULTS.refundConfirmBudget,
+    `holdBuffer must be DERIVED = refundFinalityConfs + refundConfirmBudget, got ${BRIDGE_DEFAULTS.holdBuffer}`);
+  // The confirm budget must be a GENEROUS margin over the ~3-block RBF target, not the old coincidental "+2".
+  assert.ok(BRIDGE_DEFAULTS.refundConfirmBudget >= 12,
+    `refundConfirmBudget must be a generous RBF confirm budget (>= 12 blocks), got ${BRIDGE_DEFAULTS.refundConfirmBudget}`);
+  assert.equal(BRIDGE_DEFAULTS.holdBuffer, 18);   // 6 + 12 with the current constants
+  // refundBumpWithin must cover the tightest gap (== holdBuffer) so a stuck refund at the B3 ceiling still gets
+  // the FULL confirm+bury budget of RBF bumping from the first post-refund tick.
+  assert.ok(BRIDGE_DEFAULTS.refundBumpWithin >= BRIDGE_DEFAULTS.holdBuffer,
+    `refundBumpWithin (${BRIDGE_DEFAULTS.refundBumpWithin}) must be >= holdBuffer (${BRIDGE_DEFAULTS.holdBuffer})`);
+});
+test('payer 0-conf refund SUPERSEDED by a CONFIRMED maker claim -> RECOUP (classifier resolves the confirmed claim over the conflicted refund)', () => {
+  // Tick 1: the LSP's OWN refund is on chain but only 0-conf, no P -> WAIT (hold kept ALIVE, never released on a
+  // shallow refund) — exactly the T_btc race: our 0-conf refund conflicts with an in-flight maker claim.
+  const shallowRefund = nextBridgeStep({ lnSide: 'payer', amountSat: A },
+    { tip: 135, onchain: { funded: true, amountSat: A, cltv: 130, lockedToReceiver: true, spent: true, spendStatus: 'spent_refund', spendConfs: 0 }, ln: { registered: true, held: true, settled: false, preimage: null }, crossFund: true });
+  assert.equal(shallowRefund.action, 'wait');
+  // Tick 2: a reorg swaps the maker's CLAIM in over the shallow refund and it CONFIRMS (spendConfs 3, revealing P).
+  // The seqdex classifier resolves the CONFIRMED claim over the conflicted 0-conf refund -> spendStatus spent_claim.
+  // The authoritative rule (a confirmed spend beats a 0-conf/conflicted one; a claim reveals P) drives RECOUP: the
+  // LSP settles the STILL-LIVE hold with the revealed P — never release (the maker got paid; we recoup our fund).
+  const confirmedClaim = nextBridgeStep({ lnSide: 'payer', amountSat: A },
+    { tip: 138, onchain: { funded: true, amountSat: A, cltv: 130, lockedToReceiver: true, spent: true, spendStatus: 'spent_claim', spendConfs: 3 }, ln: { registered: true, held: true, settled: false, preimage: 'cd'.repeat(32) }, crossFund: true });
+  assert.equal(confirmedClaim.action, 'recoup-settle');
+  assert.match(confirmedClaim.reason, /CLAIM branch|maker got paid/i);
+});
+// ---- Fix 1 (round 10): RECOUP NEVER AFTER REFUND. A shallow-but-CONFIRMED refund (spendConfs 1..finality-1)
+// plus a LATE public P must NEVER recoup-settle: the LSP already reclaimed its BTC on the refund branch, so
+// settling the hold too would DOUBLE-DIP (keep the near-certain-to-bury refund AND collect the taker's LN,
+// robbing the maker). The pPublic recoup is now decided STRICTLY AFTER the refund fate, and only over a
+// DEFINITIVELY-UNSPENT HTLC — so any spent_refund WAITS for chain truth (burial => done, or a conflicting
+// spent_claim swapping in => recoup). This is the closed hole. ----
+test('Fix 1: payer SHALLOW-CONFIRMED refund + P PUBLIC -> WAIT, NEVER recoup-settle (no double-dip after a refund)', () => {
+  // Our own refund is CONFIRMED but shallow (finality-1 deep, not 0-conf so not RBF-bumpable) and P leaks public.
+  // The OLD ordering ran pPublic ahead of the shallow-refund branch and recoup-settled here => double-dip. Now it
+  // WAITS: the near-certain-to-bury refund is left to bury (=> done), and only a conflicting claim swapping in
+  // (spent_claim) would recoup. Never settle the hold on top of our own refund.
+  const s = nextBridgeStep({ lnSide: 'payer', amountSat: A },
+    { tip: 135, onchain: { funded: true, amountSat: A, cltv: 130, lockedToReceiver: true, spent: true, spendStatus: 'spent_refund', spendConfs: BRIDGE_DEFAULTS.refundFinalityConfs - 1 }, ln: { registered: true, held: true, settled: false, preimage: 'cd'.repeat(32) }, crossFund: true });
+  assert.equal(s.action, 'wait');
+  assert.notEqual(s.action, 'recoup-settle');
+  assert.match(s.reason, /NEVER a recoup|double-dip|let the maker/i);
+});
+test('Fix 1: that same shallow-confirmed refund, once it BURIES, is terminal done (P still public) — never recoup', () => {
+  // The wait above resolves cleanly at burial: the refund is the maker's loss (P went public after T_btc, too
+  // late), the LSP keeps its BTC and RELEASES the hold to the taker. Still no recoup-settle (no double-dip).
+  const s = nextBridgeStep({ lnSide: 'payer', amountSat: A },
+    { tip: 140, onchain: { funded: true, amountSat: A, cltv: 130, lockedToReceiver: true, spent: true, spendStatus: 'spent_refund', spendConfs: BRIDGE_DEFAULTS.refundFinalityConfs }, ln: { registered: true, held: true, settled: false, preimage: 'cd'.repeat(32) }, crossFund: true });
+  assert.equal(s.action, 'done');
+  assert.notEqual(s.action, 'recoup-settle');
+});
+test('Fix 1: the ONLY recoup after a refund is a conflicting CLAIM swapping in (spent_claim), never pPublic alone', () => {
+  // If the maker's claim actually swaps in over the unconfirmed refund (classifier flips to spent_claim), THEN we
+  // recoup — chain truth, not an anticipatory pPublic. This is the "watch for a conflicting claim" resolution.
+  const s = nextBridgeStep({ lnSide: 'payer', amountSat: A },
+    { tip: 136, onchain: { funded: true, amountSat: A, cltv: 130, lockedToReceiver: true, spent: true, spendStatus: 'spent_claim', spendConfs: 0 }, ln: { registered: true, held: true, settled: false, preimage: 'cd'.repeat(32) }, crossFund: true });
+  assert.equal(s.action, 'recoup-settle');
+});
+// The task's explicit Fix-1 case: spent_refund at 3 conf + P public => WAIT (mined-but-shallow, not RBF-bumpable),
+// then done at >= refundFinalityConfs, NEVER recoup at any point.
+test('Fix 1 (task case): spent_refund @3conf + P public -> WAIT; then @>=finality -> done; never recoup', () => {
+  const at3 = nextBridgeStep({ lnSide: 'payer', amountSat: A },
+    { tip: 135, onchain: { funded: true, amountSat: A, cltv: 130, lockedToReceiver: true, spent: true, spendStatus: 'spent_refund', spendConfs: 3 }, ln: { registered: true, held: true, settled: false, preimage: 'cd'.repeat(32), expiryBlocks: 5 }, crossFund: true });
+  assert.equal(at3.action, 'wait');               // 3 conf is mined (not 0-conf) => not RBF-bumpable; P public => never recoup
+  assert.notEqual(at3.action, 'recoup-settle');
+  assert.notEqual(at3.action, 'refund-bump');
+  const atFinal = nextBridgeStep({ lnSide: 'payer', amountSat: A },
+    { tip: 138, onchain: { funded: true, amountSat: A, cltv: 130, lockedToReceiver: true, spent: true, spendStatus: 'spent_refund', spendConfs: BRIDGE_DEFAULTS.refundFinalityConfs }, ln: { registered: true, held: true, settled: false, preimage: 'cd'.repeat(32), expiryBlocks: 2 }, crossFund: true });
+  assert.equal(atFinal.action, 'done');
+  assert.notEqual(atFinal.action, 'recoup-settle');
+});
+
+// ---- Fix 2 (round 10): REFUND FEE ADEQUACY — RBF fee-BUMP a 0-conf refund so it confirms inside the hold. ----
+// nextBridgeStep emits 'refund-bump' ONLY for a 0-conf spent_refund (mempool, RBF-replaceable), with NO public P
+// (a public P means the maker is entitled — let its claim win, never race it), when the hold's remaining life is
+// inside the danger window (holdLife <= refundBumpWithin). Everything else stays 'wait' (unchanged).
+test('Fix 2: 0-conf refund + no P + hold in the danger window -> refund-bump (RBF the stalled refund)', () => {
+  const s = nextBridgeStep({ lnSide: 'payer', amountSat: A },
+    { tip: 131, onchain: { funded: true, amountSat: A, cltv: 130, lockedToReceiver: true, spent: true, spendStatus: 'spent_refund', spendConfs: 0 }, ln: { registered: true, held: true, settled: false, preimage: null, expiryBlocks: 6 }, crossFund: true });
+  assert.equal(s.action, 'refund-bump');
+  assert.match(s.reason, /FEE-BUMP|RBF|0-conf/i);
+});
+test('Fix 2: 0-conf refund but P PUBLIC -> WAIT, never bump (let the maker\'s claim win, never race it)', () => {
+  const s = nextBridgeStep({ lnSide: 'payer', amountSat: A },
+    { tip: 131, onchain: { funded: true, amountSat: A, cltv: 130, lockedToReceiver: true, spent: true, spendStatus: 'spent_refund', spendConfs: 0 }, ln: { registered: true, held: true, settled: false, preimage: 'cd'.repeat(32), expiryBlocks: 6 }, crossFund: true });
+  assert.equal(s.action, 'wait');
+  assert.notEqual(s.action, 'refund-bump');
+  assert.notEqual(s.action, 'recoup-settle');
+});
+test('Fix 2: 0-conf refund but hold-life UNKNOWN (no expiryBlocks) -> WAIT (fail-safe; never bump on an unknown deadline)', () => {
+  const s = nextBridgeStep({ lnSide: 'payer', amountSat: A },
+    { tip: 131, onchain: { funded: true, amountSat: A, cltv: 130, lockedToReceiver: true, spent: true, spendStatus: 'spent_refund', spendConfs: 0 }, ln: { registered: true, held: true, settled: false, preimage: null }, crossFund: true });
+  assert.equal(s.action, 'wait');
+  assert.notEqual(s.action, 'refund-bump');
+});
+test('Fix 2: 0-conf refund but hold-life OUTSIDE the danger window -> WAIT (not yet urgent, do not burn fees)', () => {
+  const s = nextBridgeStep({ lnSide: 'payer', amountSat: A },
+    { tip: 131, onchain: { funded: true, amountSat: A, cltv: 130, lockedToReceiver: true, spent: true, spendStatus: 'spent_refund', spendConfs: 0 }, ln: { registered: true, held: true, settled: false, preimage: null, expiryBlocks: BRIDGE_DEFAULTS.refundBumpWithin + 5 }, crossFund: true });
+  assert.equal(s.action, 'wait');
+  assert.notEqual(s.action, 'refund-bump');
+});
+test('Fix 2: MINED-but-shallow refund (spendConfs 1) in the window -> WAIT (a confirmed tx cannot be RBF-bumped)', () => {
+  const s = nextBridgeStep({ lnSide: 'payer', amountSat: A },
+    { tip: 131, onchain: { funded: true, amountSat: A, cltv: 130, lockedToReceiver: true, spent: true, spendStatus: 'spent_refund', spendConfs: 1 }, ln: { registered: true, held: true, settled: false, preimage: null, expiryBlocks: 6 }, crossFund: true });
+  assert.equal(s.action, 'wait');
+  assert.notEqual(s.action, 'refund-bump');
+});
+
+// ---- Fix 2: sizeRefundFee (pure fee math) ----
+test('sizeRefundFee: sizes from estimate * vsize, above the floor', () => {
+  const fee = sizeRefundFee({ estSatPerVb: 10, vsize: 250, amountSat: 100000, floorSats: 600, ceilSats: 50000 });
+  assert.equal(fee, 2500);   // 10 sat/vB * 250 vB
+});
+test('sizeRefundFee: floors at floorSats when the estimate is tiny', () => {
+  const fee = sizeRefundFee({ estSatPerVb: 0.5, vsize: 250, amountSat: 100000, floorSats: 600, ceilSats: 50000 });
+  assert.equal(fee, 600);
+});
+test('sizeRefundFee: caps at ceilSats', () => {
+  const fee = sizeRefundFee({ estSatPerVb: 1000, vsize: 250, amountSat: 10_000_000, floorSats: 600, ceilSats: 50000 });
+  assert.equal(fee, 50000);
+});
+test('sizeRefundFee: never fees past (amount - dust) even below the ceiling', () => {
+  const fee = sizeRefundFee({ estSatPerVb: 1000, vsize: 250, amountSat: 5000, floorSats: 600, ceilSats: 50000, dustSats: 546 });
+  assert.equal(fee, 5000 - 546);
+});
+test('sizeRefundFee: a bump escalates the last fee by bumpFactor (min-increment) even when the estimate is flat', () => {
+  const fee = sizeRefundFee({ estSatPerVb: 4, vsize: 250, amountSat: 100000, floorSats: 600, ceilSats: 50000, lastFee: 2000, bumpFactor: 1.5 });
+  assert.equal(fee, 3000);   // max(estimate 1000, lastFee*1.5 = 3000, floor 600)
+});
+
+// ---- Fix 2: runPayerRefundBumpOnce (pure orchestrator) ----
+test('runPayerRefundBumpOnce: 0-conf spent_refund + new block + higher fee -> RBF rebroadcast', async () => {
+  let rebroadcastFee = null;
+  const r = await runPayerRefundBumpOnce({
+    classifySpend: async () => ({ status: 'spent_refund', spendConfs: 0 }),
+    tipAdvanced: async () => true,
+    computeFee: async () => ({ fee: 3000, bump: true }),
+    rebroadcast: async (fee) => { rebroadcastFee = fee; return 'txid'; },
+  });
+  assert.equal(r.bumped, true);
+  assert.equal(rebroadcastFee, 3000);
+});
+test('runPayerRefundBumpOnce: a refund that CONFIRMED (spendConfs >= 1) is NOT bumped', async () => {
+  let called = false;
+  const r = await runPayerRefundBumpOnce({
+    classifySpend: async () => ({ status: 'spent_refund', spendConfs: 2 }),
+    tipAdvanced: async () => true,
+    computeFee: async () => ({ fee: 9999, bump: true }),
+    rebroadcast: async () => { called = true; return 'x'; },
+  });
+  assert.equal(r.bumped, false);
+  assert.equal(called, false);
+});
+test('runPayerRefundBumpOnce: a claim that swapped in (spent_claim) is NOT bumped (driver recoups instead)', async () => {
+  let called = false;
+  const r = await runPayerRefundBumpOnce({
+    classifySpend: async () => ({ status: 'spent_claim', spendConfs: 0 }),
+    tipAdvanced: async () => true,
+    computeFee: async () => ({ fee: 9999, bump: true }),
+    rebroadcast: async () => { called = true; return 'x'; },
+  });
+  assert.equal(r.bumped, false);
+  assert.equal(called, false);
+});
+test('runPayerRefundBumpOnce: throttled to one bump per new BTC block (no tip advance -> no bump)', async () => {
+  let called = false;
+  const r = await runPayerRefundBumpOnce({
+    classifySpend: async () => ({ status: 'spent_refund', spendConfs: 0 }),
+    tipAdvanced: async () => false,
+    computeFee: async () => ({ fee: 9999, bump: true }),
+    rebroadcast: async () => { called = true; return 'x'; },
+  });
+  assert.equal(r.bumped, false);
+  assert.equal(called, false);
+});
+test('runPayerRefundBumpOnce: no strictly-higher fee (ceiling reached) -> no rebroadcast', async () => {
+  let called = false;
+  const r = await runPayerRefundBumpOnce({
+    classifySpend: async () => ({ status: 'spent_refund', spendConfs: 0 }),
+    tipAdvanced: async () => true,
+    computeFee: async () => ({ fee: 50000, bump: false }),
+    rebroadcast: async () => { called = true; return 'x'; },
+  });
+  assert.equal(r.bumped, false);
+  assert.equal(called, false);
+});
+test('runPayerRefundBumpOnce: an uncertain/unreadable classifier PROPAGATES (fail closed, no bump)', async () => {
+  await assert.rejects(() => runPayerRefundBumpOnce({
+    classifySpend: async () => { throw new Error('UNCERTAIN'); },
+    tipAdvanced: async () => true,
+    computeFee: async () => ({ fee: 3000, bump: true }),
+    rebroadcast: async () => 'x',
+  }), /UNCERTAIN/);
+});
+test('runPayerRefundBumpOnce: fails closed if any injected primitive is missing', async () => {
+  await assert.rejects(() => runPayerRefundBumpOnce({ classifySpend: async () => ({ status: 'spent_refund' }) }), /must all be functions/);
+});
+test('payer spent_claim at 0-conf -> RECOUP-SETTLE (a claim reveals P immutably — safe to act at ANY depth)', () => {
+  const s = nextBridgeStep({ lnSide: 'payer', amountSat: A },
+    { tip: 118, onchain: { funded: true, amountSat: A, cltv: 130, lockedToReceiver: true, spent: true, spendStatus: 'spent_claim', spendConfs: 0 }, ln: { registered: true, held: true, settled: false, preimage: 'cd'.repeat(32) }, crossFund: true });
+  assert.equal(s.action, 'recoup-settle');
+  assert.match(s.reason, /CLAIM|any depth|0-conf/i);
+});
+test('payer UNCERTAIN spend -> WAIT (retry), never release or double-broadcast — even with a public P', () => {
+  // An uncertain spend could be an already-buried refund, so a public P alone must NOT force a recoup here.
+  const s = nextBridgeStep({ lnSide: 'payer', amountSat: A },
+    { tip: 135, onchain: { funded: true, amountSat: A, cltv: 130, lockedToReceiver: true, spent: true, spendStatus: 'uncertain' }, ln: { registered: true, held: true, settled: false, preimage: 'cd'.repeat(32) }, crossFund: true });
+  assert.equal(s.action, 'wait');
+  assert.notEqual(s.action, 'done');
+  assert.notEqual(s.action, 'recoup-settle');
+});
+
+// ---- CLASSIFIER-DOWN / ABSENT => FAIL CLOSED (wait), even at/after T_btc (never a blind refund) ----
+test('payer uncertain-classifier at/after T_btc: WAIT, never refund on an unresolved chain read', () => {
+  // Even with tip>=T_btc, an UNCERTAIN classification must NOT drive refund-onchain — only a DEFINITIVELY-unspent
+  // read may refund. The action is wait (the reason legitimately mentions "refund" while explaining why we do NOT).
+  const s = nextBridgeStep({ lnSide: 'payer', amountSat: A },
+    { tip: 200, onchain: { funded: true, amountSat: A, cltv: 130, lockedToReceiver: true, spent: false, spendStatus: 'uncertain' }, ln: { registered: true, held: true, settled: false, preimage: null }, crossFund: true });
+  assert.equal(s.action, 'wait');
+  assert.notEqual(s.action, 'refund-onchain');
+  assert.match(s.reason, /UNCERTAIN|fail closed/i);
+});
+test('payer uncertain-classifier + P public: WAIT (a maybe-refund must not force a recoup double-dip)', () => {
+  const s = nextBridgeStep({ lnSide: 'payer', amountSat: A },
+    { tip: 200, onchain: { funded: true, amountSat: A, cltv: 130, lockedToReceiver: true, spent: true, spendStatus: 'uncertain' }, ln: { registered: true, held: true, settled: false, preimage: 'cd'.repeat(32) }, crossFund: true });
+  assert.equal(s.action, 'wait');
+});
+test('payer absent spendStatus over a funded leg: FAIL CLOSED wait (classifier not yet read)', () => {
+  const s = nextBridgeStep({ lnSide: 'payer', amountSat: A },
+    { tip: 200, onchain: { funded: true, amountSat: A, cltv: 130, lockedToReceiver: true, spent: false }, ln: { registered: true, held: true, settled: false, preimage: null }, crossFund: true });
+  assert.equal(s.action, 'wait');
+  assert.match(s.reason, /UNAVAILABLE|fail closed/i);
 });
 
 // ---- guards ----
@@ -846,6 +1302,80 @@ test('FIX 2b — a min-T_seq violation is REJECTED (bound + requiredTakerHold bo
   assert.equal(checkTseqWithinBound({ seqTip: seqTipT, seqRefundHeight: seqTipT + HL.minTseqBlocks }).ok, true);   // exactly at the min: ok
 });
 
+// ============================================================================
+// B — PAYER-SIDE FUND-TIME GATE (checkPayerFundGate). The MIRROR for the LSP payer leg-bridge (buy: taker
+// pays BTC over LN, receives the asset on-chain). The LSP RECEIVES the taker's BTC-LN hold and FUNDS an
+// on-chain BTC HTLC to the maker; before funding it must verify, from the ACTUAL committed incoming-HTLC
+// CLTV, that (B2) the hold covers T_seq and (B3) T_btc matures inside the hold's remaining life. Pure BTC
+// blocks (both HTLCs are on Bitcoin). Fail closed on any invalid/timestamp/degenerate input.
+// ============================================================================
+const HB = BRIDGE_DEFAULTS.holdBuffer;   // 18 (DERIVED = refundFinalityConfs 6 + refundConfirmBudget 12)
+// requiredTakerBlocks for the honest 240-SEQ-block T_seq (== the front-HTLC survival used elsewhere).
+const REQ_PAYER = requiredTakerHold({ seqTip: 44000, seqRefundHeight: 44000 + 240 }).minFinalCltvBlocks;   // 210
+// btcTip 800000; incoming hold CLTV 800220 (220 >= 210 covers T_seq); T_btc 800180 (> tip, >= B1 floor 800150,
+// <= 800220 - 18 = 800202). The honest maker rests T_btc at seqdex BtcLocktimeDelta 180 (tip + 180), ~40 blocks
+// below the ~220-block hold — clearing the holdBuffer=18 (finality 6 + confirm 12) window with headroom.
+const HONEST_PAYER = { btcTip: 800000, incomingHtlcExpiry: 800220, btcRefundHeight: 800180, seqTip: 44000, seqRefundHeight: 44000 + 240 };
+
+test('payer fund gate: an honest hold (covers T_seq) + T_btc inside the hold PASSES', () => {
+  const g = checkPayerFundGate(HONEST_PAYER);
+  assert.equal(g.ok, true, g.reason);
+  assert.equal(g.requiredTakerBlocks, REQ_PAYER);
+  assert.equal(g.incomingHoldBlocks, 220);
+  assert.equal(g.tBtcInsideHold, true);
+});
+
+test('payer fund gate (B2): an incoming hold too SHORT to cover T_seq is REFUSED', () => {
+  // incomingHtlcExpiry 800100 -> only 100 blocks of hold life, below the ~210 needed to cover a 240-block T_seq.
+  const g = checkPayerFundGate({ ...HONEST_PAYER, incomingHtlcExpiry: 800100 });
+  assert.equal(g.ok, false);
+  assert.match(g.reason, /B2|settleable|T_seq|below/i);
+  assert.ok(g.incomingHoldBlocks < g.requiredTakerBlocks);
+});
+
+test('payer fund gate (B3): a T_btc that matures OUTSIDE the hold (too far) is REFUSED', () => {
+  // T_btc 800300 > incomingHtlcExpiry 800220 - holdBuffer 18 = 800202 -> not inside the hold's life.
+  const g = checkPayerFundGate({ ...HONEST_PAYER, btcRefundHeight: 800300 });
+  assert.equal(g.ok, false);
+  assert.match(g.reason, /B3|inside the hold|holdBuffer/i);
+});
+
+test('payer fund gate: a T_btc already at/below the tip (refundable immediately) is REFUSED', () => {
+  const g = checkPayerFundGate({ ...HONEST_PAYER, btcRefundHeight: HONEST_PAYER.btcTip });
+  assert.equal(g.ok, false);
+  assert.match(g.reason, /refundable immediately|<= tip/i);
+});
+
+test('payer fund gate: boundaries — exactly at requiredTakerBlocks (B2) and exactly at hold-holdBuffer (B3) PASS', () => {
+  // B2 boundary: incomingHtlcExpiry = btcTip + requiredTakerBlocks exactly. T_btc pinned inside.
+  const atB2 = checkPayerFundGate({ ...HONEST_PAYER, incomingHtlcExpiry: 800000 + REQ_PAYER, btcRefundHeight: 800000 + REQ_PAYER - HB });
+  assert.equal(atB2.ok, true, atB2.reason);
+  // B3 boundary: T_btc = incomingHtlcExpiry - holdBuffer exactly.
+  const atB3 = checkPayerFundGate({ ...HONEST_PAYER, btcRefundHeight: HONEST_PAYER.incomingHtlcExpiry - HB });
+  assert.equal(atB3.ok, true, atB3.reason);
+  // one block past B3 fails.
+  assert.equal(checkPayerFundGate({ ...HONEST_PAYER, btcRefundHeight: HONEST_PAYER.incomingHtlcExpiry - HB + 1 }).ok, false);
+});
+
+test('payer fund gate: a degenerate T_seq (too near, margin-collapse) is REFUSED via requiredTakerHold', () => {
+  const g = checkPayerFundGate({ ...HONEST_PAYER, seqRefundHeight: HONEST_PAYER.seqTip + 30 });   // 30 < minTseqBlocks 120
+  assert.equal(g.ok, false);
+  assert.match(g.reason, /below the min|margin-collapse|min /i);
+});
+
+test('payer fund gate: a TIMESTAMP height (incoming hold / T_btc / T_seq) fails closed', () => {
+  assert.equal(checkPayerFundGate({ ...HONEST_PAYER, incomingHtlcExpiry: LOCKTIME_THRESHOLD + 800260 }).ok, false);
+  assert.equal(checkPayerFundGate({ ...HONEST_PAYER, btcRefundHeight: LOCKTIME_THRESHOLD + 800250 }).ok, false);
+  assert.equal(checkPayerFundGate({ ...HONEST_PAYER, seqRefundHeight: LOCKTIME_THRESHOLD + 44000 }).ok, false);
+});
+
+test('payer fund gate: a non-finite input fails closed (never fund on an unverifiable ordering)', () => {
+  for (const bad of [{ btcTip: NaN }, { incomingHtlcExpiry: undefined }, { btcRefundHeight: 'x' }, { seqTip: null }, { seqRefundHeight: NaN }]) {
+    assert.equal(checkPayerFundGate({ ...HONEST_PAYER, ...bad }).ok, false);
+  }
+  assert.equal(checkPayerFundGate().ok, false);
+});
+
 test('SELF-TRADE (maker==taker) with tuned small T_seq/T_btc is REFUSED — the gate itself now enforces the T_seq min bound', () => {
   // A self-trader tunes a tiny T_seq to shrink the required front HTLC so a matched tiny T_btc would clear the
   // recoup deadline, then waits to race the LSP recoup. The gate now delegates to requiredTakerHold, so BOTH
@@ -862,4 +1392,258 @@ test('SELF-TRADE (maker==taker) with tuned small T_seq/T_btc is REFUSED — the 
   assert.match(collapsed.reason, /below the min|margin-collapse|min /i);
   assert.equal(requiredTakerHold({ seqTip: seqTipT, seqRefundHeight: tinyTseq }).ok, false);   // ...via the same min bound
   assert.equal(checkTseqWithinBound({ seqTip: seqTipT, seqRefundHeight: tinyTseq }).ok, false);
+});
+
+// ============================================================================
+// B0 — HELD-AMOUNT gate (hole 1). holdinvoice marks HELD on the FIRST incoming HTLC regardless of amount, so
+// a 1-sat pay must NOT trip funding. Enforced only when the caller supplies the amounts (fundOnchain always
+// does; the pure CLTV-only tests above omit them, and still pass). Mirror of stepReceiverLn's amount fail-close.
+// ============================================================================
+const PRICE = 100000;   // the ordered BTC price (sats)
+
+test('payer fund gate (B0): a held amount COVERING the ordered price PASSES', () => {
+  const g = checkPayerFundGate({ ...HONEST_PAYER, heldAmountSat: PRICE, orderedAmountSat: PRICE });
+  assert.equal(g.ok, true, g.reason);
+});
+
+test('payer fund gate (B0): a 1-sat pay (held < ordered) is REFUSED even though the hold is marked HELD', () => {
+  const g = checkPayerFundGate({ ...HONEST_PAYER, heldAmountSat: 1, orderedAmountSat: PRICE });
+  assert.equal(g.ok, false);
+  assert.match(g.reason, /B0|HELD|full price|below the ordered/i);
+});
+
+test('payer fund gate (B0): a held amount ONE sat short is REFUSED; exactly equal PASSES', () => {
+  assert.equal(checkPayerFundGate({ ...HONEST_PAYER, heldAmountSat: PRICE - 1, orderedAmountSat: PRICE }).ok, false);
+  assert.equal(checkPayerFundGate({ ...HONEST_PAYER, heldAmountSat: PRICE, orderedAmountSat: PRICE }).ok, true);
+  // an over-pay is fine (the LSP fronts exactly the price; the extra just sits in the hold).
+  assert.equal(checkPayerFundGate({ ...HONEST_PAYER, heldAmountSat: PRICE + 5, orderedAmountSat: PRICE }).ok, true);
+});
+
+test('payer fund gate (B0): an unverifiable held amount (NaN) with a real ordered price fails closed', () => {
+  const g = checkPayerFundGate({ ...HONEST_PAYER, heldAmountSat: NaN, orderedAmountSat: PRICE });
+  assert.equal(g.ok, false);
+  // and a bogus (<= 0) ordered price cannot bound the check -> fail closed.
+  assert.equal(checkPayerFundGate({ ...HONEST_PAYER, heldAmountSat: PRICE, orderedAmountSat: 0 }).ok, false);
+});
+
+// ============================================================================
+// B1 — T_btc >= f(T_seq) WALL-CLOCK ORDERING gate (hole 4). The payer analog of checkBridgeLocktimeOrdering:
+// convert the T_seq window to BTC blocks with the SAME slow-SEQ/fast-BTC divisors requiredTakerHold uses and
+// require T_btc >= that height + a maker-claim runway, so a wall-clock inversion (T_btc <= T_seq) that B2/B3
+// (which only bound T_btc from ABOVE) would MISS can never let the LSP refund its BTC before P reveals at T_seq.
+// ============================================================================
+const RUN = BRIDGE_DEFAULTS.makerClaimRunwayBlocks;   // 6
+const TSEQ_BTC = Math.ceil(240 * HOLD_LIFE_DEFAULTS.seqSecsPerBlock / HOLD_LIFE_DEFAULTS.fastBtcSecsPerBlock);   // ceil(240*90/150)=144
+const B1_FLOOR = 800000 + TSEQ_BTC + RUN;   // 800150
+
+test('payer fund gate (B1): the honest T_btc clears the wall-clock ordering floor', () => {
+  const g = checkPayerFundGate(HONEST_PAYER);
+  assert.equal(g.ok, true, g.reason);
+  assert.equal(g.tSeqCoverHeight, 800000 + TSEQ_BTC);
+  assert.ok(HONEST_PAYER.btcRefundHeight >= B1_FLOOR);
+});
+
+test('payer fund gate (B1): a T_btc BELOW the T_seq wall-clock (an inversion) is REFUSED even though it passes B3', () => {
+  // T_btc 800100 < floor 800150, yet it IS inside the hold (800100 <= 800220 - 18 = 800202) and > tip — so B2/B3
+  // pass and only B1 catches it. This is exactly the maker-sets-T_btc<=T_seq inversion of hole 4.
+  const inverted = { ...HONEST_PAYER, btcRefundHeight: 800100 };
+  assert.ok(inverted.btcRefundHeight > inverted.btcTip);                                  // not immediately refundable
+  assert.ok(inverted.btcRefundHeight <= inverted.incomingHtlcExpiry - HB);                // passes B3 (inside the hold)
+  const g = checkPayerFundGate(inverted);
+  assert.equal(g.ok, false);
+  assert.match(g.reason, /B1|ordering floor|inversion|reveal/i);
+});
+
+test('payer fund gate (B1): boundary — T_btc exactly at the floor PASSES, one below FAILS', () => {
+  assert.equal(checkPayerFundGate({ ...HONEST_PAYER, btcRefundHeight: B1_FLOOR }).ok, true);
+  const below = checkPayerFundGate({ ...HONEST_PAYER, btcRefundHeight: B1_FLOOR - 1 });
+  assert.equal(below.ok, false);
+  assert.match(below.reason, /B1|ordering floor/i);
+});
+
+// ============================================================================
+// B — RESUMABLE RELAY (hole 5): a funded crossFund payer leg whose maker asset-leg relay is not yet complete
+// (relayPending) RE-DRIVES fund-onchain instead of stalling, but the settle/refund actions always win first.
+// ============================================================================
+test('crossFund payer: RE-DRIVES the relay (fund-onchain) while funded (unspent) but relayPending — never strands a funded leg', () => {
+  const s = nextBridgeStep({ lnSide: 'payer', amountSat: A },
+    { tip: 110, onchain: { funded: true, amountSat: A, cltv: 130, lockedToReceiver: true, spent: false, spendStatus: 'unspent' },
+      ln: { registered: true, held: true, settled: false, preimage: null }, crossFund: true, relayPending: true });
+  assert.equal(s.action, 'fund-onchain');
+  assert.match(s.reason, /relay|resumable|stranded/i);
+});
+
+test('crossFund payer: a PUBLIC P (unspent) takes priority over the relay re-drive (recoup-settle, not re-fund)', () => {
+  const s = nextBridgeStep({ lnSide: 'payer', amountSat: A },
+    { tip: 110, onchain: { funded: true, amountSat: A, cltv: 130, lockedToReceiver: true, spent: false, spendStatus: 'unspent' },
+      ln: { registered: true, held: true, settled: false, preimage: 'cd'.repeat(32) }, crossFund: true, relayPending: true });
+  assert.equal(s.action, 'recoup-settle');
+});
+
+test('crossFund payer: T_btc reached (unspent) takes priority over the relay re-drive (refund-onchain)', () => {
+  const s = nextBridgeStep({ lnSide: 'payer', amountSat: A },
+    { tip: 130, onchain: { funded: true, amountSat: A, cltv: 130, lockedToReceiver: true, spent: false, spendStatus: 'unspent' },
+      ln: { registered: true, held: true, settled: false, preimage: null }, crossFund: true, relayPending: true });
+  assert.equal(s.action, 'refund-onchain');
+});
+
+test('crossFund payer: NOT relayPending + funded (unspent) -> plain wait (no spurious re-drive)', () => {
+  const s = nextBridgeStep({ lnSide: 'payer', amountSat: A },
+    { tip: 110, onchain: { funded: true, amountSat: A, cltv: 130, lockedToReceiver: true, spent: false, spendStatus: 'unspent' },
+      ln: { registered: true, held: true, settled: false, preimage: null }, crossFund: true, relayPending: false });
+  assert.equal(s.action, 'wait');
+});
+
+// ============================================================================
+// runPayerFundOnce — the payer-bridge FUND-ONCE discipline (round-6 convergence tail). Pure control-flow with
+// all I/O injected, so the three fund-loss disciplines are exercised without a node:
+//   (i)  NEVER broadcast on a locate UNCERTAINTY (dryLocate REJECTS -> propagate, no broadcast).
+//   (ii) ADOPT-BEFORE-GATE (a persisted intent -> locate + adopt an already-funded leg BEFORE the gate runs).
+//   (iii) PERSIST-INTENT-BEFORE-BROADCAST + a DEFINITIVE scan-before-broadcast (broadcast only on funded:false).
+const FUNDED = { funded: true, btc_htlc_txid: 'aa'.repeat(32), btc_htlc_vout: 0, btc_htlc_amount: A, btc_htlc_script: 'ab', btc_locktime: 130 };
+const NOT_FUNDED = { funded: false };
+// A fund harness: records the ORDER of every injected step, and lets each test script the two dryLocate answers.
+function fundHarness({ hasIntent, locateAnswers = [], gateThrows = false }) {
+  const calls = [];
+  let li = 0;
+  const io = {
+    hasIntent,
+    dryLocate: async () => {
+      calls.push('locate');
+      const a = locateAnswers[li++];
+      if (a instanceof Error) throw a;           // UNCERTAIN — the seqdex CLI exited non-zero (fail closed)
+      return a;
+    },
+    runGate: async () => { calls.push('gate'); if (gateThrows) throw new Error('GATE FAIL (assumes not-yet-funded)'); },
+    persistIntent: async () => { calls.push('persistIntent'); },
+    broadcast: async () => { calls.push('broadcast'); return FUNDED; },
+  };
+  return { calls, io };
+}
+
+test('runPayerFundOnce: locate UNCERTAIN on adopt-before-gate does NOT broadcast (throws, no gate, no broadcast)', async () => {
+  const { calls, io } = fundHarness({ hasIntent: true, locateAnswers: [new Error('locate UNCERTAIN: a lookup failed')] });
+  await assert.rejects(runPayerFundOnce(io), /UNCERTAIN/);
+  assert.deepEqual(calls, ['locate']);                 // stopped at the locate; never gated, never broadcast
+  assert.ok(!calls.includes('broadcast'), 'must NOT broadcast on an uncertain locate');
+});
+
+test('runPayerFundOnce: locate UNCERTAIN on the scan-before-broadcast does NOT broadcast (first-fund path)', async () => {
+  // hasIntent:false -> skip the adopt locate; gate passes; persistIntent; then the scan-before-broadcast locate
+  // comes back UNCERTAIN -> must THROW and NEVER broadcast (a transient read over an already-funded leg must not
+  // trigger a second broadcast).
+  const { calls, io } = fundHarness({ hasIntent: false, locateAnswers: [new Error('locate UNCERTAIN')] });
+  await assert.rejects(runPayerFundOnce(io), /UNCERTAIN/);
+  assert.deepEqual(calls, ['gate', 'persistIntent', 'locate']);
+  assert.ok(!calls.includes('broadcast'), 'uncertain scan-before-broadcast must NOT broadcast');
+});
+
+test('runPayerFundOnce: ADOPT-BEFORE-GATE — a persisted intent + already-funded leg adopts, gate NEVER runs', async () => {
+  // The grief case: the gate WOULD throw (inputs moved on re-entry), but adoption must happen first so a funded
+  // leg is never abandoned. gateThrows:true proves the gate is not even reached.
+  const { calls, io } = fundHarness({ hasIntent: true, locateAnswers: [FUNDED], gateThrows: true });
+  const r = await runPayerFundOnce(io);
+  assert.equal(r.broadcasted, false);
+  assert.equal(r.adopted, 'pre-gate');
+  assert.equal(r.funded.btc_htlc_txid, FUNDED.btc_htlc_txid);
+  assert.deepEqual(calls, ['locate']);                 // adopted BEFORE the (throwing) gate; no broadcast
+});
+
+test('runPayerFundOnce: first-fund happy path broadcasts EXACTLY once after a definitive funded:false', async () => {
+  const { calls, io } = fundHarness({ hasIntent: false, locateAnswers: [NOT_FUNDED] });
+  const r = await runPayerFundOnce(io);
+  assert.equal(r.broadcasted, true);
+  assert.equal(r.adopted, null);
+  assert.deepEqual(calls, ['gate', 'persistIntent', 'locate', 'broadcast']);
+  assert.equal(calls.filter((c) => c === 'broadcast').length, 1);
+});
+
+test('runPayerFundOnce: scan-before-broadcast finds a prior broadcast -> ADOPT, do NOT re-broadcast (no double-fund)', async () => {
+  // hasIntent:false (no adopt locate), gate passes, persistIntent, then the scan-before-broadcast DEFINITIVELY
+  // finds an output already funded (a crash after a prior broadcast on this same tick's key) -> adopt, never
+  // broadcast a second output to the deterministic P2SH.
+  const { calls, io } = fundHarness({ hasIntent: false, locateAnswers: [FUNDED] });
+  const r = await runPayerFundOnce(io);
+  assert.equal(r.broadcasted, false);
+  assert.equal(r.adopted, 'pre-broadcast');
+  assert.ok(!calls.includes('broadcast'), 'a located prior funding must NOT be re-broadcast');
+});
+
+test('runPayerFundOnce: adopt-before-gate MISS (definitive funded:false) falls through to first-fund', async () => {
+  // hasIntent:true but the leg is DEFINITIVELY not funded -> the adopt locate returns funded:false, then the
+  // first-fund path runs (gate -> persistIntent -> scan -> broadcast). Two locates total.
+  const { calls, io } = fundHarness({ hasIntent: true, locateAnswers: [NOT_FUNDED, NOT_FUNDED] });
+  const r = await runPayerFundOnce(io);
+  assert.equal(r.broadcasted, true);
+  assert.deepEqual(calls, ['locate', 'gate', 'persistIntent', 'locate', 'broadcast']);
+});
+
+test('runPayerFundOnce: fails closed if any injected primitive is missing', async () => {
+  await assert.rejects(runPayerFundOnce({ dryLocate: async () => NOT_FUNDED }), /must all be functions/);
+});
+
+// ============================================================================
+// runPayerRefundOnce — CHAIN-TRUTH idempotency (round-7). classifySpend (the seqdex xsubas-htlc-spend-status
+// classifier, DEFINITIVE-or-throw) is consulted FIRST, immediately before broadcasting: it NEVER broadcasts
+// unless the BTC HTLC is DEFINITIVELY unspent. spent_claim => skip (recoup next observe); spent_refund => done;
+// uncertain / unreadable => THROW (fail closed). s.refunded is persisted only as a broadcast-dedup hint.
+function refundHarness({ status = 'unspent', broadcastThrows = false, classifyThrows = false } = {}) {
+  const calls = [];
+  const io = {
+    classifySpend: async () => { calls.push('classify'); if (classifyThrows) throw new Error('classifier UNREADABLE (fail closed)'); return { status }; },
+    persistRefundIntent: async () => calls.push('persist(refunded=true)'),
+    broadcastRefund: async () => { calls.push('broadcast'); if (broadcastThrows) throw new Error('refund broadcast FAILED (HTLC untouched, retryable)'); return 'REFUNDED'; },
+    clearRefundIntent: async () => calls.push('clear(refunded=false)'),
+  };
+  return { calls, io };
+}
+
+test('runPayerRefundOnce: DEFINITIVELY unspent -> classify, persist BEFORE broadcast, broadcast once', async () => {
+  const { calls, io } = refundHarness({ status: 'unspent' });
+  const r = await runPayerRefundOnce(io);
+  assert.equal(r.broadcasted, true);
+  assert.equal(r.result, 'REFUNDED');
+  // classify FIRST, then persist STRICTLY before broadcast; no clear on success.
+  assert.deepEqual(calls, ['classify', 'persist(refunded=true)', 'broadcast']);
+  assert.ok(calls.indexOf('classify') < calls.indexOf('broadcast'), 'must classify before broadcasting');
+  assert.ok(calls.indexOf('persist(refunded=true)') < calls.indexOf('broadcast'), 'dedup hint must persist before the broadcast');
+});
+
+test('runPayerRefundOnce: spent_claim -> NEVER broadcasts (recoup instead next observe)', async () => {
+  const { calls, io } = refundHarness({ status: 'spent_claim' });
+  const r = await runPayerRefundOnce(io);
+  assert.equal(r.broadcasted, false);
+  assert.equal(r.status, 'spent_claim');
+  assert.deepEqual(calls, ['classify']);   // no persist, no broadcast — the maker already claimed
+});
+
+test('runPayerRefundOnce: spent_refund -> DONE (idempotent), NEVER re-broadcasts', async () => {
+  const { calls, io } = refundHarness({ status: 'spent_refund' });
+  const r = await runPayerRefundOnce(io);
+  assert.equal(r.broadcasted, false);
+  assert.equal(r.status, 'spent_refund');
+  assert.deepEqual(calls, ['classify']);
+});
+
+test('runPayerRefundOnce: uncertain -> THROWS (fail closed, no broadcast on an unresolved chain read)', async () => {
+  const { calls, io } = refundHarness({ status: 'uncertain' });
+  await assert.rejects(runPayerRefundOnce(io), /not DEFINITIVELY unspent|fail closed/i);
+  assert.deepEqual(calls, ['classify']);   // classified, then refused — never persisted or broadcast
+});
+
+test('runPayerRefundOnce: an UNREADABLE classifier propagates (never a blind broadcast)', async () => {
+  const { calls, io } = refundHarness({ classifyThrows: true });
+  await assert.rejects(runPayerRefundOnce(io), /UNREADABLE/);
+  assert.deepEqual(calls, ['classify']);
+});
+
+test('runPayerRefundOnce: a broadcast that does NOT land CLEARS the dedup hint and re-throws', async () => {
+  const { calls, io } = refundHarness({ status: 'unspent', broadcastThrows: true });
+  await assert.rejects(runPayerRefundOnce(io), /FAILED/);
+  assert.deepEqual(calls, ['classify', 'persist(refunded=true)', 'broadcast', 'clear(refunded=false)']);
+});
+
+test('runPayerRefundOnce: fails closed if any injected primitive is missing', async () => {
+  await assert.rejects(runPayerRefundOnce({ persistRefundIntent: async () => {} }), /must all be functions/);
+  await assert.rejects(runPayerRefundOnce({ classifySpend: async () => ({ status: 'unspent' }) }), /must all be functions/);
 });

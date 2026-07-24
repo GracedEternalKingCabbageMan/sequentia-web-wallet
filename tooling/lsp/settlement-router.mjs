@@ -100,6 +100,48 @@ export function planLeg(unit, payerRail, receiverRail, receiverInbound) {
   };
 }
 
+/**
+ * Route a rail-blind MATCH to its settlement PATH, given the resting offer's signed capability signals.
+ *
+ * PRINCIPLE (rail-crossing-p2p-lsp-design.md): matching is rail-blind; settlement picks a mutually-supported
+ * rail. A DIRECT peer-to-peer submarine is the FIRST-CLASS path whenever the counterparties line up (an
+ * interactive online maker that can itself accept BTC-LN); the LSP leg-bridge is the FALLBACK ONLY on a
+ * genuine mismatch (an on-chain-only / passive covenant maker). This applies symmetrically both directions.
+ *
+ * The rail crossing is on the BTC leg (the mismatch is always the BTC leg — the asset leg is Sequentia
+ * on-chain). Its lnSide names who is on Lightning: 'payer' = the BUYER pays BTC over LN (a BUY), 'receiver'
+ * = the SELLER receives BTC over LN (a SELL).
+ *   • interactive maker that accepts BTC-LN  -> P2P submarine (no LSP in the value path): ln_direction 1 for
+ *     the buy (reverse submarine, maker locks the asset + mints a bolt11 the taker pays), 0 for the sell
+ *     (normal submarine, taker mints a bolt11 the maker pays).
+ *   • else (on-chain-only / covenant)        -> the LSP payer/receiver leg-bridge terminates the LN end and
+ *     originates the on-chain BTC HTLC, passing the shared H through.
+ *
+ * PURE. `offerSignals` is the taken offer's meta.caps (unified-book) — {btc_ln, interactive, asset_onchain,
+ * maker_ln_node_pubkey} — or an object carrying them directly. planSettlement/planLeg are unchanged; this
+ * only decides HOW, from the plan they produce.
+ *
+ * @param {object} match          a planSettlement match ({asset, buyer, seller})
+ * @param {object} [offerSignals] the resting offer's caps (or {caps:{...}})
+ * @returns {{ path:'native'|'p2p-submarine'|'lsp-bridge', ln_direction:0|1|null, lnSide:'payer'|'receiver'|null }}
+ */
+export function chooseSettlementPath(match, offerSignals = {}) {
+  const plan = planSettlement(match);
+  if (plan.happyCoincidence) return { path: 'native', ln_direction: null, lnSide: null };
+  const caps = (offerSignals && offerSignals.caps) || offerSignals || {};
+  const btc = plan.btcLeg, asset = plan.assetLeg;
+  if (btc && btc.bridge) {
+    // The BTC leg crosses. Its lnSide fixes the taker side: payer=>buy (taker pays BTC-LN), receiver=>sell.
+    const side = btc.lnSide === 'payer' ? 'buy' : 'sell';
+    if (caps.interactive && caps.btc_ln)
+      return { path: 'p2p-submarine', ln_direction: side === 'buy' ? 1 : 0, lnSide: btc.lnSide };
+    return { path: 'lsp-bridge', ln_direction: null, lnSide: btc.lnSide };
+  }
+  // Only the ASSET leg crosses (a JIT asset-LN receive) — no P2P submarine for that in this phase; the LSP
+  // asset-leg bridge is the path (its lnSide names the LN endpoint on the asset leg).
+  return { path: 'lsp-bridge', ln_direction: null, lnSide: (asset && asset.lnSide) || null };
+}
+
 function buildSteps(btcLeg, assetLeg) {
   const steps = [];
   // Provision inbound BEFORE anything locks, so an LN receiver can actually receive.

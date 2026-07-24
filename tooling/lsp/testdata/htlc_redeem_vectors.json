@@ -1,0 +1,58 @@
+[
+  {
+    "hash_h": "abababababababababababababababababababababababababababababababab",
+    "claim_pub": "034f355bdcb7cc0af728ef3cceb9615d90684bb5b2ca5f859ab0f0b704075871aa",
+    "refund_pub": "02466d7fcae563e5cb09a0d1870bb580344804617879a14949cf22285f1bae3f27",
+    "t_btc": 16,
+    "redeem_hex": "63a820abababababababababababababababababababababababababababababababab8821034f355bdcb7cc0af728ef3cceb9615d90684bb5b2ca5f859ab0f0b704075871aaac6760b1752102466d7fcae563e5cb09a0d1870bb580344804617879a14949cf22285f1bae3f27ac68"
+  },
+  {
+    "hash_h": "abababababababababababababababababababababababababababababababab",
+    "claim_pub": "034f355bdcb7cc0af728ef3cceb9615d90684bb5b2ca5f859ab0f0b704075871aa",
+    "refund_pub": "02466d7fcae563e5cb09a0d1870bb580344804617879a14949cf22285f1bae3f27",
+    "t_btc": 17,
+    "redeem_hex": "63a820abababababababababababababababababababababababababababababababab8821034f355bdcb7cc0af728ef3cceb9615d90684bb5b2ca5f859ab0f0b704075871aaac670111b1752102466d7fcae563e5cb09a0d1870bb580344804617879a14949cf22285f1bae3f27ac68"
+  },
+  {
+    "hash_h": "abababababababababababababababababababababababababababababababab",
+    "claim_pub": "034f355bdcb7cc0af728ef3cceb9615d90684bb5b2ca5f859ab0f0b704075871aa",
+    "refund_pub": "02466d7fcae563e5cb09a0d1870bb580344804617879a14949cf22285f1bae3f27",
+    "t_btc": 127,
+    "redeem_hex": "63a820abababababababababababababababababababababababababababababababab8821034f355bdcb7cc0af728ef3cceb9615d90684bb5b2ca5f859ab0f0b704075871aaac67017fb1752102466d7fcae563e5cb09a0d1870bb580344804617879a14949cf22285f1bae3f27ac68"
+  },
+  {
+    "hash_h": "abababababababababababababababababababababababababababababababab",
+    "claim_pub": "034f355bdcb7cc0af728ef3cceb9615d90684bb5b2ca5f859ab0f0b704075871aa",
+    "refund_pub": "02466d7fcae563e5cb09a0d1870bb580344804617879a14949cf22285f1bae3f27",
+    "t_btc": 128,
+    "redeem_hex": "63a820abababababababababababababababababababababababababababababababab8821034f355bdcb7cc0af728ef3cceb9615d90684bb5b2ca5f859ab0f0b704075871aaac67028000b1752102466d7fcae563e5cb09a0d1870bb580344804617879a14949cf22285f1bae3f27ac68"
+  },
+  {
+    "hash_h": "abababababababababababababababababababababababababababababababab",
+    "claim_pub": "034f355bdcb7cc0af728ef3cceb9615d90684bb5b2ca5f859ab0f0b704075871aa",
+    "refund_pub": "02466d7fcae563e5cb09a0d1870bb580344804617879a14949cf22285f1bae3f27",
+    "t_btc": 65535,
+    "redeem_hex": "63a820abababababababababababababababababababababababababababababababab8821034f355bdcb7cc0af728ef3cceb9615d90684bb5b2ca5f859ab0f0b704075871aaac6703ffff00b1752102466d7fcae563e5cb09a0d1870bb580344804617879a14949cf22285f1bae3f27ac68"
+  },
+  {
+    "hash_h": "abababababababababababababababababababababababababababababababab",
+    "claim_pub": "034f355bdcb7cc0af728ef3cceb9615d90684bb5b2ca5f859ab0f0b704075871aa",
+    "refund_pub": "02466d7fcae563e5cb09a0d1870bb580344804617879a14949cf22285f1bae3f27",
+    "t_btc": 499999999,
+    "redeem_hex": "63a820abababababababababababababababababababababababababababababababab8821034f355bdcb7cc0af728ef3cceb9615d90684bb5b2ca5f859ab0f0b704075871aaac6704ff64cd1db1752102466d7fcae563e5cb09a0d1870bb580344804617879a14949cf22285f1bae3f27ac68"
+  },
+  {
+    "hash_h": "abababababababababababababababababababababababababababababababab",
+    "claim_pub": "034f355bdcb7cc0af728ef3cceb9615d90684bb5b2ca5f859ab0f0b704075871aa",
+    "refund_pub": "02466d7fcae563e5cb09a0d1870bb580344804617879a14949cf22285f1bae3f27",
+    "t_btc": 44300,
+    "redeem_hex": "63a820abababababababababababababababababababababababababababababababab8821034f355bdcb7cc0af728ef3cceb9615d90684bb5b2ca5f859ab0f0b704075871aaac67030cad00b1752102466d7fcae563e5cb09a0d1870bb580344804617879a14949cf22285f1bae3f27ac68"
+  },
+  {
+    "hash_h": "3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c",
+    "claim_pub": "032c0b7cf95324a07d05398b240174dc0c2be444d96b159aa6c7f7b1e668680991",
+    "refund_pub": "029ac20335eb38768d2052be1dbbc3c8f6178407458e51e6b4ad22f1d91758895b",
+    "t_btc": 850000,
+    "redeem_hex": "63a8203c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c8821032c0b7cf95324a07d05398b240174dc0c2be444d96b159aa6c7f7b1e668680991ac670350f80cb17521029ac20335eb38768d2052be1dbbc3c8f6178407458e51e6b4ad22f1d91758895bac68"
+  }
+]

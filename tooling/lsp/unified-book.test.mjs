@@ -21,6 +21,23 @@ eq({ side:ocAsk.side, rail:ocAsk.rail, asset:ocAsk.assetAtoms, btc:ocAsk.btcSats
 const ocBid = classifyRelayOffer({ offer_id:'c2', base_amount:1000, offer_amount:58, want_amount:1000, offer_asset:'BTC', want_asset:'GOLD' });
 eq({ side:ocBid.side, rail:ocBid.rail, asset:ocBid.assetAtoms, btc:ocBid.btcSats, price:ocBid.price }, { side:'bid', rail:'onchain', asset:1000, btc:58, price:0.058 }, 'offer_asset=BTC -> bid');
 
+// --- classify: SUBMARINE offers (ln_direction 0/1: asset on-chain + BTC-LN) + caps ---
+// dir 1 (REVERSE, maker sells the asset) -> ASK (taker BUYS). base=asset, want=BTC.
+const subAsk = classifyRelayOffer({ offer_id:'s1', base_amount:1000, want_amount:53, maker_ln_node_pubkey:'02aa', lightning:{ ln_direction:1 } });
+eq({ side:subAsk.side, rail:subAsk.rail, asset:subAsk.assetAtoms, btc:subAsk.btcSats, price:subAsk.price },
+   { side:'ask', rail:'submarine', asset:1000, btc:53, price:0.053 }, 'LN dir1 (reverse submarine) -> ask, submarine rail');
+eq(subAsk.meta.caps, { btc_ln:true, interactive:true, asset_onchain:true, maker_ln_node_pubkey:'02aa' }, 'dir1 caps: btc_ln + interactive + asset_onchain + node pubkey');
+// dir 0 (NORMAL, maker buys the asset) -> BID (taker SELLS). base=asset, offer=BTC.
+const subBid = classifyRelayOffer({ offer_id:'s0', base_amount:1000, offer_amount:49, lightning:{ ln_direction:0 } });
+eq({ side:subBid.side, rail:subBid.rail, asset:subBid.assetAtoms, btc:subBid.btcSats, price:subBid.price },
+   { side:'bid', rail:'submarine', asset:1000, btc:49, price:0.049 }, 'LN dir0 (normal submarine) -> bid, submarine rail');
+ok(subBid.meta.caps.btc_ln === true && subBid.meta.caps.interactive === true && subBid.meta.caps.asset_onchain === true, 'dir0 caps: btc_ln + interactive + asset_onchain');
+
+// --- classify: caps generalized across the other shapes ---
+ok(lnAsk.meta.caps.btc_ln === false && lnAsk.meta.caps.asset_onchain === false && lnAsk.meta.caps.interactive === true, 'sub-asset dir4 caps: asset over LN (btc_ln false), interactive');
+ok(lnBid.meta.caps.btc_ln === false && lnBid.meta.caps.interactive === false, 'sub-asset dir5 caps: not interactive (passive hold)');
+ok(ocAsk.meta.caps.btc_ln === false && ocAsk.meta.caps.interactive === false && ocAsk.meta.caps.asset_onchain === true, 'on-chain cross caps: no LN, not interactive, asset on-chain');
+
 // --- classify: rejects ---
 ok(classifyRelayOffer({ _verified:false, lightning:{ ln_direction:4 } }) === null, 'signature-unverified rejected');
 ok(classifyRelayOffer({ offer_id:'x' }) === null, 'unrecognized (no rail metadata) rejected');
@@ -45,6 +62,19 @@ ok(bestFor({ asks:[], bids:[] }, 'buy') === null, 'empty side -> null');
 // --- merge drops sizeless offers ---
 const withZero = buildUnifiedBook([{ offer_id:'z', offer_amount:0, want_amount:10, lightning:{ ln_direction:4 } }]);
 ok(withZero.asks.length === 0, 'zero-size offer dropped (no price)');
+
+// --- classify: a NIL / unpopulated LightningTerms must NOT be misclassified as a normal (dir 0) submarine ---
+// protojson EmitUnpopulated can render an unset LightningTerms as ln_direction: null / "" (which Number()
+// coerces to 0), colliding with the REAL normal-submarine direction 0. Such an offer must classify by its
+// actual rail (recognized here by the on-chain BTC leg), never as a phantom submarine bid.
+const nilLnAsk = classifyRelayOffer({ offer_id:'n1', base_amount:1000, offer_amount:1000, want_amount:52, offer_asset:'GOLD', want_asset:'BTC', lightning:{ ln_direction:null } });
+eq({ side:nilLnAsk.side, rail:nilLnAsk.rail }, { side:'ask', rail:'onchain' }, 'nil lightning (ln_direction null) -> classified by the real on-chain leg, NOT a submarine');
+const emptyStrLnBid = classifyRelayOffer({ offer_id:'n2', base_amount:1000, offer_amount:58, want_amount:1000, offer_asset:'BTC', want_asset:'GOLD', lightning:{ ln_direction:'' } });
+eq({ side:emptyStrLnBid.side, rail:emptyStrLnBid.rail }, { side:'bid', rail:'onchain' }, 'nil lightning (ln_direction "") -> on-chain bid, NOT a submarine');
+ok(classifyRelayOffer({ offer_id:'n3', lightning:{ ln_direction:null } }) === null, 'nil lightning + no rail metadata -> null (no phantom submarine)');
+// a GENUINE numeric ln_direction 0 STILL classifies as a submarine bid (the fix does not over-reject).
+const realDir0 = classifyRelayOffer({ offer_id:'n4', base_amount:1000, offer_amount:49, lightning:{ ln_direction:0 } });
+eq({ side:realDir0.side, rail:realDir0.rail }, { side:'bid', rail:'submarine' }, 'genuine numeric ln_direction 0 still classifies as a submarine bid');
 
 console.log(`\n${passed} passed, ${failed} failed`);
 process.exit(failed ? 1 : 0);

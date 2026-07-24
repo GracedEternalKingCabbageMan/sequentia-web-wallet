@@ -98,7 +98,15 @@ export function parseHtlcRedeem(script) {
   const cp = readPush(b, i); need(cp && cp.data.length === 33, 'claim pubkey push must be 33 bytes'); i = cp.next;
   need(b[i++] === OP.CHECKSIG, 'missing claim OP_CHECKSIG');
   need(b[i++] === OP.ELSE, 'missing OP_ELSE');
-  const lt = readPush(b, i); need(lt, 'missing locktime push'); i = lt.next;
+  // The locktime is a data push for a value > 16, but btcd's AddInt64 encodes a small integer 1..16 as a
+  // single OP_N opcode (OP_1=0x51..OP_16=0x60) and 0 as OP_0 — accept BOTH so a Go-produced small-locktime
+  // script round-trips (the inverse of buildHtlcRedeem's pushLocktime).
+  let locktime, ltNext;
+  const ltOp = b[i];
+  if (ltOp >= 0x51 && ltOp <= 0x60) { locktime = ltOp - 0x50; ltNext = i + 1; }        // OP_1..OP_16
+  else if (ltOp === 0x00) { locktime = 0; ltNext = i + 1; }                             // OP_0
+  else { const lt = readPush(b, i); need(lt, 'missing locktime push'); locktime = decodeScriptNum(lt.data); ltNext = lt.next; }
+  i = ltNext;
   need(b[i++] === OP.CHECKLOCKTIMEVERIFY, 'missing OP_CHECKLOCKTIMEVERIFY');
   need(b[i++] === OP.DROP, 'missing OP_DROP');
   const rp = readPush(b, i); need(rp && rp.data.length === 33, 'refund pubkey push must be 33 bytes'); i = rp.next;
@@ -106,7 +114,57 @@ export function parseHtlcRedeem(script) {
   need(b[i++] === OP.ENDIF, 'missing OP_ENDIF');
   need(i === b.length, 'trailing bytes after OP_ENDIF');
   return { hashHex: bytesToHex(h.data), claimPubHex: bytesToHex(cp.data),
-    refundPubHex: bytesToHex(rp.data), locktime: decodeScriptNum(lt.data) };
+    refundPubHex: bytesToHex(rp.data), locktime };
+}
+
+// Minimal CScriptNum encode (the inverse of decodeScriptNum) — how btcd's ScriptBuilder.AddInt64 serialises a
+// non-negative locktime: little-endian bytes, with a trailing 0x00 appended when the MSB of the top byte is set
+// (so the value is never read as negative). A CLTV height is always > 0 here, so it is always a multi-byte push.
+function encodeScriptNum(nIn) {
+  let n = BigInt(nIn);
+  if (n === 0n) return new Uint8Array(0);
+  const neg = n < 0n; if (neg) n = -n;
+  const out = [];
+  while (n > 0n) { out.push(Number(n & 0xffn)); n >>= 8n; }
+  if (out[out.length - 1] & 0x80) out.push(neg ? 0x80 : 0x00);
+  else if (neg) out[out.length - 1] |= 0x80;
+  return Uint8Array.from(out);
+}
+
+/**
+ * Build a Design-A HTLC redeemScript from its four bound parameters — the exact byte-for-byte inverse of
+ * parseHtlcRedeem, mirroring pkg/xchain/primitive.go's LockScript (OP_IF OP_SHA256 <H> OP_EQUALVERIFY <claimPub>
+ * OP_CHECKSIG OP_ELSE <T> OP_CHECKLOCKTIMEVERIFY OP_DROP <refundPub> OP_CHECKSIG OP_ENDIF, all canonical <=75-byte
+ * pushes). PURE. The LSP payer bridge uses it to PRE-COMPUTE the intended redeemScript for the BTC HTLC it is
+ * about to fund — so it can persist its own refund key + the intended script BEFORE the irreversible funding
+ * broadcast, and then VERIFY-NOT-TRUST that the funding CLI returned exactly this script (never record an HTLC it
+ * cannot refund). Throws on a malformed pubkey/hash or a non-height locktime.
+ * @param {{ hashHex:string, claimPubHex:string, refundPubHex:string, locktime:number }} a
+ * @returns {string} redeemScript hex
+ */
+export function buildHtlcRedeem({ hashHex, claimPubHex, refundPubHex, locktime }) {
+  const H = hexToBytes(hashHex); if (H.length !== 32) throw new Error('buildHtlcRedeem: hashHex must be 32-byte hex H');
+  const claim = hexToBytes(claimPubHex); if (claim.length !== 33) throw new Error('buildHtlcRedeem: claimPubHex must be 33-byte compressed hex');
+  const refund = hexToBytes(refundPubHex); if (refund.length !== 33) throw new Error('buildHtlcRedeem: refundPubHex must be 33-byte compressed hex');
+  const T = Number(locktime);
+  if (!Number.isFinite(T) || T <= 0 || T >= LOCKTIME_THRESHOLD) throw new Error(`buildHtlcRedeem: locktime ${locktime} must be a positive block height (< ${LOCKTIME_THRESHOLD})`);
+  const out = [];
+  const op = (o) => out.push(o);
+  const push = (data) => { if (data.length > 0x4b) throw new Error('buildHtlcRedeem: push too large'); out.push(data.length); for (const x of data) out.push(x); };
+  // btcd's ScriptBuilder.AddInt64 — which pkg/xchain/primitive.go LockScript uses for the CLTV locktime —
+  // emits a SINGLE OP_N opcode (OP_1=0x51 .. OP_16=0x60) for a small integer 1..16, NOT a data push. Mirror
+  // that EXACTLY so the redeemScript byte-matches Go across every locktime; a naive always-data-push disagrees
+  // at T<=16 (the golden vectors pin T=16 -> OP_16). Real block-height locktimes are >16 so this is a
+  // correctness/robustness match, not a hot path — but a mismatch here fund-loses (broadcast-then-verify-throw).
+  const pushLocktime = (t) => { if (t >= 1 && t <= 16) op(0x50 + t); else push(encodeScriptNum(t)); };
+  op(OP.IF);
+  op(OP.SHA256); push(H); op(OP.EQUALVERIFY);
+  push(claim); op(OP.CHECKSIG);
+  op(OP.ELSE);
+  pushLocktime(T); op(OP.CHECKLOCKTIMEVERIFY); op(OP.DROP);
+  push(refund); op(OP.CHECKSIG);
+  op(OP.ENDIF);
+  return bytesToHex(Uint8Array.from(out));
 }
 
 /**
@@ -138,6 +196,73 @@ export function verifyMakerBtcHtlc({ redeemScriptHex, hashHex, lspClaimPubHex, m
   } catch (e) {
     return { ok: false, reason: `HTLC verify failed: ${(e && e.message) || e}` };
   }
+}
+
+/**
+ * Fund-safety parse-verdict for the FORWARD (payer) bridge's maker ASSET leg. PURE. The MIRROR of
+ * verifyMakerBtcHtlc: in the payer bridge the taker mints H + holds P and buys the asset on-chain, so the
+ * maker must lock its Sequentia-asset HTLC to the REAL TAKER's asset-claim pubkey on the taker's H (never to
+ * the LSP — the LSP holds no taker key and must not be able to claim the asset). ok is TRUE only when the
+ * redeemScript binds claim==takerSeqClaimPub, hash==H, refund==maker, and CLTV==T_seq. Anything else =>
+ * ok:false, so the LSP REFUSES to relay the asset leg to the taker (the taker exposes nothing; the LSP
+ * refunds its own BTC HTLC at T_btc — double no-loss). The asset HTLC uses the SAME Design-A redeem format.
+ * @returns {{ ok:boolean, reason:string }}
+ */
+export function verifyMakerAssetLeg({ redeemScriptHex, hashHex, takerSeqClaimPubHex, makerRefundPubHex, locktime }) {
+  try {
+    const p = parseHtlcRedeem(hexToBytes(redeemScriptHex));
+    // A Sequentia nLockTime >= LOCKTIME_THRESHOLD is a UNIX TIMESTAMP, not a height; the bridge's block
+    // arithmetic (T_seq bound / hold sizing) needs a height, so refuse a non-height CLTV up front.
+    if (!Number.isFinite(p.locktime) || p.locktime < 0 || p.locktime >= LOCKTIME_THRESHOLD)
+      return { ok: false, reason: `asset HTLC CLTV ${p.locktime} is not a block height (an nLockTime >= ${LOCKTIME_THRESHOLD} is a UNIX TIMESTAMP; heights are 0..${LOCKTIME_THRESHOLD - 1}) — refuse` };
+    if (p.hashHex.toLowerCase() !== String(hashHex).toLowerCase())
+      return { ok: false, reason: `asset HTLC hash ${p.hashHex} != swap H ${hashHex}` };
+    if (p.claimPubHex.toLowerCase() !== String(takerSeqClaimPubHex).toLowerCase())
+      return { ok: false, reason: `asset HTLC claim pubkey is NOT the taker key (got ${p.claimPubHex}) — the maker must lock the asset to the REAL taker's claim key on H; refuse to relay` };
+    if (makerRefundPubHex && p.refundPubHex.toLowerCase() !== String(makerRefundPubHex).toLowerCase())
+      return { ok: false, reason: `asset HTLC refund pubkey != maker refund pubkey` };
+    if (locktime != null && Number(locktime) !== p.locktime)
+      return { ok: false, reason: `asset HTLC CLTV ${p.locktime} != terms T_seq ${locktime}` };
+    return { ok: true, reason: 'asset HTLC parse-verified: claim=taker on H, refund=maker, CLTV bound' };
+  } catch (e) {
+    return { ok: false, reason: `asset HTLC verify failed: ${(e && e.message) || e}` };
+  }
+}
+
+/**
+ * Fund-safety ON-CHAIN value-verdict for the FORWARD (payer) bridge's maker ASSET leg (half (b), the MIRROR of
+ * the io's observeNativeLocked binding for the receiver bridge). PURE over an already-observed outpoint. The
+ * parse verdict (verifyMakerAssetLeg — claim==taker on H, refund==maker, CLTV==T_seq) proves what the maker
+ * CLAIMS; this proves the maker actually FUNDED it, for the AGREED asset + amount, bound to that redeemScript —
+ * BEFORE the LSP hands the leg to the taker to claim. `observed` is the seqob-cli xhtlc-observe JSON for the
+ * maker's asset outpoint (fetched with `-hash H -redeem <script>` so `script_bound` = funded output is
+ * P2SH(redeem)). ok is TRUE only when the output is funded, script-bound to the SAME redeem, carries the
+ * AGREED asset id, and pays AT LEAST the AGREED atoms. Anything else / unreadable => ok:false, so the LSP
+ * REFUSES to relay (the taker exposes nothing; the LSP refunds its BTC HTLC at T_btc — double no-loss).
+ * @param {{ observed:object|null, expectAssetId?:string, expectAtoms?:number }} a
+ * @returns {{ ok:boolean, reason:string }}
+ */
+export function checkMakerAssetLegObserved({ observed, expectAssetId, expectAtoms } = {}) {
+  if (!observed || typeof observed !== 'object')
+    return { ok: false, reason: 'maker asset leg on-chain observe returned nothing — cannot confirm the maker funded it; refuse to relay (fail closed)' };
+  if (!observed.funded)
+    return { ok: false, reason: 'maker asset HTLC outpoint is NOT funded on-chain — the maker has not locked the asset; refuse to relay (fail closed)' };
+  // script_bound = the funded scriptPubKey is P2SH(the SAME redeemScript we parse-verified). Without it the
+  // maker could parse-verify one script yet fund a different (e.g. unencumbered) output. Require it.
+  if (observed.script_bound !== true)
+    return { ok: false, reason: 'maker asset HTLC funded output is NOT P2SH(redeem) — the funded output is not bound to the verified HTLC script; refuse to relay (fail closed)' };
+  // Asset id MUST be present AND equal the agreed asset — the taker is about to claim THIS output; a wrong /
+  // unreadable asset id must not be relayed.
+  if (expectAssetId) {
+    if (!observed.asset_id)
+      return { ok: false, reason: `maker asset HTLC has no readable asset id to bind to the agreed ${expectAssetId} — refuse to relay (fail closed)` };
+    if (String(observed.asset_id).toLowerCase() !== String(expectAssetId).toLowerCase())
+      return { ok: false, reason: `maker asset HTLC carries asset ${observed.asset_id}, not the agreed ${expectAssetId} — refuse to relay (fail closed)` };
+  }
+  // Amount MUST cover the agreed atoms (the maker may over-deliver, never under-deliver).
+  if (Number(expectAtoms) > 0 && Number(observed.amount || 0) < Number(expectAtoms))
+    return { ok: false, reason: `maker asset HTLC pays ${observed.amount} atoms, below the agreed ${expectAtoms} — refuse to relay (fail closed)` };
+  return { ok: true, reason: `maker asset HTLC observed on-chain: funded + script-bound + asset ${observed.asset_id || '(unchecked)'} + amount ${observed.amount} >= agreed ${expectAtoms || 0} — safe to relay to the taker` };
 }
 
 // ---------------------------------------------------------------------------
@@ -241,6 +366,125 @@ export function newBridgeClaimKeypair() {
 // Open a live reverse-bridge session to the maker over the relay. Impure (real WS); thin wrapper so the
 // handshake above stays pure/testable. `offer` is a VERIFIED resting reverse cross offer from the book.
 export async function openReverseBridgeSession({ offer, relayBase, takeAtoms }) {
+  if (relayBase) setSeqobBase(relayBase);
+  return openCourierSession(offer, takeAtoms, '');
+}
+
+// ---------------------------------------------------------------------------
+// The FORWARD-maker handshake (payer bridge) — pure over an injected CourierSession.
+// ---------------------------------------------------------------------------
+// The MIRROR of the reverse handshake, for the PAYER shape (buy: the taker pays BTC over LN, receives the
+// asset on-chain). Here the TAKER mints H + holds P; the LSP funds the on-chain BTC HTLC to the maker and
+// RELAYS the maker's asset leg to the taker. The forward flow is a TWO-round handshake (unlike the reverse's
+// single BtcLegLocked), so it is split:
+//   (1) runForwardBridgeTerms — send XcTermsRequest, receive the maker's XcTerms {maker_btc_claim_pub,
+//       maker_refund_pub (asset), T_btc, T_seq, amounts}. TERMS ONLY (no funding), so the LSP records the
+//       recoup wiring (fund an on-chain BTC HTLC claim=maker_btc_claim_pub on H, refund=LSP at T_btc) and
+//       sizes the taker's BTC-LN hold from T_seq BEFORE the taker pays anything.
+//   (2) sendForwardBtcLegFunded — AFTER the LSP has funded that BTC HTLC (only once the taker's hold is HELD),
+//       send XcBtcLegFunded {H, taker_seq_claim_pub = the REAL taker's key, taker_btc_refund_pub = the LSP's
+//       key, the funded BTC leg}, receive the maker's XcSeqLegLocked, and VERIFY-NOT-TRUST it binds the asset
+//       to the REAL taker's claim key on H (verifyMakerAssetLeg) before returning it for relay to the taker.
+// The maker side is RunMakerForward (seqdex xdriver.go:665): it mints per-lift keys, verifies the LSP-funded
+// BTC leg, locks the asset to the taker, and NEVER learns P (P is the taker's).
+
+/**
+ * FORWARD terms round (payer bridge). Sends XcTermsRequest and parses the maker's XcTerms. PURE over
+ * `session`. Binds the maker's amounts to the offer the taker took (the LSP funds btc_amount for the taker;
+ * the maker delivers seq_amount to the taker) — refuse a maker that wants MORE BTC than agreed or delivers
+ * LESS asset. Returns the terms the LSP needs to fund the BTC leg + size the hold, WITHOUT funding anything.
+ * @param {object} a
+ * @param {CourierSession} a.session   an OPEN forward session to the maker (openForwardBridgeSession or a fake)
+ * @param {{ btcSats:number, seqAtoms:number }} a.expect  amounts from the resting offer (bind the terms)
+ * @param {object} [a.cfg]  { termsWaitMs }
+ * @returns {Promise<{ makerBtcClaimPubHex, makerSeqRefundPubHex, btcLocktime, seqLocktime, btcAmount, seqAmount, feeBtc }>}
+ */
+export async function runForwardBridgeTerms({ session, expect, cfg = {} }) {
+  const c = { ...BRIDGE_MAKER_DEFAULTS, ...cfg };
+  await session.send({ type: XcType.TermsRequest });
+  const t = await session.recv(XcType.Terms, c.termsWaitMs);
+  const makerBtcClaimPubHex = String(t.maker_btc_claim_pub || t.makerBtcClaimPub || '');
+  const makerSeqRefundPubHex = String(t.maker_refund_pub || t.makerRefundPub || '');
+  const btcLocktime = Number(t.btc_locktime || t.btcLocktime || 0);
+  const seqLocktime = Number(t.seq_locktime || t.seqLocktime || 0);
+  const btcAmount = Number(t.btc_amount || t.btcAmount || 0);
+  const seqAmount = Number(t.seq_amount || t.seqAmount || 0);
+  const feeBtc = Number(t.fee_btc || t.feeBtc || 0);
+
+  if (!/^[0-9a-fA-F]{66}$/.test(makerBtcClaimPubHex)) throw new Error('maker Terms has no BTC claim pubkey');
+  if (!/^[0-9a-fA-F]{66}$/.test(makerSeqRefundPubHex)) throw new Error('maker Terms has no asset (SEQ) refund pubkey');
+  if (!(btcLocktime > 0)) throw new Error('maker Terms has no BTC (T_btc) locktime');
+  if (!(seqLocktime > 0)) throw new Error('maker Terms has no asset (T_seq) locktime');
+  // FUND-SAFETY — VERIFY-NOT-TRUST the maker's stated BTC PRICE. The LSP FUNDS exactly terms.btcAmount for the
+  // taker, so a non-positive BTC price is nonsense — and it is a fund-loss trap: a maker quoting btcAmount <= 0
+  // SLIPS PAST the upper-bound check below (0 > btcSats is false), then the fallback funds body.btc_sats while
+  // persisting bridge_terms.btc_amount = 0, so a boot-resume driving off the maker-stated amount would drive a
+  // 0-sat (or NaN) leg. Refuse a non-positive price up front so terms.btcAmount ALWAYS equals the funded amount.
+  if (!(btcAmount > 0))
+    throw new Error(`maker Terms quotes a non-positive BTC price (btcAmount ${btcAmount}) — the LSP funds exactly this amount; refuse (fail closed, nothing funded)`);
+  // Bind to the offer we took. The LSP FUNDS the BTC leg for the taker -> refuse a maker that wants MORE BTC
+  // than the taker agreed. The maker DELIVERS the asset -> refuse one that delivers LESS asset than offered.
+  if (expect && Number(expect.btcSats) > 0 && btcAmount > Number(expect.btcSats))
+    throw new Error(`maker wants ${btcAmount} BTC sats, above the offered ${expect.btcSats} — refuse`);
+  if (expect && Number(expect.seqAtoms) > 0 && seqAmount < Number(expect.seqAtoms))
+    throw new Error(`maker delivers ${seqAmount} asset atoms, below the offered ${expect.seqAtoms} — refuse`);
+  return { makerBtcClaimPubHex, makerSeqRefundPubHex, btcLocktime, seqLocktime, btcAmount, seqAmount, feeBtc };
+}
+
+/**
+ * FORWARD BTC-leg-funded round (payer bridge). AFTER the LSP has funded the on-chain BTC HTLC (claim=maker on
+ * H, refund=LSP at T_btc), send XcBtcLegFunded and receive+verify the maker's XcSeqLegLocked. PURE over
+ * `session`. VERIFY-NOT-TRUST: the maker's asset leg MUST bind claim==the REAL taker's asset-claim key on the
+ * taker's H (verifyMakerAssetLeg) — else the LSP refuses to relay (the taker exposes nothing; the LSP refunds
+ * its BTC at T_btc). Returns the verified maker asset leg for the LSP to relay to the taker.
+ * @param {object} a
+ * @param {CourierSession} a.session
+ * @param {string} a.hashHex               the taker's H (32-byte hex)
+ * @param {string} a.takerSeqClaimPubHex   33-byte hex — the maker must lock the asset to this (the taker's key)
+ * @param {string} a.lspBtcRefundPubHex    33-byte hex — the LSP's own BTC refund key on the funded HTLC
+ * @param {{txid,vout,amount,redeem_script}} a.btcLeg   the LSP-funded BTC HTLC outpoint
+ * @param {number} a.takeSeqAtoms          asset atoms the taker buys (the maker locks this slice)
+ * @param {string} a.makerSeqRefundPubHex  the maker's asset refund key (from the terms)
+ * @param {number} a.seqLocktime           T_seq (from the terms)
+ * @param {object} [a.cfg]  { secretWaitMs }
+ * @returns {Promise<{ makerSeqLeg:{txid,vout,amount,asset,redeem_script,locktime,block_hash,anchor_height} }>}
+ */
+export async function sendForwardBtcLegFunded({ session, hashHex, takerSeqClaimPubHex, lspBtcRefundPubHex,
+  btcLeg, takeSeqAtoms, makerSeqRefundPubHex, seqLocktime, cfg = {} }) {
+  const c = { ...BRIDGE_MAKER_DEFAULTS, ...cfg };
+  if (!/^[0-9a-f]{64}$/.test(String(hashHex || '').toLowerCase())) throw new Error('sendForwardBtcLegFunded: hashHex must be 32-byte hex H');
+  if (!/^[0-9a-fA-F]{66}$/.test(takerSeqClaimPubHex || '')) throw new Error('sendForwardBtcLegFunded: takerSeqClaimPubHex must be 33-byte hex');
+  if (!/^[0-9a-fA-F]{66}$/.test(lspBtcRefundPubHex || '')) throw new Error('sendForwardBtcLegFunded: lspBtcRefundPubHex must be 33-byte hex');
+  if (!btcLeg || !btcLeg.txid || !btcLeg.redeem_script) throw new Error('sendForwardBtcLegFunded: btcLeg needs {txid, redeem_script, ...}');
+
+  await session.send({ type: XcType.BtcLegFunded, hash_h: String(hashHex).toLowerCase(),
+    taker_seq_claim_pub: takerSeqClaimPubHex, taker_btc_refund_pub: lspBtcRefundPubHex,
+    seq_amount: Number(takeSeqAtoms) || 0, leg: btcLeg });
+
+  const sl = await session.recv(XcType.SeqLegLocked, c.secretWaitMs);
+  const leg = sl.leg || {};
+  const redeemScriptHex = String(leg.redeem_script || leg.redeemScript || '');
+  if (!redeemScriptHex || !leg.txid) throw new Error('maker SeqLegLocked has no funded asset leg');
+
+  // Fund-safety: the maker's asset HTLC MUST bind claim=the REAL taker on H (never the LSP).
+  const v = verifyMakerAssetLeg({ redeemScriptHex, hashHex, takerSeqClaimPubHex,
+    makerRefundPubHex: makerSeqRefundPubHex, locktime: seqLocktime });
+  if (!v.ok) { try { await session.fail('asset_leg_not_locked_to_taker', v.reason); } catch {} throw new Error(`maker asset leg verify failed: ${v.reason}`); }
+
+  return {
+    makerSeqLeg: {
+      txid: String(leg.txid), vout: Number(leg.vout || 0), amount: Number(leg.amount || 0),
+      asset: String(leg.asset || ''), redeem_script: redeemScriptHex, locktime: Number(leg.locktime || seqLocktime),
+      block_hash: leg.block_hash || leg.blockHash || '', anchor_height: Number(leg.anchor_height || leg.anchorHeight || 0),
+    },
+  };
+}
+
+// Open a live forward-bridge session to the maker over the relay. Impure (real WS); thin wrapper so the
+// forward handshake above stays pure/testable. `offer` is a VERIFIED resting forward cross offer from the
+// book. (The courier session is direction-agnostic — the maker's serve loop runs forward vs reverse per its
+// own offer direction — so this mirrors openReverseBridgeSession.)
+export async function openForwardBridgeSession({ offer, relayBase, takeAtoms }) {
   if (relayBase) setSeqobBase(relayBase);
   return openCourierSession(offer, takeAtoms, '');
 }

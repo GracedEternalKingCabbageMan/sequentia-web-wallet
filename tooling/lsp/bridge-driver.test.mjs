@@ -4,8 +4,9 @@
 // deadlock when both legs bridge — all without a node.
 import test from 'node:test';
 import assert from 'node:assert';
-import { runBridgedLeg, runBridgedSwap, classifyLegs, describeBridge, matchFromTake, makerRailsFromOffer, takeRailsCrossed, bridgeAssetHandoffAdmissible, bridgeAssetRelayLocktimeVerdict, bridgeFrontConfirmed, isPureLnTake, crossingShapeSupported, bridgedTakeSupported, describeCrossingSupport } from './bridge-driver.mjs';
+import { runBridgedLeg, runBridgedSwap, classifyLegs, describeBridge, matchFromTake, makerRailsFromOffer, takeRailsCrossed, bridgeAssetHandoffAdmissible, bridgeAssetRelayLocktimeVerdict, bridgeFrontConfirmed, isPureLnTake, crossingShapeSupported, bridgedTakeSupported, describeCrossingSupport, fundedBtcSatsForResume } from './bridge-driver.mjs';
 import { planSettlement } from './settlement-router.mjs';
+import { BRIDGE_DEFAULTS } from './leg-bridge.mjs';
 
 const A = 100000;
 const DCFG = { pollMs: 0, maxTicks: 200 };   // low ceiling
@@ -37,11 +38,11 @@ function payerWorld({ amount = A, gate = () => true, expiryBlocks = 40 } = {}) {
   return {
     world: w, swapLocked: gate, sleep: nap1, log: () => {},
     observe: async () => {
-      // A few ticks after we fund on-chain, the receiver claims (spent) and P is read from the witness.
-      if (w.onchain && w.onchain.funded && !w.onchain.spent) { if (++w._fundedTicks >= 2) { w.onchain.spent = true; w.ln.preimage = 'cd'.repeat(32); } }
+      // A few ticks after we fund on-chain, the receiver claims (spent via CLAIM) and P is read from the witness.
+      if (w.onchain && w.onchain.funded && !w.onchain.spent) { if (++w._fundedTicks >= 2) { w.onchain.spent = true; w.onchain.spendStatus = 'spent_claim'; w.ln.preimage = 'cd'.repeat(32); } }
       return { tip: w.tip, onchain: w.onchain ? { ...w.onchain } : null, ln: { ...w.ln } };
     },
-    fundOnchain: async () => { w.calls.push('fundOnchain'); w.onchain = { funded: true, amountSat: amount, cltv: w.tip + 12, lockedToReceiver: true, spent: false }; },
+    fundOnchain: async () => { w.calls.push('fundOnchain'); w.onchain = { funded: true, amountSat: amount, cltv: w.tip + 12, lockedToReceiver: true, spent: false, spendStatus: 'unspent' }; },
     recoupSettle: async () => { w.calls.push('recoupSettle'); w.ln.settled = true; },
   };
 }
@@ -59,6 +60,60 @@ test('runBridgedLeg payer-LN: walks ->fund-onchain->...->recoup-settle->done', a
   const r = await runBridgedLeg({ leg: { lnSide: 'payer', amountSat: A }, io, driverCfg: DCFG });
   assert.equal(r.ok, true);
   assert.deepEqual(io.world.calls, ['fundOnchain', 'recoupSettle']);
+});
+
+// crossFund payer BRIDGE (the taker holds P): the maker's asset leg locks ONLY AFTER the LSP funds its BTC
+// HTLC + relays XcBtcLegFunded, so swapLocked can NEVER open before the fund — a generic payer leg would
+// deadlock. crossFund funds the instant the hold is HELD (skipping swapLocked), the fund action ALSO drives
+// the maker relay (here: locks the asset), the taker claims the asset revealing P (the PRIMARY source, BEFORE
+// the maker claims our BTC HTLC), and the LSP recoup-settles. Proves the whole HELD->fund->lock->claim->recoup
+// completes with no deadlock even with swapLocked pinned false.
+function crossFundPayerWorld({ amount = A, expiryBlocks = 40 } = {}) {
+  const w = { tip: 100, onchain: null, ln: { registered: true, held: true, settled: false, preimage: null, expiryBlocks },
+    _fundedTicks: 0, calls: [] };
+  return {
+    world: w, swapLocked: () => false, sleep: nap1, log: () => {},   // swapLocked pinned FALSE (asset locks only after fund)
+    observe: async () => {
+      // A few ticks after we fund+relay, the TAKER claims the maker's asset leg -> P is public while our BTC
+      // HTLC is STILL DEFINITIVELY UNSPENT by the maker (primary P source; spendStatus stays 'unspent').
+      if (w.onchain && w.onchain.funded && !w.ln.preimage) { if (++w._fundedTicks >= 2) w.ln.preimage = 'cd'.repeat(32); }
+      return { tip: w.tip, onchain: w.onchain ? { ...w.onchain } : null, ln: { ...w.ln }, crossFund: true };
+    },
+    // fund-onchain funds the BTC HTLC AND drives the maker relay (asset lock) — one action, as in the live io.
+    fundOnchain: async () => { w.calls.push('fundOnchain'); w.onchain = { funded: true, amountSat: amount, cltv: w.tip + 40, lockedToReceiver: true, spent: false, spendStatus: 'unspent' }; },
+    recoupSettle: async () => { w.calls.push('recoupSettle'); w.ln.settled = true; },
+    refundOnchain: async () => { w.calls.push('refundOnchain'); },
+  };
+}
+
+test('runBridgedLeg crossFund payer: HELD->fund->lock->claim->recoup with swapLocked PINNED FALSE (no deadlock)', async () => {
+  const io = crossFundPayerWorld();
+  const r = await runBridgedLeg({ leg: { lnSide: 'payer', amountSat: A }, io, driverCfg: DCFG });
+  assert.equal(r.ok, true);
+  assert.deepEqual(io.world.calls, ['fundOnchain', 'recoupSettle']);   // never refunded; recouped via the primary P
+  assert.equal(r.fronted, true);
+});
+
+// Fix 2 dispatch: a 0-conf refund inside the hold danger window drives io.refundBump (RBF), then once it BURIES
+// the leg is terminal 'done' (released to the taker) — the driver executes exactly nextBridgeStep's 'refund-bump'.
+function stuckRefundPayerWorld({ amount = A } = {}) {
+  const w = { tip: 200, onchain: { funded: true, amountSat: amount, cltv: 190, lockedToReceiver: true, spent: true, spendStatus: 'spent_refund', spendConfs: 0 },
+    ln: { registered: true, held: true, settled: false, preimage: null, expiryBlocks: 6 }, _bumps: 0, calls: [] };
+  return {
+    world: w, swapLocked: () => false, sleep: nap1, log: () => {},
+    observe: async () => ({ tip: w.tip, onchain: { ...w.onchain }, ln: { ...w.ln }, crossFund: true }),
+    // each bump raises the tip (new block) and, after two bumps, the refund finally buries.
+    refundBump: async () => { w.calls.push('refundBump'); w.tip += 1; if (++w._bumps >= 2) w.onchain.spendConfs = 6; },
+    recoupSettle: async () => { w.calls.push('recoupSettle'); w.ln.settled = true; },
+    refundOnchain: async () => { w.calls.push('refundOnchain'); },
+  };
+}
+test('runBridgedLeg payer: a stuck 0-conf refund inside the hold window drives refund-bump, then done at burial', async () => {
+  const io = stuckRefundPayerWorld();
+  const r = await runBridgedLeg({ leg: { lnSide: 'payer', amountSat: A }, io, driverCfg: DCFG });
+  assert.equal(r.ok, true);                              // terminal done (buried refund => release the hold)
+  assert.ok(io.world.calls.includes('refundBump'), 'must have RBF-bumped the stalled refund');
+  assert.ok(!io.world.calls.includes('recoupSettle'), 'never recoup-settles after our own refund (no double-dip)');
 });
 
 test('runBridgedLeg receiver-LN: NEVER fronts while the whole-swap gate is closed', async () => {
@@ -311,6 +366,81 @@ test('W2b runBridgedLeg: maxTicks exhausted AFTER a front is NOT resumable (inte
   assert.equal(r.interrupted, false, 'post-front exhaustion needs operator attention, never a silent resume');
 });
 
+// ---------- hole 2: a FUNDED PAYER leg exhaustion is RESUMABLE (unlike a receiver's) ----------
+test('hole 2 runBridgedLeg PAYER: maxTicks exhausted AFTER funding stays RESUMABLE (interrupted:true) — a funded payer leg is never abandoned', async () => {
+  // The LSP funds its BTC on-chain (fronted), then P never becomes public and T_btc stays far off -> post-fund
+  // 'wait' -> maxTicks. Unlike a RECEIVER leg (post-front = anomaly), a FUNDED PAYER leg MUST resume: its
+  // recoup/refund horizon (T_seq / hold) is hours, far beyond one driver session, so it is marked interrupted
+  // (re-driven by resume-on-boot to settle on P or refund at T_btc), never terminal 'failed'.
+  let funded = false;
+  const io = { sleep: nap1, log: () => {},
+    observe: async () => ({ tip: 100,
+      onchain: funded ? { funded: true, amountSat: A, cltv: 200, lockedToReceiver: true, spent: false, spendStatus: 'unspent' } : null,
+      ln: { registered: true, held: true, settled: false, preimage: null, expiryBlocks: 40 }, crossFund: true }),
+    fundOnchain: async () => { funded = true; } };
+  const r = await runBridgedLeg({ leg: { lnSide: 'payer', amountSat: A }, io, driverCfg: { pollMs: 0, maxTicks: 5 } });
+  assert.equal(r.ok, false);
+  assert.equal(r.fronted, true, 'the payer leg funded on-chain (real BTC at stake)');
+  assert.equal(r.interrupted, true, 'a FUNDED payer leg stays resumable — never abandoned as terminal failed');
+});
+
+// ---------- C — a FUNDED payer leg that hits FAIL-CLOSED (not just maxTicks) stays RESUMABLE ----------
+test('C runBridgedLeg PAYER: a fail-closed AFTER funding stays RESUMABLE (interrupted:true) — never dropped to terminal failed', async () => {
+  // Fund the BTC on-chain (fronted), then a later tick drives the core to fail-closed (a near-expiry hold whose
+  // on-chain read is momentarily gone and NOT flagged known-funded). A FUNDED payer leg must NOT be abandoned as
+  // terminal 'failed' on ANY fail-close — it stays interrupted so resume-on-boot can still settle/refund the BTC.
+  let funded = false;
+  const io = { sleep: nap1, log: () => {},
+    observe: async () => (funded
+      ? { tip: 100, onchain: null, ln: { registered: true, held: true, settled: false, preimage: null, expiryBlocks: BRIDGE_DEFAULTS.holdBuffer }, crossFund: true }
+      : { tip: 100, onchain: null, ln: { registered: true, held: true, settled: false, preimage: null, expiryBlocks: 40 }, crossFund: true }),
+    fundOnchain: async () => { funded = true; } };
+  const r = await runBridgedLeg({ leg: { lnSide: 'payer', amountSat: A }, io, driverCfg: { pollMs: 0, maxTicks: 20 } });
+  assert.equal(r.ok, false);
+  assert.equal(r.lastAction, 'fail-closed');
+  assert.equal(r.fronted, true, 'the payer leg funded on-chain (real BTC at stake)');
+  assert.equal(r.interrupted, true, 'a FUNDED payer fail-close stays resumable — never terminal failed');
+});
+
+test('C runBridgedLeg PAYER: a PRE-FRONT fail-closed is STILL resumable (interrupted:true) — a resumed leg may be funded from a PRIOR session, so lnSide alone gates', async () => {
+  // A payer leg resumed after a restart begins THIS driver session with fronted=false, yet its BTC may already
+  // be funded on-chain from the prior session (recovered by the boot chain-recover / fundOnchain scan). If this
+  // session hits a fail-close (here: the hold is near expiry and the on-chain read is momentarily gone and NOT
+  // flagged known-funded) BEFORE it re-fronts, it must NOT be dropped to terminal 'failed' — that would strand
+  // the prior-session fund. Gating on lnSide ALONE (not `fronted && payer`) keeps it resumable. Contrast the
+  // receiver pre-front fail-close below, which IS a genuine no-loss terminal.
+  const io = { sleep: nap1, log: () => {},
+    observe: async () => ({ tip: 100, onchain: null, ln: { registered: true, held: true, settled: false, preimage: null, expiryBlocks: BRIDGE_DEFAULTS.holdBuffer }, crossFund: true }),
+    fundOnchain: async () => { throw new Error('must not fund — the core fail-closes before any fund this session'); } };
+  const r = await runBridgedLeg({ leg: { lnSide: 'payer', amountSat: A }, io, driverCfg: { pollMs: 0, maxTicks: 20 } });
+  assert.equal(r.lastAction, 'fail-closed');
+  assert.equal(r.fronted, false, 'nothing fronted THIS session');
+  assert.equal(r.interrupted, true, 'a payer pre-front fail-close stays resumable — a prior-session fund must never be stranded');
+});
+
+test('C runBridgedLeg RECEIVER: a pre-front fail-closed is NOT resumable (interrupted falsy) — genuine no-loss terminal', async () => {
+  const io = { sleep: nap1, log: () => {},
+    observe: async () => ({ tip: 100, onchain: { funded: true, amountSat: A, cltv: 200, lockedToLsp: false, confs: 6 }, ln: { registered: true, held: false, settled: false, preimage: null } }),
+    frontLn: async () => { throw new Error('must never front'); } };
+  const r = await runBridgedLeg({ leg: { lnSide: 'receiver', amountSat: A }, io, driverCfg: { pollMs: 0, maxTicks: 20 } });
+  assert.equal(r.lastAction, 'fail-closed');
+  assert.equal(r.fronted, false);
+  assert.notEqual(r.interrupted, true, 'a pre-front fail-close is a no-loss terminal, not resumable');
+});
+
+// ---------- D — resume drives off the PERSISTED funded amount, never the maker-stated bridge_terms ----------
+test('D fundedBtcSatsForResume: uses legState.btc.amountSat (an on-chain fact), never a maker-stated amount', () => {
+  assert.equal(fundedBtcSatsForResume({ amountSat: 76066 }), 76066);
+  // amountSat absent/0 -> fall back to the recorded HTLC output amount (still persisted on-chain), never terms.
+  assert.equal(fundedBtcSatsForResume({ amountSat: 0, htlc: { amount: 76066 } }), 76066);
+  assert.equal(fundedBtcSatsForResume({ htlc: { amount: 50000 } }), 50000);
+  // nothing funded recorded -> 0 (never a maker-stated value); NaN / negative amountSat are ignored.
+  assert.equal(fundedBtcSatsForResume({ amountSat: NaN }), 0);
+  assert.equal(fundedBtcSatsForResume({ amountSat: -5 }), 0);
+  assert.equal(fundedBtcSatsForResume(null), 0);
+  assert.equal(fundedBtcSatsForResume(undefined), 0);
+});
+
 test('W2b runBridgedSwap: a whole-swap pre-front maxTicks exhaustion surfaces interrupted:true', async () => {
   const io = {
     sleep: nap1, log: () => {}, legAmountSat: () => A,
@@ -545,8 +675,8 @@ test('W3c isPureLnTake: a mixed or crossed take is never the pure-LN route', () 
 function payerLegWorld() {
   const w = { tip: 100, onchain: null, ln: { registered: true, held: true, settled: false, preimage: null, expiryBlocks: 40 }, _f: 0 };
   return {
-    observe: () => { if (w.onchain && w.onchain.funded && !w.onchain.spent) { if (++w._f >= 2) { w.onchain.spent = true; w.ln.preimage = 'cd'.repeat(32); } } return { tip: w.tip, onchain: w.onchain ? { ...w.onchain } : null, ln: { ...w.ln } }; },
-    fund: () => { w.onchain = { funded: true, amountSat: A, cltv: w.tip + 12, lockedToReceiver: true, spent: false }; },
+    observe: () => { if (w.onchain && w.onchain.funded && !w.onchain.spent) { if (++w._f >= 2) { w.onchain.spent = true; w.onchain.spendStatus = 'spent_claim'; w.ln.preimage = 'cd'.repeat(32); } } return { tip: w.tip, onchain: w.onchain ? { ...w.onchain } : null, ln: { ...w.ln } }; },
+    fund: () => { w.onchain = { funded: true, amountSat: A, cltv: w.tip + 12, lockedToReceiver: true, spent: false, spendStatus: 'unspent' }; },
     settle: () => { w.ln.settled = true; },
   };
 }
@@ -561,12 +691,13 @@ test('P3.2 crossingShapeSupported: the WIRED shape (SELL asset / receive BTC ove
   assert.equal(crossingShapeSupported(plan), true);
 });
 
-test('P3.2 crossingShapeSupported: a payer-side BTC-leg bridge (BUY, pay BTC over LN) is NOT wired -> unsupported', () => {
+test('P3.2 crossingShapeSupported: a payer-side BTC-leg bridge (BUY, pay BTC over LN) with a native asset leg IS wired', () => {
   const m = matchFromTake({ asset: 'GOLD', side: 'buy', payRail: 'ln', recvRail: 'chain', makerBtcRail: 'chain', makerAssetRail: 'chain' });
   const plan = planSettlement(m);
   assert.equal(plan.btcLeg.bridge, true);
   assert.equal(plan.btcLeg.lnSide, 'payer');
-  assert.equal(crossingShapeSupported(plan), false);   // the io never funds a payer-side BTC HTLC for this shape
+  assert.equal(plan.assetLeg.bridge, false);
+  assert.equal(crossingShapeSupported(plan), true);   // the LSP payer leg-bridge funds the on-chain BTC HTLC to the maker
 });
 
 test('P3.2 crossingShapeSupported: an asset-leg bridge (maker sub-asset LN, taker wants asset on-chain) is NOT wired', () => {
@@ -609,13 +740,22 @@ test('P3.2 bridgedTakeSupported: exactly the shapes the LSP admission accepts (p
         }
 });
 
-test('P3.2 describeCrossingSupport: publishes the wired shape + at least one supported crossing, all supported entries pass the predicate', () => {
+test('P3.2 describeCrossingSupport: publishes the wired shape + supported crossings both directions, all supported entries pass the predicate', () => {
   const d = describeCrossingSupport();
-  assert.match(d.wired_shape, /SELL|receive|reverse/i);
+  assert.match(d.wired_shape, /SELL|receive|reverse|BUY|pay|forward/i);
   assert.ok(Array.isArray(d.supported_crossings) && d.supported_crossings.length >= 1);
   assert.ok(Array.isArray(d.unsupported_crossings) && d.unsupported_crossings.length >= 1);
   for (const s of d.supported_crossings) assert.equal(s.supported, true);
   for (const s of d.unsupported_crossings) assert.equal(s.supported, false);
-  // The one supported crossing today is SELL / recv BTC over LN (BTC-leg receiver bridge).
-  assert.ok(d.supported_crossings.every((s) => s.side === 'sell' && s.recvRail === 'ln'));
+  // The supported crossings are exactly the BTC-leg crossings with a NATIVE asset leg (bridge=false), BOTH
+  // directions. Reconstruct each entry's plan and assert the predicate it encodes: the BTC leg bridges and
+  // the asset leg does not (its rail may be on-chain OR native LN — both are "native asset leg").
+  for (const s of d.supported_crossings) {
+    const plan = planSettlement(matchFromTake({ asset: 'x', side: s.side, payRail: s.payRail, recvRail: s.recvRail, makerBtcRail: 'chain', makerAssetRail: s.makerAssetRail }));
+    assert.equal(plan.btcLeg.bridge, true, `supported entry must bridge the BTC leg: ${JSON.stringify(s)}`);
+    assert.equal(plan.assetLeg.bridge, false, `supported entry must keep the asset leg native: ${JSON.stringify(s)}`);
+  }
+  // BOTH a sell/receiver and a buy/payer BTC-leg crossing are now supported.
+  assert.ok(d.supported_crossings.some((s) => s.side === 'sell' && s.recvRail === 'ln'), 'sell/receiver crossing supported');
+  assert.ok(d.supported_crossings.some((s) => s.side === 'buy' && s.payRail === 'ln'), 'buy/payer crossing supported');
 });

@@ -28,24 +28,59 @@ function mk(side, rail, assetAtoms, btcSats, raw, meta) {
   };
 }
 
+// The maker's advertised LN node pubkey (needed to reach an interactive submarine maker), if any.
+const lnNodePub = (o) => (o && (o.maker_ln_node_pubkey ?? o.makerLnNodePubkey)) || null;
+
 // Classify ONE relay offer (the shared /v1/market/<asset>/BTC/orderbook shape) into a normalized
-// entry, or null if unrecognized / signature-unverified. LN offers carry lightning.ln_direction
-// (4 = SELL-asset-for-BTC = ask; 5 = BUY-asset-with-BTC = bid). On-chain cross offers are PLAIN
-// INTENTS — the courier mints the HTLC terms per-lift, so they carry NO cross_chain metadata;
-// recognize them by the parent-BTC leg: want_asset==='BTC' (maker sells the asset for BTC = a taker
-// BUYS = ask) or offer_asset==='BTC' (maker offers BTC for the asset = a taker SELLS = bid). The
-// literal string 'BTC' = the parent chain; a hex asset id = a same-chain pair (dropped here).
-// base_amount is always the asset; the BTC amount is want_amount (ask) or offer_amount (bid).
+// entry, or null if unrecognized / signature-unverified.
+//
+// SETTLEMENT SURFACE (meta.caps). Every recognized offer now carries a signed-in-spirit capability
+// descriptor the settlement router (chooseSettlementPath) reads to pick the rail: btc_ln (can the
+// maker settle the BTC leg over Lightning?), interactive (online + runs the handshake live, false =>
+// passive covenant), asset_onchain (is the asset leg on-chain?), and maker_ln_node_pubkey. This
+// generalizes the old bare `interactive` flag; matching stays rail-blind, caps are read only on take.
+//
+// The recognized shapes, by their BTC/asset rails:
+//   • SUBMARINE (lightning.ln_direction 0/1): asset leg ON-CHAIN (Sequentia), BTC leg over Lightning.
+//     These are the P2P rail-crossing counterparties. ln_direction=1 (REVERSE, LnBTCForAsset) = the
+//     maker SELLS the asset (locks it on-chain, mints a bolt11) => a taker BUYS = ask. ln_direction=0
+//     (NORMAL, LnAssetForBTC) = the maker BUYS the asset (pays the taker's bolt11) => a taker SELLS =
+//     bid. An online interactive maker => caps.btc_ln + interactive + asset_onchain. base_amount is the
+//     asset; BTC is want_amount (ask) or offer_amount (bid).
+//   • SUB-ASSET LN (ln_direction 4/5): asset leg over Lightning, BTC leg an ON-CHAIN HTLC (btc_ln:false).
+//   • ON-CHAIN cross (plain intents): both legs on-chain — recognized by the parent-BTC leg
+//     (want_asset==='BTC' => a taker BUYS = ask; offer_asset==='BTC' => a taker SELLS = bid). No LN.
 export function classifyRelayOffer(o) {
   if (!o || o._verified === false) return null;
   const lt = o.lightning || o.Lightning || {};
   const dir = Number(lt.ln_direction);
-  if (dir === 4) return mk('ask', 'ln', num(o.offer_amount), num(o.want_amount), o, { ln_direction: 4, interactive: true });
-  if (dir === 5) return mk('bid', 'ln', num(o.want_amount), num(o.offer_amount), o, { ln_direction: 5, interactive: false });
+  const nodePub = lnNodePub(o);
+  const baseAtoms = num(o.base_amount ?? o.baseAmount);
+  // SUBMARINE (asset on-chain + BTC-LN): the P2P rail-crossing offers. An interactive online maker.
+  // GATE 0/1 on a GENUINE numeric ln_direction. The zero enum value (LnAssetForBTC=0) COLLIDES with the
+  // protobuf/JSON default, so a NON-submarine offer carrying a nil/unpopulated LightningTerms — which
+  // protojson EmitUnpopulated can render as ln_direction: null / "" (which `Number(...)` coerces to 0), or
+  // an absent field — would otherwise be MIS-classified as a normal (ln_direction=0) submarine bid. Requiring
+  // ln_direction to be a real JS number (never a coerced null/""/undefined) keeps an unpopulated block out of
+  // the submarine branches; a genuine numeric 0/1 still classifies. (4/5 don't collide with the 0 default, so
+  // they keep the plain Number coercion below.)
+  const dirIsNum = typeof lt.ln_direction === 'number' && Number.isFinite(lt.ln_direction);
+  if (dirIsNum && dir === 1) return mk('ask', 'submarine', baseAtoms || num(o.offer_amount), num(o.want_amount), o,
+    { ln_direction: 1, interactive: true, caps: { btc_ln: true, interactive: true, asset_onchain: true, maker_ln_node_pubkey: nodePub } });
+  if (dirIsNum && dir === 0) return mk('bid', 'submarine', baseAtoms || num(o.want_amount), num(o.offer_amount), o,
+    { ln_direction: 0, interactive: true, caps: { btc_ln: true, interactive: true, asset_onchain: true, maker_ln_node_pubkey: nodePub } });
+  // SUB-ASSET LN (asset over LN + BTC on-chain HTLC): the BTC leg cannot go over Lightning (btc_ln:false).
+  if (dir === 4) return mk('ask', 'ln', num(o.offer_amount), num(o.want_amount), o,
+    { ln_direction: 4, interactive: true, caps: { btc_ln: false, interactive: true, asset_onchain: false, maker_ln_node_pubkey: nodePub } });
+  if (dir === 5) return mk('bid', 'ln', num(o.want_amount), num(o.offer_amount), o,
+    { ln_direction: 5, interactive: false, caps: { btc_ln: false, interactive: false, asset_onchain: false, maker_ln_node_pubkey: nodePub } });
   const oa = o.offer_asset ?? o.offerAsset, wa = o.want_asset ?? o.wantAsset;
   const assetAtoms = num(o.base_amount ?? o.baseAmount);
-  if (wa === 'BTC') return mk('ask', 'onchain', assetAtoms || num(o.offer_amount), num(o.want_amount), o, { trade_dir: 'sell' });
-  if (oa === 'BTC') return mk('bid', 'onchain', assetAtoms || num(o.want_amount), num(o.offer_amount), o, { trade_dir: 'buy' });
+  // ON-CHAIN cross (both legs on-chain): a passive fill the LSP bridge settles — no LN, not interactive.
+  if (wa === 'BTC') return mk('ask', 'onchain', assetAtoms || num(o.offer_amount), num(o.want_amount), o,
+    { trade_dir: 'sell', caps: { btc_ln: false, interactive: false, asset_onchain: true, maker_ln_node_pubkey: null } });
+  if (oa === 'BTC') return mk('bid', 'onchain', assetAtoms || num(o.want_amount), num(o.offer_amount), o,
+    { trade_dir: 'buy', caps: { btc_ln: false, interactive: false, asset_onchain: true, maker_ln_node_pubkey: null } });
   return null;
 }
 

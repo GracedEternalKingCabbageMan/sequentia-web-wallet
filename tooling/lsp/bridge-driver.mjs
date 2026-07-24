@@ -40,6 +40,7 @@ const ACTION_IO = Object.freeze({
   'recoup-claim':   'recoupClaim',
   'recoup-settle':  'recoupSettle',
   'refund-onchain': 'refundOnchain',
+  'refund-bump':    'refundBump',
 });
 
 /**
@@ -51,7 +52,7 @@ const ACTION_IO = Object.freeze({
  * @param {{
  *   observe: () => Promise<{tip:number, onchain:object|null, ln:object}>,   // the leg's live state
  *   frontLn?: Function, fundOnchain?: Function,                              // value-front actions
- *   recoupClaim?: Function, recoupSettle?: Function, refundOnchain?: Function,
+ *   recoupClaim?: Function, recoupSettle?: Function, refundOnchain?: Function, refundBump?: Function,
  *   swapLocked?: () => boolean,   // whole-swap gate: are ALL OTHER legs locked? (default true)
  *   sleep?: (ms:number)=>Promise, log?: Function, signal?: {aborted:boolean},
  * }} args.io
@@ -84,8 +85,20 @@ export async function runBridgedLeg({ leg, io, cfg = {}, driverCfg = {} }) {
     if (step.action === 'fail-closed') {
       // Nothing was fronted (the core only fail-closes before a front), so aborting is no-loss. If a
       // future core ever fail-closed AFTER a front, `fronted` surfaces it loudly for the operator.
-      log('[bridge-leg] FAIL-CLOSED', fronted ? '(AFTER a front — operator attention!)' : '(no value fronted, no loss)', step.reason);
-      return { ok: false, reason: step.reason, fronted, lastAction };
+      // FUND-SAFETY (funded payer leg NEVER dropped to terminal 'failed'): a PAYER leg has real on-chain
+      // exposure (an LSP-funded BTC HTLC) recoverable only by settling the hold on P (revealed hours out,
+      // beyond one driver session) or refunding at T_btc. So EVERY payer-leg fail-closed must stay RESUMABLE
+      // (interrupted:true) — abandoning it as terminal would strand the funded BTC (never settled, never
+      // refunded). Gate on lnSide ALONE, NOT `fronted && payer`: a leg RESUMED after a restart begins this
+      // driver session with fronted=false, yet its BTC may already be funded from the PRIOR session — a
+      // reorg near expiry (or any transient) that trips a fail-closed on that resumed leg would else be marked
+      // terminal 'failed' and strand the fund. This now MATCHES the maxTicks rule below (payer => resumable).
+      // Any RECEIVER-leg fail-closed (the core only fail-closes a receiver leg BEFORE fronting = no loss) stays
+      // a genuine no-loss / operator-attention terminal — unchanged.
+      const resumable = leg.lnSide === 'payer';
+      log('[bridge-leg] FAIL-CLOSED', fronted ? '(AFTER a front — operator attention!)' : '(no value fronted this session)',
+        resumable ? '(payer leg — RESUMABLE, re-driven on the next boot; BTC may be funded from a prior session)' : '', step.reason);
+      return { ok: false, reason: step.reason, fronted, lastAction, interrupted: resumable };
     }
     const method = ACTION_IO[step.action];
     if (!method) { await nap(d.pollMs); continue; }   // 'wait' or anything unmapped -> observe again; NEVER a value move
@@ -102,12 +115,18 @@ export async function runBridgedLeg({ leg, io, cfg = {}, driverCfg = {} }) {
     }
     await nap(d.pollMs);
   }
-  // maxTicks exhausted. If NOTHING was fronted, no value is at stake and the leg is RESUMABLE — surface
-  // `interrupted` so the whole-swap layer marks the job 'interrupted' (re-driven by resume-on-boot) rather
-  // than 'failed' (which would strand a taker whose asset leg is already committed). A POST-front exhaustion
-  // is a genuine anomaly needing attention, so it stays a plain (non-resumable) failure with fronted:true.
+  // maxTicks exhausted. RESUMABLE (marked 'interrupted' so resume-on-boot re-drives it, not 'failed' which
+  // strands a committed leg) when EITHER:
+  //   • nothing was fronted (no value at stake), for either side; OR
+  //   • this is a PAYER leg that already FUNDED. The LSP fronted its OWN BTC on-chain, but P is the TAKER's
+  //     secret, revealed hours out (T_seq/hold) — far beyond one driver session (maxTicks ~= mixedTimeoutMs,
+  //     45min). A funded payer leg MUST stay resumable so the LSP can still recoup (settle the hold on P) or
+  //     refund (at T_btc); abandoning it as terminal 'failed' would strand the fronted BTC (never settled,
+  //     never refunded). For a RECEIVER leg a POST-front exhaustion is a genuine anomaly (the front already
+  //     committed the LN + revealed the recoup path), so it stays a non-resumable failure — unchanged.
+  const resumable = !fronted || leg.lnSide === 'payer';
   return { ok: false, reason: 'exceeded maxTicks without terminal state — failing closed', fronted, lastAction,
-    interrupted: !fronted };
+    interrupted: resumable };
 }
 
 // Split a settlement plan's two legs into { bridged, native, jit }. Each entry carries the router leg
@@ -267,16 +286,21 @@ export function takeRailsCrossed(take) {
 }
 
 // P3.2 — CROSSING-SHAPE CAPABILITY. A crossing may be REQUIRED (takeRailsCrossed/plan.bridged) yet not be
-// one the LSP's live bridge io actually SETTLES. Today EXACTLY ONE shape is wired end to end: the BTC leg
-// is BRIDGED with the LSP on the LN-receiver side (the taker SELLS the asset and RECEIVES BTC over
-// Lightning) while the asset leg settles NATIVELY (direct taker<->maker). This is the SINGLE source of
+// one the LSP's live bridge io actually SETTLES. The LSP leg-bridge is the FALLBACK for an on-chain-only /
+// passive maker (an interactive maker that accepts BTC-LN is settled PEER-TO-PEER instead — chooseSettlementPath).
+// The bridge settles a BTC-leg crossing in BOTH directions, with the asset leg NATIVE (direct taker<->maker):
+//   • lnSide 'receiver' — the taker SELLS the asset and RECEIVES BTC over Lightning (the LSP terminates the
+//     taker's BTC-LN and CLAIMS the maker's on-chain BTC HTLC with the revealed P).
+//   • lnSide 'payer'    — the taker BUYS the asset and PAYS BTC over Lightning (the LSP terminates the taker's
+//     BTC-LN hold and FUNDS an on-chain BTC HTLC to the maker; the taker mints H and holds P).
+// An asset-leg bridge (BTC leg native, asset leg crossed) is NOT wired here. This is the SINGLE source of
 // truth for "is this crossing settleable" — the LSP's prepareBridgeLegs admission (`canBridge`) and the
 // wallet's PRE-REVIEW check both call it, so a Review can never promise a bridge the LSP refuses
 // post-confirm. Pure. `plan` is a planSettlement result.
 export function crossingShapeSupported(plan) {
   if (!plan || plan.happyCoincidence) return false;   // not a crossing -> settle natively, not via the bridge
   const btc = plan.btcLeg, asset = plan.assetLeg;
-  return !!(btc && btc.bridge && btc.lnSide === 'receiver' && (!asset || !asset.bridge));
+  return !!(btc && btc.bridge && (btc.lnSide === 'receiver' || btc.lnSide === 'payer') && (!asset || !asset.bridge));
 }
 
 // P3.2 — the wallet's pre-Review verdict for a rail-blind TAKE: does this crossing settle on the LSP's
@@ -306,7 +330,7 @@ export function describeCrossingSupport() {
           shapes.push({ side, payRail, recvRail, makerAssetRail, supported: crossingShapeSupported(plan) });
         }
   return {
-    wired_shape: 'taker SELLS the asset and RECEIVES BTC over Lightning, against an on-chain reverse maker (BTC leg bridged LN-receiver, asset leg native)',
+    wired_shape: 'a BTC-leg rail crossing with a NATIVE asset leg, BOTH directions: taker SELLS the asset and RECEIVES BTC over Lightning (BTC leg bridged LN-receiver, vs an on-chain reverse maker), OR taker BUYS the asset and PAYS BTC over Lightning (BTC leg bridged LN-payer, vs an on-chain forward maker)',
     supported_crossings: shapes.filter((s) => s.supported),
     unsupported_crossings: shapes.filter((s) => !s.supported),
   };
@@ -372,6 +396,7 @@ function legIoFor(io, leg, swapLockedFn) {
     observe: () => io.observe(leg),
     frontLn: bind('frontLn'), fundOnchain: bind('fundOnchain'),
     recoupClaim: bind('recoupClaim'), recoupSettle: bind('recoupSettle'), refundOnchain: bind('refundOnchain'),
+    refundBump: bind('refundBump'),
     swapLocked: swapLockedFn,
     sleep: io.sleep, log: io.log, signal: io.signal,
   };
@@ -404,6 +429,19 @@ export function matchFromTake({
   throw new Error("matchFromTake: side must be 'buy' or 'sell'");
 }
 function assertR(r, w) { if (r !== 'ln' && r !== 'chain') throw new Error(`matchFromTake: ${w} must be 'ln' or 'chain' (got ${JSON.stringify(r)})`); }
+
+// The BTC amount a PAYER-bridge boot-resume must drive off. Pure. Fund-safety: resume MUST bind the leg to the
+// ACTUAL funded amount (a persisted on-chain fact — legState.btc.amountSat, set from the verified terms and
+// funded on-chain) and NEVER the maker-STATED bridge_terms.btc_amount, which a 0-price maker could have set to 0
+// (or NaN) while the LSP still funded the real price. Falls back to the recorded HTLC output amount, then 0 —
+// never to the maker-stated terms. `sbtc` is job.legState.btc.
+export function fundedBtcSatsForResume(sbtc) {
+  const amt = Number(sbtc && sbtc.amountSat);
+  if (Number.isFinite(amt) && amt > 0) return amt;
+  const htlcAmt = Number(sbtc && sbtc.htlc && sbtc.htlc.amount);
+  if (Number.isFinite(htlcAmt) && htlcAmt > 0) return htlcAmt;
+  return 0;
+}
 
 // Derive a unified-book offer's per-leg maker rails. The unified book merges ONLY on-chain cross offers
 // (both legs on-chain) and sub-asset LN offers (asset leg over LN, BTC leg on-chain — that is exactly
