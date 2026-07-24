@@ -50,9 +50,13 @@ import * as sbtc from './sbtc.js';
 // rails (bestFor), build the settlement match (matchFromTake), and when the best offer's rail CROSSES
 // the taker's, drive the LSP bridge (/swap {bridge:true}) instead of dead-ending on "no maker for your
 // rail". ONE source of truth with the LSP + the pure driver (tooling/lsp/*).
-import { planSettlement } from './tooling/lsp/settlement-router.mjs';
+import { planSettlement, chooseSettlementPath } from './tooling/lsp/settlement-router.mjs';
 import { bestFor } from './tooling/lsp/unified-book.mjs';
 import { matchFromTake, makerRailsFromOffer, describeBridge, bridgedTakeSupported } from './tooling/lsp/bridge-driver.mjs';
+// P2P SUBMARINE taker client (both directions) + the LSP payer leg-bridge client (the buy fallback). The
+// rail-crossing matrix settles PEER-TO-PEER whenever the maker is interactive + can accept BTC-LN, and the
+// LSP leg-bridge ONLY on a genuine mismatch (an on-chain-only / passive maker). See subswap.js.
+import { runTakerReverseSubmarine, runTakerSubmarine, runLspPayerBridge, claimReverseSeqLeg, resumeReversePay, dispatchSubswap, sizeSubswapTake, verifySeqLeg as verifySubswapSeqLeg } from './subswap.js';
 
 let C = null;            // injected app context (see index.html initSwapTab)
 let X = null;            // the cross-chain route handle ({ openFromComposer, renderXswap, hasInFlight })
@@ -2389,6 +2393,15 @@ async function requoteMixed(route, amtStr){
     setReviewEnabled(true);
     return;
   }
+  // Sub-asset BUY shape (pay BTC on-chain, receive the asset over Lightning) with NO resting sub-asset buy
+  // offer (subassetCapable false): there is no maker that delivers the asset over Lightning, so this shape
+  // cannot settle — HONEST-DISABLE Review up front rather than offer a doomed take (no offer-then-refuse).
+  if (route.payRail === 'chain' && route.recvRail === 'ln' && route.payIsBtc && !subassetCapable(route.seqAsset)){
+    await loadBtcBook(route);
+    $('swRate').textContent = `No resting BTC→${am.ticker} offer that delivers over Lightning right now · this rail needs a sub-asset maker. Try again shortly, or set the receive leg to on-chain.`;
+    $('swRoute').textContent = 'Mixed rails · buy over Lightning, pay BTC on-chain';
+    setReviewEnabled(false); renderTiming(route); return;
+  }
   // Sub-asset BUY (pay BTC on-chain, receive the asset over Lightning): like the sell, reviewMixed
   // lifts the WHOLE resting sub-asset BUY offer at the maker's fixed terms (startBuy uses
   // offer.asset_amount and ignores the typed amount). So quote off THAT offer — not the on-chain
@@ -2442,6 +2455,68 @@ async function requoteMixed(route, amtStr){
     return;
   }
   await loadBtcBook(route);
+  // Submarine BUY (pay BTC over Lightning, receive the asset on-chain): NO native settlement — it settles
+  // PEER-TO-PEER against an interactive submarine maker, else via the LSP payer leg-bridge. NEVER the inline
+  // BTC-LN channel + LSP custodial submarine (reviewMixed/startMixed). Price off the routable best offer, or
+  // HONEST-DISABLE Review when the book has no maker that can settle it (no offer-then-refuse).
+  if (route.payRail === 'ln' && route.recvRail === 'chain' && route.payIsBtc){
+    const disp = settlementDispatch(route);
+    // ONLY the P2P submarine (an interactive maker that accepts BTC-LN) is a live buy shape here. The LSP PAYER
+    // leg-bridge (an on-chain-only maker) needs the seqln hold-invoice node update the node does not yet mint,
+    // so onReview honest-DISABLES it — surfacing a priced+enabled "Bridged buy" row that onReview then refuses
+    // is offer-then-refuse. SINGLE SOURCE: settlementDispatch -> lsp-bridge&&payer is DISABLED here too, with
+    // the same honest note onReview shows.
+    if (disp && disp.path === 'p2p-submarine'){
+      // BUY OUTBOUND CHECK (same gate reviewSubmarineP2P enforces): a P2P submarine BUY pays BTC over the
+      // taker's OWN Lightning and does NOT JIT-provision a channel like the LSP bridge. Require REAL spendable
+      // BTC-LN outbound (a funded BTC channel) BEFORE enabling Review — else honest-disable up front, so Review
+      // is never enabled for a buy the taker can't pay (no click-then-refuse in reviewSubmarineP2P).
+      if (!railAvail('BTC', route.seqAsset).payLn.ok){
+        $('swRate').textContent = `Paying Bitcoin over Lightning needs a funded Bitcoin Lightning channel · move Bitcoin to Lightning first (Balance tab), then take this offer. This peer-to-peer route does not open a channel for you.`;
+        $('swRoute').textContent = 'Peer-to-peer submarine · pay BTC over Lightning, receive ' + am.ticker + ' on-chain';
+        paintFee('BTC', null, 'Move Bitcoin to Lightning first · this direct route does not open a channel for you.');
+        LAST_QUOTE = null; setReviewEnabled(false); renderTiming(route); return;
+      }
+      // §2.4 SIZE GUARD (mirror reviewSubmarineP2P): a submarine offer is WHOLE-OFFER-ONLY. When the user's
+      // requested size differs from the whole resting offer, settlementDispatch/sizeSubswapTake sets
+      // disp.overshoot (+ disp.wholeOnly for a submarine) — surface the size mismatch and DISABLE Review (fail
+      // closed), NEVER paint the whole-offer size + enable Review (which would silently sign the user up for the
+      // whole offer). This keeps the composer preview == what reviewSubmarineP2P/startSubswapP2P actually execute.
+      const offerAssetStr = C.fmtAtoms(BigInt(disp.offer.assetAtoms || 0), am.precision || 0) + ' ' + am.ticker;
+      if (disp.overshoot){
+        const wantStr = C.fmtAtoms(BigInt(disp.want || 0), am.precision || 0);
+        $('swRate').textContent = disp.wholeOnly
+          ? `This peer-to-peer submarine offer settles as a WHOLE (${offerAssetStr}) · you asked to buy ${wantStr} ${am.ticker}. Enter ${offerAssetStr} to take it, or place a limit order to trade a different size.`
+          : `You asked to buy ${wantStr} ${am.ticker}, but the best resting offer (${offerAssetStr}) can't be partially filled · enter a matching size, or place a limit order.`;
+        $('swRoute').textContent = 'Peer-to-peer submarine · pay BTC over Lightning, receive ' + am.ticker + ' on-chain';
+        paintFee('BTC', null, 'Size does not match a resting offer · adjust the amount or place a limit order.');
+        LAST_QUOTE = null; setReviewEnabled(false); renderTiming(route); return;
+      }
+      // Paint the SIZED take (disp.takeAtoms/takeBtc — for a submarine this is the whole offer), never a raw
+      // whole-offer figure disconnected from what executes.
+      const assetStr = C.fmtAtoms(BigInt(disp.takeAtoms || 0), am.precision || 0);
+      const btcStr = C.fmtAtoms(BigInt(disp.takeBtc || 0), 8);
+      setNativeField($('swRecvAmt'), assetStr); setNativeField($('swPayAmt'), btcStr);
+      $('swRate').textContent = `${btcStr} BTC → ${assetStr} ${am.ticker} · best resting offer`;
+      $('swRoute').textContent = 'Peer-to-peer submarine · pay BTC over Lightning, receive ' + am.ticker + ' on-chain';
+      paintFee('BTC', null, 'Direct peer-to-peer · no bridge fee. Your device verifies the on-chain ' + am.ticker + ' is anchor-buried in your key before it pays.');
+      LAST_QUOTE = { kind: 'mixed', route, seqAsset: route.seqAsset, payIsBtc: true, payRail: 'ln', recvRail: 'chain' };
+      renderTiming(route); setReviewEnabled(true); return;
+    }
+    if (disp && disp.path === 'lsp-bridge' && disp.lnSide === 'payer'){
+      // SHARED honest-disable (payerBridgeDisabledNote) — identical across requoteMixed / onReview / reviewMixed;
+      // the payer bridge never reaches an enabled Place until the seqln hold-invoice capability lands.
+      $('swErr').textContent = payerBridgeDisabledNote(am.ticker);
+      $('swRate').textContent = `This ${am.ticker} maker settles Bitcoin on-chain · paying Bitcoin over Lightning to it needs the hold-invoice node update.`;
+      $('swRoute').textContent = 'Mixed rails · buy over Lightning, receive ' + am.ticker + ' on-chain';
+      paintFee('BTC', null, 'This on-chain-only maker can’t receive Bitcoin over Lightning yet · set the pay leg to on-chain to post a durable limit order.');
+      LAST_QUOTE = null; setReviewEnabled(false); renderTiming(route); return;
+    }
+    $('swRate').textContent = `No resting BTC→${am.ticker} offer that settles over Lightning right now · this rail needs a resting maker.`;
+    $('swRoute').textContent = 'Mixed rails · buy over Lightning, receive ' + am.ticker + ' on-chain';
+    paintFee('BTC', null, 'This rail needs a resting maker. Try again shortly, or set the pay leg to on-chain to post a durable limit order.');
+    LAST_QUOTE = null; setReviewEnabled(false); renderTiming(route); return;
+  }
   deriveXOpposite(route);
   const o = (XBOOK.offers || [])[0];
   if (o){
@@ -3173,38 +3248,37 @@ function bridgedTakePlan(route){
     // there is never a Review that fails post-confirm. Unsupported -> bridged:false, so onReview FALLS BACK
     // to the native/on-chain path at the same price (never a dead-end promise).
     const supported = crosses && bridgedTakeSupported(take);
+    // SUBMARINE = a P2P submarine settlement (an interactive maker that accepts BTC-LN). Those makers
+    // (RunMakerReverseSubmarine / RunMakerSubmarine) lock the WHOLE offer, so a submarine take is
+    // whole-offer-only — sizeSubswapTake must NOT slice it (partial fill is the covenant CLOB's job). The LSP
+    // leg-bridge (an on-chain-only / passive maker) is NOT a submarine, so it keeps the partial path.
+    const submarine = crosses && chooseSettlementPath(match, (offer && offer.meta) || {}).path === 'p2p-submarine';
     // P3.1 — SIZE THE TAKE to the USER's composer amount, never the whole resting offer (spec §2.4: asking
     // to sell 10 must not sign you up for 43). Partial-fill the offer when it allows it and the slice clears
     // its min_fill; otherwise flag an overshoot so Review warns and Place is blocked (fail closed, never a
     // silent whole-offer overshoot). The LSP + maker re-verify every amount and fail closed on any mismatch.
     const offerAtoms = BigInt(offer.assetAtoms || 0), offerBtc = BigInt(offer.btcSats || 0);
     const want = assetLegAtoms(route);
-    let takeAtoms = offerAtoms, takeBtc = offerBtc, partial = false, overshoot = false;
-    if (want > 0n && offerAtoms > 0n && want < offerAtoms){
-      const raw = offer.raw || {};
-      const allowPartial = raw.allow_partial === true || raw.allowPartial === true;
-      const minFill = BigInt(raw.min_fill || raw.minFill || 0);
-      if (allowPartial && want >= (minFill > 0n ? minFill : 1n)){
-        takeAtoms = want;
-        // FLOOR the BTC the taker EXPECTS for the slice — never demand MORE than the proportional amount the
-        // maker will pay (the reverse-FLOOR rule the maker's proportional terms use, P2.3). The bind is only
-        // a floor; the LSP verifies the maker pays AT LEAST this and fails closed otherwise.
-        takeBtc = (want * offerBtc) / offerAtoms;
-        partial = true;
-      } else {
-        overshoot = true;   // this offer can't be sliced to the requested size -> refuse to overshoot
-      }
-    }
+    // P3.1 — SIZE the take to the USER's composer amount, never the whole resting offer, via the SHARED
+    // sizeSubswapTake authority (subswap.js) so the P2P submarine review + the bridged review agree on
+    // takeAtoms/takeBtc/partial/overshoot. Partial-fill when allowed + the slice clears min_fill; else flag
+    // overshoot so Review BLOCKS Place (fail closed, never a silent whole-offer lift). A submarine offer is
+    // whole-offer-only (never sliced -> wholeOnly overshoot on a size mismatch). BTC is floored.
+    const raw = offer.raw || {};
+    const { takeAtoms, takeBtc, partial, overshoot, wholeOnly } = sizeSubswapTake({ want, offerAtoms, offerBtc,
+      allowPartial: raw.allow_partial === true || raw.allowPartial === true, minFill: BigInt(raw.min_fill || raw.minFill || 0), submarine });
     return { side, offer, match, plan, describe: describeBridge(match), bridged: crosses && supported,
-      crosses, supported, makerBtcRail, makerAssetRail,
-      takeAtoms, takeBtc, want, partial, overshoot };
+      crosses, supported, makerBtcRail, makerAssetRail, submarine,
+      takeAtoms, takeBtc, want, partial, overshoot, wholeOnly };
   } catch { return null; }
 }
 
 async function reviewBridged(route, bp){
   const { $ } = C;
   if (!L || !L.swap){ $('swErr').textContent = 'The bridged (rail-crossing) route needs the Lightning service, which is unavailable in this build.'; return; }
-  if (hasBridgeInFlight()){ $('swErr').textContent = 'You already have a bridged swap in progress · finish it first (Active trades) before starting another.'; return; }
+  // IN-FLIGHT GUARD: block on BOTH a bridge AND a P2P subswap in flight — two concurrent rail-crossings can't
+  // start (a p2p subswap in flight blocks a receiver-bridge sell, and vice-versa; each recovers via ONE key).
+  if (hasBridgeInFlight() || hasSubswapInFlight()){ $('swErr').textContent = 'You already have a rail-crossing swap in progress · finish it first (Active trades) before starting another.'; return; }
   const am = C.assetMeta(route.seqAsset) || {};
   const aprec = am.precision || 0, tk = am.ticker || 'asset';
   const d = bp.describe;
@@ -3245,7 +3319,7 @@ async function reviewBridged(route, bp){
 // Persist BEFORE the /swap POST (persist-before-broadcast): a lost 202 + retry (or a restart) re-POSTs
 // with the SAME swap_nonce, which the LSP dedupes to ONE job — never a second funded HTLC.
 async function startBridged(route, bp){
-  if (_bridgeStarting || hasBridgeInFlight()){ try { C.toast && C.toast('A bridged swap is already in progress · finish it first under Active trades.'); } catch {} return; }
+  if (_bridgeStarting || hasBridgeInFlight() || hasSubswapInFlight()){ try { C.toast && C.toast('A rail-crossing swap is already in progress · finish it first under Active trades.'); } catch {} return; }
   _bridgeStarting = true;
   try {
     const asset = route.seqAsset;
@@ -3537,17 +3611,509 @@ export async function resumeBridged(){
   driveBridged();
 }
 
+// ===========================================================================
+// RAIL-CROSSING SETTLEMENT DISPATCH — P2P-first, LSP-fallback, BOTH directions.
+// ---------------------------------------------------------------------------
+// The rail crossing is always on the BTC leg (the asset leg is Sequentia on-chain). Its lnSide names who is
+// on Lightning: 'payer' = the BUYER pays BTC over LN (a BUY), 'receiver' = the SELLER receives BTC over LN
+// (a SELL). settlementDispatch reads the matched best-price offer's signed capability signals (unified-book
+// meta.caps) and routes via the SHARED chooseSettlementPath:
+//   • interactive maker that accepts BTC-LN -> a DIRECT peer-to-peer submarine (no LSP in the value path):
+//     runTakerReverseSubmarine for a BUY (ln_direction 1), runTakerSubmarine for a SELL (ln_direction 0).
+//   • else (on-chain-only / passive covenant) -> the LSP leg-bridge terminates the LN end (payer bridge for
+//     a BUY via POST /bridge/hold; the existing receiver bridge, startBridged, for a SELL).
+// Returns { path:'native'|'p2p-submarine'|'lsp-bridge', ln_direction, lnSide, offer, ...bp }, or null when
+// there is no unified book / no resting offer (the caller then honest-disables Review for a shape that
+// REQUIRES the bridge, never falling through to a doomed native submarine/422). PURE + defensive.
+function settlementDispatch(route){
+  try {
+    const bp = bridgedTakePlan(route);
+    if (!bp || !bp.offer) return null;
+    const side = route.payIsBtc ? 'buy' : 'sell';
+    const disp = chooseSettlementPath(bp.match, (bp.offer && bp.offer.meta) || {});
+    let path = disp.path;
+    // OFFER-THEN-REFUSE: a p2p-submarine / lsp-bridge whose crossing shape the LSP can't settle (the best
+    // offer rests its asset over Lightning, so the asset leg ALSO crosses — no single on-chain asset HTLC)
+    // is honest-disabled here as 'unsupported', never routed to a doomed native submarine / startMixed.
+    // bp.supported == crossingShapeSupported (the shared authority, identical to the LSP's own admission).
+    if ((path === 'p2p-submarine' || path === 'lsp-bridge') && !bp.supported) path = 'unsupported';
+    return { ...bp, side, path, ln_direction: disp.ln_direction, lnSide: disp.lnSide };
+  } catch { return null; }
+}
+
+// payerBridgeDisabledNote — the SINGLE honest-disable authority for the LSP PAYER leg-bridge (a rail-crossing
+// BUY paying BTC over Lightning to an on-chain-only maker). That path needs the LSP to ISSUE a BTC-LN HOLD
+// invoice on the taker's H, which the seqln node cannot yet mint (runLspPayerBridge also fails closed with
+// ZERO exposure if ever reached). Until that node capability lands this shape must NEVER reach an enabled
+// Place (offer-then-refuse), so EVERY entry point (requoteMixed, onReview, reviewMixed) surfaces THIS note and
+// disables Review — one message, one gate, no path where a priced+enabled "Bridged buy" is offered then refused.
+function payerBridgeDisabledNote(tk){
+  const t = tk || 'asset';
+  return `This ${t} maker settles Bitcoin on-chain; paying Bitcoin over Lightning to it needs the hold-invoice node update · use an interactive maker for now, or set the pay leg to on-chain to post a durable limit order.`;
+}
+
+// --- chain read helpers (anchor depth + tips), same endpoints the wallet's watchers use ------------------
+async function anchorHeightOf(blockHash){
+  if (!blockHash) return null;
+  try { const a = await fetch(location.origin + '/anchor/' + blockHash).then(r => r.ok ? r.json() : null); return a && a.anchorheight != null ? Number(a.anchorheight) : null; } catch { return null; }
+}
+async function btcTipHeight(){ try { const t = await fetch(location.origin + '/testnet4/api/blocks/tip/height').then(r => r.ok ? r.text() : null); return t != null ? parseInt(t.trim(), 10) : null; } catch { return null; } }
+async function seqTipHeight(){ try { const t = await fetch(location.origin + '/api/blocks/tip/height').then(r => r.ok ? r.text() : null); return t != null ? parseInt(t.trim(), 10) : null; } catch { return null; } }
+function randomSecretHex(){ const b = new Uint8Array(32); crypto.getRandomValues(b); return [...b].map((x) => x.toString(16).padStart(2, '0')).join(''); }
+
+// The subswap taker deps built from the wallet's own C.seqLeg / C.wasm primitives + the LSP `L` bridge. The
+// SEQ-leg claim/fund/read + the anchor gate are the SAME primitives the native cross-chain flow uses; the
+// BTC-LN pay/receive rides the user's OWN hosted BTC node (device-cosigned, the LSP never holds the key).
+// max0ConfAtoms:0 => the taker ALWAYS waits the asset HTLC anchor-buries before its irreversible act
+// (never fronts a Bitcoin-reorg risk to obtain P) — fund-safety over instant.
+function subCommonDeps(){
+  return {
+    seqClaimKey: C.seqLeg.refundKey(),
+    buildRedeem: (h, c, r, l) => C.wasm.buildSeqHtlcRedeemScript(h, c, r, l),
+    htlcSpkHex: (redeem) => C.seqLeg.htlcSpkHex(redeem),
+    readOutput: (txid, vout) => C.seqLeg.readOutput(txid, vout),
+    // CONFIRMED-FUNDING + TXID-BOUND BLOCK: bind the anchor block to the ACTUAL funding txid's confirmed
+    // status (never the maker-supplied leg.block_hash); verifySeqLeg / waitAnchorBuried fail closed unless the
+    // funding tx is CONFIRMED — so a maker cannot pass a fake/mempool leg.
+    txStatus: (txid) => C.seqLeg.txStatus(txid),
+    anchorHeightOf: (bh) => anchorHeightOf(bh),
+    btcTip: () => btcTipHeight(),
+    seqTip: () => seqTipHeight(),
+    sha256Hex: (hex) => sha256HexHex(hex),
+    claimSeq: (p) => C.seqLeg.claim(p),
+    minAnchorDepth: 3,
+    max0ConfAtoms: 0,
+  };
+}
+// Bring the user's OWN hosted BTC-LN node online + return its node key (the counterpart of the asset node);
+// the taker PAYS or RECEIVES BTC over Lightning through it. Idempotent (re-attaches without re-funding).
+async function ensureBtcNodeKey(){
+  if (L && L.connectBtcNode){ const p = await L.connectBtcNode(); if (!(p && p.connected)) throw new Error('Could not bring your Bitcoin Lightning node online · reopen the wallet and try again.'); }
+  return await L.btcNodeKey();
+}
+
+// ===========================================================================
+// P2P SUBMARINE + LSP PAYER BRIDGE — persisted, resumable taker driver.
+// One localStorage record at a time (whole-HTLC): the asset leg is a real time-locked commitment, so an
+// in-flight swap MUST survive a reload (else a crash between the irreversible act and the claim, or before a
+// T_seq refund, strands funds). Fund-safety: P + the verified leg are persisted BEFORE the claim.
+// ===========================================================================
+const SUBSWAP_KEY = 'swk.sequentia.subswap';
+let SUBSWAP = null;
+try { SUBSWAP = JSON.parse(localStorage.getItem(SUBSWAP_KEY) || 'null'); } catch { SUBSWAP = null; }
+function saveSubswap(){ try { localStorage.setItem(SUBSWAP_KEY, JSON.stringify(SUBSWAP)); } catch {} }
+function clearSubswap(){ SUBSWAP = null; try { localStorage.removeItem(SUBSWAP_KEY); } catch {} }
+function subswapTerminal(){ return !SUBSWAP || SUBSWAP.state === 'settled' || SUBSWAP.state === 'failed' || SUBSWAP.state === 'refunded'; }
+export function hasSubswapInFlight(){ return !!SUBSWAP && !subswapTerminal(); }
+let _subswapDriving = false;
+
+// Review a rail-crossing take that settles PEER-TO-PEER (no LSP in the value path, so no bridge fee). Both
+// directions. The Review states the EXACT whole-HTLC amounts + the single-T_seq fund-safety story.
+async function reviewSubmarineP2P(route, disp){
+  const { $ } = C;
+  if (hasSubswapInFlight() || hasBridgeInFlight()){ $('swErr').textContent = 'You already have a rail-crossing swap in progress · finish it first (Active trades) before starting another.'; return; }
+  if (!(L && L.btcNodeKey && L.nodePay)){ $('swErr').textContent = 'The peer-to-peer submarine route needs your Bitcoin Lightning node, which is unavailable in this build.'; return; }
+  const am = C.assetMeta(route.seqAsset) || {}; const tk = am.ticker || 'asset', aprec = am.precision || 0;
+  const buy = disp.ln_direction === 1;
+  // BUY BTC-LN OUTBOUND CHECK: a P2P submarine BUY pays BTC over the taker's OWN Lightning and does NOT
+  // JIT-provision a channel like the LSP bridge. Require REAL spendable BTC-LN outbound (a funded BTC channel);
+  // else honest-disable (move BTC to Lightning first) — never enable Place for a buy the taker can't pay.
+  if (buy){
+    const pv = railAvail('BTC', route.seqAsset).payLn;
+    if (!pv.ok){
+      $('swErr').textContent = 'Paying Bitcoin over Lightning needs a funded Bitcoin Lightning channel · move Bitcoin to Lightning first (Balance tab), then take this offer. This peer-to-peer route does not open a channel for you.';
+      return;
+    }
+  }
+  // P3.1 — the SIZED take (disp.takeAtoms/takeBtc), never the whole resting offer, so Review == what executes.
+  const assetStr = C.fmtAtoms(BigInt(disp.takeAtoms || 0), aprec) + ' ' + tk;
+  const btcStr = C.fmtAtoms(BigInt(disp.takeBtc || 0), 8) + ' BTC';
+  const offerAssetStr = C.fmtAtoms(BigInt(disp.offer.assetAtoms || 0), aprec) + ' ' + tk;
+  const partialNote = disp.partial ? ` Partial fill of a larger resting offer (${offerAssetStr}).` : '';
+  const kv = buy ? [
+    ['Route', 'Peer-to-peer submarine · you pay Bitcoin over Lightning and the maker locks the ' + tk + ' in a single on-chain HTLC bound to the SAME secret. No bridge, no bridge fee — the service is not in the value path.'],
+    ['Direction', 'Buy ' + tk + ' with Bitcoin over Lightning · receive ' + tk + ' on-chain'],
+    ['You trade', 'Pay ' + btcStr + ', receive ' + assetStr + '.' + partialNote],
+    ['Fund-safety', 'Your device VERIFIES the on-chain ' + tk + ' is locked to YOUR key on the secret hash (right asset, amount, timeout), that the invoice it is about to pay is bound to the SAME secret hash and price, and that the ' + tk + ' is anchor-buried under Bitcoin — ALL before it pays. The only way to learn the secret is to pay, and paying IS the maker receiving the Bitcoin.'],
+    ['Finality', 'Anchored to Bitcoin (reverts only if Bitcoin reverts), so not the instant finality of a pure-Lightning swap.'],
+    ['If it stalls', 'Nothing is lost · you never pay until the ' + tk + ' HTLC is verified + anchor-buried, and once paid you claim it before its timeout.'],
+  ] : [
+    ['Route', 'Peer-to-peer submarine · you fund the ' + tk + ' in a single on-chain HTLC and receive Bitcoin over Lightning on the SAME secret. No bridge, no bridge fee.'],
+    ['Direction', 'Sell ' + tk + ' on-chain · receive Bitcoin over Lightning'],
+    ['You trade', 'Sell ' + assetStr + ', receive ' + btcStr + '.' + partialNote],
+    ['Fund-safety', 'You receive the Bitcoin the instant you settle your held Lightning invoice with the secret — which is also what reveals it to the maker. You never reveal the secret without capturing the Bitcoin.'],
+    ['Finality', 'The Bitcoin arrives over Lightning; the ' + tk + ' leg is a single on-chain HTLC.'],
+    ['If it stalls', 'Nothing is lost · if the maker never pays your invoice, you reclaim the ' + tk + ' after its on-chain timeout.'],
+  ];
+  // §2.4 overshoot guard: the best offer can't be sliced to the requested size, so taking it would sign the
+  // user up for the WHOLE offer. Warn and BLOCK Place (fail closed) rather than silently lift the whole offer.
+  // A SUBMARINE offer is whole-offer-only (wholeOnly): the makers lock the whole offer, so a size other than
+  // the whole offer can't be a partial (that's the covenant CLOB's job) — surface that honestly.
+  if (disp.overshoot){
+    const overMsg = disp.wholeOnly
+      ? `This peer-to-peer submarine offer settles as a WHOLE — a submarine take is the whole resting offer (${offerAssetStr}). You asked to ${buy ? 'buy' : 'sell'} ${C.fmtAtoms(BigInt(disp.want || 0), aprec)} ${tk}. Enter ${offerAssetStr} to take it, or place a limit order to trade a different size.`
+      : `You asked to ${buy ? 'buy' : 'sell'} ${C.fmtAtoms(BigInt(disp.want || 0), aprec)} ${tk}, but the best resting offer (${offerAssetStr}) can't be partially filled. Taking it would trade the whole offer — cancelled. Enter a size that matches an offer, or place a limit order.`;
+    kv.splice(2, 0, ['⚠ Size mismatch', overMsg]);
+  }
+  const { m: modal, ok, st } = C.modalRows({ title: 'Review peer-to-peer swap', kv });
+  if (disp.overshoot){
+    ok.disabled = true; ok.textContent = 'Size does not match an offer';
+    if (st) st.textContent = 'Adjust the amount to a size a resting offer can fill.';
+    return;
+  }
+  ok.onclick = async () => { modal.remove(); resetComposer(); await startSubswapP2P(route, disp); };
+}
+
+async function startSubswapP2P(route, disp){
+  if (_subswapDriving || hasSubswapInFlight() || hasBridgeInFlight()){ try { C.toast && C.toast('A rail-crossing swap is already in progress · finish it first under Active trades.'); } catch {} return; }
+  if (disp.overshoot){ try { C.toast && C.toast('That size does not match a resting offer · adjust the amount or place a limit order.'); } catch {} return; }   // fail closed — never lift the whole offer
+  const buy = disp.ln_direction === 1;
+  // P3.1 — persist the SIZED take (disp.takeAtoms/takeBtc), never the whole offer, so the courier bind, the
+  // expect{atoms,msat} the driver gates on, and any resume all use the user's requested size (§2.4).
+  SUBSWAP = { kind: buy ? 'p2p-buy' : 'p2p-sell', state: 'starting', asset: route.seqAsset,
+    offer_id: disp.offer.id || null, maker_pubkey: disp.offer.maker || null,
+    asset_atoms: String(disp.takeAtoms || 0), btc_sats: String(disp.takeBtc || 0), partial: !!disp.partial,
+    ln_direction: disp.ln_direction, started_ms: Date.now() };
+  saveSubswap();
+  driveSubswap();
+}
+
+// Drive the persisted subswap to completion (self-heals a transient gap; toasts on settle). Whole flow runs
+// in one live courier session; the RESUME-critical state (learned P + verified leg for a buy) is persisted
+// via the driver's onPaid before the claim, so a crash re-claims on the next boot (see resumeSubswap).
+async function driveSubswap(){
+  if (!SUBSWAP || subswapTerminal() || _subswapDriving) return;
+  _subswapDriving = true;
+  const b = SUBSWAP, asset = b.asset;
+  try {
+    if (b.kind === 'p2p-buy'){
+      const deps = { ...subCommonDeps(),
+        offer: { offer_id: b.offer_id, maker_pubkey: b.maker_pubkey }, takeAtoms: BigInt(b.asset_atoms),
+        expect: { asset, atoms: BigInt(b.asset_atoms), msat: BigInt(b.btc_sats) * 1000n },
+        payInvoice: async (bolt11, opts) => {
+          const node_key = await ensureBtcNodeKey();
+          // Thread wantHash(H)+amountMsat+maxCltv into /node/pay so the node can bind the payment_hash + amount
+          // (mirror the Go PayInvoice(bolt11,wantHash,amountMsat)) AND cap the route's total CLTV delay to the
+          // hold-safe ceiling — so a masqueraded hold fails back (refunds us) early. Client-side gates stay primary.
+          const r = await L.nodePay({ node_key, bolt11, wantHash: opts && opts.wantHash, amountMsat: opts && opts.amountMsat, maxCltv: opts && opts.maxCltv });
+          if (!(r && r.preimage)) throw new Error('The Bitcoin Lightning payment did not return a preimage.');
+          return r.preimage;
+        },
+        onLocked: () => { b.state = 'verifying'; saveSubswap(); },
+        onVerified: () => { b.state = 'verified'; saveSubswap(); },
+        // CRASH GAP: persist the leg outpoint + bolt11 + H + the 'paying' marker BEFORE the irreversible pay,
+        // so resumeSubswap can RE-QUERY the node for a settled payment on H (idempotent) and recover P + claim
+        // — never silently dropping a record that may already have paid.
+        onAboutToPay: (info) => { b.leg = info.leg; b.hash_h = info.hash_h; b.bolt11 = info.bolt11; b.state = 'paying'; saveSubswap(); },
+        onPaid: (preimage, leg) => { b.preimage = preimage; b.leg = leg; b.state = 'claiming'; saveSubswap(); },
+        onClaimed: (txid) => { b.seq_claim_txid = txid; b.state = 'settled'; saveSubswap(); },
+      };
+      await runTakerReverseSubmarine(deps);
+    } else if (b.kind === 'p2p-sell'){
+      const node_key = await ensureBtcNodeKey();
+      b.btc_node_key = node_key; saveSubswap();
+      const deps = { ...subCommonDeps(),
+        offer: { offer_id: b.offer_id, maker_pubkey: b.maker_pubkey }, takeAtoms: BigInt(b.asset_atoms),
+        seqRefundKey: C.seqLeg.refundKey(),
+        expect: { asset, atoms: BigInt(b.asset_atoms), msat: BigInt(b.btc_sats) * 1000n },
+        randomSecret: () => randomSecretHex(),
+        fundSeq: async ({ redeemHex, asset: a, atoms }) => {
+          const found = await C.seqLeg.findFundingByAddress(redeemHex).catch(() => null);
+          const txid = (found && found.txid) ? found.txid : (await C.seqLeg.fund(redeemHex, a, BigInt(atoms))).txid;
+          const conf = await C.seqLeg.waitConf(txid, redeemHex);
+          return { txid, vout: conf.vout, block_hash: conf.block_hash, height: conf.height };
+        },
+        mintHold: async ({ hashH, preimage, msat, expirySecs }) => {
+          const sats = Math.ceil(Number(msat) / 1000);
+          try { if (L.channelInbound) await L.channelInbound({ node_key, amount: sats }); } catch {}
+          // Pass P so the node can mint a PLAIN bolt11 that auto-settles on payment (RunMakerSubmarine needs
+          // Bolt11 != ''); the settle-with-P loop remains the HODL fallback if the node returns no bolt11.
+          const inv = await L.nodeInvoice({ node_key, amount: sats, payment_hash: hashH, preimage, expiry: expirySecs });
+          if (!(inv && inv.node_id)) throw new Error('Could not register the Bitcoin Lightning invoice on your node.');
+          return { node_id: inv.node_id, bolt11: inv.bolt11 || null };
+        },
+        invoiceStatus: (p) => L.invoiceStatus({ node_key, payment_hash: p.hashH }).then((s) => ({ held: !!(s && (s.held || s.settled)), settled: !!(s && s.settled) })).catch(() => ({})),
+        settleHold: (p) => L.nodeSettle({ node_key, payment_hash: p.hashH, preimage: p.preimage }),
+        // SELL PERSIST-BEFORE-FUND (fund-loss): persist H/P/redeem + the intended leg (redeem/asset/amount/
+        // locktime) + the refund secret + the BTC node key BEFORE fundSeq broadcasts the asset HTLC, so a reload
+        // during the ~12min waitConf recovers everything and resumeSubswap re-derives the funding — never a
+        // funded-but-unpersisted asset. state 'funding' is what resumeSubswap's recovery branch matches.
+        onAboutToFund: (info) => { b.hash_h = info.hash_h; b.preimage = info.preimage; b.seq_locktime = info.seq_locktime;
+          b.refund_secret = info.refund_secret; b.btc_node_key = node_key;
+          b.leg = { redeem_script: info.redeem, asset: info.asset, amount: info.atoms, locktime: info.seq_locktime };
+          b.state = 'funding'; saveSubswap(); },
+        onFunded: (rec) => { b.leg = rec.leg; b.hash_h = rec.hash_h; b.preimage = rec.preimage; b.seq_locktime = rec.seq_locktime; b.refund_secret = rec.refund_secret; b.state = 'settling'; saveSubswap(); },
+        onSettled: () => { b.state = 'settled'; saveSubswap(); },
+      };
+      const r = await runTakerSubmarine(deps);
+      if (r && !r.ok && r.refundable){ b.state = 'settling'; saveSubswap(); }   // unpaid -> keep the leg for a T_seq refund
+    }
+  } catch (e){
+    // A failure AFTER learning P (buy) or funding the asset (sell) stays RESUMABLE (the claim/refund off-ramp
+    // is still live); a failure before anything is committed is a clean terminal failure (nothing lost).
+    if (SUBSWAP && (SUBSWAP.preimage || (SUBSWAP.leg && SUBSWAP.leg.txid))){ SUBSWAP.detail = C.prettyErr(e); if (SUBSWAP.state === 'starting' || SUBSWAP.state === 'verifying' || SUBSWAP.state === 'paying') SUBSWAP.state = SUBSWAP.preimage ? 'claiming' : SUBSWAP.state; saveSubswap(); }
+    else if (SUBSWAP){ SUBSWAP.state = 'failed'; SUBSWAP.detail = C.prettyErr(e); saveSubswap(); }
+  } finally { _subswapDriving = false; }
+  if (SUBSWAP && SUBSWAP.state === 'settled'){ try { C.toast(SUBSWAP.kind === 'p2p-buy' ? 'Swap settled · you bought the asset over Lightning, anchor-bound to Bitcoin.' : 'Swap settled · you received Bitcoin over Lightning.'); } catch {} try { await C.sync(); } catch {} }
+}
+
+// Review the LSP PAYER leg-bridge — the BUY fallback vs an on-chain-only maker. The taker mints H (holds P),
+// the LSP issues a BTC-LN hold on H and originates the on-chain BTC HTLC to the maker; the taker verifies the
+// maker's relayed asset leg (claim=my key on H, anchor-buried) then claims with P self-custody.
+async function reviewLspPayerBridge(route, disp){
+  const { $ } = C;
+  if (hasSubswapInFlight() || hasBridgeInFlight()){ $('swErr').textContent = 'You already have a rail-crossing swap in progress · finish it first (Active trades) before starting another.'; return; }
+  if (!(L && L.swap && L.bridgeHold)){ $('swErr').textContent = 'The bridged buy route needs the Lightning service (LSP payer bridge), which is unavailable in this build.'; return; }
+  const am = C.assetMeta(route.seqAsset) || {}; const tk = am.ticker || 'asset', aprec = am.precision || 0;
+  const assetStr = C.fmtAtoms(BigInt(disp.takeAtoms || disp.offer.assetAtoms || 0), aprec) + ' ' + tk;
+  const btcStr = C.fmtAtoms(BigInt(disp.takeBtc || disp.offer.btcSats || 0), 8) + ' BTC';
+  const kv = [
+    ['Route', 'Rail-crossing buy · the service bridges the Bitcoin leg between Lightning and on-chain on ONE shared secret (both legs settle together or not at all). Used because the resting maker settles Bitcoin on-chain only.'],
+    ['Direction', 'Buy ' + tk + ' with Bitcoin over Lightning · receive ' + tk + ' on-chain'],
+    ['You trade', 'Pay ' + btcStr + ', receive ' + assetStr + '.'],
+    ['Bridge', 'Your device mints the secret and holds it. The service HOLDS your Bitcoin (not captured) and only funds the maker after your hold is held; your device VERIFIES the maker locked the ' + tk + ' to YOUR key before it ever reveals the secret.'],
+    ['Finality', 'Anchored to Bitcoin (reverts only if Bitcoin reverts), so not the instant finality of a pure-Lightning swap.'],
+    ['If it stalls', 'Nothing is lost · your Bitcoin is only ever HELD until the ' + tk + ' is verified in your key; a stall lets the hold expire and nothing is committed.'],
+  ];
+  const { m: modal, ok } = C.modalRows({ title: 'Review bridged buy', kv });
+  ok.onclick = async () => { modal.remove(); resetComposer(); await startLspPayerBridge(route, disp); };
+}
+
+async function startLspPayerBridge(route, disp){
+  if (_subswapDriving || hasSubswapInFlight() || hasBridgeInFlight()){ try { C.toast && C.toast('A rail-crossing swap is already in progress · finish it first under Active trades.'); } catch {} return; }
+  SUBSWAP = { kind: 'lsp-payer-buy', state: 'starting', asset: route.seqAsset,
+    offer_id: disp.offer.id || null, maker_pubkey: disp.offer.maker || null,
+    asset_atoms: String(disp.takeAtoms || disp.offer.assetAtoms || 0), btc_sats: String(disp.takeBtc || disp.offer.btcSats || 0),
+    started_ms: Date.now() };
+  saveSubswap();
+  driveLspPayerBridge();
+}
+
+async function driveLspPayerBridge(){
+  if (!SUBSWAP || subswapTerminal() || _subswapDriving) return;
+  _subswapDriving = true;
+  const b = SUBSWAP, asset = b.asset;
+  try {
+    const deps = { ...subCommonDeps(),
+      asset, assetAtoms: BigInt(b.asset_atoms), btcSats: BigInt(b.btc_sats),
+      offer: { id: b.offer_id, maker: b.maker_pubkey },
+      randomSecret: () => randomSecretHex(),
+      lspSwap: (body) => L.swap(body),
+      lspSwapStatus: (jobId) => L.swapStatus(jobId),
+      lspBridgeHold: (p) => L.bridgeHold(p),
+      payHold: async ({ node_id, bolt11, hashH, minFinalCltv, amountMsat }) => {
+        if (!bolt11) throw new Error('The service could not issue a payable Bitcoin Lightning hold invoice · try an interactive maker (peer-to-peer) instead.');
+        const node_key = await ensureBtcNodeKey();
+        // Thread wantHash(H)+amountMsat+minFinalCltv into /node/pay so the node binds hash+amount+cltv (mirror
+        // the Go PayInvoice); the client-side hold-hash/overpay pre-pay gates remain the primary guard.
+        const r = await L.nodePay({ node_key, bolt11, wantHash: hashH, amountMsat, minFinalCltv });
+        if (!(r && (r.paid || r.preimage))) throw new Error('The Bitcoin Lightning hold payment did not go through.');
+        return r.preimage || null;
+      },
+      persist: (rec) => { b.hash_h = rec.hash_h; b.preimage = rec.preimage; b.job_id = rec.job_id || b.job_id; b.poll = rec.poll || b.poll; if (rec.leg) b.leg = rec.leg; b.state = rec.state || b.state; saveSubswap(); },
+      onPaid: (preimage, leg) => { b.preimage = preimage; b.leg = leg; b.state = 'claiming'; saveSubswap(); },
+      onClaimed: (txid) => { b.seq_claim_txid = txid; b.state = 'settled'; saveSubswap(); },
+    };
+    await runLspPayerBridge(deps);
+  } catch (e){
+    if (SUBSWAP && SUBSWAP.preimage && SUBSWAP.leg && SUBSWAP.leg.txid){ SUBSWAP.detail = C.prettyErr(e); SUBSWAP.state = 'claiming'; saveSubswap(); }
+    else if (SUBSWAP){ SUBSWAP.state = 'failed'; SUBSWAP.detail = C.prettyErr(e); saveSubswap(); }
+  } finally { _subswapDriving = false; }
+  if (SUBSWAP && SUBSWAP.state === 'settled'){ try { C.toast('Bridged buy settled · you bought the asset, anchor-bound to Bitcoin.'); } catch {} try { await C.sync(); } catch {} }
+}
+
+// Resume a persisted subswap on load. FUND-SAFETY: for a BUY that already learned P + verified the leg
+// (state 'claiming') the claim is re-driven idempotently (a crash between the irreversible act and the claim
+// never strands the asset). A p2p-sell whose maker never paid is refunded after T_seq. Terminal records are
+// dropped. A p2p-buy/lsp-buy still pre-payment cannot resume its live courier session (nothing was
+// committed) — it is dropped so it never re-shows.
+export async function resumeSubswap(){
+  if (!SUBSWAP) return;
+  if (subswapTerminal()){ clearSubswap(); return; }
+  const b = SUBSWAP;
+  // (A) A BUY that already learned P + verified the leg (state 'claiming'): re-claim idempotently (a crash
+  //     between the irreversible act and the claim must never strand the asset — we hold P).
+  if ((b.kind === 'p2p-buy' || b.kind === 'lsp-payer-buy') && b.preimage && b.leg && b.leg.txid){
+    try { await claimReverseSeqLeg({ preimage: b.preimage, leg: b.leg, asset: b.asset }, { seqClaimKey: C.seqLeg.refundKey(), claimSeq: (p) => C.seqLeg.claim(p) });
+      b.state = 'settled'; b.seq_claim_txid = b.seq_claim_txid || 'resumed'; saveSubswap(); try { C.toast('Rail-crossing buy claimed · the asset is yours.'); } catch {} try { await C.sync(); } catch {} }
+    catch (e){ b.detail = C.prettyErr(e); saveSubswap(); }   // leave RESUMABLE; a retry re-claims (we hold P)
+    return;
+  }
+  // (B) CRASH GAP — a reverse-submarine BUY that persisted its leg + bolt11 + H BEFORE the (irreversible) pay
+  //     but crashed before learning P (state 'paying'). It MAY have paid, so it must NEVER be silently dropped:
+  //     re-query the node for the settled payment on H (idempotent re-pay returns the cached preimage), verify
+  //     sha256(P)==H, then claim. Guarded by the claim window (past T_seq we do NOT re-pay). Not recovered ->
+  //     keep resumable (a retry re-queries next boot).
+  if (b.kind === 'p2p-buy' && b.state === 'paying' && b.leg && b.leg.txid && b.bolt11 && !b.preimage){
+    try {
+      const node_key = await ensureBtcNodeKey();
+      const r = await resumeReversePay({ hash_h: b.hash_h, bolt11: b.bolt11, asset: b.asset, leg: b.leg }, {
+        payInvoice: async (bolt11, opts) => { const rr = await L.nodePay({ node_key, bolt11, wantHash: opts && opts.wantHash }).catch(() => null); return rr && rr.preimage ? rr.preimage : null; },
+        sha256Hex: (hex) => sha256HexHex(hex), seqClaimKey: C.seqLeg.refundKey(), claimSeq: (p) => C.seqLeg.claim(p),
+        seqTip: () => seqTipHeight(), claimMargin: 120,
+      });
+      if (r.ok && r.recovered){ b.preimage = r.preimage; b.seq_claim_txid = r.seqClaimTxid; b.state = 'settled'; saveSubswap(); try { C.toast('Rail-crossing buy recovered · the payment settled and the asset is yours.'); } catch {} try { await C.sync(); } catch {} }
+      else { b.detail = r.reason || 'Recovering your rail-crossing buy · re-checking the Lightning payment.'; saveSubswap(); }   // NEVER dropped
+    } catch (e){ b.detail = C.prettyErr(e); saveSubswap(); }
+    return;
+  }
+  // (C) An LSP PAYER-bridge BUY whose hold is HELD (P self-custody, persisted early) but the maker's asset leg
+  //     had not yet arrived (state 'held'/'confirming'): re-poll the LSP for the relayed leg, VERIFY it binds
+  //     MY key on H + anchor-buried, then claim with P. Never dropped (the hold may be HELD — only a verified
+  //     asset-in-our-key claim reveals P and lets the LSP recoup).
+  if (b.kind === 'lsp-payer-buy' && b.preimage && (b.job_id || b.poll) && !(b.leg && b.leg.txid) && (b.state === 'held' || b.state === 'confirming')){
+    try {
+      const j = await L.swapStatus(b.poll || b.job_id).catch(() => null);
+      const terms = j && j.bridge_terms;
+      const ml = j && (j.maker_seq_leg || (terms && terms.maker_seq_leg));
+      if (ml && ml.txid && terms){
+        const claimKey = C.seqLeg.refundKey();
+        const v = await verifySubswapSeqLeg({
+          hashH: b.hash_h, myClaimPub: claimKey.public_key, makerRefundPub: terms.maker_seq_refund_pub,
+          leg: { txid: ml.txid, vout: ml.vout, amount: ml.amount, asset: ml.asset || b.asset, redeem_script: ml.redeem_script, locktime: ml.locktime, block_hash: ml.block_hash },
+          expectAsset: b.asset, expectAtoms: BigInt(b.asset_atoms), expectLocktime: Number(terms.seq_locktime) || ml.locktime,
+          minAnchorDepth: 3, max0ConfAtoms: 0,
+        }, { ...subCommonDeps(), anchorHeightOf: (bh) => anchorHeightOf(bh || ml.block_hash) });
+        if (v.ok){
+          const leg = { txid: ml.txid, vout: ml.vout, amount: String(ml.amount), asset: b.asset, redeem_script: v.redeem, locktime: Number(terms.seq_locktime) || ml.locktime };
+          b.leg = leg; b.state = 'claiming'; saveSubswap();
+          await claimReverseSeqLeg({ preimage: b.preimage, leg, asset: b.asset }, { seqClaimKey: claimKey, claimSeq: (p) => C.seqLeg.claim(p) });
+          b.state = 'settled'; b.seq_claim_txid = b.seq_claim_txid || 'resumed'; saveSubswap(); try { C.toast('Rail-crossing buy claimed · the asset is yours.'); } catch {} try { await C.sync(); } catch {}
+        }
+      }
+      // else: the maker's asset leg has not locked yet -> keep resumable (NEVER dropped).
+    } catch (e){ b.detail = C.prettyErr(e); saveSubswap(); }
+    return;
+  }
+  // (D0) CRASH GAP (SELL fund-loss) — a p2p-sell that PERSISTED P/H/redeem + the intended leg BEFORE it
+  //      broadcast the asset HTLC (state 'funding'/'starting') but crashed during the ~12min waitConf. The
+  //      asset MAY be funded on-chain, so this record must NEVER be dropped: re-derive the funding outpoint
+  //      from the persisted redeem (idempotent — findFundingByAddress), and once found continue to settle/
+  //      refund via (D). Still un-findable (broadcast lost / never sent) -> keep resumable (retry next boot).
+  if (b.kind === 'p2p-sell' && b.preimage && b.hash_h && b.leg && b.leg.redeem_script && !b.leg.txid){
+    try {
+      // Bind the funding outpoint from the persisted redeem. Use the STRICT reader so we can tell a genuine
+      // "no HTLC output anywhere (confirmed or mempool)" from a transient read error — esplora /utxo includes
+      // mempool, so a definitive empty means NOTHING was ever committed.
+      let found = null, definitivelyEmpty = false;
+      if (C.seqLeg.findFundingByAddressStrict){
+        try { const res = await C.seqLeg.findFundingByAddressStrict(b.leg.redeem_script); found = res && res.found; definitivelyEmpty = !found; }
+        catch { found = null; definitivelyEmpty = false; }   // read error -> NOT definitive -> keep resumable
+      } else {
+        found = await C.seqLeg.findFundingByAddress(b.leg.redeem_script).catch(() => null);   // lenient: never treat as definitive
+      }
+      if (found && found.txid){
+        let conf = null; try { conf = await C.seqLeg.waitConf(found.txid, b.leg.redeem_script); } catch {}
+        b.leg = { ...b.leg, txid: found.txid, vout: (conf && conf.vout != null) ? conf.vout : (found.vout || 0),
+          block_hash: (conf && conf.block_hash) || b.leg.block_hash || null, height: (conf && conf.height) || b.leg.height || null };
+        b.state = 'settling'; saveSubswap();
+        return resumeSubswap();   // continue at (D): re-check the hold -> settle with P, else refund after T_seq
+      }
+      // NEVER-CONFIRMED / NEVER-BROADCAST (item 5): the strict read DEFINITIVELY found no HTLC output on-chain
+      // OR in the mempool. So the fund tx never broadcast (fundSeq threw before broadcast) or was evicted — NO
+      // asset was ever locked, and the live courier session is gone so this swap can no longer complete. Treat
+      // it as PRE-COMMITMENT and DROP it cleanly: no dangling 'funding' record wedging the rail, and no
+      // double-fund (nothing to fund; fundSeq is idempotent regardless). A transient/unreadable state is NOT
+      // definitive -> keep it resumable and retry next boot (never a false drop of a real funded leg).
+      if (definitivelyEmpty){ clearSubswap(); return; }
+      b.detail = 'Recovering your rail-crossing sell · waiting for the asset HTLC to appear on-chain.'; saveSubswap();   // NEVER dropped on an unreadable/transient read
+    } catch (e){ b.detail = C.prettyErr(e); saveSubswap(); }
+    return;
+  }
+  // (D) A SELL whose asset HTLC is funded (state 'settling'): FIRST re-check the invoice — if the maker's
+  //     payment is HELD, settle it with P to CAPTURE the BTC (and reveal P so the maker claims the asset);
+  //     only if it never paid AND T_seq has passed do we reclaim the asset via its CLTV branch. Never a loss.
+  if (b.kind === 'p2p-sell' && b.leg && b.leg.txid && b.state === 'settling'){
+    try {
+      const node_key = b.btc_node_key || await ensureBtcNodeKey();
+      let s = null; try { s = await L.invoiceStatus({ node_key, payment_hash: b.hash_h }); } catch {}
+      if (s && s.settled){ b.state = 'settled'; saveSubswap(); try { C.toast('Rail-crossing sell settled · you received Bitcoin over Lightning.'); } catch {} try { await C.sync(); } catch {} return; }
+      if (s && s.held && b.preimage){
+        await L.nodeSettle({ node_key, payment_hash: b.hash_h, preimage: b.preimage });   // capture BTC + reveal P
+        b.state = 'settled'; saveSubswap(); try { C.toast('Rail-crossing sell settled · you received Bitcoin over Lightning.'); } catch {} try { await C.sync(); } catch {} return;
+      }
+      // Not paid: reclaim the asset via its CLTV branch after T_seq (idempotent — a pre-timeout attempt just
+      // fails and stays resumable). Nothing else of ours was ever committed.
+      const tip = await seqTipHeight();
+      if (tip != null && Number(tip) >= Number(b.seq_locktime || 0) && C.seqLeg.refund){
+        // FUND-SAFETY: pass a REAL dest_spk (the wallet's OWN script) — the Rust buildSeqHtlcRefundTx requires
+        // a String (null throws) — and let seqLeg.refund compute a real any-asset fee (fee:0 -> derived from
+        // the asset's published rate), never a bogus 1-atom underpay the mempool would reject.
+        await C.seqLeg.refund({ txid: b.leg.txid, vout: b.leg.vout, amount: b.leg.amount, asset_id: b.asset,
+          redeem_script: b.leg.redeem_script, locktime: b.seq_locktime, refund_secret: b.refund_secret,
+          dest_spk: (C.seqLeg.ownDestSpk ? C.seqLeg.ownDestSpk() : undefined), fee: 0 });
+        b.state = 'refunded'; saveSubswap(); try { C.toast('Rail-crossing sell refunded · your asset is back.'); } catch {} try { await C.sync(); } catch {}
+      }
+    } catch (e){ b.detail = C.prettyErr(e); saveSubswap(); }
+    return;
+  }
+  // Pre-commitment (no P, no funded leg, no in-flight payment): the live session cannot be resumed and nothing
+  // was committed — drop it. (A 'paying' buy / 'held' payer-bridge / funded sell are all handled above and are
+  // NEVER reached here, so a record that may have moved value is never silently dropped.)
+  clearSubswap();
+}
+
 async function onReview(){
   const { $ } = C; $('swErr').textContent = '';
   const q = LAST_QUOTE;
   if (!q){ $('swErr').textContent = 'Enter an amount to get a quote first.'; return; }
-  // RAIL-BLIND TAKE: before the rail-specific native dispatch, check whether the BEST-price offer across
-  // rails crosses the taker's chosen rails. If so, the LSP bridges it (never dead-end on "no maker for
-  // your rail"). A happy coincidence (rails agree) falls through to the proven native path below.
+  // RAIL-BLIND TAKE: before the rail-specific native dispatch, route the BEST-price offer across rails by its
+  // signed capabilities (settlementDispatch -> chooseSettlementPath). P2P submarine (both directions) when the
+  // maker is interactive + accepts BTC-LN; the LSP leg-bridge (payer for a BUY, receiver for a SELL) on a
+  // genuine mismatch. A happy coincidence (native) falls through to the proven native path below. NO
+  // offer-then-refuse: a shape that REQUIRES the bridge with an empty book honest-disables here, never
+  // falling through to reviewMixed/startMixed (a doomed inline-channel submarine / 422).
   if (q.kind === 'cross' || q.kind === 'mixed' || q.kind === 'ln'){
     const route = q.route || { seqAsset: q.seqAsset, payIsBtc: q.payIsBtc, assetAsset: q.assetAsset };
-    const bp = bridgedTakePlan(route);
-    if (bp && bp.bridged) return reviewBridged(route, bp);
+    const disp = settlementDispatch(route);
+    // The taker's ACTUAL submarine rail shapes: a BUY paying BTC over LN + receiving the asset on-chain, or a
+    // SELL paying the asset on-chain + receiving BTC over LN. The P2P submarine + the LSP payer bridge only
+    // apply when the taker really holds the LN leg for that direction (so a pure-LN taker is never re-routed
+    // to an on-chain-receive submarine). The receiver leg-bridge (a SELL) stays exactly as before.
+    const pr = route.payRail || S.payRail, rr = route.recvRail || S.recvRail;
+    const buySubShape  = !!route.payIsBtc && pr === 'ln' && rr === 'chain';
+    const sellSubShape = !route.payIsBtc && pr === 'chain' && rr === 'ln';
+    // A submarine shape (BUY pay-BTC-over-LN / receive asset on-chain, or SELL pay-asset-on-chain / receive
+    // BTC-over-LN) is settled PEER-TO-PEER or via the LSP leg-bridge — it has NO native/inline-channel path.
+    // Route EVERY such shape here and RETURN in every branch: it must NEVER fall through to reviewMixed/
+    // startMixed (a doomed inline-channel submarine / 422) or offer-then-refuse.
+    if (buySubShape || sellSubShape){
+      const tk = (C.assetMeta(q.seqAsset) || {}).ticker || 'asset';
+      // No routable resting maker at all -> honest-disable (this rail needs a resting maker).
+      if (!disp || !disp.offer){
+        $('swErr').textContent = buySubShape
+          ? `No resting BTC→${tk} offer that settles over Lightning right now · this rail needs a resting maker. Try again shortly, or set the pay leg to on-chain to post a durable limit order.`
+          : `No resting ${tk}→BTC offer that settles over Lightning right now · this rail needs a resting maker. Try again shortly, or set the receive leg to on-chain.`;
+        return;
+      }
+      // The best offer rests its ASSET over Lightning, so this crossing has no on-chain asset leg to settle
+      // (dispatch -> 'unsupported'). Honest-disable, never misroute into a doomed submarine.
+      if (disp.path === 'unsupported'){
+        $('swErr').textContent = `The best ${tk} offer rests over Lightning, so this rail crossing has no on-chain ${tk} leg to settle against right now · try again shortly, or switch the ${tk} leg to on-chain.`;
+        return;
+      }
+      if (disp.path === 'p2p-submarine') return reviewSubmarineP2P(route, disp);   // DIRECT peer-to-peer (both directions)
+      if (disp.path === 'lsp-bridge'){
+        // BUY fallback vs an on-chain-only maker: paying BTC over Lightning to it needs the LSP hold-invoice,
+        // which the seqln node does not yet mint. Honest-disable via the SHARED payerBridgeDisabledNote
+        // (identical across requoteMixed / onReview / reviewMixed) rather than a broken Place (runLspPayerBridge
+        // also fails closed with zero exposure if ever reached).
+        if (disp.lnSide === 'payer' && buySubShape){
+          $('swErr').textContent = payerBridgeDisabledNote(tk);
+          return;
+        }
+        // SELL via the existing receiver leg-bridge — ONLY when the LSP actually settles this crossing shape.
+        if (disp.lnSide === 'receiver' && sellSubShape && disp.bridged && disp.supported) return reviewBridged(route, disp);
+        // Any other lsp-bridge shape here (e.g. no supported receiver bridge) -> honest-disable, never startMixed.
+        $('swErr').textContent = `No resting ${tk} offer that settles this Lightning crossing right now · try again shortly, or set the crossed leg to on-chain.`;
+        return;
+      }
+      // path === 'native' for a declared sub-shape means no crossing maker was routable -> honest-disable.
+      $('swErr').textContent = buySubShape
+        ? `No resting BTC→${tk} offer that settles over Lightning right now · this rail needs a resting maker. Try again shortly.`
+        : `No resting ${tk}→BTC offer that settles over Lightning right now · this rail needs a resting maker. Try again shortly.`;
+      return;
+    }
   }
   if (q.kind === 'cross-make'){
     // BUY-with-BTC LIMIT + "keep resting while offline" ON -> the SBTC silent peg: rest as a covenant
@@ -4285,6 +4851,26 @@ async function reviewMixed(q){
   // Which leg is the ASSET, which is BTC.
   const assetLeg = q.payIsBtc ? q.recvRail : q.payRail;
   const btcLeg   = q.payIsBtc ? q.payRail : q.recvRail;
+  // DEFENCE-IN-DEPTH (kill offer-then-refuse): a BUY paying BTC over Lightning to receive the asset on-chain
+  // has NO custodial-submarine settlement here — it settles PEER-TO-PEER (interactive maker) or via the LSP
+  // PAYER leg-bridge. It must NEVER reach the inline BTC-LN channel provisioning + startMixed below. onReview
+  // already routes it via settlementDispatch; this re-dispatches if ever reached directly, and fails closed
+  // (no channel opened) when no maker can settle it.
+  if (side === 'buy' && btcLeg === 'ln' && assetLeg === 'chain'){
+    const route = q.route || { seqAsset: q.seqAsset, payIsBtc: true, payRail: 'ln', recvRail: 'chain' };
+    const disp = settlementDispatch(route);
+    if (disp && disp.path === 'p2p-submarine') return reviewSubmarineP2P(route, disp);
+    // PAYER leg-bridge (on-chain-only maker): honest-DISABLE via the SHARED payerBridgeDisabledNote — the SAME
+    // gate requoteMixed + onReview apply. It must NEVER reach reviewLspPayerBridge's enabled Place until the
+    // seqln hold-invoice capability lands (offer-then-refuse); runLspPayerBridge also fails closed with zero
+    // exposure. (This was the last entry point that still routed the payer bridge into an enabled Review.)
+    if (disp && disp.path === 'lsp-bridge' && disp.lnSide === 'payer'){
+      $('swErr').textContent = payerBridgeDisabledNote(am.ticker);
+      return;
+    }
+    $('swErr').textContent = `This buy needs a resting maker that settles over Lightning · none right now. Try again shortly, or set the pay leg to on-chain to post a durable limit order.`;
+    return;
+  }
   // Two mixed shapes settle: the submarine (asset on-chain + BTC-LN), and its MIRROR the
   // sub-asset (asset over LN + BTC on-chain) — a BUY only, gated to pairs with a maker.
   const isSubAsset = (side === 'buy' && assetLeg === 'ln' && btcLeg === 'chain');

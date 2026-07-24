@@ -414,8 +414,23 @@ export function seqlnNodeReceive({ node_key, amount, description }) {
 }
 // Generic Lightning SEND: the user's own hosted node PAYS `bolt11` (device co-signs every HTLC).
 // Returns { paid, preimage, amount_msat, destination }.
-export function seqlnNodePay({ node_key, bolt11 }) {
-  return lspFetch('/node/pay', { method: 'POST', body: JSON.stringify({ node_key, bolt11 }) });
+//
+// DEFENCE-IN-DEPTH (rail-crossing submarine / payer-bridge pay): thread wantHash(H) + amountMsat +
+// minFinalCltv + maxCltv so the node can BIND the payment_hash, amount and final-hop CLTV of the outgoing
+// payment (mirror the Go PayInvoice(bolt11, wantHash, amountMsat)). maxCltv BOUNDS the whole route's CLTV
+// delay (CLN `maxdelay`): the reverse-submarine taker caps it to the safe ceiling so that if the maker HOLDS
+// the payment (a masqueraded hold invoice), the incoming HTLC fails back — refunding the taker — as EARLY as
+// possible instead of lingering to the invoice's requested delay. The wallet's client-side pre-pay gates
+// (payment_hash === H, amount == the offer price, min_final_cltv can't settle past T_seq) remain the PRIMARY
+// guard; these are forwarded best-effort. NOTE: the seqln /node/pay handler must be enhanced to enforce them —
+// until it is, they are advisory (a no-op the node ignores), and the client-side gates carry fund-safety.
+export function seqlnNodePay({ node_key, bolt11, wantHash, amountMsat, minFinalCltv, maxCltv }) {
+  const body = { node_key, bolt11 };
+  if (wantHash) body.wantHash = String(wantHash).toLowerCase();
+  if (amountMsat != null) body.amount_msat = Number(amountMsat);
+  if (minFinalCltv != null) body.min_final_cltv = Number(minFinalCltv);
+  if (maxCltv != null) body.max_cltv = Number(maxCltv);
+  return lspFetch('/node/pay', { method: 'POST', body: JSON.stringify(body) });
 }
 // Advisory status of an async LSP job (e.g. the sub-asset HODL BUY /swap job). Takes the poll path
 // ('/swap/<id>') the /swap 202 returned, or a bare id. The wallet drives its own settle; this is only
@@ -515,6 +530,15 @@ export function seqlnBridgeFront({ job_id, recv_node_id, recv_min_final_cltv }) 
 // GET /swap/<id> shows status 'fronted' AND the taker's own hold on H is 'accepted'.
 export function seqlnBridgeAsset({ job_id, taker_seq_leg, recv_node_id }) {
   return lspFetch('/bridge/asset', { method: 'POST', body: JSON.stringify({ job_id, taker_seq_leg, recv_node_id }) });
+}
+// LSP PAYER LEG-BRIDGE (rail-crossing BUY vs an on-chain-only maker): the INVERSE of /bridge/front. The taker
+// mints H (holds P self-custody) and, after the /swap handshake secures the forward-maker terms, calls this so
+// the LSP ISSUES a BTC-LN HOLD invoice on H at its OWN node. The taker pays it -> the payment lands HELD (not
+// captured) at the LSP; only then does the LSP fund the on-chain BTC HTLC to the maker. Returns { node_id,
+// payment_hash, bolt11, amount_msat, hold_min_final_cltv, hold_expiry_secs }. Idempotent (a re-post re-affirms
+// the hold on H). Pay it setting the final-hop CLTV >= hold_min_final_cltv so the hold stays settleable past T_seq.
+export function seqlnBridgeHold({ job_id }) {
+  return lspFetch('/bridge/hold', { method: 'POST', body: JSON.stringify({ job_id }) });
 }
 
 // The sub-asset order book for an asset: { sell_available, buy_available, sell_offers[],

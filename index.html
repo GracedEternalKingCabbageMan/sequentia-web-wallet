@@ -950,13 +950,13 @@ import init, { Mnemonic, Network, Signer, Wollet, Update, EsploraClient, Address
   openampComputeAid, enclaveSighash, decodeEnclaveSpend, stringToQr }
   from './pkg/lwk_wasm.js';
 import { HDKey, mnemonicToSeedSync, btc, schnorr } from './btc.js';
-import { initSwap, renderSwap, resumeCrossMakers, resumeCovenantOrders, resumePegIns, resumePegOuts, resumeMixedSwap, resumeSell, resumeBuy, resumeBridged, hasBuyInFlight, hasBridgeInFlight, scanCovenantCompanion, setConfidentialReceive, confidentialReceive, logTrade } from './swap.js';
+import { initSwap, renderSwap, resumeCrossMakers, resumeCovenantOrders, resumePegIns, resumePegOuts, resumeMixedSwap, resumeSell, resumeBuy, resumeBridged, resumeSubswap, hasBuyInFlight, hasBridgeInFlight, hasSubswapInFlight, scanCovenantCompanion, setConfidentialReceive, confidentialReceive, logTrade } from './swap.js';
 import { initXswap, renderXswap, fetchXmarkets, fetchXquote, fetchXbook, openFromComposer, hasInFlight } from './xswap.js';
 import { initXrswap, fetchRQuote, openReverseFromComposer, hasInFlight as hasReverseInFlight, renderReverse } from './xrswap.js';
 import { initXmaker, startForwardMaker, startReverseMaker, liveMakerOffers, resumeMakerSwaps } from './xmaker.js';
 import { initSeqln, connectDevice as lnConnectDevice, disconnectDevice as lnDisconnect,
   onSeqlnStatus, seqlnState, seqlnAvailable, seqlnGetStatus, seqlnListNodes, seqlnNodeOnchain, seqlnSwap, seqlnBook, seqlnUnifiedBook, seqlnLnBook, seqlnPostOffer, lnFinalityCopy,
-  seqlnChannelInbound, seqlnNodeInvoice, seqlnInvoiceStatus, seqlnNodeSettle, seqlnNodeReceive, seqlnNodePay, seqlnJobStatus, seqlnBridgeFront, seqlnBridgeAsset,
+  seqlnChannelInbound, seqlnNodeInvoice, seqlnInvoiceStatus, seqlnNodeSettle, seqlnNodeReceive, seqlnNodePay, seqlnJobStatus, seqlnBridgeFront, seqlnBridgeAsset, seqlnBridgeHold,
   seqlnChannels, seqlnFunding, fundChannel, resumeFundChannel, provisionAndConnect, waitNodeReady, provisionedState,
   disconnectProvisioned, deviceTransportPubkey, registerOwnStatusKeys, closeChannelLsp } from './seqln.js';
 import { lnDeriveNode, lnDeriveAsset } from './seqln-keys.js';
@@ -1927,10 +1927,47 @@ const seqLeg = {
     } catch {}
     return null;
   },
+  // STRICT variant for the never-confirmed sell-resume DROP decision (swap.js resumeSubswap D0). Esplora's
+  // /address/<a>/utxo INCLUDES mempool (0-conf) UTXOs, so a SUCCESSFUL empty read proves the HTLC funding is
+  // neither confirmed NOR in the mempool — nothing was ever committed on-chain. Unlike findFundingByAddress
+  // above (which swallows errors into null, right for the fund/strand-recovery callers), this THROWS on a
+  // fetch/HTTP error so a transient blip is NEVER mistaken for a genuine empty, and returns { found }
+  // (found = {txid,vout} | null). The caller drops the record ONLY on a { found:null } (a real empty), and
+  // keeps it resumable when this throws.
+  async findFundingByAddressStrict(redeemHex){
+    const addr = this.htlcAddress(redeemHex);
+    const r = await fetch(`${ESPLORA}/address/${addr}/utxo`);
+    if (!r.ok) throw new Error('esplora utxo read failed: HTTP ' + r.status);
+    const utxos = await r.json();
+    if (!Array.isArray(utxos)) throw new Error('esplora utxo read returned a non-array');
+    for (const u of utxos){ if (u && u.txid) return { found: { txid: u.txid, vout: (u.vout==null?0:u.vout) } }; }
+    return { found: null };
+  },
+  // The wallet's OWN scriptPubkey hex — the CLTV refund destination. The Rust buildSeqHtlcRefundTx REQUIRES a
+  // String dest_spk (a null throws), so a refund must always bind a real output. Mirrors claim()'s derivation.
+  ownDestSpk(){
+    const a = wollet.address(addrIndex==null?undefined:addrIndex).address();
+    const unconf = a.toUnconfidential ? a.toUnconfidential() : a;
+    return hexOfBytes(unconf.scriptPubkey().bytes());
+  },
   // Refund the SEQ leg via the CLTV/ELSE branch after T_seq (a Sequentia tx). The
   // refund key is the canonical HTLC key (re-derived; secret passed for parity).
   async refund({ txid, vout, amount, asset_id, redeem_script, locktime, refund_secret, dest_spk, fee }){
-    const spend = { txid, vout, amount: Number(amount), asset_id, dest_spk, fee: Number(fee) };
+    // FUND-SAFETY: dest_spk MUST be a real String (buildSeqHtlcRefundTx rejects null) — default to the wallet's
+    // OWN scriptPubkey. fee: a real any-asset fee (mirror claim(), paid IN THE REFUNDED ASSET from its own
+    // published rate) when the caller passes none / <= 0, never a bogus 1-atom underpay the mempool rejects.
+    const destSpk = dest_spk || this.ownDestSpk();
+    let f = Number(fee);
+    if (!Number.isFinite(f) || f <= 0){
+      f = 1;
+      try {
+        const rate = Number(feeRateFor(asset_id));   // policy asset uses its OWN published rate, no 1:1 privilege
+        const nativeFeeSats = Math.ceil(DEFAULT_FEERATE * 350 / 1000);
+        f = Math.max(1, Math.ceil(nativeFeeSats * EXCHANGE_RATE_SCALE / rate));
+      } catch {}
+    }
+    if (f > Math.floor(Number(amount)/2)) f = Math.max(1, Math.floor(Number(amount)/2));
+    const spend = { txid, vout, amount: Number(amount), asset_id, dest_spk: destSpk, fee: f };
     const hex = buildSeqHtlcRefundTx(spend, redeem_script, refund_secret, locktime);
     return await broadcastSeqRaw(hex);
   },
@@ -1963,8 +2000,24 @@ const seqLeg = {
       if (!o) return null;
       const value = (o.value != null) ? BigInt(o.value) : null;
       const asset = o.asset || o.assetid || null;
-      return (value != null && asset) ? { value, asset } : null;   // blinded outputs lack explicit value/asset
+      // Return the funding output's scriptPubkey so verifySeqLeg/checkFundingOutput can REQUIRE it equals
+      // P2SH(the rebuilt redeem) — the taker never pays/exposes against an output it cannot bind to the exact
+      // HTLC it verified. checkFundingOutput fails CLOSED when spk is absent, so surface it verbatim.
+      const spk = o.scriptpubkey || o.scriptPubKey || o.scriptpubkey_hex || null;
+      return (value != null && asset) ? { value, asset, spk } : null;   // blinded outputs lack explicit value/asset
     } catch { return null; }
+  },
+  // Bind a funding tx to its CONFIRMED block: read /tx/<txid>/status and return { confirmed, block_hash,
+  // block_height }. verifySeqLeg / waitAnchorBuried use THIS (never the maker-supplied leg.block_hash) so the
+  // anchor depth is computed from the tx's OWN confirmed block — a maker cannot pass a fake/mempool leg with a
+  // decoy block_hash. Fails closed (confirmed:false) on any read error or a still-mempool (0-conf) funding.
+  async txStatus(txid){
+    try {
+      const s = await fetch(`${ESPLORA}/tx/${txid}/status`).then(r=>r.ok?r.json():null);
+      if (!s) return { confirmed: false, block_hash: null, block_height: null };
+      return { confirmed: s.confirmed === true, block_hash: s.block_hash || null,
+        block_height: (s.block_height != null) ? Number(s.block_height) : null };
+    } catch { return { confirmed: false, block_hash: null, block_height: null }; }
   },
   // TRUSTLESS preimage read: find the tx that SPENT our funded asset HTLC (the maker's claim) and extract
   // the push whose sha256 equals the hashlock H. This is how the W2 bridged SELL learns P off the chain
@@ -2177,6 +2230,9 @@ async function openWallet(phrase){
   // A rail-blind BRIDGED take (a genuine rail crossing the LSP bridges): re-POST with the same nonce
   // (idempotent) or re-poll the anchor-gated job, so a reload never strands or double-funds it.
   try{ resumeBridged(); }catch(e){ console.warn('[resume] bridged-take resume failed:', e?.message??e); }
+  // Resume a persisted P2P submarine / LSP payer-bridge take: re-claim a BUY that already learned P (fund-
+  // safety), refund a SELL whose maker never paid past T_seq, and drop terminal/pre-commitment records.
+  try{ resumeSubswap(); }catch(e){ console.warn('[resume] rail-crossing subswap resume failed:', e?.message??e); }
   // Finish a Move-to-Lightning that was interrupted after its deposit landed (funds on the user's
   // own node, never lost) — self-healing so a network blip / reload can't strand a deposit.
   try{ updateLnMoveBanner(); }catch{}   // show the in-flight banner immediately if a move is still pending from last session
@@ -2977,6 +3033,10 @@ function initSwapTab(){
       // funded asset leg to relay. The LSP fronts BEFORE the taker exposes any asset (see swap.js driveBridged).
       bridgeFront: (p) => seqlnBridgeFront(p),
       bridgeAsset: (p) => seqlnBridgeAsset(p),
+      // LSP PAYER leg-bridge (rail-crossing BUY vs an on-chain-only maker): the LSP issues a BTC-LN hold on
+      // the taker's H so the taker pays it HELD before the LSP funds the maker's on-chain BTC HTLC (see
+      // subswap.runLspPayerBridge / swap.js driveLspPayerBridge).
+      bridgeHold: (p) => seqlnBridgeHold(p),
       jobStatus: (pathOrId) => seqlnJobStatus(pathOrId),   // advisory async-job status (sub-asset HODL BUY)
       // The submarine (mixed) async-job status — GET /swap/<id>, the SAME endpoint as jobStatus. Wiring
       // this is what lets pollMixed advance an anchor-gated (over-0-conf) submarine past SETTLING; it was
